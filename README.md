@@ -1,16 +1,32 @@
 # Stacks
 
-Stacks is a personal document ingestion and retrieval service. The project will
-watch document sources, preserve their provenance, index their contents, and
-provide grounded retrieval over a continuously growing collection.
+Stacks builds a temporal knowledge graph from personal documents and other
+source material. It is designed to answer questions about change: how a
+relationship evolved, how a product reached its current form, what was believed
+at a particular point, and which evidence supports that history.
 
-The initial scaffold is deliberately small and uses only the Go standard
-library. Storage, ingestion, chunking, embeddings, and retrieval contracts will
-be added as their boundaries are defined.
+Documents remain immutable evidence. Stacks extracts observations, resolves
+entities, and records time-bounded relationships without erasing prior states.
+Answers must distinguish source evidence from inference and cite their path back
+to the original material.
+
+The initial scaffold is deliberately small. PostgreSQL and pgvector provide the
+storage foundation, but vector search is supporting machinery rather than the
+product: similarity can find candidate evidence; it cannot establish identity,
+chronology, or truth.
+
+## Product principles
+
+- Preserve both when something happened and when Stacks learned about it.
+- Never replace history with the latest state.
+- Treat model-produced observations and entity matches as untrusted proposals.
+- Preserve aliases, uncertainty, conflicting evidence, and source provenance.
+- Answer temporal questions with inspectable graph paths and citations.
 
 ## Requirements
 
 - Go 1.26 or newer
+- Docker with Compose
 
 ## Run
 
@@ -41,12 +57,42 @@ make staticcheck
 make build
 ```
 
+## Local database
+
+Create local credentials before starting PostgreSQL:
+
+```sh
+cp .env.example .env
+openssl rand -hex 24
+```
+
+Put independently generated values in `STACKS_DB_ADMIN_PASSWORD` and
+`STACKS_DB_APP_PASSWORD`, then run:
+
+```sh
+make db-up
+make db-migrate
+make db-status
+```
+
+`stacks_admin` owns the local database and is used only for migrations.
+Application code must connect as the least-privileged `stacks_app` role. The
+database listens only on `127.0.0.1` and uses `STACKS_DB_PORT` (default `5432`).
+
+`make db-down` stops the database while preserving its named volume. To remove
+local database contents deliberately, run `docker compose down --volumes`.
+Bootstrap credentials and roles are created only when PostgreSQL initializes a
+new volume; changing `.env` later does not update roles in an existing volume.
+
 ## Intended architecture
 
 - `cmd/stacks`: process entrypoint
 - `internal/app`: application lifecycle and dependency wiring
 - `internal/config`: validated runtime configuration
 - `internal/httpapi`: HTTP transport boundary
+- `db/init`: first-start cluster and role bootstrap
+- `db/migrations`: ordered, forward-only schema migrations
 
-The next slice should define the source-document and ingestion-job contracts,
-then add PostgreSQL and pgvector behind a storage interface.
+The next slice should define immutable source evidence and temporal observation
+contracts, including valid time, recorded time, provenance, and epistemic
+status, before introducing graph persistence or model extraction.
