@@ -1,12 +1,27 @@
 # Stacks
 
-Stacks is a personal document ingestion and retrieval service. The project will
-watch document sources, preserve their provenance, index their contents, and
-provide grounded retrieval over a continuously growing collection.
+Stacks builds a temporal knowledge graph from personal documents and other
+source material. It is designed to answer questions about change: how a
+relationship evolved, how a product reached its current form, what was believed
+at a particular point, and which evidence supports that history.
 
-The initial scaffold is deliberately small and uses only the Go standard
-library. Storage, ingestion, chunking, embeddings, and retrieval contracts will
-be added as their boundaries are defined.
+Documents remain immutable evidence. Stacks extracts observations, resolves
+entities, and records time-bounded relationships without erasing prior states.
+Answers must distinguish source evidence from inference and cite their path back
+to the original material.
+
+The initial scaffold is deliberately small. PostgreSQL and pgvector provide the
+storage foundation, but vector search is supporting machinery rather than the
+product: similarity can find candidate evidence; it cannot establish identity,
+chronology, or truth.
+
+## Product principles
+
+- Preserve both when something happened and when Stacks learned about it.
+- Never replace history with the latest state.
+- Treat model-produced observations and entity matches as untrusted proposals.
+- Preserve aliases, uncertainty, conflicting evidence, and source provenance.
+- Answer temporal questions with inspectable graph paths and citations.
 
 ## Requirements
 
@@ -78,5 +93,6 @@ new volume; changing `.env` later does not update roles in an existing volume.
 - `db/init`: first-start cluster and role bootstrap
 - `db/migrations`: ordered, forward-only schema migrations
 
-The next slice should define the source-document and ingestion-job contracts,
-then connect the service to PostgreSQL behind a focused storage boundary.
+The next slice should define immutable source evidence and temporal observation
+contracts, including valid time, recorded time, provenance, and epistemic
+status, before introducing graph persistence or model extraction.

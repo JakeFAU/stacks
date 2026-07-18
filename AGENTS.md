@@ -2,7 +2,10 @@
 
 ## Purpose
 
-Stacks is a personal document ingestion and retrieval service written in Go.
+Stacks builds a provenance-backed temporal knowledge graph from personal
+documents and other source material. Its purpose is not merely to find relevant
+passages, but to explain how entities, relationships, events, and beliefs
+changed over time.
 
 The system should remain understandable, auditable, and easy to operate by one person. Prefer explicit data flow, narrow interfaces, deterministic behavior, and boring infrastructure over clever abstractions.
 
@@ -11,9 +14,14 @@ The likely long-term shape is:
 1. discover documents from one or more sources,
 2. detect additions and changes,
 3. extract and normalize content,
-4. preserve provenance,
-5. index content for retrieval,
-6. answer queries with citations back to the source material.
+4. extract source-grounded observations with explicit uncertainty,
+5. resolve entities without destroying aliases or prior interpretations,
+6. build time-bounded relationships and events,
+7. answer temporal questions with an evidence trail back to source material.
+
+Document retrieval, embeddings, and language models support that goal; they are
+not the product by themselves. A graph edge without provenance, temporal
+semantics, or epistemic status is not trusted knowledge.
 
 Do not assume that every step belongs in the same process or abstraction. Introduce boundaries only when the code has earned them.
 
@@ -39,9 +47,11 @@ As the system grows, keep these concerns behind explicit boundaries:
 * document sources,
 * content extraction,
 * persistence,
-* indexing,
+* observation extraction,
+* entity resolution,
+* temporal graph construction,
 * embedding or model providers,
-* retrieval,
+* graph and evidence retrieval,
 * application orchestration,
 * HTTP transport.
 
@@ -61,7 +71,7 @@ A little duplication is cheaper than the wrong abstraction. Extract shared code 
 
 ### Make state transitions explicit
 
-Document ingestion is stateful. Code should make it clear:
+Document ingestion and graph construction are stateful. Code should make it clear:
 
 * what was observed,
 * what changed,
@@ -70,11 +80,17 @@ Document ingestion is stateful. Code should make it clear:
 * what failed,
 * what may safely be retried.
 
-Prefer idempotent operations and stable identifiers. A repeated ingestion run should not silently duplicate documents, chunks, embeddings, or index entries.
+Prefer idempotent operations and stable identifiers. A repeated ingestion run
+should not silently duplicate documents, observations, entities,
+relationships, evidence links, or derived artifacts.
+
+Never overwrite history to represent a new state. Preserve the prior assertion
+and record when the replacement became valid or known.
 
 ### Preserve provenance
 
-Every stored or retrieved unit of content must remain traceable to its source.
+Every observation, relationship, event, and answer must remain traceable to its
+source evidence and the transformation that produced it.
 
 Where applicable, retain:
 
@@ -85,9 +101,16 @@ Where applicable, retain:
 * ingestion timestamp,
 * extraction method,
 * chunk position,
-* relevant source metadata.
+* relevant source metadata,
+* model and prompt version for model-derived claims,
+* confidence and epistemic status.
 
-Retrieval results should expose enough provenance to support citations and debugging.
+Distinguish when something was true or occurred from when Stacks observed or
+recorded it. Do not substitute ingestion time when source time is unknown; keep
+the time unknown and preserve that uncertainty.
+
+Graph results should expose enough provenance to support citations, temporal
+reasoning, correction, and debugging.
 
 ### Keep policy separate from mechanism
 
@@ -98,8 +121,10 @@ For example:
 * a Drive client may list and fetch files,
 * an extractor may convert bytes into normalized text,
 * an ingestion service decides whether a document is new or changed,
-* a repository persists ingestion state,
-* a retriever ranks candidate passages.
+* an observation extractor may propose source-grounded claims,
+* entity resolution decides whether two mentions refer to the same entity,
+* a graph service applies temporal and provenance invariants,
+* a retriever gathers graph paths and supporting evidence.
 
 Do not let vendor behavior become the domain model by accident.
 
@@ -218,35 +243,47 @@ Keep SQL and database-specific behavior behind a focused storage boundary.
 
 Prefer explicit queries over opaque ORM behavior. Transactions should be visible at the application operation that requires atomicity.
 
-Schema changes must be forward-moving, reviewable, and safe against existing local data. Do not silently destroy or reinterpret stored document state.
+Schema changes must be forward-moving, reviewable, and safe against existing
+local data. Do not silently destroy or reinterpret stored documents, graph
+history, or provenance.
 
 When adding persistence behavior, define the relevant invariants. Examples include:
 
 * source document IDs are unique within a provider,
 * document versions are immutable,
 * only one active version exists per logical document,
-* chunks belong to exactly one document version,
+* observations point to immutable source evidence,
+* valid time and recorded time have distinct meanings,
+* entity merges preserve aliases and can be audited or reversed,
+* relationships may change without erasing their prior state,
 * repeated writes are idempotent.
 
-## Ingestion and Retrieval
+## Ingestion and Temporal Graphs
 
 Treat ingestion as a resumable pipeline, not a single magical function.
 
-Keep source discovery, fetching, extraction, normalization, chunking, indexing, and state recording separable enough to test independently.
+Keep source discovery, fetching, extraction, normalization, observation
+extraction, entity resolution, graph updates, and state recording separable
+enough to test independently.
 
 Do not mark a document version complete until all required durable work has succeeded.
 
-Retrieval code should distinguish:
+Temporal query code should distinguish:
 
-* filtering,
-* candidate generation,
-* ranking,
-* context assembly,
-* answer generation.
+* entity and time-range resolution,
+* graph traversal,
+* supporting and conflicting evidence retrieval,
+* chronology construction,
+* answer generation with citations.
 
-Do not bury retrieval policy inside a model prompt or provider client.
+Do not bury temporal semantics, entity identity rules, or graph mutation policy
+inside a model prompt or provider client. Embedding similarity may suggest
+candidates; it must not silently establish identity or truth.
 
-Any generated answer based on private documents should retain references to the passages used. A plausible answer without provenance is a failure mode, not a feature.
+Any generated answer should retain references to the observations and source
+passages used, distinguish evidence from inference, and surface material
+conflicts or gaps. A plausible narrative without provenance is a failure mode,
+not a feature.
 
 ## Testing
 
@@ -256,7 +293,7 @@ Name tests after observable behavior:
 
 ```go
 func TestLoaderRejectsMissingDatabaseURL(t *testing.T)
-func TestIngestUnchangedDocumentDoesNotCreateNewVersion(t *testing.T)
+func TestRelationshipChangePreservesPriorState(t *testing.T)
 ```
 
 Use table tests when multiple inputs exercise the same contract. Do not force unrelated scenarios into one table merely to reduce line count.
@@ -314,8 +351,8 @@ Use concise imperative commit subjects:
 
 ```text
 Add document ingestion contract
-Persist source document versions
-Return provenance with retrieval results
+Persist temporal relationship observations
+Answer graph queries with supporting evidence
 ```
 
 Each commit should represent one coherent concern. Do not mix broad cleanup, formatting churn, dependency upgrades, and behavior changes unless they are inseparable.
