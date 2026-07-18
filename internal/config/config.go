@@ -2,25 +2,52 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const (
-	defaultHTTPHost                      = "127.0.0.1"
-	defaultHTTPPort                      = 8080
-	defaultReadHeaderTimeoutSeconds      = 5
-	HTTPHostEnvironmentVariable          = "STACKS_HTTP_HOST"
-	HTTPPortEnvironmentVariable          = "STACKS_HTTP_PORT"
-	ReadHeaderTimeoutEnvironmentVariable = "STACKS_READ_HEADER_TIMEOUT_SECONDS"
+	defaultHTTPHost                         = "127.0.0.1"
+	defaultHTTPPort                         = 8080
+	defaultReadHeaderTimeoutSeconds         = 5
+	defaultLogLevel                         = "info"
+	defaultOTelEndpoint                     = "127.0.0.1:4317"
+	defaultOTelMetricExportInterval         = 10 * time.Second
+	defaultOTelServiceName                  = "stacks"
+	defaultOTelTraceSampleRatio             = 1.0
+	HTTPHostEnvironmentVariable             = "STACKS_HTTP_HOST"
+	HTTPPortEnvironmentVariable             = "STACKS_HTTP_PORT"
+	ReadHeaderTimeoutEnvironmentVariable    = "STACKS_READ_HEADER_TIMEOUT_SECONDS"
+	LogLevelEnvironmentVariable             = "STACKS_LOG_LEVEL"
+	OTelEnabledEnvironmentVariable          = "STACKS_OTEL_ENABLED"
+	OTelEndpointEnvironmentVariable         = "STACKS_OTEL_ENDPOINT"
+	OTelInsecureEnvironmentVariable         = "STACKS_OTEL_INSECURE"
+	OTelMetricIntervalEnvironmentVariable   = "STACKS_OTEL_METRIC_EXPORT_INTERVAL"
+	OTelServiceNameEnvironmentVariable      = "STACKS_OTEL_SERVICE_NAME"
+	OTelTraceSampleRatioEnvironmentVariable = "STACKS_OTEL_TRACE_SAMPLE_RATIO"
 )
 
 // Settings contains validated runtime configuration.
 type Settings struct {
 	HTTPAddress       string
 	ReadHeaderTimeout time.Duration
+	LogLevel          string
+	Telemetry         TelemetrySettings
+}
+
+// TelemetrySettings controls OTLP export. Telemetry remains optional so the
+// service can run without the local observability stack.
+type TelemetrySettings struct {
+	Enabled              bool
+	Endpoint             string
+	Insecure             bool
+	MetricExportInterval time.Duration
+	ServiceName          string
+	TraceSampleRatio     float64
 }
 
 // Load reads and validates settings from the environment.
@@ -42,9 +69,46 @@ func Load() (Settings, error) {
 		return Settings{}, err
 	}
 
+	logLevel := strings.ToLower(environmentOrDefault(LogLevelEnvironmentVariable, defaultLogLevel))
+	if !validLogLevel(logLevel) {
+		return Settings{}, fmt.Errorf("%s must be one of debug, info, warn, or error", LogLevelEnvironmentVariable)
+	}
+
+	telemetryEnabled, err := booleanEnvironment(OTelEnabledEnvironmentVariable, false)
+	if err != nil {
+		return Settings{}, err
+	}
+	telemetryInsecure, err := booleanEnvironment(OTelInsecureEnvironmentVariable, true)
+	if err != nil {
+		return Settings{}, err
+	}
+	metricExportInterval, err := durationEnvironment(
+		OTelMetricIntervalEnvironmentVariable,
+		defaultOTelMetricExportInterval,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+	traceSampleRatio, err := unitIntervalEnvironment(
+		OTelTraceSampleRatioEnvironmentVariable,
+		defaultOTelTraceSampleRatio,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+
 	return Settings{
 		HTTPAddress:       net.JoinHostPort(host, strconv.Itoa(port)),
 		ReadHeaderTimeout: time.Duration(readHeaderTimeoutSeconds) * time.Second,
+		LogLevel:          logLevel,
+		Telemetry: TelemetrySettings{
+			Enabled:              telemetryEnabled,
+			Endpoint:             environmentOrDefault(OTelEndpointEnvironmentVariable, defaultOTelEndpoint),
+			Insecure:             telemetryInsecure,
+			MetricExportInterval: metricExportInterval,
+			ServiceName:          environmentOrDefault(OTelServiceNameEnvironmentVariable, defaultOTelServiceName),
+			TraceSampleRatio:     traceSampleRatio,
+		},
 	}, nil
 }
 
@@ -66,4 +130,52 @@ func positiveIntegerEnvironment(name string, fallback int) (int, error) {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return parsed, nil
+}
+
+func booleanEnvironment(name string, fallback bool) (bool, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", name)
+	}
+	return parsed, nil
+}
+
+func durationEnvironment(name string, fallback time.Duration) (time.Duration, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", name)
+	}
+	return parsed, nil
+}
+
+func unitIntervalEnvironment(name string, fallback float64) (float64, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 || parsed > 1 {
+		return 0, fmt.Errorf("%s must be a finite number between 0 and 1", name)
+	}
+	return parsed, nil
+}
+
+func validLogLevel(level string) bool {
+	switch level {
+	case "debug", "info", "warn", "error":
+		return true
+	default:
+		return false
+	}
 }

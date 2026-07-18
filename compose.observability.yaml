@@ -1,0 +1,85 @@
+name: stacks-observability
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.153.0
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+    depends_on:
+      - loki
+      - tempo
+    ports:
+      - 127.0.0.1:4317:4317
+      - 127.0.0.1:4318:4318
+    restart: unless-stopped
+    volumes:
+      - ./deploy/observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
+    ports:
+      - 127.0.0.1:9090:9090
+    restart: unless-stopped
+    volumes:
+      - ./deploy/observability/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus_data:/prometheus
+
+  tempo:
+    image: grafana/tempo:3.0.2
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+    depends_on:
+      - prometheus
+    ports:
+      - 127.0.0.1:3200:3200
+    restart: unless-stopped
+    volumes:
+      - ./deploy/observability/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+
+  loki:
+    image: grafana/loki:3.7.3
+    command:
+      - -config.file=/etc/loki/local-config.yaml
+    depends_on:
+      loki-init:
+        condition: service_completed_successfully
+    ports:
+      - 127.0.0.1:3100:3100
+    restart: unless-stopped
+    volumes:
+      - ./deploy/observability/loki.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/var/loki
+
+  loki-init:
+    image: busybox:1.37.0
+    command:
+      - chown
+      - 10001:10001
+      - /var/loki
+    user: 0:0
+    volumes:
+      - loki_data:/var/loki
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    depends_on:
+      - loki
+      - prometheus
+      - tempo
+    ports:
+      - 127.0.0.1:3000:3000
+    restart: unless-stopped
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  grafana_data:
+  loki_data:
+  prometheus_data:
+  tempo_data:

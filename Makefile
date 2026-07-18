@@ -2,7 +2,7 @@ STATICCHECK_VERSION := 2026.1
 GOOSE_VERSION := v3.27.1
 ENV_FILE ?= .env
 
-.PHONY: build db-down db-migrate db-status db-up fmt run staticcheck test
+.PHONY: build db-down db-migrate db-status db-up fmt obs-config obs-down obs-up run staticcheck test
 
 build:
 	go build -o bin/stacks ./cmd/stacks
@@ -33,6 +33,15 @@ db-up:
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -not -path './vendor/*')
+
+obs-config:
+	docker compose -f compose.observability.yaml config --quiet
+
+obs-down:
+	docker compose -f compose.observability.yaml down
+
+obs-up:
+	docker compose -f compose.observability.yaml up --detach
 
 run:
 	go run ./cmd/stacks

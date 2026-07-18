@@ -47,6 +47,13 @@ curl http://127.0.0.1:8080/healthz
 | `STACKS_HTTP_HOST` | `127.0.0.1` | HTTP bind host |
 | `STACKS_HTTP_PORT` | `8080` | HTTP bind port |
 | `STACKS_READ_HEADER_TIMEOUT_SECONDS` | `5` | Maximum time to read request headers |
+| `STACKS_LOG_LEVEL` | `info` | Zap log level: `debug`, `info`, `warn`, or `error` |
+| `STACKS_OTEL_ENABLED` | `false` | Export logs, metrics, and traces through OTLP |
+| `STACKS_OTEL_ENDPOINT` | `127.0.0.1:4317` | OTLP gRPC collector endpoint |
+| `STACKS_OTEL_INSECURE` | `true` | Use plaintext OTLP transport for local development |
+| `STACKS_OTEL_METRIC_EXPORT_INTERVAL` | `10s` | Metric export interval as a Go duration |
+| `STACKS_OTEL_SERVICE_NAME` | `stacks` | OpenTelemetry service name |
+| `STACKS_OTEL_TRACE_SAMPLE_RATIO` | `1` | Parent-based trace sampling ratio from `0` to `1` |
 
 ## Development
 
@@ -56,6 +63,27 @@ make test
 make staticcheck
 make build
 ```
+
+## Local observability
+
+The optional observability Compose project runs an OpenTelemetry Collector,
+Prometheus, Tempo, Loki, and Grafana without changing the database stack:
+
+```sh
+make obs-up
+STACKS_OTEL_ENABLED=true make run
+```
+
+Grafana is available at `http://127.0.0.1:3000`; Prometheus, Tempo, and Loki are
+also bound to loopback on ports `9090`, `3200`, and `3100`. Grafana starts with
+its standard local `admin` login and provisions all three data sources. Run
+`make obs-down` to stop the observability project while preserving its volumes.
+
+Application code logs through Zap. OpenTelemetry exports all three signals over
+OTLP when enabled. Successful spans are explicitly marked `OK`. Decisions should
+be recorded as events on an existing meaningful span and as duration, input/output
+size, and confidence histograms; they should not create a child span merely to
+make a decision visible.
 
 ## Local database
 
@@ -90,6 +118,7 @@ new volume; changing `.env` later does not update roles in an existing volume.
 - `internal/app`: application lifecycle and dependency wiring
 - `internal/config`: validated runtime configuration
 - `internal/httpapi`: HTTP transport boundary
+- `internal/observability`: Zap, OpenTelemetry lifecycle, and decision telemetry
 - `internal/knowledge`: immutable evidence and temporal observation contracts
 - `internal/query`: temporal query plans and deterministic retrieval operators
 - `db/init`: first-start cluster and role bootstrap
