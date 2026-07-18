@@ -284,6 +284,11 @@ Aggregation, conflict handling, diffing, and chronology construction belong in
 the deterministic retrieval layer. Narration must consume dated, ordered,
 provenance-bearing results rather than undated source snippets.
 
+State aggregation must never select a winner by confidence alone. It should
+merge agreeing support, preserve competing values with provenance, and mark
+temporally uncertain or hypothesized values explicitly. Recorded-time cutoffs
+and valid-time inclusion are independent filters.
+
 Temporal precedence alone does not establish causality. Causal-chain retrieval
 must require explicit source-supported causal observations and must preserve
 contradicting evidence.

@@ -101,4 +101,6 @@ epistemic status. Graph persistence and model extraction remain intentionally
 unimplemented until these contracts have been exercised. Query plans represent
 classified point-in-time, comparison, trajectory, and causal-chain intent;
 resolve valid and recorded time independently; and require aggregation and
-diffing before a narrator receives results.
+diffing before a narrator receives results. In-memory state aggregation applies
+those temporal filters, merges agreeing observations, and preserves conflicting,
+hypothesized, or temporally uncertain values rather than manufacturing state.
