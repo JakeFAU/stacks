@@ -1,0 +1,13 @@
+# Build output
+/bin/
+/stacks
+*.out
+
+# Local configuration
+.env
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+

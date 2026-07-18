@@ -1,0 +1,344 @@
+# Repository Guidelines
+
+## Purpose
+
+Stacks is a personal document ingestion and retrieval service written in Go.
+
+The system should remain understandable, auditable, and easy to operate by one person. Prefer explicit data flow, narrow interfaces, deterministic behavior, and boring infrastructure over clever abstractions.
+
+The likely long-term shape is:
+
+1. discover documents from one or more sources,
+2. detect additions and changes,
+3. extract and normalize content,
+4. preserve provenance,
+5. index content for retrieval,
+6. answer queries with citations back to the source material.
+
+Do not assume that every step belongs in the same process or abstraction. Introduce boundaries only when the code has earned them.
+
+## Project Structure
+
+```text
+cmd/stacks/         process entrypoint and dependency wiring
+internal/app/       application lifecycle and orchestration
+internal/config/    environment loading, defaults, and validation
+internal/httpapi/   HTTP handlers, routing, middleware, and transport types
+internal/...        focused application packages added as capabilities emerge
+bin/                local build output; never committed
+```
+
+`cmd/stacks` must remain thin. It may construct dependencies, handle process signals, start the application, and report fatal startup errors. It must not contain business logic.
+
+Keep tests beside the code they exercise using `*_test.go`.
+
+As the system grows, keep these concerns behind explicit boundaries:
+
+* document sources,
+* content extraction,
+* persistence,
+* indexing,
+* embedding or model providers,
+* retrieval,
+* application orchestration,
+* HTTP transport.
+
+Domain logic must not depend directly on provider SDKs, SQL drivers, HTTP frameworks, or model-specific request types.
+
+Do not create packages such as `common`, `shared`, `helpers`, `utils`, or `manager`. Name packages after the responsibility they own.
+
+## Engineering Principles
+
+### Prefer the smallest complete design
+
+Implement the narrowest design that satisfies the current requirement.
+
+Do not add speculative extension points, plugin systems, registries, factories, event buses, generic repositories, or configuration options for hypothetical future needs.
+
+A little duplication is cheaper than the wrong abstraction. Extract shared code only after the common contract is visible.
+
+### Make state transitions explicit
+
+Document ingestion is stateful. Code should make it clear:
+
+* what was observed,
+* what changed,
+* what work was attempted,
+* what succeeded,
+* what failed,
+* what may safely be retried.
+
+Prefer idempotent operations and stable identifiers. A repeated ingestion run should not silently duplicate documents, chunks, embeddings, or index entries.
+
+### Preserve provenance
+
+Every stored or retrieved unit of content must remain traceable to its source.
+
+Where applicable, retain:
+
+* source provider,
+* source document identifier,
+* source path or URL,
+* document version or content hash,
+* ingestion timestamp,
+* extraction method,
+* chunk position,
+* relevant source metadata.
+
+Retrieval results should expose enough provenance to support citations and debugging.
+
+### Keep policy separate from mechanism
+
+Provider clients perform I/O. Domain code decides what the system means.
+
+For example:
+
+* a Drive client may list and fetch files,
+* an extractor may convert bytes into normalized text,
+* an ingestion service decides whether a document is new or changed,
+* a repository persists ingestion state,
+* a retriever ranks candidate passages.
+
+Do not let vendor behavior become the domain model by accident.
+
+### Optimize for observability before scale
+
+This is a private-data system. Failures must be diagnosable without logging private document contents.
+
+Use structured logs. Include stable operational identifiers where useful, such as source ID, document ID, ingestion run ID, or content hash. Do not log raw documents, extracted passages, prompts containing private text, embeddings, credentials, or authorization headers.
+
+Add metrics or tracing only when they answer a concrete operational question.
+
+## Build and Development Commands
+
+* `make run` starts the service with `go run ./cmd/stacks`.
+* `make build` compiles `bin/stacks`.
+* `make test` runs `go test ./...`.
+* `make vet` runs `go vet ./...`.
+* `make fmt` formats all non-vendored Go files with `gofmt`.
+
+The default health endpoint is:
+
+```text
+http://127.0.0.1:8080/healthz
+```
+
+Before considering a change complete, run:
+
+```bash
+make fmt
+make test
+make vet
+```
+
+Do not claim verification that was not actually performed.
+
+## Go Conventions
+
+Use idiomatic Go and standard `gofmt` formatting.
+
+* Exported identifiers use `PascalCase`.
+* Unexported identifiers use `camelCase`.
+* Package names are short lowercase nouns without underscores.
+* Constructors should return concrete types unless callers genuinely need an interface.
+* Accept interfaces at boundaries; return concrete implementations.
+* Define interfaces near the code that consumes them, not near the implementation.
+* Keep interfaces small and behavior-oriented.
+* Avoid `interface{}` and `any` unless the data is genuinely untyped.
+* Prefer ordinary control flow over reflection, code generation, or elaborate generic machinery.
+* Use the standard library unless an external dependency provides substantial, concrete value.
+
+Do not introduce a framework to avoid writing a small amount of straightforward Go.
+
+### Configuration
+
+All runtime-tunable values belong in `internal/config`.
+
+Use `STACKS_*` environment variables. Apply defaults deliberately and validate configuration once during startup.
+
+Do not scatter these values through application code:
+
+* ports,
+* timeouts,
+* model names,
+* provider URLs,
+* database locations,
+* concurrency limits,
+* retry policies,
+* chunk sizes,
+* retrieval limits.
+
+Invalid configuration should fail clearly before the service begins accepting work.
+
+### Errors
+
+Return errors rather than logging them deep in the call stack.
+
+Wrap errors with useful operation context while preserving the original error:
+
+```go
+return fmt.Errorf("load document %q: %w", documentID, err)
+```
+
+Error messages should describe the failed operation, not merely restate the lower-level error.
+
+Use sentinel or typed errors only when callers need to make a behavioral decision. Do not create custom error taxonomies for decoration.
+
+### Context
+
+Pass `context.Context` through I/O and potentially long-running operations.
+
+Do not store contexts in structs. Do not replace a caller-provided context with `context.Background()`. Respect cancellation and deadlines at provider and storage boundaries.
+
+## HTTP API
+
+Keep HTTP concerns in `internal/httpapi`.
+
+Handlers should:
+
+1. decode and validate transport input,
+2. call an application service,
+3. translate the result into an HTTP response.
+
+Handlers must not contain persistence queries, provider-specific logic, retrieval algorithms, or document-processing workflows.
+
+Use explicit request and response types. Do not expose internal persistence models or provider SDK types directly through the API.
+
+Health endpoints should report process health without performing expensive dependency checks on every request. Add separate readiness semantics if startup later depends on external systems.
+
+## Persistence and Schema Changes
+
+Keep SQL and database-specific behavior behind a focused storage boundary.
+
+Prefer explicit queries over opaque ORM behavior. Transactions should be visible at the application operation that requires atomicity.
+
+Schema changes must be forward-moving, reviewable, and safe against existing local data. Do not silently destroy or reinterpret stored document state.
+
+When adding persistence behavior, define the relevant invariants. Examples include:
+
+* source document IDs are unique within a provider,
+* document versions are immutable,
+* only one active version exists per logical document,
+* chunks belong to exactly one document version,
+* repeated writes are idempotent.
+
+## Ingestion and Retrieval
+
+Treat ingestion as a resumable pipeline, not a single magical function.
+
+Keep source discovery, fetching, extraction, normalization, chunking, indexing, and state recording separable enough to test independently.
+
+Do not mark a document version complete until all required durable work has succeeded.
+
+Retrieval code should distinguish:
+
+* filtering,
+* candidate generation,
+* ranking,
+* context assembly,
+* answer generation.
+
+Do not bury retrieval policy inside a model prompt or provider client.
+
+Any generated answer based on private documents should retain references to the passages used. A plausible answer without provenance is a failure mode, not a feature.
+
+## Testing
+
+Use Go’s standard `testing` package.
+
+Name tests after observable behavior:
+
+```go
+func TestLoaderRejectsMissingDatabaseURL(t *testing.T)
+func TestIngestUnchangedDocumentDoesNotCreateNewVersion(t *testing.T)
+```
+
+Use table tests when multiple inputs exercise the same contract. Do not force unrelated scenarios into one table merely to reduce line count.
+
+Behavior changes and bug fixes require a regression test that would previously have failed.
+
+Prefer testing through public behavior. Use fakes at I/O boundaries when needed, but do not mock every internal function. Tests should preserve freedom to refactor implementation details.
+
+Tests must be deterministic. Avoid real network calls, wall-clock dependence, random sleeps, and shared mutable global state.
+
+When time or randomness affects behavior, inject the narrow capability required by the code.
+
+No numeric coverage target is enforced. Coverage is not a substitute for testing invariants and failure paths.
+
+## Dependencies
+
+Before adding a dependency, verify that the standard library or a small local implementation is insufficient.
+
+A new dependency should justify its:
+
+* operational value,
+* maintenance cost,
+* transitive dependency graph,
+* security exposure,
+* effect on build and startup behavior.
+
+Do not add dependencies solely to save a few lines of clear code.
+
+Keep provider SDKs at the edge of the system. Do not allow their types to spread across package boundaries.
+
+## Security and Privacy
+
+Never commit:
+
+* API keys,
+* credentials,
+* tokens,
+* `.env` files,
+* private document contents,
+* production database files,
+* exported embeddings,
+* retrieved passages from personal documents.
+
+Do not weaken TLS verification, authentication, authorization, or credential handling to simplify local development.
+
+Use least-privilege credentials for source providers and databases.
+
+Private source payloads must not appear in logs, test fixtures, panic output, or error messages. Use synthetic fixtures in tests.
+
+Treat prompts and model-provider requests as data disclosure boundaries. Code should make it possible to understand which private content is sent to which external provider.
+
+## Commits and Pull Requests
+
+Use concise imperative commit subjects:
+
+```text
+Add document ingestion contract
+Persist source document versions
+Return provenance with retrieval results
+```
+
+Each commit should represent one coherent concern. Do not mix broad cleanup, formatting churn, dependency upgrades, and behavior changes unless they are inseparable.
+
+Pull requests should include:
+
+* the behavior changed,
+* the reason for the change,
+* important design trade-offs,
+* configuration or schema changes,
+* privacy or security implications,
+* exact verification performed,
+* relevant issue links.
+
+Include screenshots only for user-visible interface changes.
+
+## Rules for Automated Changes
+
+When modifying this repository:
+
+1. Read the relevant code before proposing architecture.
+2. Preserve existing behavior unless the task requires changing it.
+3. Keep the patch scoped to the requested work.
+4. Do not rename, reorganize, or reformat unrelated code.
+5. Do not introduce abstractions merely to make the patch appear extensible.
+6. Add or update tests for changed behavior.
+7. Update documentation when commands, configuration, schemas, or externally visible behavior change.
+8. Run the relevant formatting, tests, and static analysis.
+9. Report any checks that could not be run.
+10. Call out assumptions rather than silently encoding them.
+
+When requirements are ambiguous, prefer the simplest reversible implementation consistent with the repository’s existing direction.
