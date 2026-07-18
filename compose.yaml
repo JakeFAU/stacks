@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.5-pg18-trixie
+    environment:
+      POSTGRES_DB: stacks
+      POSTGRES_PASSWORD: ${STACKS_DB_ADMIN_PASSWORD:?set STACKS_DB_ADMIN_PASSWORD in .env}
+      POSTGRES_USER: stacks_admin
+      STACKS_DB_APP_PASSWORD: ${STACKS_DB_APP_PASSWORD:?set STACKS_DB_APP_PASSWORD in .env}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready --dbname=stacks --username=stacks_admin
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    ports:
+      - 127.0.0.1:${STACKS_DB_PORT:-5432}:5432
+    shm_size: 128mb
+    stop_grace_period: 30s
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  postgres_data:
+

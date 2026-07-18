@@ -26,6 +26,8 @@ internal/config/    environment loading, defaults, and validation
 internal/httpapi/   HTTP handlers, routing, middleware, and transport types
 internal/...        focused application packages added as capabilities emerge
 bin/                local build output; never committed
+db/init/            first-start PostgreSQL role and schema bootstrap
+db/migrations/      ordered, forward-only SQL migrations
 ```
 
 `cmd/stacks` must remain thin. It may construct dependencies, handle process signals, start the application, and report fatal startup errors. It must not contain business logic.
@@ -116,6 +118,10 @@ Add metrics or tracing only when they answer a concrete operational question.
 * `make test` runs `go test ./...`.
 * `make staticcheck` runs the repository-pinned Staticcheck release.
 * `make fmt` formats all non-vendored Go files with `gofmt`.
+* `make db-up` starts the local PostgreSQL and pgvector container.
+* `make db-migrate` applies pending forward migrations as `stacks_admin`.
+* `make db-status` reports applied and pending migrations.
+* `make db-down` stops PostgreSQL without deleting its named volume.
 
 The default health endpoint is:
 

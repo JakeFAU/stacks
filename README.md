@@ -11,6 +11,7 @@ be added as their boundaries are defined.
 ## Requirements
 
 - Go 1.26 or newer
+- Docker with Compose
 
 ## Run
 
@@ -41,12 +42,41 @@ make staticcheck
 make build
 ```
 
+## Local database
+
+Create local credentials before starting PostgreSQL:
+
+```sh
+cp .env.example .env
+openssl rand -hex 24
+```
+
+Put independently generated values in `STACKS_DB_ADMIN_PASSWORD` and
+`STACKS_DB_APP_PASSWORD`, then run:
+
+```sh
+make db-up
+make db-migrate
+make db-status
+```
+
+`stacks_admin` owns the local database and is used only for migrations.
+Application code must connect as the least-privileged `stacks_app` role. The
+database listens only on `127.0.0.1` and uses `STACKS_DB_PORT` (default `5432`).
+
+`make db-down` stops the database while preserving its named volume. To remove
+local database contents deliberately, run `docker compose down --volumes`.
+Bootstrap credentials and roles are created only when PostgreSQL initializes a
+new volume; changing `.env` later does not update roles in an existing volume.
+
 ## Intended architecture
 
 - `cmd/stacks`: process entrypoint
 - `internal/app`: application lifecycle and dependency wiring
 - `internal/config`: validated runtime configuration
 - `internal/httpapi`: HTTP transport boundary
+- `db/init`: first-start cluster and role bootstrap
+- `db/migrations`: ordered, forward-only schema migrations
 
 The next slice should define the source-document and ingestion-job contracts,
-then add PostgreSQL and pgvector behind a storage interface.
+then connect the service to PostgreSQL behind a focused storage boundary.
