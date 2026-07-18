@@ -32,6 +32,7 @@ cmd/stacks/         process entrypoint and dependency wiring
 internal/app/       application lifecycle and orchestration
 internal/config/    environment loading, defaults, and validation
 internal/httpapi/   HTTP handlers, routing, middleware, and transport types
+internal/knowledge/ immutable evidence and temporal observation contracts
 internal/...        focused application packages added as capabilities emerge
 bin/                local build output; never committed
 db/init/            first-start PostgreSQL role and schema bootstrap

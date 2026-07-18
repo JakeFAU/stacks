@@ -90,9 +90,11 @@ new volume; changing `.env` later does not update roles in an existing volume.
 - `internal/app`: application lifecycle and dependency wiring
 - `internal/config`: validated runtime configuration
 - `internal/httpapi`: HTTP transport boundary
+- `internal/knowledge`: immutable evidence and temporal observation contracts
 - `db/init`: first-start cluster and role bootstrap
 - `db/migrations`: ordered, forward-only schema migrations
 
-The next slice should define immutable source evidence and temporal observation
-contracts, including valid time, recorded time, provenance, and epistemic
-status, before introducing graph persistence or model extraction.
+The current domain layer defines immutable source evidence and temporal
+observations, including valid time, recorded time, provenance, derivation, and
+epistemic status. Graph persistence and model extraction remain intentionally
+unimplemented until these contracts have been exercised.
