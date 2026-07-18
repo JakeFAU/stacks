@@ -16,12 +16,29 @@ type Fact struct {
 	EvidenceIDs    []knowledge.EvidenceID
 }
 
-// WindowSummary is a pre-narration aggregate for one resolved window.
-// UnresolvedKeys records conflicts or gaps that aggregation could not settle.
+// UnresolvedReason explains why aggregation did not promote a fact to state.
+type UnresolvedReason string
+
+const (
+	UnresolvedConflict            UnresolvedReason = "conflicting-values"
+	UnresolvedTransition          UnresolvedReason = "multiple-states-in-window"
+	UnresolvedTemporalUncertainty UnresolvedReason = "temporal-uncertainty"
+	UnresolvedHypothesis          UnresolvedReason = "hypothesized"
+)
+
+// UnresolvedFact preserves candidate values and provenance that aggregation
+// could not safely collapse into one state value.
+type UnresolvedFact struct {
+	Key        string
+	Reason     UnresolvedReason
+	Candidates []Fact
+}
+
+// WindowSummary is a pre-narration aggregate for one resolved selection.
 type WindowSummary struct {
-	Selection      TemporalSelection
-	Facts          []Fact
-	UnresolvedKeys []string
+	Selection  TemporalSelection
+	Facts      []Fact
+	Unresolved []UnresolvedFact
 }
 
 // ChangeKind identifies a semantic state difference between two windows.
@@ -44,12 +61,14 @@ type Change struct {
 
 // Comparison is the dated, ordered structure supplied to narration.
 type Comparison struct {
-	Before         TemporalSelection
-	After          TemporalSelection
-	BeforeFacts    []Fact
-	AfterFacts     []Fact
-	Changes        []Change
-	UnresolvedKeys []string
+	Before           TemporalSelection
+	After            TemporalSelection
+	BeforeFacts      []Fact
+	AfterFacts       []Fact
+	Changes          []Change
+	UnresolvedKeys   []string
+	BeforeUnresolved []UnresolvedFact
+	AfterUnresolved  []UnresolvedFact
 }
 
 // CompareWindowSummaries computes semantic changes without asking a model to
@@ -88,10 +107,12 @@ func CompareWindowSummaries(before, after WindowSummary) (Comparison, error) {
 	sort.Strings(orderedKeys)
 
 	comparison := Comparison{
-		Before:      before.Selection,
-		After:       after.Selection,
-		BeforeFacts: orderedFacts(beforeFacts),
-		AfterFacts:  orderedFacts(afterFacts),
+		Before:           before.Selection,
+		After:            after.Selection,
+		BeforeFacts:      orderedFacts(beforeFacts),
+		AfterFacts:       orderedFacts(afterFacts),
+		BeforeUnresolved: orderedUnresolved(beforeUnresolved),
+		AfterUnresolved:  orderedUnresolved(afterUnresolved),
 	}
 	for _, key := range orderedKeys {
 		if _, unresolved := beforeUnresolved[key]; unresolved {
@@ -107,22 +128,22 @@ func CompareWindowSummaries(before, after WindowSummary) (Comparison, error) {
 		afterFact, inAfter := afterFacts[key]
 		switch {
 		case !inBefore && inAfter:
-			afterCopy := afterFact
+			afterCopy := cloneFact(afterFact)
 			comparison.Changes = append(comparison.Changes, Change{
 				Kind:  ChangeAdded,
 				Key:   key,
 				After: &afterCopy,
 			})
 		case inBefore && !inAfter:
-			beforeCopy := beforeFact
+			beforeCopy := cloneFact(beforeFact)
 			comparison.Changes = append(comparison.Changes, Change{
 				Kind:   ChangeRemoved,
 				Key:    key,
 				Before: &beforeCopy,
 			})
 		case inBefore && inAfter && beforeFact.Value != afterFact.Value:
-			beforeCopy := beforeFact
-			afterCopy := afterFact
+			beforeCopy := cloneFact(beforeFact)
+			afterCopy := cloneFact(afterFact)
 			comparison.Changes = append(comparison.Changes, Change{
 				Kind:   ChangeChanged,
 				Key:    key,
@@ -135,52 +156,101 @@ func CompareWindowSummaries(before, after WindowSummary) (Comparison, error) {
 	return comparison, nil
 }
 
-func validateSummary(name string, summary WindowSummary) (map[string]Fact, map[string]struct{}, error) {
+func validateSummary(name string, summary WindowSummary) (map[string]Fact, map[string]UnresolvedFact, error) {
 	if summary.Selection.kind != SelectionWindow {
 		return nil, nil, fmt.Errorf("%s summary requires a window selection", name)
 	}
 
 	facts := make(map[string]Fact, len(summary.Facts))
 	for _, fact := range summary.Facts {
-		fact.Key = strings.TrimSpace(fact.Key)
-		fact.Value = strings.TrimSpace(fact.Value)
-		if fact.Key == "" || fact.Value == "" {
-			return nil, nil, fmt.Errorf("%s summary fact key and value are required", name)
-		}
-		if len(fact.ObservationIDs) == 0 || len(fact.EvidenceIDs) == 0 {
-			return nil, nil, fmt.Errorf("%s summary fact provenance is required", name)
-		}
-		observationIDs, err := normalizeObservationIDs(name, fact.ObservationIDs)
+		normalized, err := validateFact(name, fact)
 		if err != nil {
 			return nil, nil, err
 		}
-		evidenceIDs, err := normalizeEvidenceIDs(name, fact.EvidenceIDs)
-		if err != nil {
-			return nil, nil, err
-		}
-		if _, exists := facts[fact.Key]; exists {
+		if _, exists := facts[normalized.Key]; exists {
 			return nil, nil, fmt.Errorf("%s summary fact keys must be unique", name)
 		}
-		fact.ObservationIDs = observationIDs
-		fact.EvidenceIDs = evidenceIDs
-		facts[fact.Key] = fact
+		facts[normalized.Key] = normalized
 	}
 
-	unresolved := make(map[string]struct{}, len(summary.UnresolvedKeys))
-	for _, key := range summary.UnresolvedKeys {
-		key = strings.TrimSpace(key)
-		if key == "" {
+	unresolved := make(map[string]UnresolvedFact, len(summary.Unresolved))
+	for _, item := range summary.Unresolved {
+		item.Key = strings.TrimSpace(item.Key)
+		if item.Key == "" {
 			return nil, nil, fmt.Errorf("%s summary unresolved key is required", name)
 		}
-		if _, exists := unresolved[key]; exists {
+		if !item.Reason.valid() {
+			return nil, nil, fmt.Errorf("%s summary unresolved reason is invalid", name)
+		}
+		if len(item.Candidates) == 0 {
+			return nil, nil, fmt.Errorf("%s summary unresolved candidates are required", name)
+		}
+		if item.Reason == UnresolvedConflict && len(item.Candidates) < 2 {
+			return nil, nil, fmt.Errorf("%s summary conflict requires at least two candidates", name)
+		}
+		if _, exists := unresolved[item.Key]; exists {
 			return nil, nil, fmt.Errorf("%s summary unresolved keys must be unique", name)
 		}
-		if _, exists := facts[key]; exists {
+		if _, exists := facts[item.Key]; exists {
 			return nil, nil, fmt.Errorf("%s summary key cannot be both resolved and unresolved", name)
 		}
-		unresolved[key] = struct{}{}
+
+		candidates := make([]Fact, len(item.Candidates))
+		seenValues := make(map[string]struct{}, len(item.Candidates))
+		for index, candidate := range item.Candidates {
+			candidate.Key = strings.TrimSpace(candidate.Key)
+			if candidate.Key != item.Key {
+				return nil, nil, fmt.Errorf("%s summary unresolved candidate key must match its parent", name)
+			}
+			normalized, err := validateFact(name, candidate)
+			if err != nil {
+				return nil, nil, err
+			}
+			if _, exists := seenValues[normalized.Value]; exists {
+				return nil, nil, fmt.Errorf("%s summary unresolved candidate values must be unique", name)
+			}
+			seenValues[normalized.Value] = struct{}{}
+			candidates[index] = normalized
+		}
+		sort.Slice(candidates, func(left, right int) bool {
+			return candidates[left].Value < candidates[right].Value
+		})
+		item.Candidates = candidates
+		unresolved[item.Key] = item
 	}
 	return facts, unresolved, nil
+}
+
+func validateFact(name string, fact Fact) (Fact, error) {
+	fact.Key = strings.TrimSpace(fact.Key)
+	fact.Value = strings.TrimSpace(fact.Value)
+	if fact.Key == "" || fact.Value == "" {
+		return Fact{}, fmt.Errorf("%s summary fact key and value are required", name)
+	}
+	if len(fact.ObservationIDs) == 0 || len(fact.EvidenceIDs) == 0 {
+		return Fact{}, fmt.Errorf("%s summary fact provenance is required", name)
+	}
+
+	observationIDs, err := normalizeObservationIDs(name, fact.ObservationIDs)
+	if err != nil {
+		return Fact{}, err
+	}
+	evidenceIDs, err := normalizeEvidenceIDs(name, fact.EvidenceIDs)
+	if err != nil {
+		return Fact{}, err
+	}
+	fact.ObservationIDs = observationIDs
+	fact.EvidenceIDs = evidenceIDs
+	return fact, nil
+}
+
+func (reason UnresolvedReason) valid() bool {
+	switch reason {
+	case UnresolvedConflict, UnresolvedTransition, UnresolvedTemporalUncertainty, UnresolvedHypothesis:
+		return true
+	default:
+		return false
+	}
 }
 
 func orderedFacts(facts map[string]Fact) []Fact {
@@ -193,6 +263,25 @@ func orderedFacts(facts map[string]Fact) []Fact {
 	ordered := make([]Fact, 0, len(keys))
 	for _, key := range keys {
 		ordered = append(ordered, cloneFact(facts[key]))
+	}
+	return ordered
+}
+
+func orderedUnresolved(items map[string]UnresolvedFact) []UnresolvedFact {
+	keys := make([]string, 0, len(items))
+	for key := range items {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	ordered := make([]UnresolvedFact, 0, len(keys))
+	for _, key := range keys {
+		item := items[key]
+		item.Candidates = append([]Fact(nil), item.Candidates...)
+		for index := range item.Candidates {
+			item.Candidates[index] = cloneFact(item.Candidates[index])
+		}
+		ordered = append(ordered, item)
 	}
 	return ordered
 }
@@ -211,6 +300,9 @@ func normalizeObservationIDs(name string, values []knowledge.ObservationID) ([]k
 		seen[value] = struct{}{}
 		normalized[index] = value
 	}
+	sort.Slice(normalized, func(left, right int) bool {
+		return normalized[left] < normalized[right]
+	})
 	return normalized, nil
 }
 
@@ -228,6 +320,9 @@ func normalizeEvidenceIDs(name string, values []knowledge.EvidenceID) ([]knowled
 		seen[value] = struct{}{}
 		normalized[index] = value
 	}
+	sort.Slice(normalized, func(left, right int) bool {
+		return normalized[left] < normalized[right]
+	})
 	return normalized, nil
 }
 

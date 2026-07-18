@@ -51,14 +51,25 @@ func TestCompareWindowSummariesComputesOrderedSemanticChanges(t *testing.T) {
 func TestCompareWindowSummariesDoesNotInventChangesForUnresolvedKeys(t *testing.T) {
 	windowA, windowB := comparisonWindows(t)
 	before := WindowSummary{
-		Selection:      windowA,
-		Facts:          []Fact{fact("status", "prototype", "observation-1", "evidence-1")},
-		UnresolvedKeys: []string{"relationship"},
+		Selection: windowA,
+		Facts:     []Fact{fact("status", "prototype", "observation-1", "evidence-1")},
+		Unresolved: []UnresolvedFact{{
+			Key:    "relationship",
+			Reason: UnresolvedConflict,
+			Candidates: []Fact{
+				fact("relationship", "colleague", "observation-3", "evidence-3"),
+				fact("relationship", "friend", "observation-5", "evidence-5"),
+			},
+		}},
 	}
 	after := WindowSummary{
-		Selection:      windowB,
-		Facts:          []Fact{fact("status", "released", "observation-2", "evidence-2")},
-		UnresolvedKeys: []string{"relationship"},
+		Selection: windowB,
+		Facts:     []Fact{fact("status", "released", "observation-2", "evidence-2")},
+		Unresolved: []UnresolvedFact{{
+			Key:        "relationship",
+			Reason:     UnresolvedHypothesis,
+			Candidates: []Fact{fact("relationship", "partner", "observation-4", "evidence-4")},
+		}},
 	}
 
 	comparison, err := CompareWindowSummaries(before, after)
