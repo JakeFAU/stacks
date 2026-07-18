@@ -33,6 +33,7 @@ internal/app/       application lifecycle and orchestration
 internal/config/    environment loading, defaults, and validation
 internal/httpapi/   HTTP handlers, routing, middleware, and transport types
 internal/knowledge/ immutable evidence and temporal observation contracts
+internal/query/     temporal query plans and deterministic retrieval operators
 internal/...        focused application packages added as capabilities emerge
 bin/                local build output; never committed
 db/init/            first-start PostgreSQL role and schema bootstrap
@@ -276,6 +277,16 @@ Temporal query code should distinguish:
 * supporting and conflicting evidence retrieval,
 * chronology construction,
 * answer generation with citations.
+
+Query planning must classify temporal intent, resolve valid-time selections and
+recorded-time knowledge cutoffs, and produce explicit retrieval operations.
+Aggregation, conflict handling, diffing, and chronology construction belong in
+the deterministic retrieval layer. Narration must consume dated, ordered,
+provenance-bearing results rather than undated source snippets.
+
+Temporal precedence alone does not establish causality. Causal-chain retrieval
+must require explicit source-supported causal observations and must preserve
+contradicting evidence.
 
 Do not bury temporal semantics, entity identity rules, or graph mutation policy
 inside a model prompt or provider client. Embedding similarity may suggest

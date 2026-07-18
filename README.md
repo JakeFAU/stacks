@@ -91,10 +91,14 @@ new volume; changing `.env` later does not update roles in an existing volume.
 - `internal/config`: validated runtime configuration
 - `internal/httpapi`: HTTP transport boundary
 - `internal/knowledge`: immutable evidence and temporal observation contracts
+- `internal/query`: temporal query plans and deterministic retrieval operators
 - `db/init`: first-start cluster and role bootstrap
 - `db/migrations`: ordered, forward-only schema migrations
 
 The current domain layer defines immutable source evidence and temporal
 observations, including valid time, recorded time, provenance, derivation, and
 epistemic status. Graph persistence and model extraction remain intentionally
-unimplemented until these contracts have been exercised.
+unimplemented until these contracts have been exercised. Query plans represent
+classified point-in-time, comparison, trajectory, and causal-chain intent;
+resolve valid and recorded time independently; and require aggregation and
+diffing before a narrator receives results.
