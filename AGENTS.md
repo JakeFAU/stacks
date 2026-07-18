@@ -114,7 +114,7 @@ Add metrics or tracing only when they answer a concrete operational question.
 * `make run` starts the service with `go run ./cmd/stacks`.
 * `make build` compiles `bin/stacks`.
 * `make test` runs `go test ./...`.
-* `make vet` runs `go vet ./...`.
+* `make staticcheck` runs the repository-pinned Staticcheck release.
 * `make fmt` formats all non-vendored Go files with `gofmt`.
 
 The default health endpoint is:
@@ -128,7 +128,7 @@ Before considering a change complete, run:
 ```bash
 make fmt
 make test
-make vet
+make staticcheck
 ```
 
 Do not claim verification that was not actually performed.

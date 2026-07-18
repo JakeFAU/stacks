@@ -1,4 +1,6 @@
-.PHONY: build fmt run test vet
+STATICCHECK_VERSION := 2026.1
+
+.PHONY: build fmt run staticcheck test
 
 build:
 	go build -o bin/stacks ./cmd/stacks
@@ -12,6 +14,5 @@ run:
 test:
 	go test ./...
 
-vet:
-	go vet ./...
-
+staticcheck:
+	go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
