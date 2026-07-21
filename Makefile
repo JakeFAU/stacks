@@ -2,7 +2,7 @@ STATICCHECK_VERSION := 2026.1
 GOOSE_VERSION := v3.27.1
 ENV_FILE ?= .env
 
-.PHONY: build db-down db-migrate db-status db-up fmt obs-config obs-down obs-up run staticcheck test
+.PHONY: build db-down db-migrate db-status db-up fmt obs-config obs-down obs-up run staticcheck test test-integration
 
 build:
 	go build -o bin/stacks ./cmd/stacks
@@ -48,6 +48,10 @@ run:
 
 test:
 	go test ./...
+
+test-integration:
+	@test -n "$$STACKS_TEST_DATABASE_URL" || (echo "STACKS_TEST_DATABASE_URL is required" >&2; exit 1)
+	STACKS_TEST_DATABASE_URL="$$STACKS_TEST_DATABASE_URL" go test ./internal/storage
 
 staticcheck:
 	go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
