@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"stacks/internal/knowledge"
@@ -19,7 +20,7 @@ const testDatabaseURLEnvironmentVariable = "STACKS_TEST_DATABASE_URL"
 func TestPutDocumentVersionIsIdempotent(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	documents := NewDocumentRepository(pool)
-	version := testDocumentVersion(t, "document-idempotent")
+	version := testDocumentVersion(t, testIdentifier("document-idempotent"))
 
 	first, created, err := documents.PutDocumentVersion(context.Background(), version)
 	if err != nil {
@@ -44,7 +45,7 @@ func TestPutDocumentVersionIsIdempotent(t *testing.T) {
 func TestDocumentTransactionRollsBackVersion(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	documents := NewDocumentRepository(pool)
-	version := testDocumentVersion(t, "document-rollback")
+	version := testDocumentVersion(t, testIdentifier("document-rollback"))
 
 	err := documents.InTransaction(context.Background(), func(transaction *DocumentRepository) error {
 		_, _, err := transaction.PutDocumentVersion(context.Background(), version)
@@ -71,11 +72,11 @@ func TestCorrectionLeavesOneEffectiveDecision(t *testing.T) {
 	entities := NewEntityRepository(pool)
 	ctx := context.Background()
 
-	firstEntity, err := entities.CreateEntity(ctx, EntityInput{Kind: "person", DisplayName: "Synthetic Person A"})
+	firstEntity, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Person A"})
 	if err != nil {
 		t.Fatalf("create first entity: %v", err)
 	}
-	secondEntity, err := entities.CreateEntity(ctx, EntityInput{Kind: "person", DisplayName: "Synthetic Person B"})
+	secondEntity, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Person B"})
 	if err != nil {
 		t.Fatalf("create second entity: %v", err)
 	}
@@ -101,6 +102,16 @@ func TestCorrectionLeavesOneEffectiveDecision(t *testing.T) {
 	if second.SupersedesID != first.ID {
 		t.Fatalf("correction supersedes %q, want %q", second.SupersedesID, first.ID)
 	}
+	repeatedCorrection, err := entities.CorrectDecision(ctx, first.ID, ResolutionDecisionInput{
+		Outcome:  ResolutionOutcomeAccepted,
+		EntityID: secondEntity.ID,
+	})
+	if err != nil {
+		t.Fatalf("repeat correction: %v", err)
+	}
+	if repeatedCorrection.ID != second.ID {
+		t.Fatalf("repeated correction ID = %q, want %q", repeatedCorrection.ID, second.ID)
+	}
 
 	effective, err := entities.EffectiveDecision(ctx, proposal.ID)
 	if err != nil {
@@ -108,6 +119,14 @@ func TestCorrectionLeavesOneEffectiveDecision(t *testing.T) {
 	}
 	if effective.ID != second.ID {
 		t.Fatalf("effective decision ID = %q, want %q", effective.ID, second.ID)
+	}
+
+	var decisionCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM stacks.resolution_decisions WHERE proposal_id = $1`, proposal.ID).Scan(&decisionCount); err != nil {
+		t.Fatalf("count decision history: %v", err)
+	}
+	if decisionCount != 2 {
+		t.Fatalf("decision history count = %d, want 2", decisionCount)
 	}
 }
 
@@ -117,21 +136,31 @@ func TestCompleteAnalysisDeduplicatesStableInput(t *testing.T) {
 	analysis := NewAnalysisRepository(pool)
 	ctx := context.Background()
 
-	employee, err := entities.CreateEntity(ctx, EntityInput{Kind: "person", DisplayName: "Synthetic Employee"})
+	employee, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Employee"})
 	if err != nil {
 		t.Fatalf("create employee: %v", err)
 	}
-	manager, err := entities.CreateEntity(ctx, EntityInput{Kind: "person", DisplayName: "Synthetic Manager"})
+	manager, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Manager"})
 	if err != nil {
 		t.Fatalf("create manager: %v", err)
+	}
+	version := testDocumentVersion(t, testIdentifier("document-analysis"))
+	documents := NewDocumentRepository(pool)
+	storedVersion, _, err := documents.PutDocumentVersion(ctx, version)
+	if err != nil {
+		t.Fatalf("put analysis document version: %v", err)
 	}
 	digest := sha256.Sum256([]byte("synthetic-analysis-input"))
 	input := AnalysisInput{
 		EmployeeEntityID:      employee.ID,
 		ManagerEntityID:       manager.ID,
-		InputDigest:           digest[:],
 		AnalysisPromptVersion: "analyze-test-v1",
 		PolicyVersion:         "policy-test-v1",
+		Inputs: []AnalysisInputReference{{
+			Kind:   AnalysisInputKindDocumentVersion,
+			ID:     storedVersion.ID,
+			Digest: digest[:],
+		}},
 	}
 
 	first, created, err := analysis.Complete(ctx, input)
@@ -150,6 +179,177 @@ func TestCompleteAnalysisDeduplicatesStableInput(t *testing.T) {
 	}
 	if second.ID != first.ID {
 		t.Fatalf("repeated analysis ID = %q, want %q", second.ID, first.ID)
+	}
+
+	var inputCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM stacks.analysis_inputs WHERE analysis_run_id = $1`, first.ID).Scan(&inputCount); err != nil {
+		t.Fatalf("count stored analysis inputs: %v", err)
+	}
+	if inputCount != len(input.Inputs) {
+		t.Fatalf("stored analysis input count = %d, want %d", inputCount, len(input.Inputs))
+	}
+}
+
+func TestStorageRetriesDoNotDuplicateGraphRecords(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	entities := NewEntityRepository(pool)
+	graph := NewGraphRepository(pool)
+
+	entity, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Retry Person"})
+	if err != nil {
+		t.Fatalf("create retry entity: %v", err)
+	}
+	aliasInput := AliasInput{EntityID: entity.ID, NormalizedValue: "synthetic retry person", Type: "name"}
+	firstAlias, err := entities.PutAlias(ctx, aliasInput)
+	if err != nil {
+		t.Fatalf("put first alias: %v", err)
+	}
+	secondAlias, err := entities.PutAlias(ctx, aliasInput)
+	if err != nil {
+		t.Fatalf("put repeated alias: %v", err)
+	}
+	if secondAlias.ID != firstAlias.ID {
+		t.Fatalf("repeated alias ID = %q, want %q", secondAlias.ID, firstAlias.ID)
+	}
+
+	mentionID, spanID := createSyntheticMentionAndSpan(t, pool)
+	mentionInput := MentionInput{EvidenceSpanID: spanID, Surface: "Synthetic", Role: "speaker"}
+	firstMention, err := entities.CreateMention(ctx, mentionInput)
+	if err != nil {
+		t.Fatalf("load first mention: %v", err)
+	}
+	secondMention, err := entities.CreateMention(ctx, mentionInput)
+	if err != nil {
+		t.Fatalf("load repeated mention: %v", err)
+	}
+	if firstMention.ID != mentionID || secondMention.ID != mentionID {
+		t.Fatal("repeated mention did not return its stable ID")
+	}
+
+	proposalInput := ResolutionProposalInput{MentionID: mentionID}
+	proposal, err := entities.CreateResolutionProposal(ctx, proposalInput)
+	if err != nil {
+		t.Fatalf("create proposal: %v", err)
+	}
+	repeatedProposal, err := entities.CreateResolutionProposal(ctx, proposalInput)
+	if err != nil {
+		t.Fatalf("create repeated proposal: %v", err)
+	}
+	if repeatedProposal.ID != proposal.ID {
+		t.Fatalf("repeated proposal ID = %q, want %q", repeatedProposal.ID, proposal.ID)
+	}
+	confidence := 0.75
+	candidateInput := ResolutionCandidateInput{ProposalID: proposal.ID, EntityID: entity.ID, Rank: 0, Confidence: &confidence, Reason: "synthetic"}
+	firstCandidate, err := entities.PutCandidate(ctx, candidateInput)
+	if err != nil {
+		t.Fatalf("put candidate: %v", err)
+	}
+	secondCandidate, err := entities.PutCandidate(ctx, candidateInput)
+	if err != nil {
+		t.Fatalf("put repeated candidate: %v", err)
+	}
+	if secondCandidate.ID != firstCandidate.ID {
+		t.Fatalf("repeated candidate ID = %q, want %q", secondCandidate.ID, firstCandidate.ID)
+	}
+
+	observationInput := ObservationInput{
+		ID:              uuid.NewString(),
+		SubjectEntityID: entity.ID,
+		Predicate:       "interacted_with",
+		Derivation:      "synthetic",
+		EpistemicStatus: "inferred",
+	}
+	firstObservation, err := graph.CompleteObservation(ctx, observationInput, []string{spanID})
+	if err != nil {
+		t.Fatalf("complete observation: %v", err)
+	}
+	secondObservation, err := graph.CompleteObservation(ctx, observationInput, []string{spanID})
+	if err != nil {
+		t.Fatalf("complete repeated observation: %v", err)
+	}
+	if secondObservation.ID != firstObservation.ID {
+		t.Fatalf("repeated observation ID = %q, want %q", secondObservation.ID, firstObservation.ID)
+	}
+
+	signalInput := SignalInput{
+		ID:                uuid.NewString(),
+		ObservationID:     firstObservation.ID,
+		Category:          "delegation_autonomy",
+		Direction:         "strengthening",
+		ExtractionModelID: "synthetic-model",
+		PromptVersion:     "synthetic-v1",
+		Confidence:        0.8,
+	}
+	firstSignal, err := graph.CompleteSignal(ctx, signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
+	if err != nil {
+		t.Fatalf("complete signal: %v", err)
+	}
+	secondSignal, err := graph.CompleteSignal(ctx, signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
+	if err != nil {
+		t.Fatalf("complete repeated signal: %v", err)
+	}
+	if secondSignal.ID != firstSignal.ID {
+		t.Fatalf("repeated signal ID = %q, want %q", secondSignal.ID, firstSignal.ID)
+	}
+}
+
+func TestPutEvidenceSpanRejectsImmutableQuoteConflict(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	version := testDocumentVersion(t, testIdentifier("document-evidence-conflict"))
+	documents := NewDocumentRepository(pool)
+	if _, _, err := documents.PutDocumentVersion(context.Background(), version); err != nil {
+		t.Fatalf("put evidence document version: %v", err)
+	}
+	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, TabID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+	})
+	if err != nil {
+		t.Fatalf("new evidence span: %v", err)
+	}
+	stored, err := documents.PutEvidenceSpan(context.Background(), span)
+	if err != nil {
+		t.Fatalf("put evidence span: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE stacks.evidence_spans SET quote = 'corrupted' WHERE id = $1`, stored.ID); err != nil {
+		t.Fatalf("create synthetic immutable conflict: %v", err)
+	}
+	if _, err := documents.PutEvidenceSpan(context.Background(), span); err == nil {
+		t.Fatal("repeated evidence span with conflicting stored quote succeeded")
+	}
+}
+
+func TestCompleteSignalRejectsNotesOnlyEvidence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	version := testDocumentVersionWithRole(t, testIdentifier("document-notes-signal"), source.TabRoleGeminiNotes)
+	documents := NewDocumentRepository(pool)
+	if _, _, err := documents.PutDocumentVersion(ctx, version); err != nil {
+		t.Fatalf("put notes document version: %v", err)
+	}
+	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, TabID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+	})
+	if err != nil {
+		t.Fatalf("new notes evidence span: %v", err)
+	}
+	storedSpan, err := documents.PutEvidenceSpan(ctx, span)
+	if err != nil {
+		t.Fatalf("put notes evidence span: %v", err)
+	}
+	graph := NewGraphRepository(pool)
+	observation, err := graph.CompleteObservation(ctx, ObservationInput{
+		ID: uuid.NewString(), Predicate: "interacted_with", Derivation: "synthetic", EpistemicStatus: "inferred",
+	}, []string{storedSpan.ID})
+	if err != nil {
+		t.Fatalf("complete notes observation: %v", err)
+	}
+	_, err = graph.CompleteSignal(ctx, SignalInput{
+		ID: uuid.NewString(), ObservationID: observation.ID, Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: "synthetic-model", PromptVersion: "synthetic-v1", Confidence: 0.8,
+	}, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}})
+	if err == nil {
+		t.Fatal("notes-only signal completion succeeded")
 	}
 }
 
@@ -170,8 +370,14 @@ func openIntegrationDatabase(t *testing.T) *pgxpool.Pool {
 
 func createSyntheticMention(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
+	mentionID, _ := createSyntheticMentionAndSpan(t, pool)
+	return mentionID
+}
+
+func createSyntheticMentionAndSpan(t *testing.T, pool *pgxpool.Pool) (string, string) {
+	t.Helper()
 	documents := NewDocumentRepository(pool)
-	version := testDocumentVersion(t, "document-mention")
+	version := testDocumentVersion(t, testIdentifier("document-mention"))
 	if _, _, err := documents.PutDocumentVersion(context.Background(), version); err != nil {
 		t.Fatalf("put mention document version: %v", err)
 	}
@@ -198,10 +404,18 @@ func createSyntheticMention(t *testing.T, pool *pgxpool.Pool) string {
 	if err != nil {
 		t.Fatalf("create synthetic mention: %v", err)
 	}
-	return mention.ID
+	return mention.ID, storedSpan.ID
+}
+
+func testIdentifier(prefix string) string {
+	return prefix + "-" + uuid.NewString()
 }
 
 func testDocumentVersion(t *testing.T, providerDocumentID string) knowledge.DocumentVersion {
+	return testDocumentVersionWithRole(t, providerDocumentID, source.TabRoleTranscript)
+}
+
+func testDocumentVersionWithRole(t *testing.T, providerDocumentID string, role source.TabRole) knowledge.DocumentVersion {
 	t.Helper()
 	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
 		Provider:           "synthetic-drive",
@@ -211,7 +425,7 @@ func testDocumentVersion(t *testing.T, providerDocumentID string) knowledge.Docu
 			ID:    "tab-synthetic",
 			Title: "Synthetic Transcript",
 			Order: 0,
-			Role:  source.TabRoleTranscript,
+			Role:  role,
 			Text:  "Synthetic meeting text.",
 		}},
 	})

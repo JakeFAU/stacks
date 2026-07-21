@@ -61,7 +61,8 @@ CREATE TABLE stacks.mentions (
     evidence_span_id uuid NOT NULL REFERENCES stacks.evidence_spans(id),
     surface text NOT NULL CHECK (btrim(surface) <> ''),
     role text NOT NULL CHECK (role IN ('speaker', 'reference')),
-    recorded_at timestamptz NOT NULL
+    recorded_at timestamptz NOT NULL,
+    UNIQUE (evidence_span_id, surface, role)
 );
 
 CREATE TABLE stacks.resolution_proposals (
@@ -69,7 +70,8 @@ CREATE TABLE stacks.resolution_proposals (
     mention_id uuid NOT NULL REFERENCES stacks.mentions(id),
     status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved', 'rejected', 'superseded')),
     derivation text NOT NULL CHECK (btrim(derivation) <> ''),
-    recorded_at timestamptz NOT NULL
+    recorded_at timestamptz NOT NULL,
+    UNIQUE (mention_id)
 );
 
 CREATE TABLE stacks.resolution_candidates (
@@ -88,8 +90,8 @@ CREATE TABLE stacks.resolution_decisions (
     proposal_id uuid NOT NULL REFERENCES stacks.resolution_proposals(id),
     outcome text NOT NULL CHECK (outcome IN ('accepted', 'rejected', 'created')),
     entity_id uuid REFERENCES stacks.entities(id),
-    supersedes_id uuid UNIQUE REFERENCES stacks.resolution_decisions(id),
-    superseded_by_id uuid UNIQUE REFERENCES stacks.resolution_decisions(id),
+    supersedes_id uuid UNIQUE REFERENCES stacks.resolution_decisions(id) DEFERRABLE INITIALLY DEFERRED,
+    superseded_by_id uuid UNIQUE REFERENCES stacks.resolution_decisions(id) DEFERRABLE INITIALLY DEFERRED,
     recorded_at timestamptz NOT NULL,
     CHECK ((outcome = 'rejected' AND entity_id IS NULL) OR (outcome IN ('accepted', 'created') AND entity_id IS NOT NULL))
 );
@@ -136,6 +138,46 @@ CREATE TABLE stacks.signal_evidence (
     role text NOT NULL CHECK (role IN ('supporting', 'contradicting')),
     PRIMARY KEY (signal_id, evidence_span_id, role)
 );
+
+CREATE FUNCTION stacks.require_transcript_signal_evidence()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    checked_signal_id uuid;
+BEGIN
+    IF TG_TABLE_NAME = 'interaction_signals' THEN
+        checked_signal_id := NEW.id;
+    ELSIF TG_OP = 'DELETE' THEN
+        checked_signal_id := OLD.signal_id;
+    ELSE
+        checked_signal_id := NEW.signal_id;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM stacks.signal_evidence AS signal_evidence
+        JOIN stacks.evidence_spans AS span ON span.id = signal_evidence.evidence_span_id
+        JOIN stacks.document_tabs AS tab ON tab.id = span.document_tab_id
+        WHERE signal_evidence.signal_id = checked_signal_id
+          AND signal_evidence.role = 'supporting'
+          AND tab.role = 'transcript'
+    ) THEN
+        RAISE EXCEPTION 'signal % requires supporting transcript evidence', checked_signal_id;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER interaction_signals_require_transcript_evidence
+AFTER INSERT OR UPDATE ON stacks.interaction_signals
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION stacks.require_transcript_signal_evidence();
+
+CREATE CONSTRAINT TRIGGER signal_evidence_require_transcript_evidence
+AFTER INSERT OR UPDATE OR DELETE ON stacks.signal_evidence
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION stacks.require_transcript_signal_evidence();
 
 CREATE TABLE stacks.analysis_runs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

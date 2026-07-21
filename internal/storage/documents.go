@@ -149,10 +149,32 @@ func (repository *DocumentRepository) PutEvidenceSpan(ctx context.Context, span 
 			AND document.provider_document_id = $5
 			AND version.digest = $6
 			AND tab.provider_tab_id = $7
-		ON CONFLICT (document_tab_id, start_offset, end_offset) DO UPDATE
-		SET quote = EXCLUDED.quote
+		ON CONFLICT (document_tab_id, start_offset, end_offset) DO NOTHING
 		RETURNING id`,
 		span.StartOffset(), span.EndOffset(), span.Text(), span.Provider(), span.ProviderDocumentID(), digest[:], span.TabID()).Scan(&stored.ID)
+	if err == pgx.ErrNoRows {
+		var storedQuote string
+		err = repository.query.QueryRow(ctx, `
+			SELECT span.id, span.quote
+			FROM stacks.evidence_spans AS span
+			JOIN stacks.document_tabs AS tab ON tab.id = span.document_tab_id
+			JOIN stacks.document_versions AS version ON version.id = tab.document_version_id
+			JOIN stacks.source_documents AS document ON document.id = version.source_document_id
+			WHERE document.provider = $1
+				AND document.provider_document_id = $2
+				AND version.digest = $3
+				AND tab.provider_tab_id = $4
+				AND span.start_offset = $5
+				AND span.end_offset = $6`,
+			span.Provider(), span.ProviderDocumentID(), digest[:], span.TabID(), span.StartOffset(), span.EndOffset()).Scan(&stored.ID, &storedQuote)
+		if err != nil {
+			return StoredEvidenceSpan{}, fmt.Errorf("load evidence span for document %q tab %q: %w", span.ProviderDocumentID(), span.TabID(), err)
+		}
+		if storedQuote != span.Text() {
+			return StoredEvidenceSpan{}, fmt.Errorf("persist evidence span for document %q tab %q: immutable quote conflicts", span.ProviderDocumentID(), span.TabID())
+		}
+		return stored, nil
+	}
 	if err != nil {
 		return StoredEvidenceSpan{}, fmt.Errorf("persist evidence span for document %q tab %q: %w", span.ProviderDocumentID(), span.TabID(), err)
 	}
