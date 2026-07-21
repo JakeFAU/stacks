@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -69,15 +70,24 @@ func NewGraphRepository(pool *pgxpool.Pool) *GraphRepository {
 // CompleteObservation persists an observation and all of its evidence links
 // atomically. Repeating the same ID returns the existing observation.
 func (repository *GraphRepository) CompleteObservation(ctx context.Context, input ObservationInput, evidenceSpanIDs []string) (Observation, error) {
+	canonicalInput, canonicalEvidenceSpanIDs, err := canonicalizeObservationIdentity(input, evidenceSpanIDs)
+	if err != nil {
+		return Observation{}, err
+	}
+	input = canonicalInput
+	evidenceSpanIDs = canonicalEvidenceSpanIDs
 	if err := validateObservationInput(input); err != nil {
 		return Observation{}, err
 	}
 	if len(evidenceSpanIDs) == 0 {
 		return Observation{}, fmt.Errorf("complete observation %q: evidence span IDs are required", input.ID)
 	}
-	digest := observationDigest(input, evidenceSpanIDs)
+	digest, err := ComputeObservationDigest(input, evidenceSpanIDs)
+	if err != nil {
+		return Observation{}, err
+	}
 	var observation Observation
-	err := repository.withTransaction(ctx, func(transaction pgx.Tx) error {
+	err = repository.withTransaction(ctx, func(transaction pgx.Tx) error {
 		var err error
 		observation, err = putObservation(ctx, transaction, input, digest[:])
 		if err != nil {
@@ -106,15 +116,24 @@ func (repository *GraphRepository) CompleteObservation(ctx context.Context, inpu
 // deferred constraint trigger enforces that a supporting transcript span exists
 // before the transaction may commit.
 func (repository *GraphRepository) CompleteSignal(ctx context.Context, input SignalInput, evidence []SignalEvidenceInput) (InteractionSignal, error) {
+	canonicalInput, canonicalEvidence, err := canonicalizeSignalIdentity(input, evidence)
+	if err != nil {
+		return InteractionSignal{}, err
+	}
+	input = canonicalInput
+	evidence = canonicalEvidence
 	if err := validateSignalInput(input); err != nil {
 		return InteractionSignal{}, err
 	}
 	if len(evidence) == 0 {
 		return InteractionSignal{}, fmt.Errorf("complete signal %q: evidence is required", input.ID)
 	}
-	digest := signalDigest(input, evidence)
+	digest, err := ComputeSignalDigest(input, evidence)
+	if err != nil {
+		return InteractionSignal{}, err
+	}
 	var signal InteractionSignal
-	err := repository.withTransaction(ctx, func(transaction pgx.Tx) error {
+	err = repository.withTransaction(ctx, func(transaction pgx.Tx) error {
 		var err error
 		signal, err = putSignal(ctx, transaction, input, digest[:])
 		if err != nil {
@@ -267,8 +286,15 @@ func isFinite(value float64) bool {
 	return !math.IsInf(value, 0) && !math.IsNaN(value)
 }
 
-func observationDigest(input ObservationInput, evidenceSpanIDs []string) [sha256.Size]byte {
-	fields := []string{input.ID, input.SubjectEntityID, input.ObjectEntityID, input.Predicate, input.Derivation, input.EpistemicStatus}
+// ComputeObservationDigest derives a semantic observation identity. The stable
+// row ID is intentionally excluded; evidence IDs are a canonical set.
+func ComputeObservationDigest(input ObservationInput, evidenceSpanIDs []string) ([sha256.Size]byte, error) {
+	canonicalInput, canonicalEvidenceSpanIDs, err := canonicalizeObservationIdentity(input, evidenceSpanIDs)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	input = canonicalInput
+	fields := []string{input.SubjectEntityID, input.ObjectEntityID, input.Predicate, input.Derivation, input.EpistemicStatus}
 	if input.ValidStart != nil {
 		fields = append(fields, input.ValidStart.UTC().Format(time.RFC3339Nano))
 	} else {
@@ -284,14 +310,99 @@ func observationDigest(input ObservationInput, evidenceSpanIDs []string) [sha256
 	} else {
 		fields = append(fields, "")
 	}
-	fields = append(fields, evidenceSpanIDs...)
-	return sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+	fields = append(fields, canonicalEvidenceSpanIDs...)
+	return sha256.Sum256([]byte(strings.Join(fields, "\x00"))), nil
 }
 
-func signalDigest(input SignalInput, evidence []SignalEvidenceInput) [sha256.Size]byte {
-	fields := []string{input.ID, input.ObservationID, input.Category, input.Direction, input.ExtractionModelID, input.PromptVersion, input.Rationale, fmt.Sprintf("%.17g", input.Confidence)}
-	for _, signalEvidence := range evidence {
+// ComputeSignalDigest derives a semantic signal identity. The stable row ID is
+// intentionally excluded; evidence ID/role pairs are a canonical set.
+func ComputeSignalDigest(input SignalInput, evidence []SignalEvidenceInput) ([sha256.Size]byte, error) {
+	canonicalInput, canonicalEvidence, err := canonicalizeSignalIdentity(input, evidence)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	input = canonicalInput
+	fields := []string{input.ObservationID, input.Category, input.Direction, input.ExtractionModelID, input.PromptVersion, input.Rationale, fmt.Sprintf("%.17g", input.Confidence)}
+	for _, signalEvidence := range canonicalEvidence {
 		fields = append(fields, signalEvidence.EvidenceSpanID, signalEvidence.Role)
 	}
-	return sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+	return sha256.Sum256([]byte(strings.Join(fields, "\x00"))), nil
+}
+
+func canonicalizeObservationIdentity(input ObservationInput, evidenceSpanIDs []string) (ObservationInput, []string, error) {
+	canonicalID, err := canonicalUUID(input.ID)
+	if err != nil {
+		return ObservationInput{}, nil, fmt.Errorf("complete observation: ID is invalid")
+	}
+	input.ID = canonicalID
+	for field, value := range map[string]*string{
+		"subject entity ID": &input.SubjectEntityID,
+		"object entity ID":  &input.ObjectEntityID,
+	} {
+		if *value == "" {
+			continue
+		}
+		canonicalValue, err := canonicalUUID(*value)
+		if err != nil {
+			return ObservationInput{}, nil, fmt.Errorf("complete observation %q: %s is invalid", input.ID, field)
+		}
+		*value = canonicalValue
+	}
+	canonicalEvidence, err := canonicalEvidenceIDs(evidenceSpanIDs)
+	if err != nil {
+		return ObservationInput{}, nil, fmt.Errorf("complete observation %q: %w", input.ID, err)
+	}
+	return input, canonicalEvidence, nil
+}
+
+func canonicalizeSignalIdentity(input SignalInput, evidence []SignalEvidenceInput) (SignalInput, []SignalEvidenceInput, error) {
+	canonicalID, err := canonicalUUID(input.ID)
+	if err != nil {
+		return SignalInput{}, nil, fmt.Errorf("complete signal: ID is invalid")
+	}
+	canonicalObservationID, err := canonicalUUID(input.ObservationID)
+	if err != nil {
+		return SignalInput{}, nil, fmt.Errorf("complete signal %q: observation ID is invalid", canonicalID)
+	}
+	input.ID = canonicalID
+	input.ObservationID = canonicalObservationID
+	canonicalEvidence := make([]SignalEvidenceInput, 0, len(evidence))
+	seen := make(map[string]struct{}, len(evidence))
+	for _, signalEvidence := range evidence {
+		canonicalEvidenceID, err := canonicalUUID(signalEvidence.EvidenceSpanID)
+		if err != nil {
+			return SignalInput{}, nil, fmt.Errorf("complete signal %q: evidence span ID is invalid", input.ID)
+		}
+		key := canonicalEvidenceID + "\x00" + signalEvidence.Role
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		canonicalEvidence = append(canonicalEvidence, SignalEvidenceInput{EvidenceSpanID: canonicalEvidenceID, Role: signalEvidence.Role})
+	}
+	sort.Slice(canonicalEvidence, func(left, right int) bool {
+		if canonicalEvidence[left].EvidenceSpanID == canonicalEvidence[right].EvidenceSpanID {
+			return canonicalEvidence[left].Role < canonicalEvidence[right].Role
+		}
+		return canonicalEvidence[left].EvidenceSpanID < canonicalEvidence[right].EvidenceSpanID
+	})
+	return input, canonicalEvidence, nil
+}
+
+func canonicalEvidenceIDs(evidenceSpanIDs []string) ([]string, error) {
+	canonicalEvidence := make([]string, 0, len(evidenceSpanIDs))
+	seen := make(map[string]struct{}, len(evidenceSpanIDs))
+	for _, evidenceSpanID := range evidenceSpanIDs {
+		canonicalID, err := canonicalUUID(evidenceSpanID)
+		if err != nil {
+			return nil, fmt.Errorf("evidence span ID is invalid")
+		}
+		if _, exists := seen[canonicalID]; exists {
+			continue
+		}
+		seen[canonicalID] = struct{}{}
+		canonicalEvidence = append(canonicalEvidence, canonicalID)
+	}
+	sort.Strings(canonicalEvidence)
+	return canonicalEvidence, nil
 }
