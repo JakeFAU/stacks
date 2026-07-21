@@ -79,7 +79,7 @@ CREATE TABLE stacks.resolution_candidates (
     proposal_id uuid NOT NULL REFERENCES stacks.resolution_proposals(id),
     entity_id uuid NOT NULL REFERENCES stacks.entities(id),
     rank integer NOT NULL CHECK (rank >= 0),
-    confidence double precision CHECK (confidence IS NULL OR isfinite(confidence)),
+    confidence double precision CHECK (confidence IS NULL OR (confidence > '-Infinity'::double precision AND confidence < 'Infinity'::double precision)),
     reason text NOT NULL DEFAULT '',
     UNIQUE (proposal_id, entity_id),
     UNIQUE (proposal_id, rank)
@@ -92,6 +92,7 @@ CREATE TABLE stacks.resolution_decisions (
     entity_id uuid REFERENCES stacks.entities(id),
     supersedes_id uuid UNIQUE REFERENCES stacks.resolution_decisions(id) DEFERRABLE INITIALLY DEFERRED,
     superseded_by_id uuid UNIQUE REFERENCES stacks.resolution_decisions(id) DEFERRABLE INITIALLY DEFERRED,
+    digest bytea NOT NULL UNIQUE CHECK (octet_length(digest) = 32),
     recorded_at timestamptz NOT NULL,
     CHECK ((outcome = 'rejected' AND entity_id IS NULL) OR (outcome IN ('accepted', 'created') AND entity_id IS NOT NULL))
 );
@@ -110,7 +111,8 @@ CREATE TABLE stacks.observations (
     recorded_at timestamptz NOT NULL,
     derivation text NOT NULL CHECK (btrim(derivation) <> ''),
     epistemic_status text NOT NULL CHECK (epistemic_status IN ('observed', 'inferred', 'hypothesized', 'validated_structurally', 'validated_empirically', 'rejected')),
-    confidence double precision CHECK (confidence IS NULL OR isfinite(confidence)),
+    confidence double precision CHECK (confidence IS NULL OR (confidence > '-Infinity'::double precision AND confidence < 'Infinity'::double precision)),
+    digest bytea NOT NULL UNIQUE CHECK (octet_length(digest) = 32),
     CHECK (valid_end IS NULL OR valid_start IS NOT NULL),
     CHECK (valid_end IS NULL OR valid_end >= valid_start)
 );
@@ -129,7 +131,8 @@ CREATE TABLE stacks.interaction_signals (
     extraction_model_id text NOT NULL CHECK (btrim(extraction_model_id) <> ''),
     prompt_version text NOT NULL CHECK (btrim(prompt_version) <> ''),
     rationale text NOT NULL DEFAULT '',
-    confidence double precision NOT NULL CHECK (isfinite(confidence))
+    confidence double precision NOT NULL CHECK (confidence > '-Infinity'::double precision AND confidence < 'Infinity'::double precision),
+    digest bytea NOT NULL UNIQUE CHECK (octet_length(digest) = 32)
 );
 
 CREATE TABLE stacks.signal_evidence (
@@ -139,6 +142,28 @@ CREATE TABLE stacks.signal_evidence (
     PRIMARY KEY (signal_id, evidence_span_id, role)
 );
 
+-- +goose StatementBegin
+CREATE FUNCTION stacks.validate_transcript_signal_evidence(checked_signal_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM stacks.signal_evidence AS signal_evidence
+        JOIN stacks.evidence_spans AS span ON span.id = signal_evidence.evidence_span_id
+        JOIN stacks.document_tabs AS tab ON tab.id = span.document_tab_id
+        WHERE signal_evidence.signal_id = checked_signal_id
+          AND signal_evidence.role = 'supporting'
+          AND tab.role = 'transcript'
+    ) THEN
+        RAISE EXCEPTION 'signal % requires supporting transcript evidence', checked_signal_id;
+    END IF;
+END;
+$$;
+-- +goose StatementEnd
+
+-- +goose StatementBegin
 CREATE FUNCTION stacks.require_transcript_signal_evidence()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -154,20 +179,16 @@ BEGIN
         checked_signal_id := NEW.signal_id;
     END IF;
 
-    IF NOT EXISTS (
-        SELECT 1
-        FROM stacks.signal_evidence AS signal_evidence
-        JOIN stacks.evidence_spans AS span ON span.id = signal_evidence.evidence_span_id
-        JOIN stacks.document_tabs AS tab ON tab.id = span.document_tab_id
-        WHERE signal_evidence.signal_id = checked_signal_id
-          AND signal_evidence.role = 'supporting'
-          AND tab.role = 'transcript'
-    ) THEN
-        RAISE EXCEPTION 'signal % requires supporting transcript evidence', checked_signal_id;
+    IF TG_TABLE_NAME = 'signal_evidence' AND TG_OP = 'UPDATE' THEN
+        PERFORM stacks.validate_transcript_signal_evidence(OLD.signal_id);
+        PERFORM stacks.validate_transcript_signal_evidence(NEW.signal_id);
+    ELSE
+        PERFORM stacks.validate_transcript_signal_evidence(checked_signal_id);
     END IF;
     RETURN NULL;
 END;
 $$;
+-- +goose StatementEnd
 
 CREATE CONSTRAINT TRIGGER interaction_signals_require_transcript_evidence
 AFTER INSERT OR UPDATE ON stacks.interaction_signals

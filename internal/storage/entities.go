@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"time"
@@ -399,16 +400,21 @@ func validateDecisionInput(input ResolutionDecisionInput) error {
 
 func insertDecision(ctx context.Context, transaction pgx.Tx, id string, input ResolutionDecisionInput, supersedesID string) (ResolutionDecision, error) {
 	var decision ResolutionDecision
+	digest := resolutionDecisionDigest(input, supersedesID)
 	err := transaction.QueryRow(ctx, `
 		INSERT INTO stacks.resolution_decisions
-			(id, proposal_id, outcome, entity_id, supersedes_id, recorded_at)
-		VALUES ($1, $2, $3, NULLIF($4, '')::uuid, NULLIF($5, '')::uuid, $6)
+			(id, proposal_id, outcome, entity_id, supersedes_id, digest, recorded_at)
+		VALUES ($1, $2, $3, NULLIF($4, '')::uuid, NULLIF($5, '')::uuid, $6, $7)
 		RETURNING id, proposal_id, COALESCE(supersedes_id::text, ''), outcome, COALESCE(entity_id::text, '')`,
-		id, input.ProposalID, string(input.Outcome), input.EntityID, supersedesID, time.Now().UTC()).Scan(&decision.ID, &decision.ProposalID, &decision.SupersedesID, &decision.Outcome, &decision.EntityID)
+		id, input.ProposalID, string(input.Outcome), input.EntityID, supersedesID, digest[:], time.Now().UTC()).Scan(&decision.ID, &decision.ProposalID, &decision.SupersedesID, &decision.Outcome, &decision.EntityID)
 	if err != nil {
 		return ResolutionDecision{}, fmt.Errorf("record resolution decision for proposal %q: %w", input.ProposalID, err)
 	}
 	return decision, nil
+}
+
+func resolutionDecisionDigest(input ResolutionDecisionInput, supersedesID string) [sha256.Size]byte {
+	return sha256.Sum256([]byte(strings.Join([]string{input.ProposalID, string(input.Outcome), input.EntityID, supersedesID}, "\x00")))
 }
 
 func loadEffectiveDecision(ctx context.Context, transaction pgx.Tx, proposalID string) (ResolutionDecision, error) {

@@ -9,8 +9,8 @@ func TestComputeAnalysisDigestIncludesPairVersionsAndOrderedInputs(t *testing.T)
 	firstDigest := sha256.Sum256([]byte("first-input"))
 	secondDigest := sha256.Sum256([]byte("second-input"))
 	base := AnalysisInput{
-		EmployeeEntityID:      "00000000-0000-0000-0000-000000000001",
-		ManagerEntityID:       "00000000-0000-0000-0000-000000000002",
+		EmployeeEntityID:      "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ManagerEntityID:       "11111111-2222-3333-4444-555555555555",
 		AnalysisPromptVersion: "analyze-v1",
 		PolicyVersion:         "policy-v1",
 		Inputs: []AnalysisInputReference{
@@ -64,5 +64,54 @@ func TestComputeAnalysisDigestIncludesPairVersionsAndOrderedInputs(t *testing.T)
 				t.Fatal("changed analysis identity produced the baseline digest")
 			}
 		})
+	}
+}
+
+func TestComputeAnalysisDigestCanonicalizesUUIDs(t *testing.T) {
+	digest := sha256.Sum256([]byte("input"))
+	canonical := AnalysisInput{
+		EmployeeEntityID:      "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ManagerEntityID:       "11111111-2222-3333-4444-555555555555",
+		AnalysisPromptVersion: "analyze-v1",
+		PolicyVersion:         "policy-v1",
+		Inputs: []AnalysisInputReference{{
+			Kind:   AnalysisInputKindSignal,
+			ID:     "99999999-aaaa-bbbb-cccc-dddddddddddd",
+			Digest: digest[:],
+		}},
+	}
+	variant := canonical
+	variant.EmployeeEntityID = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+	variant.Inputs = append([]AnalysisInputReference(nil), canonical.Inputs...)
+	variant.Inputs[0].ID = "99999999-AAAA-BBBB-CCCC-DDDDDDDDDDDD"
+
+	canonicalDigest, err := ComputeAnalysisDigest(canonical)
+	if err != nil {
+		t.Fatalf("compute canonical digest: %v", err)
+	}
+	variantDigest, err := ComputeAnalysisDigest(variant)
+	if err != nil {
+		t.Fatalf("compute variant digest: %v", err)
+	}
+	if canonicalDigest != variantDigest {
+		t.Fatal("equivalent UUID spellings produced distinct analysis digests")
+	}
+}
+
+func TestComputeAnalysisDigestRejectsInvalidUUID(t *testing.T) {
+	digest := sha256.Sum256([]byte("input"))
+	_, err := ComputeAnalysisDigest(AnalysisInput{
+		EmployeeEntityID:      "not-a-uuid",
+		ManagerEntityID:       "11111111-2222-3333-4444-555555555555",
+		AnalysisPromptVersion: "analyze-v1",
+		PolicyVersion:         "policy-v1",
+		Inputs: []AnalysisInputReference{{
+			Kind:   AnalysisInputKindSignal,
+			ID:     "99999999-aaaa-bbbb-cccc-dddddddddddd",
+			Digest: digest[:],
+		}},
+	})
+	if err == nil {
+		t.Fatal("invalid employee UUID was accepted")
 	}
 }

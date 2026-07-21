@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -63,6 +64,11 @@ func NewAnalysisRepository(pool *pgxpool.Pool) *AnalysisRepository {
 // Complete records a completed analysis exactly once for its stable digest.
 // A repeated completion returns the existing ID with created false.
 func (repository *AnalysisRepository) Complete(ctx context.Context, input AnalysisInput) (AnalysisRun, bool, error) {
+	canonicalInput, err := canonicalizeAnalysisInput(input)
+	if err != nil {
+		return AnalysisRun{}, false, err
+	}
+	input = canonicalInput
 	if err := validateAnalysisInput(input); err != nil {
 		return AnalysisRun{}, false, err
 	}
@@ -76,6 +82,11 @@ func (repository *AnalysisRepository) Complete(ctx context.Context, input Analys
 		return AnalysisRun{}, false, fmt.Errorf("start analysis transaction: %w", err)
 	}
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
+	for position, analysisInput := range input.Inputs {
+		if err := validatePersistedAnalysisInput(ctx, transaction, analysisInput); err != nil {
+			return AnalysisRun{}, false, fmt.Errorf("validate analysis input %d: %w", position, err)
+		}
+	}
 
 	var run AnalysisRun
 	err = transaction.QueryRow(ctx, `
@@ -160,6 +171,11 @@ func validateAnalysisInput(input AnalysisInput) error {
 // ComputeAnalysisDigest derives the immutable completed-analysis identity from
 // the configured pair, ordered input identities, and active analysis versions.
 func ComputeAnalysisDigest(input AnalysisInput) ([sha256.Size]byte, error) {
+	canonicalInput, err := canonicalizeAnalysisInput(input)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	input = canonicalInput
 	if err := validateAnalysisInput(input); err != nil {
 		return [sha256.Size]byte{}, err
 	}
@@ -177,6 +193,66 @@ func ComputeAnalysisDigest(input AnalysisInput) ([sha256.Size]byte, error) {
 	var digest [sha256.Size]byte
 	copy(digest[:], hasher.Sum(nil))
 	return digest, nil
+}
+
+func canonicalizeAnalysisInput(input AnalysisInput) (AnalysisInput, error) {
+	employeeID, err := canonicalUUID(input.EmployeeEntityID)
+	if err != nil {
+		return AnalysisInput{}, fmt.Errorf("complete analysis: employee entity ID is invalid")
+	}
+	managerID, err := canonicalUUID(input.ManagerEntityID)
+	if err != nil {
+		return AnalysisInput{}, fmt.Errorf("complete analysis: manager entity ID is invalid")
+	}
+	input.EmployeeEntityID = employeeID
+	input.ManagerEntityID = managerID
+	input.Inputs = append([]AnalysisInputReference(nil), input.Inputs...)
+	for index := range input.Inputs {
+		canonicalID, err := canonicalUUID(input.Inputs[index].ID)
+		if err != nil {
+			return AnalysisInput{}, fmt.Errorf("complete analysis input %d: ID is invalid", index)
+		}
+		input.Inputs[index].ID = canonicalID
+	}
+	return input, nil
+}
+
+func canonicalUUID(value string) (string, error) {
+	parsed, err := uuid.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
+}
+
+func validatePersistedAnalysisInput(ctx context.Context, transaction pgx.Tx, input AnalysisInputReference) error {
+	query := ""
+	switch input.Kind {
+	case AnalysisInputKindDocumentVersion:
+		query = `SELECT digest FROM stacks.document_versions WHERE id = $1`
+	case AnalysisInputKindDocumentTab:
+		query = `SELECT content_digest FROM stacks.document_tabs WHERE id = $1`
+	case AnalysisInputKindObservation:
+		query = `SELECT digest FROM stacks.observations WHERE id = $1`
+	case AnalysisInputKindSignal:
+		query = `SELECT digest FROM stacks.interaction_signals WHERE id = $1`
+	case AnalysisInputKindResolutionDecision:
+		query = `SELECT digest FROM stacks.resolution_decisions WHERE id = $1`
+	default:
+		return fmt.Errorf("kind is invalid")
+	}
+	var storedDigest []byte
+	err := transaction.QueryRow(ctx, query, input.ID).Scan(&storedDigest)
+	if err == pgx.ErrNoRows {
+		return fmt.Errorf("%s %q does not exist", input.Kind, input.ID)
+	}
+	if err != nil {
+		return fmt.Errorf("load %s %q: %w", input.Kind, input.ID, err)
+	}
+	if string(storedDigest) != string(input.Digest) {
+		return fmt.Errorf("%s %q digest does not match", input.Kind, input.ID)
+	}
+	return nil
 }
 
 func validAnalysisInputKind(kind AnalysisInputKind) bool {

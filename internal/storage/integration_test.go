@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"os"
 	"testing"
@@ -150,7 +149,7 @@ func TestCompleteAnalysisDeduplicatesStableInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("put analysis document version: %v", err)
 	}
-	digest := sha256.Sum256([]byte("synthetic-analysis-input"))
+	digest := version.Digest()
 	input := AnalysisInput{
 		EmployeeEntityID:      employee.ID,
 		ManagerEntityID:       manager.ID,
@@ -187,6 +186,18 @@ func TestCompleteAnalysisDeduplicatesStableInput(t *testing.T) {
 	}
 	if inputCount != len(input.Inputs) {
 		t.Fatalf("stored analysis input count = %d, want %d", inputCount, len(input.Inputs))
+	}
+	wrongDigestInput := input
+	wrongDigestInput.Inputs = append([]AnalysisInputReference(nil), input.Inputs...)
+	wrongDigestInput.Inputs[0].Digest = make([]byte, len(digest))
+	if _, _, err := analysis.Complete(ctx, wrongDigestInput); err == nil {
+		t.Fatal("analysis accepted an input digest that does not belong to its document version")
+	}
+	typeConfusedInput := input
+	typeConfusedInput.Inputs = append([]AnalysisInputReference(nil), input.Inputs...)
+	typeConfusedInput.Inputs[0].Kind = AnalysisInputKindSignal
+	if _, _, err := analysis.Complete(ctx, typeConfusedInput); err == nil {
+		t.Fatal("analysis accepted a document version ID as a signal input")
 	}
 }
 
@@ -291,6 +302,16 @@ func TestStorageRetriesDoNotDuplicateGraphRecords(t *testing.T) {
 	}
 	if secondSignal.ID != firstSignal.ID {
 		t.Fatalf("repeated signal ID = %q, want %q", secondSignal.ID, firstSignal.ID)
+	}
+	changedObservation := observationInput
+	changedObservation.Predicate = "different_interaction"
+	if _, err := graph.CompleteObservation(ctx, changedObservation, []string{spanID}); err == nil {
+		t.Fatal("changed observation payload with existing ID succeeded")
+	}
+	changedSignal := signalInput
+	changedSignal.Direction = "weakening"
+	if _, err := graph.CompleteSignal(ctx, changedSignal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}}); err == nil {
+		t.Fatal("changed signal payload with existing ID succeeded")
 	}
 }
 

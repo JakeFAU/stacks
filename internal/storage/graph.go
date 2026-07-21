@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"math"
 	"strings"
@@ -74,10 +75,11 @@ func (repository *GraphRepository) CompleteObservation(ctx context.Context, inpu
 	if len(evidenceSpanIDs) == 0 {
 		return Observation{}, fmt.Errorf("complete observation %q: evidence span IDs are required", input.ID)
 	}
+	digest := observationDigest(input, evidenceSpanIDs)
 	var observation Observation
 	err := repository.withTransaction(ctx, func(transaction pgx.Tx) error {
 		var err error
-		observation, err = putObservation(ctx, transaction, input)
+		observation, err = putObservation(ctx, transaction, input, digest[:])
 		if err != nil {
 			return err
 		}
@@ -110,10 +112,11 @@ func (repository *GraphRepository) CompleteSignal(ctx context.Context, input Sig
 	if len(evidence) == 0 {
 		return InteractionSignal{}, fmt.Errorf("complete signal %q: evidence is required", input.ID)
 	}
+	digest := signalDigest(input, evidence)
 	var signal InteractionSignal
 	err := repository.withTransaction(ctx, func(transaction pgx.Tx) error {
 		var err error
-		signal, err = putSignal(ctx, transaction, input)
+		signal, err = putSignal(ctx, transaction, input, digest[:])
 		if err != nil {
 			return err
 		}
@@ -151,19 +154,23 @@ func (repository *GraphRepository) withTransaction(ctx context.Context, work fun
 	return nil
 }
 
-func putObservation(ctx context.Context, transaction pgx.Tx, input ObservationInput) (Observation, error) {
+func putObservation(ctx context.Context, transaction pgx.Tx, input ObservationInput, digest []byte) (Observation, error) {
 	var observation Observation
 	err := transaction.QueryRow(ctx, `
 		INSERT INTO stacks.observations
-			(id, subject_entity_id, object_entity_id, predicate, valid_start, valid_end, recorded_at, derivation, epistemic_status, confidence)
-		VALUES ($1::uuid, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, $4, $5, $6, $7, $8, $9, $10)
+			(id, subject_entity_id, object_entity_id, predicate, valid_start, valid_end, recorded_at, derivation, epistemic_status, confidence, digest)
+		VALUES ($1::uuid, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (id) DO NOTHING
 		RETURNING id`,
-		input.ID, input.SubjectEntityID, input.ObjectEntityID, input.Predicate, input.ValidStart, input.ValidEnd, time.Now().UTC(), input.Derivation, input.EpistemicStatus, input.Confidence).Scan(&observation.ID)
+		input.ID, input.SubjectEntityID, input.ObjectEntityID, input.Predicate, input.ValidStart, input.ValidEnd, time.Now().UTC(), input.Derivation, input.EpistemicStatus, input.Confidence, digest).Scan(&observation.ID)
 	if err == pgx.ErrNoRows {
-		err = transaction.QueryRow(ctx, `SELECT id FROM stacks.observations WHERE id = $1`, input.ID).Scan(&observation.ID)
+		var storedDigest []byte
+		err = transaction.QueryRow(ctx, `SELECT id, digest FROM stacks.observations WHERE id = $1`, input.ID).Scan(&observation.ID, &storedDigest)
 		if err != nil {
 			return Observation{}, fmt.Errorf("load observation %q: %w", input.ID, err)
+		}
+		if string(storedDigest) != string(digest) {
+			return Observation{}, fmt.Errorf("load observation %q: immutable payload conflicts", input.ID)
 		}
 		return observation, nil
 	}
@@ -173,19 +180,23 @@ func putObservation(ctx context.Context, transaction pgx.Tx, input ObservationIn
 	return observation, nil
 }
 
-func putSignal(ctx context.Context, transaction pgx.Tx, input SignalInput) (InteractionSignal, error) {
+func putSignal(ctx context.Context, transaction pgx.Tx, input SignalInput, digest []byte) (InteractionSignal, error) {
 	var signal InteractionSignal
 	err := transaction.QueryRow(ctx, `
 		INSERT INTO stacks.interaction_signals
-			(id, observation_id, category, direction, extraction_model_id, prompt_version, rationale, confidence)
-		VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8)
+			(id, observation_id, category, direction, extraction_model_id, prompt_version, rationale, confidence, digest)
+		VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (id) DO NOTHING
 		RETURNING id`,
-		input.ID, input.ObservationID, input.Category, input.Direction, input.ExtractionModelID, input.PromptVersion, input.Rationale, input.Confidence).Scan(&signal.ID)
+		input.ID, input.ObservationID, input.Category, input.Direction, input.ExtractionModelID, input.PromptVersion, input.Rationale, input.Confidence, digest).Scan(&signal.ID)
 	if err == pgx.ErrNoRows {
-		err = transaction.QueryRow(ctx, `SELECT id FROM stacks.interaction_signals WHERE id = $1`, input.ID).Scan(&signal.ID)
+		var storedDigest []byte
+		err = transaction.QueryRow(ctx, `SELECT id, digest FROM stacks.interaction_signals WHERE id = $1`, input.ID).Scan(&signal.ID, &storedDigest)
 		if err != nil {
 			return InteractionSignal{}, fmt.Errorf("load signal %q: %w", input.ID, err)
+		}
+		if string(storedDigest) != string(digest) {
+			return InteractionSignal{}, fmt.Errorf("load signal %q: immutable payload conflicts", input.ID)
 		}
 		return signal, nil
 	}
@@ -254,4 +265,33 @@ func validSignalEvidenceRole(role string) bool {
 
 func isFinite(value float64) bool {
 	return !math.IsInf(value, 0) && !math.IsNaN(value)
+}
+
+func observationDigest(input ObservationInput, evidenceSpanIDs []string) [sha256.Size]byte {
+	fields := []string{input.ID, input.SubjectEntityID, input.ObjectEntityID, input.Predicate, input.Derivation, input.EpistemicStatus}
+	if input.ValidStart != nil {
+		fields = append(fields, input.ValidStart.UTC().Format(time.RFC3339Nano))
+	} else {
+		fields = append(fields, "")
+	}
+	if input.ValidEnd != nil {
+		fields = append(fields, input.ValidEnd.UTC().Format(time.RFC3339Nano))
+	} else {
+		fields = append(fields, "")
+	}
+	if input.Confidence != nil {
+		fields = append(fields, fmt.Sprintf("%.17g", *input.Confidence))
+	} else {
+		fields = append(fields, "")
+	}
+	fields = append(fields, evidenceSpanIDs...)
+	return sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+}
+
+func signalDigest(input SignalInput, evidence []SignalEvidenceInput) [sha256.Size]byte {
+	fields := []string{input.ID, input.ObservationID, input.Category, input.Direction, input.ExtractionModelID, input.PromptVersion, input.Rationale, fmt.Sprintf("%.17g", input.Confidence)}
+	for _, signalEvidence := range evidence {
+		fields = append(fields, signalEvidence.EvidenceSpanID, signalEvidence.Role)
+	}
+	return sha256.Sum256([]byte(strings.Join(fields, "\x00")))
 }
