@@ -215,6 +215,37 @@ func TestPoCSettingsValidateSyncRejectsEmptyNormalizedTitleSet(t *testing.T) {
 	}
 }
 
+func TestPoCSettingsValidateRejectsWhitespaceOnlyRequiredSettings(t *testing.T) {
+	tests := []struct {
+		name       string
+		command    Command
+		invalidate func(*PoCSettings)
+	}{
+		{name: "database URL", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.DatabaseURL = " \t " }},
+		{name: "Google folder ID", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.GoogleFolderID = " \t " }},
+		{name: "Google OAuth client file", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.GoogleOAuthClientFile = " \t " }},
+		{name: "Google OAuth token file", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.GoogleOAuthTokenFile = " \t " }},
+		{name: "AWS profile", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.AWSProfile = " \t " }},
+		{name: "AWS region", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.AWSRegion = " \t " }},
+		{name: "Bedrock model ID", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.BedrockModelID = " \t " }},
+		{name: "extraction prompt version", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.ExtractionPromptVersion = " \t " }},
+		{name: "analysis prompt version", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.AnalysisPromptVersion = " \t " }},
+		{name: "employee entity ID", command: CommandAnalyze, invalidate: func(settings *PoCSettings) { settings.EmployeeEntityID = " \t " }},
+		{name: "manager entity ID", command: CommandAnalyze, invalidate: func(settings *PoCSettings) { settings.ManagerEntityID = " \t " }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := validPoCSettings()
+			test.invalidate(&settings)
+
+			if err := settings.Validate(test.command); err == nil {
+				t.Fatal("Validate() error = nil, want whitespace-only setting error")
+			}
+		})
+	}
+}
+
 func TestPoCSettingsValidateRejectsOverlappingNormalizedTabTitles(t *testing.T) {
 	settings := validPoCSettings()
 	settings.TranscriptTitles = []string{"Transcript"}

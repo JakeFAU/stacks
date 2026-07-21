@@ -132,7 +132,7 @@ func (settings PoCSettings) validateModelSettings(command Command) error {
 
 func (settings PoCSettings) validateRequired(command Command, names ...string) error {
 	for _, name := range names {
-		if settings.valueForEnvironment(name) == "" {
+		if strings.TrimSpace(settings.valueForEnvironment(name)) == "" {
 			return fmt.Errorf("%s is required for %s", name, command)
 		}
 	}
