@@ -43,6 +43,15 @@ func TestLoadDefaults(t *testing.T) {
 	if settings.Telemetry.TraceSampleRatio != 1 {
 		t.Errorf("Telemetry.TraceSampleRatio = %v, want 1", settings.Telemetry.TraceSampleRatio)
 	}
+	if settings.PoC.BedrockMaxAttempts != defaultBedrockMaxAttempts {
+		t.Errorf("PoC.BedrockMaxAttempts = %d, want %d", settings.PoC.BedrockMaxAttempts, defaultBedrockMaxAttempts)
+	}
+	if settings.PoC.ExtractionPromptVersion != defaultExtractionPromptVersion {
+		t.Errorf("PoC.ExtractionPromptVersion = %q, want %q", settings.PoC.ExtractionPromptVersion, defaultExtractionPromptVersion)
+	}
+	if settings.PoC.AnalysisPromptVersion != defaultAnalysisPromptVersion {
+		t.Errorf("PoC.AnalysisPromptVersion = %q, want %q", settings.PoC.AnalysisPromptVersion, defaultAnalysisPromptVersion)
+	}
 }
 
 func TestLoadOverridesDefaults(t *testing.T) {
@@ -131,6 +140,142 @@ func TestLoadRejectsInvalidObservabilitySettings(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadReadsPoCSettings(t *testing.T) {
+	t.Setenv(DatabaseURLEnvironmentVariable, "postgres://stacks:test@localhost:5432/stacks")
+	t.Setenv(GoogleFolderIDEnvironmentVariable, "folder-id")
+	t.Setenv(GoogleOAuthClientFileEnvironmentVariable, "/tmp/client.json")
+	t.Setenv(GoogleOAuthTokenFileEnvironmentVariable, "/tmp/token.json")
+	t.Setenv(TranscriptTitlesEnvironmentVariable, "Transcript, Meeting transcript")
+	t.Setenv(NotesTitlesEnvironmentVariable, "Meeting notes")
+	t.Setenv(AWSProfileEnvironmentVariable, "stacks")
+	t.Setenv(AWSRegionEnvironmentVariable, "us-east-1")
+	t.Setenv(BedrockModelIDEnvironmentVariable, "model-id")
+	t.Setenv(BedrockMaxTokensEnvironmentVariable, "1000")
+	t.Setenv(BedrockMaxAttemptsEnvironmentVariable, "3")
+	t.Setenv(ExtractionPromptVersionEnvironmentVariable, "extract-test-v1")
+	t.Setenv(AnalysisPromptVersionEnvironmentVariable, "analyze-test-v1")
+	t.Setenv(EmployeeEntityIDEnvironmentVariable, "employee-id")
+	t.Setenv(ManagerEntityIDEnvironmentVariable, "manager-id")
+
+	settings, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	want := validPoCSettings()
+	want.BedrockMaxAttempts = 3
+	want.ExtractionPromptVersion = "extract-test-v1"
+	want.AnalysisPromptVersion = "analyze-test-v1"
+	want.TranscriptTitles = []string{"Transcript", "Meeting transcript"}
+	if diff := diffPoCSettings(settings.PoC, want); diff != "" {
+		t.Error(diff)
+	}
+}
+
+func TestPoCSettingsValidateSyncRequiresCorpusAndDisclosureSettings(t *testing.T) {
+	tests := []struct {
+		name       string
+		invalidate func(*PoCSettings)
+	}{
+		{name: "database URL", invalidate: func(settings *PoCSettings) { settings.DatabaseURL = "" }},
+		{name: "Google folder ID", invalidate: func(settings *PoCSettings) { settings.GoogleFolderID = "" }},
+		{name: "Google OAuth client file", invalidate: func(settings *PoCSettings) { settings.GoogleOAuthClientFile = "" }},
+		{name: "Google OAuth token file", invalidate: func(settings *PoCSettings) { settings.GoogleOAuthTokenFile = "" }},
+		{name: "transcript titles", invalidate: func(settings *PoCSettings) { settings.TranscriptTitles = nil }},
+		{name: "notes titles", invalidate: func(settings *PoCSettings) { settings.NotesTitles = nil }},
+		{name: "AWS profile", invalidate: func(settings *PoCSettings) { settings.AWSProfile = "" }},
+		{name: "AWS region", invalidate: func(settings *PoCSettings) { settings.AWSRegion = "" }},
+		{name: "Bedrock model ID", invalidate: func(settings *PoCSettings) { settings.BedrockModelID = "" }},
+		{name: "Bedrock max tokens", invalidate: func(settings *PoCSettings) { settings.BedrockMaxTokens = 0 }},
+		{name: "Bedrock max attempts", invalidate: func(settings *PoCSettings) { settings.BedrockMaxAttempts = 0 }},
+		{name: "extraction prompt version", invalidate: func(settings *PoCSettings) { settings.ExtractionPromptVersion = "" }},
+		{name: "analysis prompt version", invalidate: func(settings *PoCSettings) { settings.AnalysisPromptVersion = "" }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := validPoCSettings()
+			test.invalidate(&settings)
+
+			if err := settings.Validate(CommandSync); err == nil {
+				t.Fatal("Validate() error = nil, want missing setting error")
+			}
+		})
+	}
+}
+
+func TestPoCSettingsValidateSyncRejectsEmptyNormalizedTitleSet(t *testing.T) {
+	settings := validPoCSettings()
+	settings.TranscriptTitles = []string{"  \t "}
+
+	if err := settings.Validate(CommandSync); err == nil {
+		t.Fatal("Validate() error = nil, want empty normalized title set error")
+	}
+}
+
+func TestPoCSettingsValidateRejectsOverlappingNormalizedTabTitles(t *testing.T) {
+	settings := validPoCSettings()
+	settings.TranscriptTitles = []string{"Transcript"}
+	settings.NotesTitles = []string{"  transcript  "}
+
+	err := settings.Validate(CommandSync)
+	if err == nil {
+		t.Fatal("Validate() error = nil, want overlapping titles error")
+	}
+}
+
+func validPoCSettings() PoCSettings {
+	return PoCSettings{
+		DatabaseURL:             "postgres://stacks:test@localhost:5432/stacks",
+		GoogleFolderID:          "folder-id",
+		GoogleOAuthClientFile:   "/tmp/client.json",
+		GoogleOAuthTokenFile:    "/tmp/token.json",
+		TranscriptTitles:        []string{"Transcript"},
+		NotesTitles:             []string{"Meeting notes"},
+		AWSProfile:              "stacks",
+		AWSRegion:               "us-east-1",
+		BedrockModelID:          "model-id",
+		BedrockMaxTokens:        1000,
+		BedrockMaxAttempts:      5,
+		ExtractionPromptVersion: "extract-v1",
+		AnalysisPromptVersion:   "analyze-v1",
+		EmployeeEntityID:        "employee-id",
+		ManagerEntityID:         "manager-id",
+	}
+}
+
+func diffPoCSettings(got, want PoCSettings) string {
+	if got.DatabaseURL != want.DatabaseURL ||
+		got.GoogleFolderID != want.GoogleFolderID ||
+		got.GoogleOAuthClientFile != want.GoogleOAuthClientFile ||
+		got.GoogleOAuthTokenFile != want.GoogleOAuthTokenFile ||
+		got.AWSProfile != want.AWSProfile ||
+		got.AWSRegion != want.AWSRegion ||
+		got.BedrockModelID != want.BedrockModelID ||
+		got.BedrockMaxTokens != want.BedrockMaxTokens ||
+		got.BedrockMaxAttempts != want.BedrockMaxAttempts ||
+		got.ExtractionPromptVersion != want.ExtractionPromptVersion ||
+		got.AnalysisPromptVersion != want.AnalysisPromptVersion ||
+		got.EmployeeEntityID != want.EmployeeEntityID ||
+		got.ManagerEntityID != want.ManagerEntityID {
+		return "PoC settings did not match environment values"
+	}
+	if len(got.TranscriptTitles) != len(want.TranscriptTitles) || len(got.NotesTitles) != len(want.NotesTitles) {
+		return "PoC title sets did not match environment values"
+	}
+	for index := range want.TranscriptTitles {
+		if got.TranscriptTitles[index] != want.TranscriptTitles[index] {
+			return "PoC transcript titles did not match environment values"
+		}
+	}
+	for index := range want.NotesTitles {
+		if got.NotesTitles[index] != want.NotesTitles[index] {
+			return "PoC notes titles did not match environment values"
+		}
+	}
+	return ""
 }
 
 func clearObservabilityEnvironment(t *testing.T) {
