@@ -129,6 +129,82 @@ func TestCorrectionLeavesOneEffectiveDecision(t *testing.T) {
 	}
 }
 
+func TestInteractiveReviewActionsAppendHistoryAndRejectStaleState(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewEntityRepository(pool)
+	ctx := context.Background()
+
+	firstEntity, err := repository.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Review Person A"})
+	if err != nil {
+		t.Fatalf("create first review entity: %v", err)
+	}
+	secondEntity, err := repository.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Review Person B"})
+	if err != nil {
+		t.Fatalf("create second review entity: %v", err)
+	}
+	proposal, err := repository.CreateResolutionProposal(ctx, ResolutionProposalInput{MentionID: createSyntheticMention(t, pool)})
+	if err != nil {
+		t.Fatalf("create review proposal: %v", err)
+	}
+	accepted, err := repository.RecordReviewDecision(ctx, ResolutionDecisionInput{
+		ProposalID: proposal.ID,
+		Outcome:    ResolutionOutcomeAccepted,
+		EntityID:   firstEntity.ID,
+	})
+	if err != nil {
+		t.Fatalf("accept review proposal: %v", err)
+	}
+	if _, err := repository.RecordReviewDecision(ctx, ResolutionDecisionInput{
+		ProposalID: proposal.ID,
+		Outcome:    ResolutionOutcomeAccepted,
+		EntityID:   firstEntity.ID,
+	}); err == nil {
+		t.Fatal("repeat review acceptance error = nil, want effective-state error")
+	}
+	correction, err := repository.CorrectReviewDecision(ctx, accepted.ID, ResolutionDecisionInput{
+		Outcome:  ResolutionOutcomeAccepted,
+		EntityID: secondEntity.ID,
+	})
+	if err != nil {
+		t.Fatalf("correct review decision: %v", err)
+	}
+	if correction.SupersedesID != accepted.ID {
+		t.Fatalf("correction supersedes %q, want %q", correction.SupersedesID, accepted.ID)
+	}
+	if _, err := repository.CorrectReviewDecision(ctx, accepted.ID, ResolutionDecisionInput{
+		Outcome:  ResolutionOutcomeAccepted,
+		EntityID: firstEntity.ID,
+	}); err == nil {
+		t.Fatal("correct stale decision error = nil, want not effective error")
+	}
+
+	createProposal, err := repository.CreateResolutionProposal(ctx, ResolutionProposalInput{MentionID: createSyntheticMention(t, pool)})
+	if err != nil {
+		t.Fatalf("create new-person proposal: %v", err)
+	}
+	createdEntity, createdDecision, err := repository.CreateReviewPerson(ctx, CreateReviewPersonInput{
+		ProposalID:  createProposal.ID,
+		EntityID:    uuid.NewString(),
+		Kind:        "person",
+		DisplayName: "Synthetic Created Person",
+		Aliases:     []AliasInput{{Type: "name", NormalizedValue: "synthetic created person"}},
+	})
+	if err != nil {
+		t.Fatalf("create review person: %v", err)
+	}
+	if createdEntity.ID == "" || createdDecision.Outcome != ResolutionOutcomeCreated || createdDecision.EntityID != createdEntity.ID {
+		t.Fatalf("created review result = (%#v, %#v), want created entity decision", createdEntity, createdDecision)
+	}
+
+	rejectedProposal, err := repository.CreateResolutionProposal(ctx, ResolutionProposalInput{MentionID: createSyntheticMention(t, pool)})
+	if err != nil {
+		t.Fatalf("create rejected proposal: %v", err)
+	}
+	if _, err := repository.RecordReviewDecision(ctx, ResolutionDecisionInput{ProposalID: rejectedProposal.ID, Outcome: ResolutionOutcomeRejected}); err != nil {
+		t.Fatalf("reject review proposal: %v", err)
+	}
+}
+
 func TestCompleteAnalysisDeduplicatesStableInput(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	entities := NewEntityRepository(pool)

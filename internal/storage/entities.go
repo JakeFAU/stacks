@@ -25,6 +25,16 @@ type Entity struct {
 	ID string
 }
 
+// EntityDetail is the private review projection of one canonical entity.
+type EntityDetail struct {
+	ID           string
+	Kind         string
+	DisplayName  string
+	Aliases      []string
+	MentionCount int
+	Evidence     []string
+}
+
 // AliasInput identifies an accepted normalized alias for an entity.
 type AliasInput struct {
 	EntityID        string
@@ -59,6 +69,13 @@ type ResolutionProposal struct {
 	ID string
 }
 
+// ResolutionProposalDetail is the private review projection of a proposal.
+type ResolutionProposalDetail struct {
+	ID         string
+	Context    string
+	Candidates []ResolutionCandidateDetail
+}
+
 // ResolutionCandidateInput stores one deterministic candidate rank.
 type ResolutionCandidateInput struct {
 	ProposalID string
@@ -71,6 +88,13 @@ type ResolutionCandidateInput struct {
 // ResolutionCandidate is a stored proposal candidate.
 type ResolutionCandidate struct {
 	ID string
+}
+
+// ResolutionCandidateDetail is one ranked non-authoritative candidate.
+type ResolutionCandidateDetail struct {
+	EntityID   string
+	Confidence *float64
+	Reason     string
 }
 
 // ResolutionOutcome is the finite set of review outcomes persisted by storage.
@@ -88,6 +112,16 @@ type ResolutionDecisionInput struct {
 	ProposalID string
 	Outcome    ResolutionOutcome
 	EntityID   string
+}
+
+// CreateReviewPersonInput atomically creates a canonical person and accepts it
+// for one pending proposal. Alias values must be normalized by domain policy.
+type CreateReviewPersonInput struct {
+	ProposalID  string
+	EntityID    string
+	Kind        string
+	DisplayName string
+	Aliases     []AliasInput
 }
 
 // ResolutionDecision is an immutable review record.
@@ -265,6 +299,17 @@ func (repository *EntityRepository) PutCandidate(ctx context.Context, input Reso
 
 // RecordDecision adds the initial effective decision for a proposal.
 func (repository *EntityRepository) RecordDecision(ctx context.Context, input ResolutionDecisionInput) (ResolutionDecision, error) {
+	return repository.recordDecision(ctx, input, false)
+}
+
+// RecordReviewDecision appends an initial review decision and rejects proposals
+// that already have effective state. Retryable processing should use
+// RecordDecision instead, which retains idempotency semantics.
+func (repository *EntityRepository) RecordReviewDecision(ctx context.Context, input ResolutionDecisionInput) (ResolutionDecision, error) {
+	return repository.recordDecision(ctx, input, true)
+}
+
+func (repository *EntityRepository) recordDecision(ctx context.Context, input ResolutionDecisionInput, strict bool) (ResolutionDecision, error) {
 	if err := validateDecisionInput(input); err != nil {
 		return ResolutionDecision{}, err
 	}
@@ -272,11 +317,11 @@ func (repository *EntityRepository) RecordDecision(ctx context.Context, input Re
 	err := repository.withTransaction(ctx, func(transaction pgx.Tx) error {
 		existing, err := loadEffectiveDecision(ctx, transaction, input.ProposalID)
 		if err == nil {
-			if existing.Outcome == input.Outcome && existing.EntityID == input.EntityID {
+			if !strict && existing.Outcome == input.Outcome && existing.EntityID == input.EntityID {
 				decision = existing
 				return nil
 			}
-			return fmt.Errorf("record resolution decision for proposal %q: effective decision conflicts", input.ProposalID)
+			return fmt.Errorf("record resolution decision for proposal %q: proposal already has an effective decision", input.ProposalID)
 		}
 		if err != pgx.ErrNoRows {
 			return fmt.Errorf("load effective resolution decision for proposal %q: %w", input.ProposalID, err)
@@ -296,6 +341,16 @@ func (repository *EntityRepository) RecordDecision(ctx context.Context, input Re
 
 // CorrectDecision appends a replacement for one currently effective decision.
 func (repository *EntityRepository) CorrectDecision(ctx context.Context, effectiveDecisionID string, input ResolutionDecisionInput) (ResolutionDecision, error) {
+	return repository.correctDecision(ctx, effectiveDecisionID, input, false)
+}
+
+// CorrectReviewDecision appends a replacement only when the named decision is
+// still effective. It never treats a stale command as a successful retry.
+func (repository *EntityRepository) CorrectReviewDecision(ctx context.Context, effectiveDecisionID string, input ResolutionDecisionInput) (ResolutionDecision, error) {
+	return repository.correctDecision(ctx, effectiveDecisionID, input, true)
+}
+
+func (repository *EntityRepository) correctDecision(ctx context.Context, effectiveDecisionID string, input ResolutionDecisionInput, strict bool) (ResolutionDecision, error) {
 	if strings.TrimSpace(effectiveDecisionID) == "" {
 		return ResolutionDecision{}, fmt.Errorf("correct resolution decision: effective decision ID is required")
 	}
@@ -319,6 +374,9 @@ func (repository *EntityRepository) CorrectDecision(ctx context.Context, effecti
 			return err
 		}
 		if supersededByID != "" {
+			if strict {
+				return fmt.Errorf("correct resolution decision %q: decision is not effective", effectiveDecisionID)
+			}
 			replacement, err = loadDecision(ctx, transaction, supersededByID)
 			if err != nil {
 				return fmt.Errorf("load correction for resolution decision %q: %w", effectiveDecisionID, err)
@@ -349,6 +407,219 @@ func (repository *EntityRepository) CorrectDecision(ctx context.Context, effecti
 		return ResolutionDecision{}, err
 	}
 	return replacement, nil
+}
+
+// ListEntityDetails returns canonical people for private local review.
+func (repository *EntityRepository) ListEntityDetails(ctx context.Context) ([]EntityDetail, error) {
+	rows, err := repository.pool.Query(ctx, `
+		SELECT id::text, kind, display_name
+		FROM stacks.entities
+		ORDER BY display_name, id`)
+	if err != nil {
+		return nil, fmt.Errorf("list entities: %w", err)
+	}
+	defer rows.Close()
+	entities := make([]EntityDetail, 0)
+	for rows.Next() {
+		var detail EntityDetail
+		if err := rows.Scan(&detail.ID, &detail.Kind, &detail.DisplayName); err != nil {
+			return nil, fmt.Errorf("scan entity: %w", err)
+		}
+		entities = append(entities, detail)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate entities: %w", err)
+	}
+	for index := range entities {
+		detail, err := repository.ShowEntityDetail(ctx, entities[index].ID)
+		if err != nil {
+			return nil, err
+		}
+		entities[index] = detail
+	}
+	return entities, nil
+}
+
+// ShowEntityDetail returns accepted aliases, mention count, and cited private
+// source context for one canonical entity.
+func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entityID string) (EntityDetail, error) {
+	var detail EntityDetail
+	err := repository.pool.QueryRow(ctx, `
+		SELECT id::text, kind, display_name
+		FROM stacks.entities WHERE id = $1`, entityID).Scan(&detail.ID, &detail.Kind, &detail.DisplayName)
+	if err != nil {
+		return EntityDetail{}, fmt.Errorf("show entity %q: %w", entityID, err)
+	}
+	aliases, err := repository.pool.Query(ctx, `
+		SELECT normalized_value FROM stacks.entity_aliases
+		WHERE entity_id = $1 ORDER BY alias_type, normalized_value`, entityID)
+	if err != nil {
+		return EntityDetail{}, fmt.Errorf("list aliases for entity %q: %w", entityID, err)
+	}
+	defer aliases.Close()
+	for aliases.Next() {
+		var alias string
+		if err := aliases.Scan(&alias); err != nil {
+			return EntityDetail{}, fmt.Errorf("scan alias for entity %q: %w", entityID, err)
+		}
+		detail.Aliases = append(detail.Aliases, alias)
+	}
+	if err := aliases.Err(); err != nil {
+		return EntityDetail{}, fmt.Errorf("iterate aliases for entity %q: %w", entityID, err)
+	}
+	if err := repository.pool.QueryRow(ctx, `
+		SELECT count(*) FROM stacks.resolution_decisions
+		WHERE entity_id = $1 AND outcome IN ('accepted', 'created')`, entityID).Scan(&detail.MentionCount); err != nil {
+		return EntityDetail{}, fmt.Errorf("count mentions for entity %q: %w", entityID, err)
+	}
+	evidence, err := repository.pool.Query(ctx, `
+		SELECT DISTINCT span.quote
+		FROM stacks.resolution_decisions AS decision
+		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
+		WHERE decision.entity_id = $1 AND decision.outcome IN ('accepted', 'created')
+		ORDER BY span.quote`, entityID)
+	if err != nil {
+		return EntityDetail{}, fmt.Errorf("list evidence for entity %q: %w", entityID, err)
+	}
+	defer evidence.Close()
+	for evidence.Next() {
+		var quote string
+		if err := evidence.Scan(&quote); err != nil {
+			return EntityDetail{}, fmt.Errorf("scan evidence for entity %q: %w", entityID, err)
+		}
+		detail.Evidence = append(detail.Evidence, quote)
+	}
+	if err := evidence.Err(); err != nil {
+		return EntityDetail{}, fmt.Errorf("iterate evidence for entity %q: %w", entityID, err)
+	}
+	return detail, nil
+}
+
+// ListResolutionProposalDetails returns pending proposals for local review.
+func (repository *EntityRepository) ListResolutionProposalDetails(ctx context.Context) ([]ResolutionProposalDetail, error) {
+	rows, err := repository.pool.Query(ctx, `
+		SELECT proposal.id::text, span.quote
+		FROM stacks.resolution_proposals AS proposal
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
+		WHERE proposal.status = 'pending'
+		ORDER BY proposal.recorded_at, proposal.id`)
+	if err != nil {
+		return nil, fmt.Errorf("list resolution proposals: %w", err)
+	}
+	defer rows.Close()
+	var proposals []ResolutionProposalDetail
+	for rows.Next() {
+		var proposal ResolutionProposalDetail
+		if err := rows.Scan(&proposal.ID, &proposal.Context); err != nil {
+			return nil, fmt.Errorf("scan resolution proposal: %w", err)
+		}
+		candidates, err := repository.listResolutionCandidateDetails(ctx, proposal.ID)
+		if err != nil {
+			return nil, err
+		}
+		proposal.Candidates = candidates
+		proposals = append(proposals, proposal)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate resolution proposals: %w", err)
+	}
+	return proposals, nil
+}
+
+// ShowResolutionProposalDetail returns one proposal, including private cited
+// context and the ranked candidate list.
+func (repository *EntityRepository) ShowResolutionProposalDetail(ctx context.Context, proposalID string) (ResolutionProposalDetail, error) {
+	var proposal ResolutionProposalDetail
+	err := repository.pool.QueryRow(ctx, `
+		SELECT proposal.id::text, span.quote
+		FROM stacks.resolution_proposals AS proposal
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
+		WHERE proposal.id = $1`, proposalID).Scan(&proposal.ID, &proposal.Context)
+	if err != nil {
+		return ResolutionProposalDetail{}, fmt.Errorf("show resolution proposal %q: %w", proposalID, err)
+	}
+	candidates, err := repository.listResolutionCandidateDetails(ctx, proposalID)
+	if err != nil {
+		return ResolutionProposalDetail{}, err
+	}
+	proposal.Candidates = candidates
+	return proposal, nil
+}
+
+func (repository *EntityRepository) listResolutionCandidateDetails(ctx context.Context, proposalID string) ([]ResolutionCandidateDetail, error) {
+	rows, err := repository.pool.Query(ctx, `
+		SELECT entity_id::text, confidence, reason FROM stacks.resolution_candidates
+		WHERE proposal_id = $1 ORDER BY rank, entity_id`, proposalID)
+	if err != nil {
+		return nil, fmt.Errorf("list candidates for resolution proposal %q: %w", proposalID, err)
+	}
+	defer rows.Close()
+	var candidates []ResolutionCandidateDetail
+	for rows.Next() {
+		var candidate ResolutionCandidateDetail
+		if err := rows.Scan(&candidate.EntityID, &candidate.Confidence, &candidate.Reason); err != nil {
+			return nil, fmt.Errorf("scan candidate for resolution proposal %q: %w", proposalID, err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate candidates for resolution proposal %q: %w", proposalID, err)
+	}
+	return candidates, nil
+}
+
+// CreateReviewPerson atomically creates a person, records accepted aliases,
+// and appends the initial created decision for its proposal.
+func (repository *EntityRepository) CreateReviewPerson(ctx context.Context, input CreateReviewPersonInput) (Entity, ResolutionDecision, error) {
+	if strings.TrimSpace(input.ProposalID) == "" || strings.TrimSpace(input.EntityID) == "" || strings.TrimSpace(input.Kind) == "" || strings.TrimSpace(input.DisplayName) == "" {
+		return Entity{}, ResolutionDecision{}, fmt.Errorf("create review person: proposal ID, entity ID, kind, and display name are required")
+	}
+	var entity Entity
+	var decision ResolutionDecision
+	err := repository.withTransaction(ctx, func(transaction pgx.Tx) error {
+		if err := transaction.QueryRow(ctx, `
+			INSERT INTO stacks.entities (id, kind, display_name, recorded_at)
+			VALUES ($1::uuid, $2, $3, $4)
+			RETURNING id`, input.EntityID, input.Kind, input.DisplayName, time.Now().UTC()).Scan(&entity.ID); err != nil {
+			return fmt.Errorf("create review entity %q: %w", input.EntityID, err)
+		}
+		for _, alias := range input.Aliases {
+			if alias.EntityID != "" && alias.EntityID != entity.ID {
+				return fmt.Errorf("create review person %q: alias entity ID does not match", entity.ID)
+			}
+			if strings.TrimSpace(alias.NormalizedValue) == "" || (alias.Type != "name" && alias.Type != "email") {
+				return fmt.Errorf("create review person %q: alias is invalid", entity.ID)
+			}
+			if _, err := transaction.Exec(ctx, `
+				INSERT INTO stacks.entity_aliases (entity_id, normalized_value, alias_type, recorded_at)
+				VALUES ($1::uuid, $2, $3, $4)`, entity.ID, alias.NormalizedValue, alias.Type, time.Now().UTC()); err != nil {
+				return fmt.Errorf("create alias for review entity %q: %w", entity.ID, err)
+			}
+		}
+		if _, err := loadEffectiveDecision(ctx, transaction, input.ProposalID); err == nil {
+			return fmt.Errorf("create review person for proposal %q: proposal already has an effective decision", input.ProposalID)
+		} else if err != pgx.ErrNoRows {
+			return fmt.Errorf("load effective resolution decision for proposal %q: %w", input.ProposalID, err)
+		}
+		var err error
+		decision, err = insertDecision(ctx, transaction, uuid.NewString(), ResolutionDecisionInput{
+			ProposalID: input.ProposalID,
+			Outcome:    ResolutionOutcomeCreated,
+			EntityID:   entity.ID,
+		}, "")
+		if err != nil {
+			return err
+		}
+		return updateProposalStatus(ctx, transaction, input.ProposalID, ResolutionOutcomeCreated)
+	})
+	if err != nil {
+		return Entity{}, ResolutionDecision{}, err
+	}
+	return entity, decision, nil
 }
 
 // EffectiveDecision returns the one unsuperseded decision for a proposal.
