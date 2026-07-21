@@ -13,3 +13,4 @@
 
 # Agent worktrees
 .worktrees/
+.superpowers/
