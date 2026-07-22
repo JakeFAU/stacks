@@ -296,6 +296,52 @@ func TestLoadPairInputsRollsBackSnapshotWhenSignalReadFails(t *testing.T) {
 	}
 }
 
+func TestFindCompletedValidatesIdentityAndReadsCacheInOneTransaction(t *testing.T) {
+	identity := testCurrentAnalysisIdentity(t)
+	transaction := &fakeCompletedAnalysisLookup{
+		report: analysisdomain.Report{ID: "cached-run", InputDigest: identity.InputDigest},
+		found:  true,
+	}
+	repository := &AnalysisRepository{
+		beginCompletedLookup: func(context.Context) (completedAnalysisLookup, error) {
+			return transaction, nil
+		},
+	}
+
+	report, found, err := repository.FindCompleted(context.Background(), identity)
+	if err != nil {
+		t.Fatalf("FindCompleted() error = %v", err)
+	}
+	if !found || report.ID != "cached-run" {
+		t.Fatalf("FindCompleted() = (%#v, %t), want cached report", report, found)
+	}
+	if !slices.Equal(transaction.calls, []string{"validate", "find", "commit", "rollback"}) {
+		t.Fatalf("cache transaction calls = %#v, want validation and lookup in one transaction", transaction.calls)
+	}
+	if transaction.identity.InputDigest != identity.InputDigest ||
+		!slices.Equal(referenceIDsForStorageTest(transaction.identity.Inputs), referenceIDsForStorageTest(identity.Inputs)) {
+		t.Fatalf("validated cache identity = %#v, want complete snapshot identity", transaction.identity)
+	}
+}
+
+func TestFindCompletedReturnsStaleBeforeHistoricalCacheLookup(t *testing.T) {
+	identity := testCurrentAnalysisIdentity(t)
+	transaction := &fakeCompletedAnalysisLookup{validateErr: analysisdomain.ErrStaleAnalysisInput}
+	repository := &AnalysisRepository{
+		beginCompletedLookup: func(context.Context) (completedAnalysisLookup, error) {
+			return transaction, nil
+		},
+	}
+
+	_, found, err := repository.FindCompleted(context.Background(), identity)
+	if !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) {
+		t.Fatalf("FindCompleted() error = %v, want retryable stale-input result", err)
+	}
+	if found || !slices.Equal(transaction.calls, []string{"validate", "rollback"}) {
+		t.Fatalf("FindCompleted() found/calls = %t/%#v, want stale result before cache lookup", found, transaction.calls)
+	}
+}
+
 func TestValidateEffectivePairDecisionsRejectsCorrectedInput(t *testing.T) {
 	digest := sha256.Sum256([]byte("superseded-decision"))
 	queryer := fakeDecisionQueryer{rows: map[string]fakeDecisionRecord{}}
@@ -397,6 +443,14 @@ type fakeAnalysisSnapshot struct {
 	calls     []string
 }
 
+type fakeCompletedAnalysisLookup struct {
+	identity    analysisdomain.AnalysisIdentity
+	report      analysisdomain.Report
+	found       bool
+	validateErr error
+	calls       []string
+}
+
 type fakeDecisionRecord struct {
 	digest   []byte
 	entityID string
@@ -445,4 +499,56 @@ func (snapshot *fakeAnalysisSnapshot) Commit(context.Context) error {
 func (snapshot *fakeAnalysisSnapshot) Rollback(context.Context) error {
 	snapshot.calls = append(snapshot.calls, "rollback")
 	return nil
+}
+
+func (lookup *fakeCompletedAnalysisLookup) ValidateEffectivePairDecisions(_ context.Context, identity analysisdomain.AnalysisIdentity) error {
+	lookup.calls = append(lookup.calls, "validate")
+	lookup.identity = identity
+	lookup.identity.Inputs = append([]analysisdomain.InputReference(nil), identity.Inputs...)
+	return lookup.validateErr
+}
+
+func (lookup *fakeCompletedAnalysisLookup) FindCompleted(context.Context, [sha256.Size]byte) (analysisdomain.Report, bool, error) {
+	lookup.calls = append(lookup.calls, "find")
+	return lookup.report, lookup.found, nil
+}
+
+func (lookup *fakeCompletedAnalysisLookup) Commit(context.Context) error {
+	lookup.calls = append(lookup.calls, "commit")
+	return nil
+}
+
+func (lookup *fakeCompletedAnalysisLookup) Rollback(context.Context) error {
+	lookup.calls = append(lookup.calls, "rollback")
+	return nil
+}
+
+func testCurrentAnalysisIdentity(t *testing.T) analysisdomain.AnalysisIdentity {
+	t.Helper()
+	employeeDigest := sha256.Sum256([]byte("employee-decision"))
+	managerDigest := sha256.Sum256([]byte("manager-decision"))
+	identity := analysisdomain.AnalysisIdentity{
+		EmployeeEntityID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
+		PromptVersion:    "analyze-test-v1",
+		PolicyVersion:    "policy-test-v1",
+		Inputs: []analysisdomain.InputReference{
+			{Kind: analysisdomain.InputResolutionDecision, ID: "00000000-0000-0000-0000-000000000001", Digest: employeeDigest},
+			{Kind: analysisdomain.InputResolutionDecision, ID: "00000000-0000-0000-0000-000000000002", Digest: managerDigest},
+		},
+	}
+	var err error
+	identity.InputDigest, err = analysisdomain.ComputeInputDigest(identity)
+	if err != nil {
+		t.Fatalf("ComputeInputDigest() error = %v", err)
+	}
+	return identity
+}
+
+func referenceIDsForStorageTest(inputs []analysisdomain.InputReference) []string {
+	ids := make([]string, 0, len(inputs))
+	for _, input := range inputs {
+		ids = append(ids, input.ID)
+	}
+	return ids
 }

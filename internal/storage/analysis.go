@@ -62,8 +62,9 @@ type AnalysisRun struct {
 // AnalysisRepository owns transactions that complete an analysis run and its
 // input identity together.
 type AnalysisRepository struct {
-	pool          *pgxpool.Pool
-	beginSnapshot func(context.Context, pgx.TxOptions) (analysisSnapshot, error)
+	pool                 *pgxpool.Pool
+	beginSnapshot        func(context.Context, pgx.TxOptions) (analysisSnapshot, error)
+	beginCompletedLookup func(context.Context) (completedAnalysisLookup, error)
 }
 
 type effectivePairDecision struct {
@@ -82,6 +83,17 @@ type postgresAnalysisSnapshot struct {
 	transaction pgx.Tx
 }
 
+type completedAnalysisLookup interface {
+	ValidateEffectivePairDecisions(context.Context, analysisdomain.AnalysisIdentity) error
+	FindCompleted(context.Context, [sha256.Size]byte) (analysisdomain.Report, bool, error)
+	Commit(context.Context) error
+	Rollback(context.Context) error
+}
+
+type postgresCompletedAnalysisLookup struct {
+	transaction pgx.Tx
+}
+
 var _ analysisdomain.Repository = (*AnalysisRepository)(nil)
 
 // NewAnalysisRepository creates an analysis repository backed by pool.
@@ -94,6 +106,13 @@ func NewAnalysisRepository(pool *pgxpool.Pool) *AnalysisRepository {
 				return nil, err
 			}
 			return &postgresAnalysisSnapshot{transaction: transaction}, nil
+		}
+		repository.beginCompletedLookup = func(ctx context.Context) (completedAnalysisLookup, error) {
+			transaction, err := pool.Begin(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &postgresCompletedAnalysisLookup{transaction: transaction}, nil
 		}
 	}
 	return repository
@@ -367,6 +386,22 @@ func (snapshot *postgresAnalysisSnapshot) Rollback(ctx context.Context) error {
 	return snapshot.transaction.Rollback(ctx)
 }
 
+func (lookup *postgresCompletedAnalysisLookup) ValidateEffectivePairDecisions(ctx context.Context, identity analysisdomain.AnalysisIdentity) error {
+	return validateEffectivePairDecisions(ctx, lookup.transaction, identity)
+}
+
+func (lookup *postgresCompletedAnalysisLookup) FindCompleted(ctx context.Context, digest [sha256.Size]byte) (analysisdomain.Report, bool, error) {
+	return findCompletedAnalysis(ctx, lookup.transaction, digest)
+}
+
+func (lookup *postgresCompletedAnalysisLookup) Commit(ctx context.Context) error {
+	return lookup.transaction.Commit(ctx)
+}
+
+func (lookup *postgresCompletedAnalysisLookup) Rollback(ctx context.Context) error {
+	return lookup.transaction.Rollback(ctx)
+}
+
 type boundedAnalysisOperationError struct {
 	operation string
 	cause     error
@@ -401,12 +436,33 @@ func pairIdentitySnapshot(employeeID, managerID string, decisions []effectivePai
 	return snapshot, nil
 }
 
-// FindCompleted loads a completed report without invoking the model again.
-func (repository *AnalysisRepository) FindCompleted(ctx context.Context, digest [sha256.Size]byte) (analysisdomain.Report, bool, error) {
-	if repository == nil || repository.pool == nil {
+// FindCompleted loads a completed report only while its accepted pair decisions
+// remain current. Historical rows remain durable but are not returned for a
+// stale snapshot identity.
+func (repository *AnalysisRepository) FindCompleted(ctx context.Context, identity analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error) {
+	if repository == nil || repository.beginCompletedLookup == nil {
 		return analysisdomain.Report{}, false, fmt.Errorf("find completed analysis: repository is not configured")
 	}
-	return findCompletedAnalysis(ctx, repository.pool, digest)
+	wantDigest, err := analysisdomain.ComputeInputDigest(identity)
+	if err != nil || wantDigest != identity.InputDigest {
+		return analysisdomain.Report{}, false, fmt.Errorf("find completed analysis: input digest is invalid")
+	}
+	transaction, err := repository.beginCompletedLookup(ctx)
+	if err != nil {
+		return analysisdomain.Report{}, false, boundedAnalysisError("start completed analysis lookup", err)
+	}
+	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
+	if err := transaction.ValidateEffectivePairDecisions(ctx, identity); err != nil {
+		return analysisdomain.Report{}, false, err
+	}
+	report, found, err := transaction.FindCompleted(ctx, identity.InputDigest)
+	if err != nil {
+		return analysisdomain.Report{}, false, boundedAnalysisError("load completed analysis", err)
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		return analysisdomain.Report{}, false, boundedAnalysisError("commit completed analysis lookup", err)
+	}
+	return report, found, nil
 }
 
 // CompleteAnalysis persists one bounded report and its ordered provenance.

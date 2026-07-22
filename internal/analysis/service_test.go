@@ -128,6 +128,35 @@ func TestServicePreservesRetryableStaleInputResult(t *testing.T) {
 	}
 }
 
+func TestServiceRejectsCachedReportWhenDecisionChangesBetweenLoadAndLookup(t *testing.T) {
+	snapshot := acceptedPairSnapshot()
+	repository := &fakeRepository{
+		snapshot: snapshot,
+		cached: Report{
+			ID: "historical-run", Status: StatusMixedOrConflicting,
+		},
+		findErr: ErrStaleAnalysisInput,
+	}
+	model := &fakeModel{}
+	service := testService(repository, model)
+
+	_, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if !errors.Is(err, ErrStaleAnalysisInput) {
+		t.Fatalf("Analyze() error = %v, want stale cache identity result", err)
+	}
+	if got := referenceIDs(repository.findIdentity.Inputs); !slices.Equal(got, referenceIDs(snapshot.Inputs)) {
+		t.Fatalf("cache identity inputs = %#v, want loaded snapshot inputs", got)
+	}
+	if repository.findIdentity.EmployeeEntityID != testEmployeeID || repository.findIdentity.ManagerEntityID != testManagerID ||
+		repository.findIdentity.PromptVersion != extract.AnalysisPromptVersion || repository.findIdentity.PolicyVersion != AnalysisPolicyVersion ||
+		repository.findIdentity.InputDigest == ([sha256.Size]byte{}) {
+		t.Fatalf("cache identity = %#v, want complete pair, version, and digest identity", repository.findIdentity)
+	}
+	if model.calls != 0 || repository.completeCalls != 0 {
+		t.Fatalf("model/complete calls = %d/%d, want 0/0 after stale cache lookup", model.calls, repository.completeCalls)
+	}
+}
+
 func TestServiceUsesExactOrderedInputDigestAndCachesIdenticalRun(t *testing.T) {
 	repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
 	model := &fakeModel{output: analysisOutput(StatusMixedOrConflicting, []string{"signal-earlier"}, nil)}
@@ -646,6 +675,8 @@ func testService(repository *fakeRepository, model *fakeModel) *Service {
 type fakeRepository struct {
 	snapshot      PairSnapshot
 	cached        Report
+	findIdentity  AnalysisIdentity
+	findErr       error
 	completed     Completion
 	history       []Completion
 	completeCalls int
@@ -656,8 +687,13 @@ func (repository *fakeRepository) LoadPairInputs(context.Context, string, string
 	return clonePairSnapshot(repository.snapshot), nil
 }
 
-func (repository *fakeRepository) FindCompleted(_ context.Context, digest [sha256.Size]byte) (Report, bool, error) {
-	if repository.cached.ID != "" && repository.cached.InputDigest == digest {
+func (repository *fakeRepository) FindCompleted(_ context.Context, identity AnalysisIdentity) (Report, bool, error) {
+	repository.findIdentity = identity
+	repository.findIdentity.Inputs = append([]InputReference(nil), identity.Inputs...)
+	if repository.findErr != nil {
+		return Report{}, false, repository.findErr
+	}
+	if repository.cached.ID != "" && repository.cached.InputDigest == identity.InputDigest {
 		return repository.cached, true, nil
 	}
 	return Report{}, false, nil

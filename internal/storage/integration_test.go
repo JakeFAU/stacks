@@ -438,6 +438,9 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	if _, err := entities.CorrectDecision(ctx, firstManagerDecision.ID, ResolutionDecisionInput{Outcome: ResolutionOutcomeAccepted, EntityID: replacement.ID}); err != nil {
 		t.Fatalf("correct first manager mention between load and completion: %v", err)
 	}
+	if _, found, err := repository.FindCompleted(ctx, acceptedIdentity); !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) || found {
+		t.Fatalf("find stale cached pair analysis = (found %t, error %v), want retryable stale-input result", found, err)
+	}
 	if _, err := repository.CompleteAnalysis(ctx, acceptedCompletion); !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) {
 		t.Fatalf("complete stale pair analysis error = %v, want retryable stale-input error", err)
 	}
@@ -470,9 +473,16 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	}); err != nil {
 		t.Fatalf("complete corrected pair analysis: %v", err)
 	}
-	prior, found, err := repository.FindCompleted(ctx, acceptedIdentity.InputDigest)
-	if err != nil || !found || prior.ID != acceptedReport.ID || len(prior.Chronology) != 2 {
-		t.Fatalf("prior completed report after correction = (%#v, %t, %v)", prior, found, err)
+	var priorID string
+	var priorJSON []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT id::text, report_json
+		FROM stacks.analysis_runs
+		WHERE input_digest = $1`, acceptedIdentity.InputDigest[:]).Scan(&priorID, &priorJSON); err != nil {
+		t.Fatalf("load historical analysis row after correction: %v", err)
+	}
+	if priorID != acceptedReport.ID || len(priorJSON) == 0 {
+		t.Fatalf("historical analysis row = (%q, %d bytes), want preserved report %q", priorID, len(priorJSON), acceptedReport.ID)
 	}
 }
 

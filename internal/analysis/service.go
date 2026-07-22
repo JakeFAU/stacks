@@ -111,11 +111,11 @@ type Completion struct {
 	Report   Report
 }
 
-// Repository retrieves eligible pair inputs and atomically deduplicates
-// completed runs by InputDigest.
+// Repository retrieves eligible pair inputs, validates cache identities, and
+// atomically deduplicates completed runs by InputDigest.
 type Repository interface {
 	LoadPairInputs(context.Context, string, string) (PairSnapshot, error)
-	FindCompleted(context.Context, [sha256.Size]byte) (Report, bool, error)
+	FindCompleted(context.Context, AnalysisIdentity) (Report, bool, error)
 	CompleteAnalysis(context.Context, Completion) (Report, error)
 }
 
@@ -178,7 +178,7 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 	if err != nil {
 		return Report{}, err
 	}
-	if cached, found, err := service.Repository.FindCompleted(ctx, identity.InputDigest); err != nil {
+	if cached, found, err := service.Repository.FindCompleted(ctx, identity); err != nil {
 		return Report{}, fmt.Errorf("load completed analysis: %w", err)
 	} else if found {
 		service.recordDecision(ctx, cached.Status, len(cached.Chronology), len(cached.Counterevidence), service.now().Sub(started))
