@@ -145,6 +145,94 @@ func TestPoCSettingsValidateRequiresSelectedProviderCredential(t *testing.T) {
 	}
 }
 
+func TestPoCSettingsValidateRejectsPaddedDirectProviderSettingsWithoutValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*ModelSettings)
+		wantName  string
+		private   string
+	}{
+		{
+			name: "OpenAI API key",
+			configure: func(model *ModelSettings) {
+				model.Provider = modelpolicy.ProviderOpenAI
+				model.AWSRegion = ""
+				model.OpenAIAPIKey = " private-openai-key "
+			},
+			wantName: OpenAIAPIKeyEnvironmentVariable,
+			private:  "private-openai-key",
+		},
+		{
+			name: "Anthropic API key",
+			configure: func(model *ModelSettings) {
+				model.Provider = modelpolicy.ProviderAnthropic
+				model.AWSRegion = ""
+				model.AnthropicAPIKey = " private-anthropic-key "
+			},
+			wantName: AnthropicAPIKeyEnvironmentVariable,
+			private:  "private-anthropic-key",
+		},
+		{
+			name: "OpenAI model ID",
+			configure: func(model *ModelSettings) {
+				model.Provider = modelpolicy.ProviderOpenAI
+				model.AWSRegion = ""
+				model.OpenAIAPIKey = "synthetic-openai-key"
+				model.ModelID = " padded-openai-model "
+			},
+			wantName: ModelIDEnvironmentVariable,
+			private:  "padded-openai-model",
+		},
+		{
+			name: "Anthropic model ID",
+			configure: func(model *ModelSettings) {
+				model.Provider = modelpolicy.ProviderAnthropic
+				model.AWSRegion = ""
+				model.AnthropicAPIKey = "synthetic-anthropic-key"
+				model.ModelID = " padded-anthropic-model "
+			},
+			wantName: ModelIDEnvironmentVariable,
+			private:  "padded-anthropic-model",
+		},
+	}
+
+	for _, command := range []Command{CommandSync, CommandAnalyze} {
+		for _, testCase := range tests {
+			t.Run(string(command)+"/"+testCase.name, func(t *testing.T) {
+				settings := validModelCommandSettings()
+				testCase.configure(&settings.Model)
+
+				err := settings.Validate(command)
+				if err == nil || !strings.Contains(err.Error(), testCase.wantName) {
+					t.Fatalf("Validate(%s) error = %v, want bounded %s rejection", command, err, testCase.wantName)
+				}
+				if strings.Contains(err.Error(), testCase.private) {
+					t.Fatalf("Validate(%s) error exposed configured value: %v", command, err)
+				}
+			})
+		}
+	}
+}
+
+func TestPoCSettingsValidateAcceptsExactDirectProviderSettings(t *testing.T) {
+	for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
+		t.Run(string(provider), func(t *testing.T) {
+			settings := validModelCommandSettings()
+			settings.Model.Provider = provider
+			settings.Model.AWSRegion = ""
+			settings.Model.ModelID = "exact-model-id"
+			if provider == modelpolicy.ProviderOpenAI {
+				settings.Model.OpenAIAPIKey = "exact-openai-key"
+			} else {
+				settings.Model.AnthropicAPIKey = "exact-anthropic-key"
+			}
+			if err := settings.Validate(CommandSync); err != nil {
+				t.Fatalf("Validate(sync) error = %v, want exact direct-provider settings accepted", err)
+			}
+		})
+	}
+}
+
 func TestPoCSettingsValidateDirectProviderIgnoresAmbientAWSRegion(t *testing.T) {
 	settings := validModelCommandSettings()
 	settings.Model.Provider = modelpolicy.ProviderOpenAI

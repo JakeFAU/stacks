@@ -153,6 +153,66 @@ func TestPersonalSyncPerformsNoDisclosureInspection(t *testing.T) {
 	}
 }
 
+func TestPaddedDirectProviderSettingsRejectBeforeAnyBoundary(t *testing.T) {
+	tests := []struct {
+		name      string
+		provider  modelpolicy.Provider
+		configure func(*config.ModelSettings)
+		wantName  string
+		private   string
+	}{
+		{
+			name: "OpenAI API key", provider: modelpolicy.ProviderOpenAI,
+			configure: func(model *config.ModelSettings) { model.OpenAIAPIKey = " private-openai-key " },
+			wantName:  config.OpenAIAPIKeyEnvironmentVariable, private: "private-openai-key",
+		},
+		{
+			name: "Anthropic API key", provider: modelpolicy.ProviderAnthropic,
+			configure: func(model *config.ModelSettings) { model.AnthropicAPIKey = " private-anthropic-key " },
+			wantName:  config.AnthropicAPIKeyEnvironmentVariable, private: "private-anthropic-key",
+		},
+		{
+			name: "OpenAI model ID", provider: modelpolicy.ProviderOpenAI,
+			configure: func(model *config.ModelSettings) { model.ModelID = " padded-openai-model " },
+			wantName:  config.ModelIDEnvironmentVariable, private: "padded-openai-model",
+		},
+		{
+			name: "Anthropic model ID", provider: modelpolicy.ProviderAnthropic,
+			configure: func(model *config.ModelSettings) { model.ModelID = " padded-anthropic-model " },
+			wantName:  config.ModelIDEnvironmentVariable, private: "padded-anthropic-model",
+		},
+	}
+
+	for _, command := range []config.Command{config.CommandSync, config.CommandAnalyze} {
+		for _, testCase := range tests {
+			t.Run(string(command)+"/"+testCase.name, func(t *testing.T) {
+				settings := validCommandPoCSettings(command, testCase.provider, modelpolicy.DataModePersonal)
+				testCase.configure(&settings.Model)
+				calls := []string{}
+				runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingEnabled)
+				commands, err := pocCommandProviderWithRuntime(
+					context.Background(), config.Settings{PoC: settings}, io.Discard, io.Discard,
+					tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+				)
+				if err != nil {
+					t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+				}
+
+				err = commands[string(command)].Run(context.Background(), nil)
+				if err == nil || !strings.Contains(err.Error(), testCase.wantName) {
+					t.Fatalf("%s error = %v, want bounded %s rejection", command, err, testCase.wantName)
+				}
+				if strings.Contains(err.Error(), testCase.private) {
+					t.Fatalf("%s error exposed configured value: %v", command, err)
+				}
+				if len(calls) != 0 {
+					t.Fatalf("calls = %v, want no disclosure, source, repository, or model construction", calls)
+				}
+			})
+		}
+	}
+}
+
 var errStopAfterModelConstruction = errors.New("stop after model construction")
 
 type recordingDisclosureProbe struct {

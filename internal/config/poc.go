@@ -200,6 +200,10 @@ func (settings PoCSettings) validateModelSettings(command Command) error {
 	); err != nil {
 		return err
 	}
+	if (settings.Model.Provider == modelpolicy.ProviderOpenAI || settings.Model.Provider == modelpolicy.ProviderAnthropic) &&
+		settings.Model.ModelID != strings.TrimSpace(settings.Model.ModelID) {
+		return fmt.Errorf("%s must not contain surrounding whitespace for %s", ModelIDEnvironmentVariable, command)
+	}
 	if err := settings.Model.validateCredentials(command); err != nil {
 		return err
 	}
@@ -266,12 +270,20 @@ func (settings ModelSettings) validateCredentials(command Command) error {
 			return fmt.Errorf("%s is required for %s", AWSRegionEnvironmentVariable, command)
 		}
 	case modelpolicy.ProviderOpenAI:
-		if strings.TrimSpace(settings.OpenAIAPIKey) == "" {
+		credential := strings.TrimSpace(settings.OpenAIAPIKey)
+		if credential == "" {
 			return fmt.Errorf("%s is required for %s", OpenAIAPIKeyEnvironmentVariable, command)
 		}
+		if settings.OpenAIAPIKey != credential {
+			return fmt.Errorf("%s must not contain surrounding whitespace for %s", OpenAIAPIKeyEnvironmentVariable, command)
+		}
 	case modelpolicy.ProviderAnthropic:
-		if strings.TrimSpace(settings.AnthropicAPIKey) == "" {
+		credential := strings.TrimSpace(settings.AnthropicAPIKey)
+		if credential == "" {
 			return fmt.Errorf("%s is required for %s", AnthropicAPIKeyEnvironmentVariable, command)
+		}
+		if settings.AnthropicAPIKey != credential {
+			return fmt.Errorf("%s must not contain surrounding whitespace for %s", AnthropicAPIKeyEnvironmentVariable, command)
 		}
 	}
 	return nil
