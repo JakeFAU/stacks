@@ -149,6 +149,52 @@ func TestValidateExtractionRejectsDuplicateSignalIDs(t *testing.T) {
 	}
 }
 
+func TestValidateExtractionRejectsWhitespacePaddedModelLocalIdentifiers(t *testing.T) {
+	tests := map[string]func(*ExtractionOutput){
+		"citation ID": func(output *ExtractionOutput) {
+			output.Citations[0].ID = " citation-1"
+			output.People[0].CitationIDs[0] = " citation-1"
+			output.Statements[0].CitationIDs[0] = " citation-1"
+			output.Signals[0].SupportingCitationIDs[0] = " citation-1"
+		},
+		"citation tab reference": func(output *ExtractionOutput) { output.Citations[0].TabID = "transcript-tab " },
+		"person ID": func(output *ExtractionOutput) {
+			output.People[0].ID = " mention-a"
+			output.Statements[0].SpeakerMentionID = " mention-a"
+			output.Statements[0].SubjectMentionID = " mention-a"
+			output.Signals[0].SubjectMentionID = " mention-a"
+			output.Signals[0].ObjectMentionID = " mention-a"
+		},
+		"person citation reference": func(output *ExtractionOutput) { output.People[0].CitationIDs[0] = "citation-1 " },
+		"statement ID": func(output *ExtractionOutput) {
+			output.Statements[0].ID = "statement-1 "
+			output.Signals[0].StatementIDs[0] = "statement-1 "
+		},
+		"statement speaker reference":  func(output *ExtractionOutput) { output.Statements[0].SpeakerMentionID = " mention-a" },
+		"statement subject reference":  func(output *ExtractionOutput) { output.Statements[0].SubjectMentionID = "mention-a " },
+		"statement citation reference": func(output *ExtractionOutput) { output.Statements[0].CitationIDs[0] = " citation-1" },
+		"signal ID":                    func(output *ExtractionOutput) { output.Signals[0].ID = " signal-1" },
+		"signal subject reference":     func(output *ExtractionOutput) { output.Signals[0].SubjectMentionID = "mention-a " },
+		"signal object reference":      func(output *ExtractionOutput) { output.Signals[0].ObjectMentionID = " mention-a" },
+		"signal statement reference":   func(output *ExtractionOutput) { output.Signals[0].StatementIDs[0] = "statement-1 " },
+		"signal supporting evidence":   func(output *ExtractionOutput) { output.Signals[0].SupportingCitationIDs[0] = " citation-1" },
+		"signal contradicting evidence": func(output *ExtractionOutput) {
+			output.Signals[0].ContradictingCitationIDs = []string{"citation-1 "}
+		},
+	}
+
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			output := validExtraction()
+			mutate(&output)
+			err := ValidateExtraction(validSubmittedText(), output)
+			if err == nil || !strings.Contains(err.Error(), "whitespace") {
+				t.Fatalf("ValidateExtraction() error = %v, want padded identifier rejection", err)
+			}
+		})
+	}
+}
+
 func validSubmittedText() SubmittedText {
 	return SubmittedText{Tabs: []SubmittedTab{
 		{ID: "transcript-tab", Role: TabRoleTranscript, Text: submittedTranscript},

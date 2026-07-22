@@ -22,6 +22,26 @@ func TestSchemasCloseEveryObjectAndRequireCoreFields(t *testing.T) {
 	}
 }
 
+func TestSchemasRejectWhitespacePaddedModelLocalIdentifiers(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		schema []byte
+		count  int
+	}{
+		"extraction": {schema: ExtractionJSONSchema(), count: 14},
+		"analysis":   {schema: AnalysisJSONSchema(), count: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var document any
+			if err := json.Unmarshal(testCase.schema, &document); err != nil {
+				t.Fatalf("schema is invalid JSON: %v", err)
+			}
+			if count := assertLocalIDPatterns(t, document); count != testCase.count {
+				t.Fatalf("local identifier field count = %d, want %d", count, testCase.count)
+			}
+		})
+	}
+}
+
 func TestPromptVersionsAreEmbeddedAndExplicit(t *testing.T) {
 	for _, test := range []struct {
 		version string
@@ -121,6 +141,47 @@ func assertClosedObjects(t *testing.T, value any) {
 	for _, child := range children(value) {
 		assertClosedObjects(t, child)
 	}
+}
+
+func assertLocalIDPatterns(t *testing.T, value any) int {
+	t.Helper()
+	object, ok := value.(map[string]any)
+	if !ok {
+		return 0
+	}
+	count := 0
+	if properties, ok := object["properties"].(map[string]any); ok {
+		for name, rawProperty := range properties {
+			property, ok := rawProperty.(map[string]any)
+			if !ok {
+				continue
+			}
+			var identifierSchema map[string]any
+			switch {
+			case name == "id" || strings.HasSuffix(name, "_id"):
+				identifierSchema = property
+			case strings.HasSuffix(name, "_ids"):
+				identifierSchema, _ = property["items"].(map[string]any)
+			}
+			if identifierSchema != nil {
+				count++
+				if identifierSchema["pattern"] != `^\S(?:.*\S)?$` {
+					t.Errorf("property %q does not reject padded identifiers", name)
+				}
+			}
+		}
+	}
+	for _, child := range object {
+		switch typed := child.(type) {
+		case map[string]any:
+			count += assertLocalIDPatterns(t, typed)
+		case []any:
+			for _, item := range typed {
+				count += assertLocalIDPatterns(t, item)
+			}
+		}
+	}
+	return count
 }
 
 func children(value any) []any {

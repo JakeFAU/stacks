@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -39,7 +40,7 @@ func validateEvidenceIdentities(records []EvidenceRecord) (map[string][sha256.Si
 	byKey := make(map[string][sha256.Size]byte, len(records))
 	seenDurable := make(map[[sha256.Size]byte]string, len(records))
 	for _, record := range records {
-		if record.Key == "" {
+		if !canonicalLocalIdentifier(record.Key) {
 			return nil, ErrPersistenceReference
 		}
 		identity := digestIdentity(struct {
@@ -71,7 +72,7 @@ func validateMentionIdentities(records []MentionRecord, evidence map[string][sha
 	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
 	for _, record := range records {
 		evidenceIdentity, exists := evidence[record.EvidenceKey]
-		if record.Key == "" || !exists {
+		if !canonicalLocalIdentifier(record.Key) || !canonicalLocalIdentifier(record.EvidenceKey) || !exists {
 			return ErrPersistenceReference
 		}
 		if _, exists := seenKeys[record.Key]; exists {
@@ -95,7 +96,7 @@ func validateObservationIdentities(records []ObservationRecord, evidence map[str
 	byID := make(map[string][sha256.Size]byte, len(records))
 	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
 	for _, record := range records {
-		if record.ID == "" {
+		if !canonicalLocalIdentifier(record.ID) {
 			return nil, ErrPersistenceReference
 		}
 		if _, exists := byID[record.ID]; exists {
@@ -135,7 +136,7 @@ func validateSignalIdentities(records []SignalRecord, observations map[string][s
 	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
 	for _, record := range records {
 		observationIdentity, exists := observations[record.ObservationID]
-		if record.ID == "" || !exists {
+		if !canonicalLocalIdentifier(record.ID) || !canonicalLocalIdentifier(record.ObservationID) || !exists {
 			return ErrPersistenceReference
 		}
 		if _, exists := seenIDs[record.ID]; exists {
@@ -182,7 +183,7 @@ func canonicalEvidenceSet(keys []string, evidence map[string][sha256.Size]byte) 
 	set := make(map[[sha256.Size]byte]struct{}, len(keys))
 	for _, key := range keys {
 		identity, exists := evidence[key]
-		if !exists {
+		if !canonicalLocalIdentifier(key) || !exists {
 			return nil, ErrPersistenceReference
 		}
 		set[identity] = struct{}{}
@@ -201,7 +202,7 @@ func canonicalSignalEvidenceSet(records []SignalEvidenceRecord, evidence map[str
 	set := make(map[signalEvidenceIdentity]struct{}, len(records))
 	for _, record := range records {
 		identity, exists := evidence[record.EvidenceKey]
-		if !exists {
+		if !canonicalLocalIdentifier(record.EvidenceKey) || !exists {
 			return nil, ErrPersistenceReference
 		}
 		pair := signalEvidenceIdentity{Evidence: identity, Role: record.Role}
@@ -221,6 +222,10 @@ func canonicalSignalEvidenceSet(records []SignalEvidenceRecord, evidence map[str
 		return string(canonical[left].Evidence[:]) < string(canonical[right].Evidence[:])
 	})
 	return canonical, nil
+}
+
+func canonicalLocalIdentifier(identifier string) bool {
+	return identifier != "" && strings.TrimSpace(identifier) == identifier
 }
 
 func digestIdentity(value any) [sha256.Size]byte {

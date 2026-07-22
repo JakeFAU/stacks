@@ -207,6 +207,9 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 	}()
 
 	documents, err := service.Source.List(ctx, service.CollectionID)
+	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+		return Summary{}, cancellationErr
+	}
 	if err != nil {
 		return Summary{}, ErrSourceList
 	}
@@ -218,6 +221,9 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 		}
 		started := service.now()
 		result, documentErr := service.processDocument(ctx, listed)
+		if cancellationErr := boundedCancellation(ctx, documentErr); cancellationErr != nil {
+			return summary, errors.Join(aggregateErr, cancellationErr)
+		}
 		summary.add(result)
 		service.recordDecision(ctx, result.Outcome, service.now().Sub(started))
 		if documentErr != nil {
@@ -230,6 +236,9 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 func (service *Service) processDocument(ctx context.Context, listed source.Document) (Result, error) {
 	documentID := strings.TrimSpace(listed.ID)
 	document, err := service.Source.Get(ctx, documentID)
+	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+		return Result{}, cancellationErr
+	}
 	if err != nil {
 		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureSource}, nil
 	}
@@ -241,6 +250,9 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
 	}
 	state, err := service.Repository.PrepareVersion(ctx, version)
+	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+		return Result{}, cancellationErr
+	}
 	if err != nil {
 		return Result{DocumentID: documentID, Outcome: OutcomeIncomplete, FailureCode: FailureStorage}, nil
 	}
@@ -255,6 +267,9 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidSource)
 	}
 	response, err := service.Model.Generate(ctx, request)
+	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+		return Result{}, cancellationErr
+	}
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureModel)
 	}
@@ -266,6 +281,9 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidOutput)
 	}
 	snapshots, err := service.Repository.EntitySnapshots(ctx)
+	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+		return Result{}, cancellationErr
+	}
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
 	}
@@ -277,6 +295,9 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidOutput)
 	}
 	if err := service.Repository.CompleteVersion(ctx, completion); err != nil {
+		if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+			return Result{}, cancellationErr
+		}
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
 	}
 	result.Outcome = OutcomeCompleted
@@ -457,8 +478,14 @@ func stableID(version knowledge.DocumentVersion, kind, sourceID string) string {
 }
 
 func (service *Service) fail(ctx context.Context, result Result, status VersionStatus, code FailureCode) (Result, error) {
+	if cancellationErr := boundedCancellation(ctx, nil); cancellationErr != nil {
+		return Result{}, cancellationErr
+	}
 	if result.VersionID != "" {
 		if err := service.Repository.RecordFailure(ctx, result.VersionID, status, code); err != nil {
+			if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+				return Result{}, cancellationErr
+			}
 			result.FailureCode = FailureStorage
 			result.Outcome = OutcomeIncomplete
 			return result, ErrFailurePersistence
@@ -471,6 +498,19 @@ func (service *Service) fail(ctx context.Context, result Result, status VersionS
 		result.Outcome = OutcomeIncomplete
 	}
 	return result, nil
+}
+
+func boundedCancellation(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 func (service *Service) validate() error {

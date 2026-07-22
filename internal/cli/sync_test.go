@@ -71,6 +71,25 @@ func TestSyncCommandRendersCompletedDocumentOutcomesBeforeReturningAggregateErro
 	}
 }
 
+func TestSyncCommandRendersCompletedDocumentOutcomesBeforeReturningCancellation(t *testing.T) {
+	service := &fixedSyncer{
+		summary: ingest.Summary{
+			Results:   []ingest.Result{{DocumentID: "document-1", VersionID: "version-1", Outcome: ingest.OutcomeCompleted}},
+			Completed: 1,
+		},
+		err: context.Canceled,
+	}
+	var output bytes.Buffer
+	err := (SyncCommand{Service: service, Output: &output}).Run(context.Background(), nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context cancellation", err)
+	}
+	if !strings.Contains(output.String(), "document_id=document-1 version_id=version-1 outcome=completed") ||
+		!strings.Contains(output.String(), "summary unchanged=0 completed=1 incomplete=0 failed=0") {
+		t.Fatalf("partial-success output = %q, want completed outcome and summary", output.String())
+	}
+}
+
 type fixedSyncer struct {
 	summary ingest.Summary
 	err     error

@@ -276,6 +276,9 @@ func (repository *IngestionRepository) RecordFailure(ctx context.Context, versio
 // CompleteVersion commits the entire validated write-set and marks the version
 // complete only after every required durable row has succeeded.
 func (repository *IngestionRepository) CompleteVersion(ctx context.Context, completion ingest.Completion) error {
+	if err := ingest.ValidateForPersistence(completion); err != nil {
+		return fmt.Errorf("complete ingestion version input: %w", err)
+	}
 	if repository == nil || repository.pool == nil {
 		return fmt.Errorf("complete ingestion version: repository is not configured")
 	}
@@ -327,8 +330,8 @@ func persistIngestionEvidence(ctx context.Context, transaction pgx.Tx, records [
 	documents := &DocumentRepository{query: transaction}
 	identifiers := make(map[string]string, len(records))
 	for _, record := range records {
-		key := strings.TrimSpace(record.Key)
-		if key == "" {
+		key := record.Key
+		if key == "" || strings.TrimSpace(key) != key {
 			return nil, fmt.Errorf("persist ingestion evidence: key is required")
 		}
 		if _, exists := identifiers[key]; exists {

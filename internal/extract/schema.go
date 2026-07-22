@@ -116,8 +116,8 @@ var extractionJSONSchema = []byte(`{
         "additionalProperties": false,
         "required": ["id", "tab_id", "start_offset", "end_offset", "quote"],
         "properties": {
-          "id": {"type": "string", "minLength": 1},
-          "tab_id": {"type": "string", "minLength": 1},
+          "id": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"},
+          "tab_id": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"},
           "start_offset": {"type": "integer", "minimum": 0},
           "end_offset": {"type": "integer", "minimum": 1},
           "quote": {"type": "string", "minLength": 1}
@@ -131,11 +131,11 @@ var extractionJSONSchema = []byte(`{
         "additionalProperties": false,
         "required": ["id", "surface", "role", "email", "citation_ids"],
         "properties": {
-          "id": {"type": "string", "minLength": 1},
+          "id": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"},
           "surface": {"type": "string", "minLength": 1},
           "role": {"type": "string", "enum": ["speaker", "reference"]},
           "email": {"type": "string"},
-          "citation_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+          "citation_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"}}
         }
       }
     },
@@ -146,13 +146,13 @@ var extractionJSONSchema = []byte(`{
         "additionalProperties": false,
         "required": ["id", "speaker_mention_id", "subject_mention_id", "predicate", "object_text", "valid_date", "citation_ids"],
         "properties": {
-          "id": {"type": "string", "minLength": 1},
-          "speaker_mention_id": {"type": "string", "minLength": 1},
-          "subject_mention_id": {"type": "string", "minLength": 1},
+          "id": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"},
+          "speaker_mention_id": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"},
+          "subject_mention_id": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"},
           "predicate": {"type": "string", "minLength": 1},
           "object_text": {"type": "string", "minLength": 1},
           "valid_date": {"type": "string"},
-          "citation_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+          "citation_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"}}
         }
       }
     },
@@ -163,16 +163,16 @@ var extractionJSONSchema = []byte(`{
         "additionalProperties": false,
         "required": ["id", "subject_mention_id", "object_mention_id", "statement_ids", "category", "direction", "rationale", "confidence", "supporting_citation_ids", "contradicting_citation_ids"],
         "properties": {
-          "id": {"type": "string", "minLength": 1},
-          "subject_mention_id": {"type": "string", "minLength": 1},
-          "object_mention_id": {"type": "string", "minLength": 1},
-          "statement_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "id": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"},
+          "subject_mention_id": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"},
+          "object_mention_id": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"},
+          "statement_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"}},
           "category": {"type": "string", "enum": ["delegation_autonomy", "scrutiny_correction", "endorsement_trust", "support_advocacy", "future_responsibility"]},
           "direction": {"type": "string", "enum": ["strengthening", "weakening", "mixed", "unclear"]},
           "rationale": {"type": "string", "minLength": 1},
           "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-          "supporting_citation_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
-          "contradicting_citation_ids": {"type": "array", "items": {"type": "string", "minLength": 1}}
+          "supporting_citation_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"}},
+          "contradicting_citation_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"}}
         }
       }
     }
@@ -187,8 +187,8 @@ var analysisJSONSchema = []byte(`{
   "properties": {
     "conclusion": {"type": "string", "enum": ["insufficient evidence", "no material directional change detected", "mixed or conflicting signals", "possible declining-confidence signal"]},
     "rationale": {"type": "string", "minLength": 1},
-    "supporting_signal_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "contradicting_signal_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "supporting_signal_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"}},
+    "contradicting_signal_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"}},
     "gaps": {"type": "array", "items": {"type": "string"}}
   }
 }`)

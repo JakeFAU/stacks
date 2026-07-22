@@ -212,6 +212,9 @@ func ValidateExtraction(submitted SubmittedText, output ExtractionOutput) error 
 
 	citations := make(map[string]Citation, len(output.Citations))
 	for index, citation := range output.Citations {
+		if err := rejectPaddedIdentifiers("citation", index, citation.ID, citation.TabID); err != nil {
+			return err
+		}
 		if strings.TrimSpace(citation.ID) == "" {
 			return fmt.Errorf("citation %d ID is required", index)
 		}
@@ -236,6 +239,9 @@ func ValidateExtraction(submitted SubmittedText, output ExtractionOutput) error 
 
 	people := make(map[string]string, len(output.People))
 	for index, person := range output.People {
+		if err := rejectPaddedIdentifiers("person mention", index, append([]string{person.ID}, person.CitationIDs...)...); err != nil {
+			return err
+		}
 		if strings.TrimSpace(person.ID) == "" || strings.TrimSpace(person.Surface) == "" {
 			return fmt.Errorf("person mention %d required fields are missing", index)
 		}
@@ -253,6 +259,10 @@ func ValidateExtraction(submitted SubmittedText, output ExtractionOutput) error 
 
 	statements := make(map[string]struct{}, len(output.Statements))
 	for index, statement := range output.Statements {
+		identifiers := []string{statement.ID, statement.SpeakerMentionID, statement.SubjectMentionID}
+		if err := rejectPaddedIdentifiers("statement", index, append(identifiers, statement.CitationIDs...)...); err != nil {
+			return err
+		}
 		if strings.TrimSpace(statement.ID) == "" || strings.TrimSpace(statement.Predicate) == "" || strings.TrimSpace(statement.ObjectText) == "" {
 			return fmt.Errorf("statement %d required fields are missing", index)
 		}
@@ -280,6 +290,13 @@ func ValidateExtraction(submitted SubmittedText, output ExtractionOutput) error 
 
 	signals := make(map[string]struct{}, len(output.Signals))
 	for index, signal := range output.Signals {
+		identifiers := []string{signal.ID, signal.SubjectMentionID, signal.ObjectMentionID}
+		identifiers = append(identifiers, signal.StatementIDs...)
+		identifiers = append(identifiers, signal.SupportingCitationIDs...)
+		identifiers = append(identifiers, signal.ContradictingCitationIDs...)
+		if err := rejectPaddedIdentifiers("signal", index, identifiers...); err != nil {
+			return err
+		}
 		if strings.TrimSpace(signal.ID) == "" || strings.TrimSpace(signal.Rationale) == "" {
 			return fmt.Errorf("signal %d required fields are missing", index)
 		}
@@ -323,6 +340,15 @@ func ValidateExtraction(submitted SubmittedText, output ExtractionOutput) error 
 		}
 		if !hasTranscriptCitation(signal.SupportingCitationIDs, citations, tabs) {
 			return fmt.Errorf("signal %d requires supporting transcript evidence", index)
+		}
+	}
+	return nil
+}
+
+func rejectPaddedIdentifiers(kind string, index int, identifiers ...string) error {
+	for _, identifier := range identifiers {
+		if strings.TrimSpace(identifier) != identifier {
+			return fmt.Errorf("%s %d identifier has leading or trailing whitespace", kind, index)
 		}
 	}
 	return nil

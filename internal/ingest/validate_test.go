@@ -95,6 +95,59 @@ func TestValidateForPersistenceAcceptsDistinctDurableIdentities(t *testing.T) {
 	}
 }
 
+func TestValidateForPersistenceRejectsWhitespacePaddedLocalIdentifiersAndReferences(t *testing.T) {
+	newCompletion := func() Completion {
+		evidence := persistenceEvidence(t)
+		observation := ObservationRecord{
+			ID: "11111111-1111-1111-1111-111111111111", Predicate: interactionPredicate,
+			EvidenceKeys: []string{"citation-1"},
+		}
+		return Completion{
+			VersionID:    "version-1",
+			Evidence:     []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+			Mentions:     []MentionRecord{{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic Person", Role: "speaker"}},
+			Observations: []ObservationRecord{observation},
+			Signals: []SignalRecord{{
+				ID: "22222222-2222-2222-2222-222222222222", ObservationID: observation.ID,
+				Category: "future_responsibility", Direction: "strengthening",
+				ExtractionModelID: "synthetic-model", PromptVersion: "extract-v1",
+				Rationale: "Synthetic rationale", Confidence: 0.8,
+				Evidence: []SignalEvidenceRecord{{EvidenceKey: "citation-1", Role: "supporting"}},
+			}},
+		}
+	}
+	tests := map[string]func(*Completion){
+		"evidence key and references": func(completion *Completion) {
+			completion.Evidence[0].Key = " citation-1"
+			completion.Mentions[0].EvidenceKey = " citation-1"
+			completion.Observations[0].EvidenceKeys[0] = " citation-1"
+			completion.Signals[0].Evidence[0].EvidenceKey = " citation-1"
+		},
+		"mention key":                func(completion *Completion) { completion.Mentions[0].Key = "mention-1 " },
+		"mention evidence reference": func(completion *Completion) { completion.Mentions[0].EvidenceKey = "citation-1 " },
+		"observation ID and reference": func(completion *Completion) {
+			completion.Observations[0].ID = " 11111111-1111-1111-1111-111111111111"
+			completion.Signals[0].ObservationID = " 11111111-1111-1111-1111-111111111111"
+		},
+		"observation evidence reference": func(completion *Completion) { completion.Observations[0].EvidenceKeys[0] = "citation-1 " },
+		"signal ID":                      func(completion *Completion) { completion.Signals[0].ID = "22222222-2222-2222-2222-222222222222 " },
+		"signal observation reference": func(completion *Completion) {
+			completion.Signals[0].ObservationID = "11111111-1111-1111-1111-111111111111 "
+		},
+		"signal evidence reference": func(completion *Completion) { completion.Signals[0].Evidence[0].EvidenceKey = " citation-1" },
+	}
+
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			completion := newCompletion()
+			mutate(&completion)
+			if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
+				t.Fatalf("ValidateForPersistence() error = %v, want padded reference rejection", err)
+			}
+		})
+	}
+}
+
 func persistenceEvidence(t *testing.T) knowledge.EvidenceSpan {
 	t.Helper()
 	version := documentVersion(t, syntheticDocument("document-persistence-validation", "Synthetic evidence."))

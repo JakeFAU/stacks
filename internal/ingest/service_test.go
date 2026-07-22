@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,126 @@ func TestSyncBoundsSourceListFailureBeforeErrorTelemetryAndLogging(t *testing.T)
 	zap.New(core).Error("run stacks", zap.Error(err))
 	if strings.Contains(observed.All()[0].ContextMap()["error"].(string), privateValue) {
 		t.Fatal("logger path disclosed private source text")
+	}
+}
+
+func TestSyncPreservesBoundedCancellationFromSourceList(t *testing.T) {
+	const privateValue = "private source cancellation detail"
+	service := testServiceWithSource(
+		&memorySource{listErr: fmt.Errorf("%s: %w", privateValue, context.Canceled)},
+		newMemoryRepository(),
+		&recordingModel{},
+	)
+
+	summary, err := service.Sync(context.Background())
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrSourceList) {
+		t.Fatalf("Sync() error = %v, want context cancellation", err)
+	}
+	if err.Error() != context.Canceled.Error() || strings.Contains(err.Error(), privateValue) {
+		t.Fatalf("Sync() error = %q, want bounded cancellation sentinel", err.Error())
+	}
+	if len(summary.Results) != 0 {
+		t.Fatalf("summary results = %#v, want none", summary.Results)
+	}
+}
+
+func TestSyncPreservesCancellationDuringDocumentProcessing(t *testing.T) {
+	const privateValue = "private dependency cancellation detail"
+	wrappedCancellation := fmt.Errorf("%s: %w", privateValue, context.DeadlineExceeded)
+	tests := []struct {
+		name  string
+		setup func(*memorySource, *memoryRepository, *recordingModel)
+	}{
+		{name: "source get", setup: func(sourceBoundary *memorySource, _ *memoryRepository, _ *recordingModel) {
+			sourceBoundary.getErrs = map[string]error{"document-canceled": wrappedCancellation}
+		}},
+		{name: "prepare version", setup: func(_ *memorySource, repository *memoryRepository, _ *recordingModel) {
+			repository.prepareErr = wrappedCancellation
+		}},
+		{name: "model", setup: func(_ *memorySource, _ *memoryRepository, model *recordingModel) {
+			model.errs = []error{wrappedCancellation}
+		}},
+		{name: "entity snapshots", setup: func(_ *memorySource, repository *memoryRepository, _ *recordingModel) {
+			repository.snapshotErr = wrappedCancellation
+		}},
+		{name: "completion", setup: func(_ *memorySource, repository *memoryRepository, _ *recordingModel) {
+			repository.completionErr = wrappedCancellation
+		}},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			sourceBoundary := &memorySource{
+				listed:  []source.Document{{Provider: "drive", ID: "document-canceled"}},
+				fetched: map[string]source.Document{"document-canceled": syntheticDocument("document-canceled", "Synthetic source.")},
+			}
+			repository := newMemoryRepository()
+			model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
+			testCase.setup(sourceBoundary, repository, model)
+			service := testServiceWithSource(sourceBoundary, repository, model)
+
+			summary, err := service.Sync(context.Background())
+			if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrFailurePersistence) {
+				t.Fatalf("Sync() error = %v, want deadline exceeded", err)
+			}
+			if err.Error() != context.DeadlineExceeded.Error() || strings.Contains(err.Error(), privateValue) {
+				t.Fatalf("Sync() error = %q, want bounded deadline sentinel", err.Error())
+			}
+			if len(summary.Results) != 0 || summary.Completed != 0 || summary.Incomplete != 0 || summary.Failed != 0 {
+				t.Fatalf("summary = %#v, want no classified outcome for canceled work", summary)
+			}
+			for _, state := range repository.versions {
+				if state.Status != VersionStatusPending || state.FailureCode != "" {
+					t.Fatalf("durable state = %#v, want resumable pending state", state)
+				}
+			}
+		})
+	}
+}
+
+func TestSyncPreservesEarlierSuccessWhenLaterDocumentIsCanceled(t *testing.T) {
+	model := &recordingModel{
+		responses: []extract.Response{validEmptyResponse(t)},
+		errs:      []error{nil, context.Canceled},
+	}
+	repository := newMemoryRepository()
+	service := testServiceWithSource(&memorySource{
+		listed: []source.Document{{Provider: "drive", ID: "document-complete"}, {Provider: "drive", ID: "document-canceled"}},
+		fetched: map[string]source.Document{
+			"document-complete": syntheticDocument("document-complete", "Completed synthetic source."),
+			"document-canceled": syntheticDocument("document-canceled", "Canceled synthetic source."),
+		},
+	}, repository, model)
+
+	summary, err := service.Sync(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Sync() error = %v, want context cancellation", err)
+	}
+	if len(summary.Results) != 1 || summary.Completed != 1 || summary.Results[0].DocumentID != "document-complete" {
+		t.Fatalf("summary = %#v, want only the earlier completed outcome", summary)
+	}
+}
+
+func TestSyncPreservesCancellationWhenFailureStateCannotBeRecorded(t *testing.T) {
+	malformed := extract.Response{Output: json.RawMessage(`{"unexpected":true}`), ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion}
+	repository := newMemoryRepository()
+	repository.failureRecordErr = fmt.Errorf("private persistence detail: %w", context.Canceled)
+	service := testService(syntheticDocument("document-canceled-failure", "Synthetic source."), repository, &recordingModel{responses: []extract.Response{malformed}})
+
+	summary, err := service.Sync(context.Background())
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrFailurePersistence) {
+		t.Fatalf("Sync() error = %v, want context cancellation", err)
+	}
+	if err.Error() != context.Canceled.Error() {
+		t.Fatalf("Sync() error = %q, want bounded cancellation sentinel", err.Error())
+	}
+	if len(summary.Results) != 0 {
+		t.Fatalf("summary results = %#v, want no misleading failure outcome", summary.Results)
+	}
+	for _, state := range repository.versions {
+		if state.Status != VersionStatusPending || state.FailureCode != "" {
+			t.Fatalf("durable state = %#v, want resumable pending state", state)
+		}
 	}
 }
 
@@ -247,6 +368,42 @@ func TestSyncClassifiesPersistenceIdentityCollisionAsInvalidOutput(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+func TestSyncClassifiesPaddedModelLocalIDAsInvalidOutputBeforeStorage(t *testing.T) {
+	const transcript = "Synthetic padded identifier."
+	output := extract.ExtractionOutput{
+		Citations: []extract.Citation{{ID: " citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript}},
+		People: []extract.PersonMention{{
+			ID: " mention-1", Surface: "Synthetic Person", Role: extract.MentionRoleSpeaker,
+			CitationIDs: []string{" citation-1"},
+		}},
+		Statements: []extract.AttributedStatement{},
+		Signals:    []extract.InteractionSignal{},
+	}
+	raw, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("marshal padded extraction: %v", err)
+	}
+	repository := newMemoryRepository()
+	service := testService(
+		syntheticDocument("document-padded-output", transcript),
+		repository,
+		&recordingModel{responses: []extract.Response{{
+			Output: raw, ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion, Outcome: "success",
+		}}},
+	)
+
+	summary, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if len(summary.Results) != 1 || summary.Results[0].Outcome != OutcomeFailed || summary.Results[0].FailureCode != FailureInvalidOutput {
+		t.Fatalf("summary = %#v, want invalid-output failure", summary)
+	}
+	if repository.completionCalls != 0 {
+		t.Fatalf("completion calls = %d, want padded IDs rejected before storage", repository.completionCalls)
 	}
 }
 
@@ -455,6 +612,7 @@ type memorySource struct {
 	listed  []source.Document
 	fetched map[string]source.Document
 	listErr error
+	getErrs map[string]error
 }
 
 func (sourceBoundary *memorySource) List(context.Context, string) ([]source.Document, error) {
@@ -465,6 +623,9 @@ func (sourceBoundary *memorySource) List(context.Context, string) ([]source.Docu
 }
 
 func (sourceBoundary *memorySource) Get(_ context.Context, documentID string) (source.Document, error) {
+	if err := sourceBoundary.getErrs[documentID]; err != nil {
+		return source.Document{}, err
+	}
 	document, ok := sourceBoundary.fetched[documentID]
 	if !ok {
 		return source.Document{}, errors.New("synthetic source failure")
@@ -474,6 +635,7 @@ func (sourceBoundary *memorySource) Get(_ context.Context, documentID string) (s
 
 type recordingModel struct {
 	responses []extract.Response
+	errs      []error
 	requests  []extract.Request
 	calls     int
 }
@@ -491,6 +653,9 @@ func (model *recordingModel) Generate(_ context.Context, request extract.Request
 	model.requests = append(model.requests, request)
 	index := model.calls
 	model.calls++
+	if index < len(model.errs) && model.errs[index] != nil {
+		return extract.Response{}, model.errs[index]
+	}
 	if index >= len(model.responses) {
 		return extract.Response{}, errors.New("synthetic model response missing")
 	}
@@ -503,6 +668,9 @@ type memoryRepository struct {
 	lastCompletion        Completion
 	completionCalls       int
 	failCompletionOnce    bool
+	prepareErr            error
+	completionErr         error
+	snapshotErr           error
 	failureRecordErr      error
 	persistedEvidence     int
 	persistedMentions     int
@@ -515,6 +683,9 @@ func newMemoryRepository() *memoryRepository {
 }
 
 func (repository *memoryRepository) PrepareVersion(_ context.Context, version knowledge.DocumentVersion) (VersionState, error) {
+	if repository.prepareErr != nil {
+		return VersionState{}, repository.prepareErr
+	}
 	key := versionKey(version)
 	state, exists := repository.versions[key]
 	if !exists {
@@ -530,6 +701,9 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version kn
 
 func (repository *memoryRepository) CompleteVersion(_ context.Context, completion Completion) error {
 	repository.completionCalls++
+	if repository.completionErr != nil {
+		return repository.completionErr
+	}
 	if repository.failCompletionOnce {
 		repository.failCompletionOnce = false
 		return errors.New("synthetic completion interruption")
@@ -567,7 +741,7 @@ func (repository *memoryRepository) RecordFailure(_ context.Context, versionID s
 }
 
 func (repository *memoryRepository) EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error) {
-	return nil, nil
+	return nil, repository.snapshotErr
 }
 
 func versionKey(version knowledge.DocumentVersion) string {
