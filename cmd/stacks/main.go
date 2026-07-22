@@ -17,6 +17,7 @@ import (
 	"stacks/internal/bedrock"
 	"stacks/internal/cli"
 	"stacks/internal/config"
+	"stacks/internal/doctor"
 	"stacks/internal/entity"
 	"stacks/internal/ingest"
 	"stacks/internal/observability"
@@ -92,6 +93,21 @@ func pocCommandProvider(
 			settings.PoC.GoogleOAuthTokenFile,
 			stdout,
 		)},
+		string(config.CommandDoctor): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			database := doctor.NewPostgresProbe(settings.PoC.DatabaseURL)
+			defer database.Close()
+			google := doctor.NewGoogleProbe(
+				settings.PoC.GoogleOAuthClientFile,
+				settings.PoC.GoogleOAuthTokenFile,
+				settings.PoC.GoogleFolderID,
+				drive.NewTabClassifier(settings.PoC.TranscriptTitles, settings.PoC.NotesTitles),
+			)
+			aws := doctor.NewAWSProbe(settings.PoC.AWSProfile, settings.PoC.AWSRegion, settings.PoC.BedrockModelID)
+			return (cli.DoctorCommand{
+				Service: doctor.Service{Database: database, Google: google, AWS: aws},
+				Output:  stdout,
+			}).Run(ctx, args)
+		}),
 		string(config.CommandSync): cli.CommandFunc(func(ctx context.Context, args []string) error {
 			httpClient, err := drive.NewAuthorizedHTTPClient(
 				ctx,

@@ -1,101 +1,88 @@
 # Stacks
 
-Stacks builds a temporal knowledge graph from personal documents and other
-source material. It is designed to answer questions about change: how a
-relationship evolved, how a product reached its current form, what was believed
-at a particular point, and which evidence supports that history.
+Stacks builds provenance-backed temporal knowledge from personal source
+documents. This proof of concept reads tabbed Gemini meeting Docs from one
+Google Drive folder and analyzes one explicitly configured employee-manager
+pair for changes in observable interaction patterns.
 
-Documents remain immutable evidence. Stacks extracts observations, resolves
-entities, and records time-bounded relationships without erasing prior states.
-Answers must distinguish source evidence from inference and cite their path back
-to the original material.
-
-The initial scaffold is deliberately small. PostgreSQL and pgvector provide the
-storage foundation, but vector search is supporting machinery rather than the
-product: similarity can find candidate evidence; it cannot establish identity,
-chronology, or truth.
-
-## Product principles
-
-- Preserve both when something happened and when Stacks learned about it.
-- Never replace history with the latest state.
-- Treat model-produced observations and entity matches as untrusted proposals.
-- Preserve aliases, uncertainty, conflicting evidence, and source provenance.
-- Answer temporal questions with inspectable graph paths and citations.
+The analysis does not claim access to a manager's private beliefs or mental
+state. It reports dated, transcript-backed signals such as delegation,
+scrutiny, endorsement, support, and future responsibility. Every report keeps
+counterevidence, uncertainty, gaps, and citations visible.
 
 ## Requirements
 
 - Go 1.26 or newer
 - Docker with Compose
+- a Google installed-application OAuth client with read-only Drive and Docs
+  access
+- an AWS profile, region, and Bedrock model or inference profile configured by
+  the operator
 
-## Run
+## Configure the local environment
 
-```sh
-make run
-```
-
-The service listens on `127.0.0.1:8080` by default. Verify it with:
-
-```sh
-curl http://127.0.0.1:8080/healthz
-```
-
-## Configuration
-
-| Environment variable | Default | Purpose |
-| --- | --- | --- |
-| `STACKS_HTTP_HOST` | `127.0.0.1` | HTTP bind host |
-| `STACKS_HTTP_PORT` | `8080` | HTTP bind port |
-| `STACKS_READ_HEADER_TIMEOUT_SECONDS` | `5` | Maximum time to read request headers |
-| `STACKS_LOG_LEVEL` | `info` | Zap log level: `debug`, `info`, `warn`, or `error` |
-| `STACKS_OTEL_ENABLED` | `false` | Export logs, metrics, and traces through OTLP |
-| `STACKS_OTEL_ENDPOINT` | `127.0.0.1:4317` | OTLP gRPC collector endpoint |
-| `STACKS_OTEL_INSECURE` | `true` | Use plaintext OTLP transport for local development |
-| `STACKS_OTEL_METRIC_EXPORT_INTERVAL` | `10s` | Metric export interval as a Go duration |
-| `STACKS_OTEL_SERVICE_NAME` | `stacks` | OpenTelemetry service name |
-| `STACKS_OTEL_TRACE_SAMPLE_RATIO` | `1` | Parent-based trace sampling ratio from `0` to `1` |
-
-## Development
-
-```sh
-make fmt
-make test
-make staticcheck
-make build
-```
-
-## Local observability
-
-The optional observability Compose project runs an OpenTelemetry Collector,
-Prometheus, Tempo, Loki, and Grafana without changing the database stack:
-
-```sh
-make obs-up
-STACKS_OTEL_ENABLED=true make run
-```
-
-Grafana is available at `http://127.0.0.1:3000`; Prometheus, Tempo, and Loki are
-also bound to loopback on ports `9090`, `3200`, and `3100`. Grafana starts with
-its standard local `admin` login and provisions all three data sources. Run
-`make obs-down` to stop the observability project while preserving its volumes.
-
-Application code logs through Zap. OpenTelemetry exports all three signals over
-OTLP when enabled. Successful spans are explicitly marked `OK`. Decisions should
-be recorded as events on an existing meaningful span and as duration, input/output
-size, and confidence histograms; they should not create a child span merely to
-make a decision visible.
-
-## Local database
-
-Create local credentials before starting PostgreSQL:
+Copy the example and edit the copy; never commit `.env`:
 
 ```sh
 cp .env.example .env
 openssl rand -hex 24
+openssl rand -hex 24
 ```
 
-Put independently generated values in `STACKS_DB_ADMIN_PASSWORD` and
-`STACKS_DB_APP_PASSWORD`, then run:
+Use the generated values for `STACKS_DB_ADMIN_PASSWORD` and
+`STACKS_DB_APP_PASSWORD`, and put the application password into
+`STACKS_DATABASE_URL`. Set the corpus, Google, AWS, model, and pair values for
+your environment. `.env` is loaded by the proof-of-concept Make targets below;
+the Go process itself reads environment variables and does not parse dotenv
+files.
+
+Google's downloaded OAuth client JSON and Stacks' token JSON must live outside
+the repository at the explicit paths in `STACKS_GOOGLE_OAUTH_CLIENT_FILE` and
+`STACKS_GOOGLE_OAUTH_TOKEN_FILE`. `stacks auth google` uses an installed-app
+loopback flow with read-only Drive and Docs scopes and writes the token with
+owner-only permissions. No service-account or domain-wide-delegation flow is
+implemented.
+
+### Environment variables
+
+| Variable | Default / example | Used for |
+| --- | --- | --- |
+| `STACKS_HTTP_HOST` | `127.0.0.1` | HTTP bind host |
+| `STACKS_HTTP_PORT` | `8080` | HTTP bind port |
+| `STACKS_READ_HEADER_TIMEOUT_SECONDS` | `5` | Maximum request-header read time |
+| `STACKS_LOG_LEVEL` | `info` | Zap level: `debug`, `info`, `warn`, or `error` |
+| `STACKS_OTEL_ENABLED` | `false` | Enable OTLP logs, metrics, and traces |
+| `STACKS_OTEL_ENDPOINT` | `127.0.0.1:4317` | OTLP gRPC endpoint |
+| `STACKS_OTEL_INSECURE` | `true` | Use plaintext OTLP transport |
+| `STACKS_OTEL_METRIC_EXPORT_INTERVAL` | `10s` | Metric export interval as a Go duration |
+| `STACKS_OTEL_SERVICE_NAME` | `stacks` | OpenTelemetry service name |
+| `STACKS_OTEL_TRACE_SAMPLE_RATIO` | `1` | Parent-based sampling ratio from `0` to `1` |
+| `STACKS_DB_PORT` | `5432` | Host port for the local Compose database |
+| `STACKS_DATABASE_URL` | no default | Application PostgreSQL URL; contains the app password and must remain local |
+| `STACKS_GOOGLE_FOLDER_ID` | no default | One direct-child Drive folder boundary |
+| `STACKS_GOOGLE_OAUTH_CLIENT_FILE` | no default | External installed-app OAuth client JSON path |
+| `STACKS_GOOGLE_OAUTH_TOKEN_FILE` | no default | External owner-only OAuth token JSON path |
+| `STACKS_TRANSCRIPT_TITLES` | no default | Comma-separated exact transcript titles after case/whitespace normalization |
+| `STACKS_NOTES_TITLES` | no default | Comma-separated exact Gemini-notes titles after normalization |
+| `STACKS_AWS_PROFILE` | no default | Shared AWS profile used by implemented PoC commands |
+| `STACKS_AWS_REGION` | no default | Explicit Bedrock control-plane and runtime region |
+| `STACKS_BEDROCK_MODEL_ID` | no default | Foundation-model or inference-profile ID; no model is guessed |
+| `STACKS_BEDROCK_MAX_TOKENS` | no default | Required positive output-token limit for every invocation |
+| `STACKS_BEDROCK_MAX_ATTEMPTS` | `5` | Positive bound for retryable model failures |
+| `STACKS_EXTRACTION_PROMPT_VERSION` | `extract-v1` | Versioned extraction prompt |
+| `STACKS_ANALYSIS_PROMPT_VERSION` | `analyze-v1` | Versioned pair-analysis prompt |
+| `STACKS_EMPLOYEE_ENTITY_ID` | no default | Accepted employee entity used by `analyze` |
+| `STACKS_MANAGER_ENTITY_ID` | no default | Accepted manager entity used by `analyze` |
+
+`STACKS_DB_ADMIN_PASSWORD` and `STACKS_DB_APP_PASSWORD` are local secrets used
+by Compose and migrations, so they intentionally have no example values.
+`STACKS_TEST_DATABASE_URL` is a credential-bearing test input used only by the
+integration-test target.
+
+## Database and command workflow
+
+Start PostgreSQL and apply forward-only migrations before running corpus
+commands:
 
 ```sh
 make db-up
@@ -103,33 +90,140 @@ make db-migrate
 make db-status
 ```
 
-`stacks_admin` owns the local database and is used only for migrations.
-Application code must connect as the least-privileged `stacks_app` role. The
-database listens only on `127.0.0.1` and uses `STACKS_DB_PORT` (default `5432`).
+Then run the explicit workflow:
 
-`make db-down` stops the database while preserving its named volume. To remove
-local database contents deliberately, run `docker compose down --volumes`.
-Bootstrap credentials and roles are created only when PostgreSQL initializes a
-new volume; changing `.env` later does not update roles in an existing volume.
+```sh
+make auth-google
+make doctor
+make sync
 
-## Intended architecture
+make entities ARGS="list"
+make entities ARGS="show <entity-id>"
+make review ARGS="list"
+make review ARGS="show <proposal-id>"
+make review ARGS="accept <proposal-id> <entity-id>"
+# Or: reject, create a person, or correct the current effective decision.
+make review ARGS="reject <proposal-id>"
+make review ARGS="create <proposal-id> --name <name> [--email <email>]"
+make review ARGS="correct <effective-decision-id> <entity-id>"
 
-- `cmd/stacks`: process entrypoint
-- `internal/app`: application lifecycle and dependency wiring
-- `internal/config`: validated runtime configuration
-- `internal/httpapi`: HTTP transport boundary
-- `internal/observability`: Zap, OpenTelemetry lifecycle, and decision telemetry
-- `internal/knowledge`: immutable evidence and temporal observation contracts
-- `internal/query`: temporal query plans and deterministic retrieval operators
-- `db/init`: first-start cluster and role bootstrap
-- `db/migrations`: ordered, forward-only schema migrations
+make analyze
+```
 
-The current domain layer defines immutable source evidence and temporal
-observations, including valid time, recorded time, provenance, derivation, and
-epistemic status. Graph persistence and model extraction remain intentionally
-unimplemented until these contracts have been exercised. Query plans represent
-classified point-in-time, comparison, trajectory, and causal-chain intent;
-resolve valid and recorded time independently; and require aggregation and
-diffing before a narrator receives results. In-memory state aggregation applies
-those temporal filters, merges agreeing observations, and preserves conflicting,
-hypothesized, or temporally uncertain values rather than manufacturing state.
+`stacks doctor` is read-only. It checks PostgreSQL connectivity and applied
+migrations; Google OAuth material, configured-folder access, and one
+representative all-tabs classification; AWS credentials; configured Bedrock
+model or inference-profile control-plane availability; and account-level model
+invocation logging when inspectable. It never runs OAuth, applies migrations,
+syncs or persists graph data, extracts content, invokes a model, changes
+configuration, or enables/disables logging. Missing or expired Google
+authorization directs the operator to `stacks auth google`.
+
+The Bedrock availability check does not invoke the model and therefore cannot
+prove runtime quota, throughput, or successful inference. An account with zero
+applicable quota can pass a control-plane availability check and still fail
+`sync` or `analyze`. Treat that as not live-validated until an authorized
+invocation succeeds.
+
+## Tab and evidence rules
+
+Discovery reads only supported Google Docs whose direct parent is the
+configured folder. It does not recurse into folders or follow document links.
+Docs are fetched with all tabs, including nested child tabs, and tab hierarchy
+and display order are preserved.
+
+Tab roles are deterministic. Titles are normalized for case and whitespace and
+matched only against `STACKS_TRANSCRIPT_TITLES` or `STACKS_NOTES_TITLES`; the
+two sets may not overlap. Each analyzed document must classify exactly one
+transcript tab. Missing or multiple transcript matches are visible failures.
+Gemini notes are preserved as secondary model-derived material, but a signal
+cannot rely on notes alone: its citations must map exactly to transcript text.
+
+## Review, corrections, and bounded conclusions
+
+Ambiguous identity matches remain proposals. A ranked guess and confidence do
+not become graph truth until accepted. `review accept`, `review reject`, and
+`review create` append decisions. `review correct` appends a replacement that
+supersedes the prior effective decision without deleting it. A subsequent
+analysis uses the corrected identity while earlier decisions, analysis inputs,
+and provenance remain available for audit.
+
+`analyze` can return only:
+
+- `insufficient evidence`
+- `no material directional change detected`
+- `mixed or conflicting signals`
+- `possible declining-confidence signal`
+
+The last conclusion is a cautious hypothesis about observable signals, never a
+fact that a manager has lost confidence. Two dated meetings and specific
+earlier/later evidence are structural admission requirements, not proof of
+hidden state. Confidence describes extraction uncertainty and never selects
+truth or erases conflict.
+
+## Privacy and Bedrock disclosure
+
+Sync and analysis send private transcript material to the configured Bedrock
+model boundary. Stacks does not enable Bedrock model invocation logging, but an
+AWS organization or account can configure it externally. When enabled, full
+model inputs and outputs may be captured in CloudWatch Logs or S3. Doctor
+reports `disabled`, `enabled`, or `unknown`; `unknown`, including an
+AccessDenied inspection result, must never be treated as safe.
+
+Operational logs, metrics, and traces exclude transcript and notes text,
+prompts, raw model output, names, emails, Drive titles and URLs, credentials,
+and OAuth tokens. The local review and analysis commands deliberately print
+private evidence to their explicit terminal output for operator inspection.
+
+## Service and observability
+
+`make run` starts the health service on `127.0.0.1:8080` by default:
+
+```sh
+curl http://127.0.0.1:8080/healthz
+```
+
+The optional local observability stack runs an OpenTelemetry Collector,
+Prometheus, Tempo, Loki, and Grafana:
+
+```sh
+make obs-up
+STACKS_OTEL_ENABLED=true make run
+```
+
+Grafana is available at `http://127.0.0.1:3000`. `make obs-down` preserves its
+named volumes.
+
+## Verification and live acceptance
+
+The deterministic repository checks are:
+
+```sh
+make fmt
+make test
+make staticcheck
+make build
+git diff --check
+```
+
+With the local database configured and running, also run:
+
+```sh
+make db-up
+make db-migrate
+set -a; . ./.env; set +a
+STACKS_TEST_DATABASE_URL="$STACKS_DATABASE_URL" make test-integration
+```
+
+Live validation is separate from those checks. It requires doctor to pass;
+syncing at least two tabbed Gemini Docs; a repeated unchanged sync with no new
+versions or model work; resolving the configured pair; inspecting every
+analysis citation and counterevidence result; correcting one identity; and
+confirming a new analysis uses the correction without erasing old provenance.
+Do not copy live names, emails, Drive URLs, transcript text, prompts, or model
+output into commits or reports. If credentials, permissions, model access, or
+quota block any step, report the implementation as test-complete but not
+live-validated.
+
+`make db-down` and `make obs-down` stop local services without deleting named
+volumes. Removing database volumes is deliberately outside the normal workflow.

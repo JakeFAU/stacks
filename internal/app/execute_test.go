@@ -128,6 +128,46 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 	}
 }
 
+func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
+	settings := config.Settings{PoC: config.PoCSettings{
+		DatabaseURL:             "postgres://synthetic",
+		GoogleFolderID:          "synthetic-folder",
+		GoogleOAuthClientFile:   "/synthetic/client.json",
+		GoogleOAuthTokenFile:    "/synthetic/token.json",
+		TranscriptTitles:        []string{"Transcript"},
+		NotesTitles:             []string{"Notes"},
+		AWSProfile:              "synthetic-profile",
+		AWSRegion:               "us-east-1",
+		BedrockModelID:          "synthetic-model",
+		BedrockMaxTokens:        256,
+		BedrockMaxAttempts:      1,
+		ExtractionPromptVersion: "extract-v1",
+		AnalysisPromptVersion:   "analyze-v1",
+	}}
+	providerCalls := 0
+	doctorCalls := 0
+	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+		providerCalls++
+		return map[string]cli.Command{"doctor": cli.CommandFunc(func(_ context.Context, args []string) error {
+			doctorCalls++
+			if len(args) != 0 {
+				return fmt.Errorf("doctor received unexpected arguments")
+			}
+			return nil
+		})}, nil
+	})
+
+	err := Execute(context.Background(), []string{"doctor"}, settings,
+		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
+		provider, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if providerCalls != 1 || doctorCalls != 1 {
+		t.Fatalf("provider/doctor calls = %d/%d, want 1/1", providerCalls, doctorCalls)
+	}
+}
+
 func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
 	settings := config.Settings{PoC: config.PoCSettings{
 		DatabaseURL: "postgres://synthetic", AWSProfile: "synthetic-profile", AWSRegion: "us-east-1",
