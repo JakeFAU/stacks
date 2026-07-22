@@ -41,11 +41,11 @@ func RequireRestrictedDisclosure(ctx context.Context, invocation modelpolicy.Inv
 		return ErrDisclosureNotConfirmed
 	}
 	state, err := probe.InvocationLogging(ctx)
-	if err == nil && state == InvocationLoggingDisabled {
-		return nil
-	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return errors.Join(ErrDisclosureNotConfirmed, ctxErr)
+	}
+	if err == nil && state == InvocationLoggingDisabled {
+		return nil
 	}
 	if errors.Is(err, context.Canceled) {
 		return errors.Join(ErrDisclosureNotConfirmed, context.Canceled)

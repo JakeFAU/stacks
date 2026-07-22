@@ -90,6 +90,24 @@ func TestRequireRestrictedDisclosureFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRequireRestrictedDisclosureRejectsCancellationAfterDisabledResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	probe := &fakeDisclosureProbe{logging: func(context.Context) (InvocationLoggingState, error) {
+		cancel()
+		return InvocationLoggingDisabled, nil
+	}}
+
+	err := RequireRestrictedDisclosure(ctx, modelpolicy.Invocation{
+		Provider: modelpolicy.ProviderBedrock,
+		DataMode: modelpolicy.DataModeRestricted,
+		Region:   "us-east-1",
+	}, probe)
+
+	if !errors.Is(err, ErrDisclosureNotConfirmed) || !errors.Is(err, context.Canceled) || err != nil && len(err.Error()) > 160 {
+		t.Fatalf("RequireRestrictedDisclosure() error = %v, want bounded disclosure failure and canonical context.Canceled", err)
+	}
+}
+
 func TestPostgresProbeChecksRequiredMigrationWithoutApplyingIt(t *testing.T) {
 	connection := &fakePostgresConnection{
 		appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
@@ -404,13 +422,17 @@ func TestAWSProbeTreatsAnyLoggingConfigurationAsEnabled(t *testing.T) {
 }
 
 type fakeDisclosureProbe struct {
-	state InvocationLoggingState
-	err   error
-	calls int
+	state   InvocationLoggingState
+	err     error
+	logging func(context.Context) (InvocationLoggingState, error)
+	calls   int
 }
 
-func (fake *fakeDisclosureProbe) InvocationLogging(context.Context) (InvocationLoggingState, error) {
+func (fake *fakeDisclosureProbe) InvocationLogging(ctx context.Context) (InvocationLoggingState, error) {
 	fake.calls++
+	if fake.logging != nil {
+		return fake.logging(ctx)
+	}
 	return fake.state, fake.err
 }
 
