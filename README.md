@@ -72,7 +72,7 @@ implemented.
 | `STACKS_BEDROCK_MAX_ATTEMPTS` | `5` | Positive bound for retryable model failures |
 | `STACKS_INGEST_LEASE_DURATION` | `5m` | Positive extraction-claim duration, bounded to at most `1h` |
 | `STACKS_INGEST_ATTEMPT_TIMEOUT` | `4m` | Per-document attempt deadline; must leave at least `5s` before the extraction lease expires |
-| `STACKS_EXTRACTION_PROMPT_VERSION` | `extract-v1` | Versioned extraction prompt |
+| `STACKS_EXTRACTION_PROMPT_VERSION` | `extract-v2` | Versioned extraction prompt; v2 keeps model-proposed email non-authoritative |
 | `STACKS_ANALYSIS_PROMPT_VERSION` | `analyze-v1` | Versioned pair-analysis prompt |
 | `STACKS_EMPLOYEE_ENTITY_ID` | no default | Accepted employee entity used by `analyze` |
 | `STACKS_MANAGER_ENTITY_ID` | no default | Accepted manager entity used by `analyze` |
@@ -145,12 +145,20 @@ claim expires. The bounded failure state releases the claim while it is still
 owned, so another sync cannot begin duplicate model work merely because a long
 attempt reached the lease boundary.
 
-The legacy-admission migration preserves all pre-fix model payloads and
-provenance for audit, but excludes those old mentions, aliases, observations,
-signals, and reports from current resolution and analysis. Run `sync` again to
-produce a post-fix extraction derivation. An explicit review correction may
-re-admit the identity decision, but an ungrounded legacy model surface never
-becomes an authoritative alias and legacy signals remain excluded.
+The admission-boundary migrations preserve every pre-fix model payload and its
+provenance for audit, but exclude superseded extraction runs, mentions,
+decisions and their aliases, observations, signals, and reports from current
+resolution and analysis. Migration 7 specifically retires work created before
+the `extract-v2` prompt/schema, v4 extraction namespace, and v5 analysis policy.
+Run `sync` again to produce a current derivation; old proposals and corrections
+cannot re-admit their retired model mentions.
+
+The first post-upgrade sync also recognizes the exact revision-inclusive digest
+used by older builds, attaches the revision-free stable content identity to the
+existing immutable document version, and reprocesses only because the
+derivation contract changed. A Drive revision-marker change alone therefore
+does not create a duplicate source version. The original revision remains
+immutable provenance.
 
 The Bedrock availability check does not invoke the model and therefore cannot
 prove runtime quota, throughput, or successful inference. An account with zero
@@ -174,7 +182,11 @@ cannot rely on notes alone: its citations must map exactly to transcript text.
 
 ## Review, corrections, and bounded conclusions
 
-Ambiguous identity matches remain proposals. `review list` prints the highest
+Ambiguous identity matches remain proposals. Model-proposed email is preserved
+with its exact citation for audit, but it is never used for automatic resolution
+or taught as an alias by accepting a proposal; grounded names resolve and are
+reviewed independently. Only an email explicitly supplied to `review create`
+becomes a decision-owned accepted email alias. `review list` prints the highest
 ranked guess, confidence, alternative count, bounded reason, and bounded cited
 transcript context for local inspection. A ranked guess and confidence do not
 become graph truth until accepted. `review accept`, `review reject`, and `review

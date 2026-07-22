@@ -547,9 +547,15 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 		return EntityDetail{}, fmt.Errorf("iterate aliases for entity %q: %w", entityID, err)
 	}
 	if err := repository.pool.QueryRow(ctx, `
-		SELECT count(*) FROM stacks.resolution_decisions
-		WHERE entity_id = $1 AND outcome IN ('accepted', 'created')
-		  AND superseded_by_id IS NULL AND currently_admissible`, entityID).Scan(&detail.MentionCount); err != nil {
+		SELECT count(*)
+		FROM stacks.resolution_decisions AS decision
+		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+		WHERE decision.entity_id = $1 AND decision.outcome IN ('accepted', 'created')
+		  AND decision.superseded_by_id IS NULL AND decision.currently_admissible
+		  AND mention.currently_admissible
+		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)`, entityID).Scan(&detail.MentionCount); err != nil {
 		return EntityDetail{}, fmt.Errorf("count mentions for entity %q: %w", entityID, err)
 	}
 	evidence, err := repository.pool.Query(ctx, `
@@ -557,9 +563,12 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 		FROM stacks.resolution_decisions AS decision
 		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
 		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
 		WHERE decision.entity_id = $1 AND decision.outcome IN ('accepted', 'created')
 		  AND decision.superseded_by_id IS NULL AND decision.currently_admissible
+		  AND mention.currently_admissible
+		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
 		ORDER BY span.quote`, entityID)
 	if err != nil {
 		return EntityDetail{}, fmt.Errorf("list evidence for entity %q: %w", entityID, err)
@@ -584,8 +593,11 @@ func (repository *EntityRepository) ListResolutionProposalDetails(ctx context.Co
 		SELECT proposal.id::text, span.quote
 		FROM stacks.resolution_proposals AS proposal
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
 		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
 		WHERE proposal.status = 'pending'
+		  AND mention.currently_admissible
+		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
 		ORDER BY proposal.recorded_at, proposal.id`)
 	if err != nil {
 		return nil, fmt.Errorf("list resolution proposals: %w", err)
@@ -618,8 +630,11 @@ func (repository *EntityRepository) ShowResolutionProposalDetail(ctx context.Con
 		SELECT proposal.id::text, span.quote
 		FROM stacks.resolution_proposals AS proposal
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
 		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
-		WHERE proposal.id = $1`, proposalID).Scan(&proposal.ID, &proposal.Context)
+		WHERE proposal.id = $1
+		  AND mention.currently_admissible
+		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)`, proposalID).Scan(&proposal.ID, &proposal.Context)
 	if err != nil {
 		return ResolutionProposalDetail{}, fmt.Errorf("show resolution proposal %q: %w", proposalID, err)
 	}
@@ -772,28 +787,24 @@ func insertMentionAliasAssertions(ctx context.Context, transaction pgx.Tx, decis
 	if decision.Outcome != ResolutionOutcomeAccepted && decision.Outcome != ResolutionOutcomeCreated {
 		return nil
 	}
-	var normalizedName, normalizedEmail string
+	var normalizedName string
 	var mentionAdmissible bool
 	if err := transaction.QueryRow(ctx, `
-		SELECT mention.normalized_name, mention.normalized_email, mention.currently_admissible
+		SELECT mention.normalized_name, mention.currently_admissible
 		FROM stacks.resolution_proposals AS proposal
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
-		WHERE proposal.id = $1`, decision.ProposalID).Scan(&normalizedName, &normalizedEmail, &mentionAdmissible); err != nil {
+		WHERE proposal.id = $1`, decision.ProposalID).Scan(&normalizedName, &mentionAdmissible); err != nil {
 		return fmt.Errorf("load accepted aliases for resolution proposal %q: %w", decision.ProposalID, err)
 	}
 	if !mentionAdmissible {
 		return nil
 	}
-	for _, alias := range []AliasInput{
-		{EntityID: decision.EntityID, NormalizedValue: normalizedName, Type: "name"},
-		{EntityID: decision.EntityID, NormalizedValue: normalizedEmail, Type: "email"},
-	} {
-		if alias.NormalizedValue == "" {
-			continue
-		}
-		if err := insertAliasAssertion(ctx, transaction, decision.ID, decision.EntityID, alias); err != nil {
-			return fmt.Errorf("record accepted alias for resolution proposal %q: %w", decision.ProposalID, err)
-		}
+	if normalizedName == "" {
+		return nil
+	}
+	alias := AliasInput{EntityID: decision.EntityID, NormalizedValue: normalizedName, Type: "name"}
+	if err := insertAliasAssertion(ctx, transaction, decision.ID, decision.EntityID, alias); err != nil {
+		return fmt.Errorf("record accepted alias for resolution proposal %q: %w", decision.ProposalID, err)
 	}
 	return nil
 }

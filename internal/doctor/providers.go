@@ -27,6 +27,7 @@ const (
 	temporalPairAnalysisMigrationVersion     int64 = 4
 	managerConfidenceFinalFixesVersion       int64 = 5
 	legacyAdmissionBoundaryVersion           int64 = 6
+	compatibilityAdmissionBoundaryVersion    int64 = 7
 )
 
 const migrationSetQuery = `
@@ -111,6 +112,7 @@ func requiredMigrationVersions() []int64 {
 		temporalPairAnalysisMigrationVersion,
 		managerConfidenceFinalFixesVersion,
 		legacyAdmissionBoundaryVersion,
+		compatibilityAdmissionBoundaryVersion,
 	}
 }
 

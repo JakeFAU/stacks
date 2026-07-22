@@ -24,7 +24,7 @@ import (
 
 const (
 	testModelID       = "configured-model"
-	testPromptVersion = "extract-v1"
+	testPromptVersion = extract.ExtractionPromptVersion
 	testPrivateInput  = "private-input-marker"
 	testPrivateOutput = "private-output-marker"
 )

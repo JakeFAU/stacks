@@ -38,7 +38,7 @@ const (
 	ingestionSpanName                 = "stacks.ingest.sync"
 	ingestionDecisionName             = "ingest_document"
 	interactionPredicate              = "interaction_signal"
-	extractionDerivationDigestVersion = "stacks.extraction-derivation.v3"
+	extractionDerivationDigestVersion = "stacks.extraction-derivation.v4"
 )
 
 // Outcome is the bounded per-document result exposed by sync.
@@ -109,16 +109,17 @@ type EvidenceRecord struct {
 // MentionRecord is one source-grounded person mention and its deterministic
 // identity-resolution result.
 type MentionRecord struct {
-	Key         string
-	EvidenceKey string
-	Surface     string
-	// Normalized identity fields are durable alias inputs only when the exact
-	// evidence span associates the name and optional email. Empty values keep a
-	// separately grounded proposal reviewable without teaching aliases.
-	NormalizedName  string
-	NormalizedEmail string
-	Role            string
-	Resolution      entity.Resolution
+	Key                      string
+	EvidenceKey              string
+	ProposedEmailEvidenceKey string
+	Surface                  string
+	// NormalizedName is the independently grounded name alias input. A model
+	// email remains separate audit-only proposal provenance and is never passed
+	// to the resolver or taught as an alias by ingestion or proposal acceptance.
+	NormalizedName string
+	ProposedEmail  string
+	Role           string
+	Resolution     entity.Resolution
 }
 
 // ObservationRecord is one inferred interaction observation. Empty entity IDs
@@ -427,15 +428,13 @@ func (service *Service) completion(
 		if err != nil {
 			return Completion{}, err
 		}
-		resolution := entity.Resolution{}
-		if identity.AliasesAdmissible {
-			resolution = service.Resolver.Resolve(entity.Mention{Name: person.Surface, Email: person.Email}, snapshots)
-		}
+		resolution := service.Resolver.Resolve(entity.Mention{Name: person.Surface}, snapshots)
 		resolutions[person.ID] = resolution
 		completion.Mentions = append(completion.Mentions, MentionRecord{
-			Key: person.ID, EvidenceKey: identity.EvidenceCitationID, Surface: person.Surface,
-			NormalizedName: identity.NormalizedName, NormalizedEmail: identity.NormalizedEmail,
-			Role: person.Role, Resolution: resolution,
+			Key: person.ID, EvidenceKey: identity.NameEvidenceCitationID,
+			ProposedEmailEvidenceKey: identity.EmailEvidenceCitationID,
+			Surface:                  person.Surface, NormalizedName: identity.NormalizedName,
+			ProposedEmail: identity.ProposedEmail, Role: person.Role, Resolution: resolution,
 		})
 	}
 

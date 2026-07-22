@@ -595,53 +595,78 @@ func TestSyncKeepsSeparatelyCitedAlexNameAndBobEmailPendingWithoutTeachingAliase
 	if mention.EvidenceKey != "citation-alex" {
 		t.Fatalf("EvidenceKey = %q, want exact Alex identity evidence", mention.EvidenceKey)
 	}
-	if mention.NormalizedName != "" || mention.NormalizedEmail != "" {
-		t.Fatalf("durable aliases = %q/%q, want unassociated identity unable to teach aliases", mention.NormalizedName, mention.NormalizedEmail)
+	if mention.NormalizedName != "alex reviewer" || mention.ProposedEmail != "bob.builder@synthetic.example" || mention.ProposedEmailEvidenceKey != "citation-bob" {
+		t.Fatalf("durable identity proposal = %#v, want independently grounded name and non-authoritative email evidence", mention)
 	}
 }
 
-func TestSyncAutoResolvesAssociatedNameAndEmailUsingExactSharedEvidence(t *testing.T) {
-	const (
-		nameOnlyEvidence = "Alex Reviewer spoke earlier."
-		sharedEvidence   = "Alex Reviewer (alex.reviewer@synthetic.example) led the review."
-		transcript       = nameOnlyEvidence + " " + sharedEvidence
-	)
+func TestSyncNeverUsesCooccurringModelEmailForAutomaticResolution(t *testing.T) {
+	const transcript = "Alex Reviewer asked Bob Builder (bob.builder@synthetic.example) to follow up."
 	output := extract.ExtractionOutput{
-		Citations: []extract.Citation{
-			{ID: "citation-name", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(nameOnlyEvidence), Quote: nameOnlyEvidence},
-			{ID: "citation-shared", TabID: "transcript-tab", StartOffset: len(nameOnlyEvidence) + 1, EndOffset: len(transcript), Quote: sharedEvidence},
-		},
+		Citations: []extract.Citation{{ID: "citation-shared", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript}},
 		People: []extract.PersonMention{{
-			ID: "mention-alex", Surface: "Alex Reviewer", Email: "alex.reviewer@synthetic.example",
-			Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-name", "citation-shared"},
+			ID: "mention-alex", Surface: "Alex Reviewer", Email: "bob.builder@synthetic.example",
+			Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-shared"},
 		}},
 		Statements: []extract.AttributedStatement{},
 		Signals:    []extract.InteractionSignal{},
 	}
 	repository := newMemoryRepository()
 	repository.snapshots = []entity.EntitySnapshot{{
-		ID: "entity-alex", Kind: entity.KindPerson,
-		Aliases: []entity.Alias{{Type: entity.AliasTypeEmail, Value: "alex.reviewer@synthetic.example"}},
+		ID: "entity-bob", Kind: entity.KindPerson,
+		Aliases: []entity.Alias{{Type: entity.AliasTypeEmail, Value: "bob.builder@synthetic.example"}},
 	}}
 	service := testService(
-		syntheticDocument("document-associated-identity", transcript),
+		syntheticDocument("document-cooccurring-email", transcript),
 		repository,
 		&recordingModel{responses: []extract.Response{extractionResponse(t, output)}},
 	)
 
 	summary, err := service.Sync(context.Background())
 	if err != nil || summary.Completed != 1 {
-		t.Fatalf("Sync() = (%#v, %v), want associated identity completed", summary, err)
+		t.Fatalf("Sync() = (%#v, %v), want reviewable identity completed", summary, err)
+	}
+	mention := repository.lastCompletion.Mentions[0]
+	if mention.Resolution.AutoResolved || mention.Resolution.EntityID != "" {
+		t.Fatalf("resolution = %#v, want cooccurring model email unable to resolve Alex to Bob", mention.Resolution)
+	}
+	if mention.EvidenceKey != "citation-shared" {
+		t.Fatalf("EvidenceKey = %q, want exact Alex name evidence", mention.EvidenceKey)
+	}
+	if mention.NormalizedName != "alex reviewer" || mention.ProposedEmail != "bob.builder@synthetic.example" || mention.ProposedEmailEvidenceKey != "citation-shared" {
+		t.Fatalf("durable identity proposal = %#v, want grounded name plus non-authoritative email provenance", mention)
+	}
+}
+
+func TestSyncResolvesGroundedNameIndependentlyOfModelEmail(t *testing.T) {
+	const transcript = "Alex Reviewer asked Bob Builder (bob.builder@synthetic.example) to follow up."
+	output := extract.ExtractionOutput{
+		Citations: []extract.Citation{{ID: "citation-shared", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript}},
+		People: []extract.PersonMention{{
+			ID: "mention-alex", Surface: "Alex Reviewer", Email: "bob.builder@synthetic.example",
+			Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-shared"},
+		}},
+		Statements: []extract.AttributedStatement{},
+		Signals:    []extract.InteractionSignal{},
+	}
+	repository := newMemoryRepository()
+	repository.snapshots = []entity.EntitySnapshot{
+		{ID: "entity-alex", Kind: entity.KindPerson, Aliases: []entity.Alias{{Type: entity.AliasTypeName, Value: "alex reviewer"}}},
+		{ID: "entity-bob", Kind: entity.KindPerson, Aliases: []entity.Alias{{Type: entity.AliasTypeEmail, Value: "bob.builder@synthetic.example"}}},
+	}
+	service := testService(
+		syntheticDocument("document-name-only-resolution", transcript),
+		repository,
+		&recordingModel{responses: []extract.Response{extractionResponse(t, output)}},
+	)
+
+	summary, err := service.Sync(context.Background())
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("Sync() = (%#v, %v), want completed name-only resolution", summary, err)
 	}
 	mention := repository.lastCompletion.Mentions[0]
 	if !mention.Resolution.AutoResolved || mention.Resolution.EntityID != "entity-alex" {
-		t.Fatalf("resolution = %#v, want accepted associated email", mention.Resolution)
-	}
-	if mention.EvidenceKey != "citation-shared" {
-		t.Fatalf("EvidenceKey = %q, want exact shared name/email evidence", mention.EvidenceKey)
-	}
-	if mention.NormalizedName != "alex reviewer" || mention.NormalizedEmail != "alex.reviewer@synthetic.example" {
-		t.Fatalf("durable aliases = %q/%q, want exact grounded pair", mention.NormalizedName, mention.NormalizedEmail)
+		t.Fatalf("resolution = %#v, want grounded name independently resolved to Alex", mention.Resolution)
 	}
 }
 
@@ -1238,7 +1263,7 @@ func TestComputeDerivationDigestChangesWithMaterialExtractionConfiguration(t *te
 		"region":         func(identity *DerivationIdentity) { identity.Region = "us-west-2" },
 		"model ID":       func(identity *DerivationIdentity) { identity.ModelID = "synthetic-model-v2" },
 		"max tokens":     func(identity *DerivationIdentity) { identity.MaxTokens++ },
-		"prompt version": func(identity *DerivationIdentity) { identity.PromptVersion = "extract-v2" },
+		"prompt version": func(identity *DerivationIdentity) { identity.PromptVersion = "extract-v3" },
 		"schema":         func(identity *DerivationIdentity) { identity.SchemaDigest = sha256.Sum256([]byte("changed schema")) },
 	}
 	for name, mutate := range tests {
@@ -1253,6 +1278,12 @@ func TestComputeDerivationDigestChangesWithMaterialExtractionConfiguration(t *te
 				t.Fatal("material extraction configuration reused derivation identity")
 			}
 		})
+	}
+}
+
+func TestExtractionDerivationNamespaceAdvancesPastSupersededIdentitySemantics(t *testing.T) {
+	if extractionDerivationDigestVersion != "stacks.extraction-derivation.v4" {
+		t.Fatalf("extractionDerivationDigestVersion = %q, want v4", extractionDerivationDigestVersion)
 	}
 }
 

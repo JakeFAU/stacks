@@ -63,6 +63,25 @@ func TestPromptVersionsAreEmbeddedAndExplicit(t *testing.T) {
 	}
 }
 
+func TestExtractionContractAdvancesPastSupersededIdentityAssociationSemantics(t *testing.T) {
+	if ExtractionPromptVersion != "extract-v2" {
+		t.Fatalf("ExtractionPromptVersion = %q, want cache-invalidating extract-v2", ExtractionPromptVersion)
+	}
+	if ExtractionSchemaName != "meeting_extraction_v2" {
+		t.Fatalf("ExtractionSchemaName = %q, want versioned schema identity", ExtractionSchemaName)
+	}
+	contract, err := PromptContract(ExtractionPromptVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(contract.JSONSchema, []byte(`"$id": "https://stacks.invalid/schemas/meeting-extraction-v2"`)) {
+		t.Fatal("extraction schema does not carry its v2 identity")
+	}
+	if !strings.Contains(contract.SystemPrompt, "email is only an untrusted proposal") {
+		t.Fatal("extraction prompt does not state the model-email trust boundary")
+	}
+}
+
 func TestPromptContractReturnsIsolatedReviewedPairings(t *testing.T) {
 	tests := []struct {
 		version    string

@@ -17,14 +17,14 @@ var (
 )
 
 const (
-	ExtractionPromptVersion = "extract-v1"
+	ExtractionPromptVersion = "extract-v2"
 	AnalysisPromptVersion   = "analyze-v1"
 
-	ExtractionSchemaName = "meeting_extraction"
+	ExtractionSchemaName = "meeting_extraction_v2"
 	AnalysisSchemaName   = "pair_analysis"
 )
 
-//go:embed prompts/extract-v1.txt
+//go:embed prompts/extract-v2.txt
 var extractionPrompt string
 
 //go:embed prompts/analyze-v1.txt
@@ -112,6 +112,7 @@ func AnalysisJSONSchema() []byte {
 
 var extractionJSONSchema = []byte(`{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stacks.invalid/schemas/meeting-extraction-v2",
   "type": "object",
   "additionalProperties": false,
   "required": ["meeting_date", "citations", "people", "statements", "signals"],

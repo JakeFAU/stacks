@@ -1,6 +1,7 @@
 package knowledge
 
 import (
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -112,6 +113,40 @@ func TestDocumentVersionDigestIgnoresProviderRevisionChurn(t *testing.T) {
 	}
 	if first.Digest() != second.Digest() {
 		t.Fatal("provider revision churn changed the immutable content identity")
+	}
+}
+
+func TestDocumentVersionRetainsRevisionInclusiveLegacyDigestForUpgradeLookup(t *testing.T) {
+	input := documentVersionInput([]source.Tab{sourceTab("t.transcript", "Transcript", "Alex: synthetic words")})
+	input.ProviderRevision = "docs-revision-1"
+	version, err := NewDocumentVersion(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := version.LegacyRevisionInclusiveDigest()
+	const expectedLegacyHex = "3cfec92c9511780154a2a0517ec094652350c23cb1fa588648b033ffee1d3f46"
+	if got := hex.EncodeToString(legacy[:]); got != expectedLegacyHex {
+		t.Fatalf("LegacyRevisionInclusiveDigest() = %q, want digest produced by 0d17789", got)
+	}
+	if legacy == version.Digest() {
+		t.Fatal("legacy revision-inclusive identity collided with stable content identity")
+	}
+
+	changedInput := input
+	changedInput.ProviderRevision = "docs-revision-2"
+	changed, err := NewDocumentVersion(changedInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Digest() != version.Digest() {
+		t.Fatal("stable content identity changed with provider revision")
+	}
+	if changed.LegacyRevisionInclusiveDigest() == legacy {
+		t.Fatal("legacy compatibility identity did not retain revision-inclusive behavior")
+	}
+	if changed.LegacyRevisionInclusiveDigestFor(input.ProviderRevision) != legacy {
+		t.Fatal("stored legacy revision could not reproduce the pre-upgrade digest after provider revision churn")
 	}
 }
 

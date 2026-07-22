@@ -42,6 +42,7 @@ type DocumentVersion struct {
 	sourceMeetingTime  *time.Time
 	recordedAt         time.Time
 	digest             ContentDigest
+	legacyDigest       ContentDigest
 	tabs               []source.Tab
 }
 
@@ -104,7 +105,8 @@ func NewDocumentVersion(input DocumentVersionInput) (DocumentVersion, error) {
 		recordedAt:         input.RecordedAt.UTC(),
 		tabs:               tabs,
 	}
-	version.digest = digestDocumentVersion(version)
+	version.digest = digestDocumentVersion(version, false)
+	version.legacyDigest = digestDocumentVersion(version, true)
 	return version, nil
 }
 
@@ -150,6 +152,23 @@ func (version DocumentVersion) RecordedAt() time.Time {
 // Digest returns the SHA-256 identity of the ordered tab structure and content.
 func (version DocumentVersion) Digest() ContentDigest {
 	return version.digest
+}
+
+// LegacyRevisionInclusiveDigest returns the exact document identity produced
+// before provider revision was correctly treated as optional provenance. It is
+// used only to attach the stable content identity to an existing immutable
+// version during upgrade; new source versions use Digest.
+func (version DocumentVersion) LegacyRevisionInclusiveDigest() ContentDigest {
+	return version.legacyDigest
+}
+
+// LegacyRevisionInclusiveDigestFor reproduces the former identity using a
+// stored immutable revision marker. This lets storage recognize unchanged
+// legacy content even when the provider returns a different ephemeral revision
+// during the first upgraded sync.
+func (version DocumentVersion) LegacyRevisionInclusiveDigestFor(providerRevision string) ContentDigest {
+	version.providerRevision = strings.TrimSpace(providerRevision)
+	return digestDocumentVersion(version, true)
 }
 
 // Tabs returns a deep copy of the document tabs in their user-visible order.
@@ -214,11 +233,14 @@ func validTabRole(role source.TabRole) bool {
 	}
 }
 
-func digestDocumentVersion(version DocumentVersion) ContentDigest {
+func digestDocumentVersion(version DocumentVersion, includeProviderRevision bool) ContentDigest {
 	hasher := sha256.New()
 	writeString(hasher, version.title)
 	writeString(hasher, version.locator)
 	writeString(hasher, version.providerVersion)
+	if includeProviderRevision {
+		writeString(hasher, version.providerRevision)
+	}
 	writeString(hasher, version.modifiedAt.UTC().Format(time.RFC3339Nano))
 	if version.sourceMeetingTime == nil {
 		writeString(hasher, "")

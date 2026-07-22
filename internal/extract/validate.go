@@ -67,15 +67,15 @@ type PersonMention struct {
 	CitationIDs []string `json:"citation_ids"`
 }
 
-// GroundedPersonIdentity is the deterministic identity evidence admitted from
-// one model proposal. Alias values are populated only when one exact cited
-// span associates the name with the optional email. A proposal grounded across
-// separate spans remains reviewable but cannot resolve or teach aliases.
+// GroundedPersonIdentity is the independently validated evidence retained from
+// one model proposal. ProposedEmail is auditable but never establishes that it
+// belongs to the named person; callers decide whether they possess a separate,
+// deterministic trusted-email source.
 type GroundedPersonIdentity struct {
-	EvidenceCitationID string
-	NormalizedName     string
-	NormalizedEmail    string
-	AliasesAdmissible  bool
+	NameEvidenceCitationID  string
+	EmailEvidenceCitationID string
+	NormalizedName          string
+	ProposedEmail           string
 }
 
 type AttributedStatement struct {
@@ -443,8 +443,9 @@ func validateGroundedPerson(index int, person PersonMention, citations map[strin
 	return nil
 }
 
-// GroundPersonIdentity returns the one exact citation admitted for durable
-// identity evidence. Callers must pass an already schema-validated proposal.
+// GroundPersonIdentity independently validates exact name and optional email
+// citations. Callers must pass an already schema-validated proposal; a
+// returned proposed email remains non-authoritative.
 func GroundPersonIdentity(person PersonMention, citations []Citation) (GroundedPersonIdentity, error) {
 	byID := make(map[string]Citation, len(citations))
 	for _, citation := range citations {
@@ -464,7 +465,7 @@ func groundedPersonIdentity(person PersonMention, citations map[string]Citation)
 	}
 
 	nameCitationID := ""
-	emailGrounded := normalizedEmail == ""
+	emailCitationID := ""
 	for _, citationID := range person.CitationIDs {
 		citation, exists := citations[citationID]
 		if !exists {
@@ -473,29 +474,23 @@ func groundedPersonIdentity(person PersonMention, citations map[string]Citation)
 		quoteName := entity.NormalizeName(citation.Quote)
 		quoteEmail := entity.NormalizeEmail(citation.Quote)
 		nameGrounded := containsGroundedNameIdentity(quoteName, normalizedSurface)
-		thisEmailGrounded := normalizedEmail == "" || containsBoundedEmailIdentity(quoteEmail, normalizedEmail)
 		if nameGrounded && nameCitationID == "" {
 			nameCitationID = citationID
 		}
-		if normalizedEmail != "" && thisEmailGrounded {
-			emailGrounded = true
-		}
-		if nameGrounded && thisEmailGrounded {
-			return GroundedPersonIdentity{
-				EvidenceCitationID: citationID,
-				NormalizedName:     normalizedSurface,
-				NormalizedEmail:    normalizedEmail,
-				AliasesAdmissible:  true,
-			}, nil
+		if normalizedEmail != "" && emailCitationID == "" && containsBoundedEmailIdentity(quoteEmail, normalizedEmail) {
+			emailCitationID = citationID
 		}
 	}
 	if nameCitationID == "" {
 		return GroundedPersonIdentity{}, fmt.Errorf("surface is not grounded in cited evidence")
 	}
-	if !emailGrounded {
+	if normalizedEmail != "" && emailCitationID == "" {
 		return GroundedPersonIdentity{}, fmt.Errorf("email is not grounded in cited evidence")
 	}
-	return GroundedPersonIdentity{EvidenceCitationID: nameCitationID}, nil
+	return GroundedPersonIdentity{
+		NameEvidenceCitationID: nameCitationID, EmailEvidenceCitationID: emailCitationID,
+		NormalizedName: normalizedSurface, ProposedEmail: normalizedEmail,
+	}, nil
 }
 
 func containsGroundedNameIdentity(text, value string) bool {

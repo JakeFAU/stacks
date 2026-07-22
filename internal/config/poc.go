@@ -8,7 +8,7 @@ import (
 
 const (
 	defaultBedrockMaxAttempts      = 5
-	defaultExtractionPromptVersion = "extract-v1"
+	defaultExtractionPromptVersion = "extract-v2"
 	defaultAnalysisPromptVersion   = "analyze-v1"
 	defaultIngestionLeaseDuration  = 5 * time.Minute
 	defaultIngestionAttemptTimeout = 4 * time.Minute

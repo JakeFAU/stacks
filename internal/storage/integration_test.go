@@ -112,25 +112,31 @@ func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(
 			{Key: "citation-bob", Span: bobSpan},
 		},
 		Mentions: []ingest.MentionRecord{{
-			Key: "mention-alex", EvidenceKey: "citation-alex", Surface: "Alex Reviewer", Role: "speaker",
+			Key: "mention-alex", EvidenceKey: "citation-alex", Surface: "Alex Reviewer",
+			NormalizedName: "alex reviewer", ProposedEmail: "bob.builder@synthetic.example",
+			ProposedEmailEvidenceKey: "citation-bob", Role: "speaker",
 		}},
 	}); err != nil {
 		t.Fatalf("complete pending unassociated identity: %v", err)
 	}
 
-	var proposalID, quote, normalizedName, normalizedEmail string
+	var proposalID, quote, normalizedName, normalizedEmail, proposedEmail, proposedEmailQuote string
 	if err := pool.QueryRow(ctx, `
-		SELECT proposal.id::text, span.quote, mention.normalized_name, mention.normalized_email
+		SELECT proposal.id::text, span.quote, mention.normalized_name, mention.normalized_email,
+		       mention.proposed_email, proposed_email_span.quote
 		FROM stacks.resolution_proposals AS proposal
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
+		JOIN stacks.evidence_spans AS proposed_email_span ON proposed_email_span.id = mention.proposed_email_evidence_span_id
 		WHERE mention.extraction_run_id = $1`, state.DerivationID).Scan(
-		&proposalID, &quote, &normalizedName, &normalizedEmail,
+		&proposalID, &quote, &normalizedName, &normalizedEmail, &proposedEmail, &proposedEmailQuote,
 	); err != nil {
 		t.Fatalf("load pending identity evidence: %v", err)
 	}
-	if quote != alexEvidence || normalizedName != "" || normalizedEmail != "" {
-		t.Fatalf("stored evidence/aliases = %q/%q/%q, want exact Alex evidence and no teachable aliases", quote, normalizedName, normalizedEmail)
+	if quote != alexEvidence || normalizedName != "alex reviewer" || normalizedEmail != "" ||
+		proposedEmail != "bob.builder@synthetic.example" || proposedEmailQuote != bobEvidence {
+		t.Fatalf("stored identity provenance = %q/%q/%q/%q/%q, want exact name/email evidence with no teachable email",
+			quote, normalizedName, normalizedEmail, proposedEmail, proposedEmailQuote)
 	}
 
 	acceptedEntityID := uuid.NewString()
@@ -145,13 +151,15 @@ func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(
 	}); err != nil {
 		t.Fatalf("accept pending unassociated identity: %v", err)
 	}
-	var aliasAssertions int
+	var nameAliasAssertions, emailAliasAssertions int
 	if err := pool.QueryRow(ctx, `
-		SELECT count(*) FROM stacks.entity_alias_assertions WHERE entity_id = $1`, acceptedEntityID).Scan(&aliasAssertions); err != nil {
+		SELECT count(*) FILTER (WHERE alias_type = 'name'),
+		       count(*) FILTER (WHERE alias_type = 'email')
+		FROM stacks.entity_alias_assertions WHERE entity_id = $1`, acceptedEntityID).Scan(&nameAliasAssertions, &emailAliasAssertions); err != nil {
 		t.Fatalf("count unassociated identity aliases: %v", err)
 	}
-	if aliasAssertions != 0 {
-		t.Fatalf("alias assertion count = %d, want unassociated identity unable to teach aliases", aliasAssertions)
+	if nameAliasAssertions != 1 || emailAliasAssertions != 0 {
+		t.Fatalf("name/email alias assertion counts = %d/%d, want name taught independently and model email kept pending", nameAliasAssertions, emailAliasAssertions)
 	}
 }
 
@@ -529,6 +537,188 @@ func TestLegacyAdmissionMigrationUpgradesPre00005RowsWithoutRewritingPayload(t *
 	}
 }
 
+func TestCompatibilityAdmissionMigrationUpgradesFullyMigrated00006Database(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	schemaName := "stacks_compat_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := `"` + schemaName + `"`
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatalf("create isolated compatibility schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+	})
+
+	for _, migration := range []string{
+		"00002_manager_confidence_poc.sql",
+		"00003_ingestion_processing_state.sql",
+		"00004_temporal_pair_analysis.sql",
+		"00005_manager_confidence_final_fixes.sql",
+		"00006_legacy_admission_boundary.sql",
+	} {
+		applyMigrationToSchema(t, pool, quotedSchema, migration)
+	}
+	unsafe := seedPost00006UnsafeRows(t, pool, quotedSchema)
+	applyMigrationToSchema(t, pool, quotedSchema, "00007_compatibility_admission_boundary.sql")
+
+	for _, row := range []struct {
+		table string
+		id    string
+	}{
+		{table: "extraction_runs", id: unsafe.extractionRunID},
+		{table: "mentions", id: unsafe.mentionID},
+		{table: "resolution_decisions", id: unsafe.decisionID},
+		{table: "observations", id: unsafe.observationID},
+		{table: "interaction_signals", id: unsafe.signalID},
+		{table: "analysis_runs", id: unsafe.analysisID},
+	} {
+		var admissible bool
+		if err := pool.QueryRow(ctx, "SELECT currently_admissible FROM "+quotedSchema+`."`+row.table+`" WHERE id = $1`, row.id).Scan(&admissible); err != nil {
+			t.Fatalf("load upgraded %s admission state: %v", row.table, err)
+		}
+		if admissible {
+			t.Fatalf("superseded-semantics %s row remained currently admissible", row.table)
+		}
+	}
+
+	var rationalePreserved, hypothesisPreserved, reportPreserved, normalizedEmailPreserved bool
+	if err := pool.QueryRow(ctx, `
+		SELECT signal.rationale = $4, run.hypothesis = $5,
+		       run.report_json = $6::jsonb, mention.normalized_email = $7
+		FROM `+quotedSchema+`.interaction_signals AS signal
+		CROSS JOIN `+quotedSchema+`.analysis_runs AS run
+		CROSS JOIN `+quotedSchema+`.mentions AS mention
+		WHERE signal.id = $1 AND run.id = $2 AND mention.id = $3`,
+		unsafe.signalID, unsafe.analysisID, unsafe.mentionID,
+		unsafe.rationale, unsafe.hypothesis, unsafe.reportJSON, unsafe.email,
+	).Scan(&rationalePreserved, &hypothesisPreserved, &reportPreserved, &normalizedEmailPreserved); err != nil {
+		t.Fatalf("load preserved superseded-semantics audit payload: %v", err)
+	}
+	if !rationalePreserved || !hypothesisPreserved || !reportPreserved || !normalizedEmailPreserved {
+		t.Fatalf("compatibility migration rewrote audit payload: rationale=%t hypothesis=%t report=%t email=%t",
+			rationalePreserved, hypothesisPreserved, reportPreserved, normalizedEmailPreserved)
+	}
+
+	var admittedAliases, admittedSignals, admittedAnalyses int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE decision.currently_admissible)
+		FROM `+quotedSchema+`.entity_alias_assertions AS assertion
+		JOIN `+quotedSchema+`.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		WHERE assertion.decision_id = $1`, unsafe.decisionID).Scan(&admittedAliases); err != nil {
+		t.Fatalf("count admitted superseded aliases: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM `+quotedSchema+`.interaction_signals AS signal
+		JOIN `+quotedSchema+`.observations AS observation ON observation.id = signal.observation_id
+		JOIN `+quotedSchema+`.extraction_runs AS run ON run.id = observation.extraction_run_id
+		WHERE signal.id = $1 AND signal.currently_admissible
+		  AND observation.currently_admissible AND run.currently_admissible`, unsafe.signalID).Scan(&admittedSignals); err != nil {
+		t.Fatalf("count admitted superseded signals: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM `+quotedSchema+`.analysis_runs
+		WHERE id = $1 AND state = 'complete' AND currently_admissible`, unsafe.analysisID).Scan(&admittedAnalyses); err != nil {
+		t.Fatalf("count admitted superseded analyses: %v", err)
+	}
+	if admittedAliases != 0 || admittedSignals != 0 || admittedAnalyses != 0 {
+		t.Fatalf("admitted alias/signal/analysis counts = %d/%d/%d, want zero", admittedAliases, admittedSignals, admittedAnalyses)
+	}
+
+	for _, table := range []string{
+		"extraction_runs", "mentions", "resolution_decisions", "observations", "interaction_signals", "analysis_runs",
+	} {
+		var columnDefault string
+		if err := pool.QueryRow(ctx, `
+			SELECT column_default FROM information_schema.columns
+			WHERE table_schema = $1 AND table_name = $2 AND column_name = 'currently_admissible'`,
+			schemaName, table).Scan(&columnDefault); err != nil {
+			t.Fatalf("load compatibility %s admission default: %v", table, err)
+		}
+		if columnDefault != "true" {
+			t.Fatalf("post-compatibility %s admission default = %q, want true", table, columnDefault)
+		}
+	}
+}
+
+type post00006UnsafeRows struct {
+	extractionRunID string
+	mentionID       string
+	decisionID      string
+	observationID   string
+	signalID        string
+	analysisID      string
+	email           string
+	rationale       string
+	hypothesis      string
+	reportJSON      string
+}
+
+func seedPost00006UnsafeRows(t *testing.T, pool *pgxpool.Pool, quotedSchema string) post00006UnsafeRows {
+	t.Helper()
+	ctx := context.Background()
+	unsafe := post00006UnsafeRows{
+		extractionRunID: uuid.NewString(), mentionID: uuid.NewString(), decisionID: uuid.NewString(),
+		observationID: uuid.NewString(), signalID: uuid.NewString(), analysisID: uuid.NewString(),
+		email:     "bob.builder@synthetic.example",
+		rationale: "Superseded model rationale.", hypothesis: "Superseded hidden-state hypothesis.",
+		reportJSON: `{"rationale":"superseded hidden-state report"}`,
+	}
+	sourceID := uuid.NewString()
+	versionID := uuid.NewString()
+	tabID := uuid.NewString()
+	spanID := uuid.NewString()
+	entityID := uuid.NewString()
+	proposalID := uuid.NewString()
+	ownerID := uuid.NewString()
+	recordedAt := time.Date(2026, time.July, 22, 1, 0, 0, 0, time.UTC)
+	digest := func(value string) []byte {
+		sum := sha256.Sum256([]byte(value))
+		return sum[:]
+	}
+
+	statements := []struct {
+		operation string
+		query     string
+		arguments []any
+	}{
+		{"source", "INSERT INTO " + quotedSchema + `.source_documents (id, provider, provider_document_id, title, locator, recorded_at) VALUES ($1, 'drive', 'post-00006-document', 'Synthetic', 'https://example.invalid/synthetic', $2)`, []any{sourceID, recordedAt}},
+		{"version", "INSERT INTO " + quotedSchema + `.document_versions (id, source_document_id, digest, title, locator, provider_version, provider_revision, provider_modified_at, recorded_at) VALUES ($1, $2, $3, 'Synthetic', 'https://example.invalid/synthetic', 'version-1', 'revision-1', $4, $4)`, []any{versionID, sourceID, digest("legacy-revision-inclusive-version"), recordedAt}},
+		{"tab", "INSERT INTO " + quotedSchema + `.document_tabs (id, document_version_id, provider_tab_id, title, title_path, display_order, role, content, content_digest) VALUES ($1, $2, 'tab-1', 'Transcript', ARRAY['Transcript'], 0, 'transcript', 'Alex Reviewer asked Bob Builder.', $3)`, []any{tabID, versionID, digest("tab")}},
+		{"span", "INSERT INTO " + quotedSchema + `.evidence_spans (id, document_tab_id, start_offset, end_offset, quote) VALUES ($1, $2, 0, 32, 'Alex Reviewer asked Bob Builder.')`, []any{spanID, tabID}},
+		{"entity", "INSERT INTO " + quotedSchema + `.entities (id, kind, display_name, recorded_at) VALUES ($1, 'person', 'Synthetic Person', $2)`, []any{entityID, recordedAt}},
+		{"run", "INSERT INTO " + quotedSchema + `.extraction_runs (id, document_version_id, derivation_digest, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, processing_status, completed_by_owner, recorded_at, completed_at, currently_admissible) VALUES ($1, $2, $3, 'synthetic-model', 'us-east-1', 256, 'extract-v1', $4, 'complete', $5, $6, $6, true)`, []any{unsafe.extractionRunID, versionID, digest("derivation-v3"), digest("schema-v1"), ownerID, recordedAt}},
+		{"mention", "INSERT INTO " + quotedSchema + `.mentions (id, evidence_span_id, extraction_run_id, surface, normalized_name, normalized_email, role, recorded_at, currently_admissible) VALUES ($1, $2, $3, 'Alex Reviewer', 'alex reviewer', $4, 'speaker', $5, true)`, []any{unsafe.mentionID, spanID, unsafe.extractionRunID, unsafe.email, recordedAt}},
+		{"proposal", "INSERT INTO " + quotedSchema + `.resolution_proposals (id, mention_id, status, derivation, recorded_at) VALUES ($1, $2, 'resolved', 'model_extraction', $3)`, []any{proposalID, unsafe.mentionID, recordedAt}},
+		{"decision", "INSERT INTO " + quotedSchema + `.resolution_decisions (id, proposal_id, outcome, entity_id, digest, recorded_at, currently_admissible) VALUES ($1, $2, 'accepted', $3, $4, $5, true)`, []any{unsafe.decisionID, proposalID, entityID, digest("decision"), recordedAt}},
+		{"alias", "INSERT INTO " + quotedSchema + `.entity_alias_assertions (decision_id, entity_id, normalized_value, alias_type, recorded_at) VALUES ($1, $2, $3, 'email', $4)`, []any{unsafe.decisionID, entityID, unsafe.email, recordedAt}},
+		{"observation", "INSERT INTO " + quotedSchema + `.observations (id, extraction_run_id, subject_entity_id, object_entity_id, subject_mention_id, object_mention_id, predicate, recorded_at, derivation, epistemic_status, digest, currently_admissible) VALUES ($1, $2, $3, $3, $4, $4, 'interaction_signal', $5, 'model_extraction', 'inferred', $6, true)`, []any{unsafe.observationID, unsafe.extractionRunID, entityID, unsafe.mentionID, recordedAt, digest("observation")}},
+		{"observation evidence", "INSERT INTO " + quotedSchema + `.observation_evidence (observation_id, evidence_span_id) VALUES ($1, $2)`, []any{unsafe.observationID, spanID}},
+		{"analysis", "INSERT INTO " + quotedSchema + `.analysis_runs (id, employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version, policy_version, state, recorded_at, completed_at, hypothesis, report_state, report_json, currently_admissible) VALUES ($1, $2, $2, $3, 'analyze-v1', 'manager-confidence-policy-v4', 'complete', $4, $4, $5, 'possible declining-confidence signal', $6::jsonb, true)`, []any{unsafe.analysisID, entityID, digest("analysis-v4"), recordedAt, unsafe.hypothesis, unsafe.reportJSON}},
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement.query, statement.arguments...); err != nil {
+			t.Fatalf("seed post-00006 unsafe %s: %v", statement.operation, err)
+		}
+	}
+
+	transaction, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("start post-00006 signal seed: %v", err)
+	}
+	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
+	if _, err := transaction.Exec(ctx, "INSERT INTO "+quotedSchema+`.interaction_signals (id, observation_id, category, direction, extraction_model_id, prompt_version, rationale, confidence, digest, currently_admissible) VALUES ($1, $2, 'delegation_autonomy', 'weakening', 'synthetic-model', 'extract-v1', $3, 0.9, $4, true)`, unsafe.signalID, unsafe.observationID, unsafe.rationale, digest("signal")); err != nil {
+		t.Fatalf("seed post-00006 unsafe signal: %v", err)
+	}
+	if _, err := transaction.Exec(ctx, "INSERT INTO "+quotedSchema+`.signal_evidence (signal_id, evidence_span_id, role) VALUES ($1, $2, 'supporting')`, unsafe.signalID, spanID); err != nil {
+		t.Fatalf("seed post-00006 unsafe signal evidence: %v", err)
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		t.Fatalf("commit post-00006 unsafe signal: %v", err)
+	}
+	return unsafe
+}
+
 type pre00005AuditRows struct {
 	mentionID         string
 	decisionID        string
@@ -645,6 +835,96 @@ func TestPutDocumentVersionIsIdempotent(t *testing.T) {
 	}
 	if second.ID != first.ID {
 		t.Fatalf("repeated document version ID = %q, want %q", second.ID, first.ID)
+	}
+}
+
+func TestPutDocumentVersionReusesRevisionInclusiveLegacyDigestAcrossUpgrade(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	providerDocumentID := testIdentifier("document-legacy-digest-compatibility")
+	newVersion := func(revision string) knowledge.DocumentVersion {
+		version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+			Provider: "synthetic-drive", ProviderDocumentID: providerDocumentID,
+			Title:           "Synthetic compatibility meeting",
+			Locator:         "https://docs.example.invalid/document/" + providerDocumentID,
+			ProviderVersion: "synthetic-version-1", ProviderRevision: revision,
+			ModifiedAt: time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
+			RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
+			Tabs: []source.Tab{{
+				ID: "tab-synthetic", Title: "Synthetic Transcript", Path: []string{"Synthetic Transcript"},
+				Order: 0, Role: source.TabRoleTranscript, Text: "Synthetic compatibility text.",
+			}},
+		})
+		if err != nil {
+			t.Fatalf("new compatibility document version: %v", err)
+		}
+		return version
+	}
+	legacyVersion := newVersion("synthetic-revision-1")
+	legacyDigest := legacyVersion.LegacyRevisionInclusiveDigest()
+	sourceID := uuid.NewString()
+	legacyVersionID := uuid.NewString()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO stacks.source_documents (id, provider, provider_document_id, title, locator, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, $6)`, sourceID, legacyVersion.Provider(), legacyVersion.ProviderDocumentID(),
+		legacyVersion.Title(), legacyVersion.Locator(), legacyVersion.RecordedAt()); err != nil {
+		t.Fatalf("seed legacy source document: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO stacks.document_versions
+			(id, source_document_id, digest, title, locator, provider_version, provider_revision,
+			 provider_modified_at, source_meeting_time, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		legacyVersionID, sourceID, legacyDigest[:], legacyVersion.Title(), legacyVersion.Locator(),
+		legacyVersion.ProviderVersion(), legacyVersion.ProviderRevision(), legacyVersion.ModifiedAt(),
+		legacyVersion.SourceMeetingTime(), legacyVersion.RecordedAt()); err != nil {
+		t.Fatalf("seed legacy document version: %v", err)
+	}
+	for _, tab := range legacyVersion.Tabs() {
+		contentDigest := sha256.Sum256([]byte(tab.Text))
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO stacks.document_tabs
+				(document_version_id, provider_tab_id, title, parent_provider_tab_id, title_path,
+				 display_order, role, content, content_digest)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, legacyVersionID, tab.ID, tab.Title,
+			tab.ParentID, tab.Path, tab.Order, string(tab.Role), tab.Text, contentDigest[:]); err != nil {
+			t.Fatalf("seed legacy document tab: %v", err)
+		}
+	}
+
+	repository := NewDocumentRepository(pool)
+	revisionChurned := newVersion("synthetic-revision-2")
+	first, created, err := repository.PutDocumentVersion(ctx, revisionChurned)
+	if err != nil {
+		t.Fatalf("reuse legacy digest on first upgraded sync: %v", err)
+	}
+	if created || first.ID != legacyVersionID {
+		t.Fatalf("first upgraded write = (%q, created=%t), want legacy version %q reused", first.ID, created, legacyVersionID)
+	}
+
+	second, created, err := repository.PutDocumentVersion(ctx, revisionChurned)
+	if err != nil {
+		t.Fatalf("reuse stable compatibility identity after revision churn: %v", err)
+	}
+	if created || second.ID != legacyVersionID {
+		t.Fatalf("revision-churned write = (%q, created=%t), want legacy version %q reused", second.ID, created, legacyVersionID)
+	}
+
+	var versionCount int
+	var stableDigest []byte
+	var storedRevision string
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM stacks.document_versions WHERE source_document_id = $1`, sourceID).Scan(&versionCount); err != nil {
+		t.Fatalf("count upgraded content versions: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT content_digest_v2, provider_revision
+		FROM stacks.document_versions WHERE id = $1`, legacyVersionID).Scan(&stableDigest, &storedRevision); err != nil {
+		t.Fatalf("load upgraded content identity: %v", err)
+	}
+	currentDigest := legacyVersion.Digest()
+	if versionCount != 1 || string(stableDigest) != string(currentDigest[:]) || storedRevision != "synthetic-revision-1" {
+		t.Fatalf("upgraded version count/digest/revision = %d/%x/%q, want one stable alias and immutable original provenance",
+			versionCount, stableDigest, storedRevision)
 	}
 }
 

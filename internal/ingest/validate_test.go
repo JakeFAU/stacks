@@ -104,8 +104,9 @@ func TestValidateForPersistenceRejectsIdentityNotGroundedInSelectedEvidence(t *t
 		},
 		{
 			Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic",
-			NormalizedName: "synthetic", NormalizedEmail: "bob.builder@synthetic.example",
-			Role: "speaker",
+			NormalizedName: "synthetic", ProposedEmail: "bob.builder@synthetic.example",
+			ProposedEmailEvidenceKey: "citation-1",
+			Role:                     "speaker",
 		},
 	}
 	for _, mention := range tests {

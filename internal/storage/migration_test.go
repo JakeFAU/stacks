@@ -186,6 +186,38 @@ func TestLegacyAdmissionMigrationMarksPreFixDerivedRowsNonAdmissible(t *testing.
 	}
 }
 
+func TestCompatibilityAdmissionMigrationInvalidatesSupersededSemanticsWithoutRewritingAudit(t *testing.T) {
+	migration := readCompatibilityAdmissionMigration(t)
+	for _, required := range []string{
+		"ADD COLUMN content_digest_v2 bytea",
+		"ADD COLUMN proposed_email text NOT NULL DEFAULT ''",
+		"ADD COLUMN proposed_email_evidence_span_id uuid REFERENCES stacks.evidence_spans(id)",
+		"UPDATE stacks.extraction_runs",
+		"UPDATE stacks.mentions",
+		"UPDATE stacks.resolution_decisions",
+		"UPDATE stacks.observations",
+		"UPDATE stacks.interaction_signals",
+		"UPDATE stacks.analysis_runs",
+		"SET currently_admissible = false",
+	} {
+		if !strings.Contains(migration, required) {
+			t.Fatalf("compatibility admission migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"SET rationale =",
+		"SET hypothesis =",
+		"SET report_json =",
+		"SET normalized_email =",
+		"DELETE FROM",
+		"-- +goose Down",
+	} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("compatibility admission migration rewrites immutable audit history with %q", forbidden)
+		}
+	}
+}
+
 func readManagerConfidenceMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00002_manager_confidence_poc.sql")
@@ -209,6 +241,16 @@ func readFinalIntegrationMigration(t *testing.T) string {
 func readLegacyAdmissionMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00006_legacy_admission_boundary.sql")
+	migration, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", path, err)
+	}
+	return string(migration)
+}
+
+func readCompatibilityAdmissionMigration(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join("..", "..", "db", "migrations", "00007_compatibility_admission_boundary.sql")
 	migration, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration %q: %v", path, err)

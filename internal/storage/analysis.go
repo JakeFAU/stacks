@@ -160,10 +160,15 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairIdentity(ctx context.Context, 
 	decisionRows, err := snapshot.transaction.Query(ctx, `
 		SELECT decision.entity_id::text, decision.id::text, decision.digest
 		FROM stacks.resolution_decisions AS decision
+		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
 		JOIN stacks.entities AS entity ON entity.id = decision.entity_id
 		WHERE decision.superseded_by_id IS NULL
 		  AND decision.outcome IN ('accepted', 'created')
 		  AND decision.currently_admissible
+		  AND mention.currently_admissible
+		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
 		  AND entity.kind = 'person'
 		  AND decision.entity_id = ANY($2::uuid[])
 		ORDER BY CASE WHEN decision.entity_id = $1::uuid THEN 0 ELSE 1 END,
@@ -203,10 +208,14 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 		WITH effective_decisions AS (
 			SELECT proposal.mention_id, decision.id, decision.entity_id, decision.digest
 			FROM stacks.resolution_proposals AS proposal
+			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+			LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
 			JOIN stacks.resolution_decisions AS decision ON decision.proposal_id = proposal.id
 			WHERE decision.superseded_by_id IS NULL
 			  AND decision.outcome IN ('accepted', 'created')
 			  AND decision.currently_admissible
+			  AND mention.currently_admissible
+			  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
 		), eligible_signals AS (
 			SELECT signal.id AS signal_id,
 			       signal.digest AS signal_digest,
@@ -805,12 +814,17 @@ func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalys
 		var storedDigest []byte
 		var entityID string
 		err := queryer.QueryRow(ctx, `
-			SELECT digest, entity_id::text
-			FROM stacks.resolution_decisions
-			WHERE id = $1
-			  AND superseded_by_id IS NULL
-			  AND outcome IN ('accepted', 'created')
-			  AND currently_admissible
+			SELECT decision.digest, decision.entity_id::text
+			FROM stacks.resolution_decisions AS decision
+			JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+			LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+			WHERE decision.id = $1
+			  AND decision.superseded_by_id IS NULL
+			  AND decision.outcome IN ('accepted', 'created')
+			  AND decision.currently_admissible
+			  AND mention.currently_admissible
+			  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
 			FOR SHARE`, input.ID).Scan(&storedDigest, &entityID)
 		if err == pgx.ErrNoRows {
 			return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)

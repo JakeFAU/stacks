@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -30,6 +31,7 @@ type StoredEvidenceSpan struct {
 
 type documentQueryer interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
@@ -104,20 +106,28 @@ func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, ve
 
 	var stored StoredDocumentVersion
 	digest := version.Digest()
+	stored, exists, err := repository.findCompatibleDocumentVersion(ctx, sourceDocumentID, version)
+	if err != nil {
+		return StoredDocumentVersion{}, false, err
+	}
+	if exists {
+		return stored, false, nil
+	}
 	err = repository.query.QueryRow(ctx, `
 		INSERT INTO stacks.document_versions
 			(source_document_id, digest, title, locator, provider_version, provider_revision,
-			 provider_modified_at, source_meeting_time, recorded_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		ON CONFLICT (source_document_id, digest) DO NOTHING
+			 provider_modified_at, source_meeting_time, recorded_at, content_digest_v2)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $2)
+		ON CONFLICT DO NOTHING
 		RETURNING id`, sourceDocumentID, digest[:], version.Title(), version.Locator(),
 		version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt(), version.SourceMeetingTime(), version.RecordedAt()).Scan(&stored.ID)
 	if err == pgx.ErrNoRows {
-		err = repository.query.QueryRow(ctx, `
-			SELECT id FROM stacks.document_versions
-			WHERE source_document_id = $1 AND digest = $2`, sourceDocumentID, digest[:]).Scan(&stored.ID)
+		stored, exists, err = repository.findCompatibleDocumentVersion(ctx, sourceDocumentID, version)
 		if err != nil {
-			return StoredDocumentVersion{}, false, fmt.Errorf("load document version %q: %w", version.Digest().String(), err)
+			return StoredDocumentVersion{}, false, err
+		}
+		if !exists {
+			return StoredDocumentVersion{}, false, fmt.Errorf("load document version %q: version does not exist", version.Digest().String())
 		}
 		return stored, false, nil
 	}
@@ -129,6 +139,72 @@ func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, ve
 		if err := repository.putTab(ctx, stored.ID, tab); err != nil {
 			return StoredDocumentVersion{}, false, fmt.Errorf("persist document version %q: %w", stored.ID, err)
 		}
+	}
+	return stored, true, nil
+}
+
+func (repository *DocumentRepository) findCompatibleDocumentVersion(
+	ctx context.Context,
+	sourceDocumentID string,
+	version knowledge.DocumentVersion,
+) (StoredDocumentVersion, bool, error) {
+	stableDigest := version.Digest()
+	legacyDigest := version.LegacyRevisionInclusiveDigest()
+	var stored StoredDocumentVersion
+	err := repository.query.QueryRow(ctx, `
+		SELECT id
+		FROM stacks.document_versions
+		WHERE source_document_id = $1
+		  AND (content_digest_v2 = $2 OR digest = $2 OR digest = $3)
+		ORDER BY CASE
+			WHEN content_digest_v2 = $2 THEN 0
+			WHEN digest = $2 THEN 1
+			ELSE 2
+		END, id
+		LIMIT 1`, sourceDocumentID, stableDigest[:], legacyDigest[:]).Scan(&stored.ID)
+	if err == pgx.ErrNoRows {
+		rows, queryErr := repository.query.Query(ctx, `
+			SELECT id, digest, provider_revision
+			FROM stacks.document_versions
+			WHERE source_document_id = $1 AND content_digest_v2 IS NULL
+			ORDER BY recorded_at, id`, sourceDocumentID)
+		if queryErr != nil {
+			return StoredDocumentVersion{}, false, fmt.Errorf("load legacy document version candidates %q: %w", stableDigest.String(), queryErr)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var candidateID, storedRevision string
+			var storedDigest []byte
+			if scanErr := rows.Scan(&candidateID, &storedDigest, &storedRevision); scanErr != nil {
+				return StoredDocumentVersion{}, false, fmt.Errorf("scan legacy document version candidate %q: %w", stableDigest.String(), scanErr)
+			}
+			expected := version.LegacyRevisionInclusiveDigestFor(storedRevision)
+			if bytes.Equal(storedDigest, expected[:]) {
+				stored.ID = candidateID
+				break
+			}
+		}
+		rows.Close()
+		if rowsErr := rows.Err(); rowsErr != nil {
+			return StoredDocumentVersion{}, false, fmt.Errorf("iterate legacy document version candidates %q: %w", stableDigest.String(), rowsErr)
+		}
+		if stored.ID == "" {
+			return StoredDocumentVersion{}, false, nil
+		}
+		err = nil
+	}
+	if err != nil {
+		return StoredDocumentVersion{}, false, fmt.Errorf("load compatible document version %q: %w", stableDigest.String(), err)
+	}
+	result, err := repository.query.Exec(ctx, `
+		UPDATE stacks.document_versions
+		SET content_digest_v2 = $2
+		WHERE id = $1 AND (content_digest_v2 IS NULL OR content_digest_v2 = $2)`, stored.ID, stableDigest[:])
+	if err != nil {
+		return StoredDocumentVersion{}, false, fmt.Errorf("attach stable content identity to document version %q: %w", stored.ID, err)
+	}
+	if result.RowsAffected() != 1 {
+		return StoredDocumentVersion{}, false, fmt.Errorf("attach stable content identity to document version %q: immutable identity conflicts", stored.ID)
 	}
 	return stored, true, nil
 }
@@ -159,7 +235,7 @@ func (repository *DocumentRepository) PutEvidenceSpan(ctx context.Context, span 
 		JOIN stacks.source_documents AS document ON document.id = version.source_document_id
 		WHERE document.provider = $4
 			AND document.provider_document_id = $5
-			AND version.digest = $6
+			AND (version.content_digest_v2 = $6 OR (version.content_digest_v2 IS NULL AND version.digest = $6))
 			AND tab.provider_tab_id = $7
 		ON CONFLICT (document_tab_id, start_offset, end_offset) DO NOTHING
 		RETURNING id`,
@@ -174,7 +250,7 @@ func (repository *DocumentRepository) PutEvidenceSpan(ctx context.Context, span 
 			JOIN stacks.source_documents AS document ON document.id = version.source_document_id
 			WHERE document.provider = $1
 				AND document.provider_document_id = $2
-				AND version.digest = $3
+				AND (version.content_digest_v2 = $3 OR (version.content_digest_v2 IS NULL AND version.digest = $3))
 				AND tab.provider_tab_id = $4
 				AND span.start_offset = $5
 				AND span.end_offset = $6`,
@@ -441,25 +517,36 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, derivatio
 		var mentionID string
 		normalizedName := record.NormalizedName
 		if normalizedName == "" {
-			if record.NormalizedEmail != "" || record.Resolution.AutoResolved || record.Resolution.EntityID != "" {
+			if record.ProposedEmail != "" || record.ProposedEmailEvidenceKey != "" || record.Resolution.AutoResolved || record.Resolution.EntityID != "" {
 				return nil, fmt.Errorf("persist ingestion mention: normalized identity is invalid")
 			}
-		} else if normalizedName != entity.NormalizeName(record.Surface) ||
-			record.NormalizedEmail != entity.NormalizeEmail(record.NormalizedEmail) ||
-			(record.NormalizedEmail != "" && !entity.ValidEmail(record.NormalizedEmail)) {
+		} else if normalizedName != entity.NormalizeName(record.Surface) {
 			return nil, fmt.Errorf("persist ingestion mention: normalized identity is invalid")
+		}
+		var proposedEmailEvidenceID *string
+		if record.ProposedEmail != "" {
+			emailEvidenceID, exists := evidenceIDs[record.ProposedEmailEvidenceKey]
+			if !exists || record.ProposedEmail != entity.NormalizeEmail(record.ProposedEmail) || !entity.ValidEmail(record.ProposedEmail) {
+				return nil, fmt.Errorf("persist ingestion mention: proposed email evidence is invalid")
+			}
+			proposedEmailEvidenceID = &emailEvidenceID
+		} else if record.ProposedEmailEvidenceKey != "" {
+			return nil, fmt.Errorf("persist ingestion mention: proposed email evidence is invalid")
 		}
 		err := transaction.QueryRow(ctx, `
 			INSERT INTO stacks.mentions
-				(extraction_run_id, evidence_span_id, surface, normalized_name, normalized_email, role, recorded_at,
-				 currently_admissible)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, true)
+				(extraction_run_id, evidence_span_id, surface, normalized_name, normalized_email,
+				 proposed_email, proposed_email_evidence_span_id, role, recorded_at, currently_admissible)
+			VALUES ($1, $2, $3, $4, '', $5, $6, $7, $8, true)
 			ON CONFLICT (extraction_run_id, evidence_span_id, surface, role)
 				WHERE extraction_run_id IS NOT NULL
 			DO UPDATE
 			SET normalized_name = EXCLUDED.normalized_name,
-				normalized_email = EXCLUDED.normalized_email
-			RETURNING id`, derivationID, evidenceID, record.Surface, normalizedName, record.NormalizedEmail, record.Role, time.Now().UTC()).Scan(&mentionID)
+				normalized_email = '',
+				proposed_email = EXCLUDED.proposed_email,
+				proposed_email_evidence_span_id = EXCLUDED.proposed_email_evidence_span_id
+			RETURNING id`, derivationID, evidenceID, record.Surface, normalizedName,
+			record.ProposedEmail, proposedEmailEvidenceID, record.Role, time.Now().UTC()).Scan(&mentionID)
 		if err != nil {
 			return nil, fmt.Errorf("persist ingestion mention: %w", err)
 		}

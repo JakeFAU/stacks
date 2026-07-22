@@ -433,7 +433,9 @@ func TestValidateEffectivePairDecisionsLocksAndAcceptsCurrentPair(t *testing.T) 
 	for _, query := range queryer.queries {
 		if !strings.Contains(query, "superseded_by_id IS NULL") ||
 			!strings.Contains(query, "outcome IN ('accepted', 'created')") ||
-			!strings.Contains(query, "currently_admissible") ||
+			!strings.Contains(query, "decision.currently_admissible") ||
+			!strings.Contains(query, "mention.currently_admissible") ||
+			!strings.Contains(query, "extraction_run.currently_admissible") ||
 			!strings.Contains(query, "FOR SHARE") {
 			t.Fatalf("decision validation query does not filter and lock current accepted input: %s", query)
 		}
