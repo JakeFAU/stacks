@@ -16,9 +16,10 @@ counterevidence, uncertainty, gaps, and citations visible.
 - Docker with Compose
 - a Google installed-application OAuth client with read-only Drive and Docs
   access
-- AWS credentials available through the default credential chain or an
-  optional shared profile, an explicit region, and a Bedrock model or inference
-  profile
+- one explicitly selected model provider: an OpenAI API key, an Anthropic API
+  key, or AWS credentials available through the default credential chain or an
+  optional shared profile
+- an explicit compatible model ID; Bedrock also requires an explicit AWS region
 
 ## Configure the local environment
 
@@ -65,11 +66,15 @@ implemented.
 | `STACKS_GOOGLE_OAUTH_TOKEN_FILE` | no default | External owner-only OAuth token JSON path |
 | `STACKS_TRANSCRIPT_TITLES` | no default | Comma-separated exact transcript titles after case/whitespace normalization |
 | `STACKS_NOTES_TITLES` | no default | Comma-separated exact Gemini-notes titles after normalization |
+| `STACKS_DATA_MODE` | no default | Explicit disclosure mode: `personal` or `restricted` |
+| `STACKS_MODEL_PROVIDER` | no default | Explicit provider: `bedrock`, `openai`, or `anthropic` |
+| `STACKS_MODEL_ID` | no default | Provider model or inference-profile ID; no model is guessed |
+| `STACKS_MODEL_MAX_OUTPUT_TOKENS` | no default | Required positive output-token limit for `sync` and `analyze` |
+| `STACKS_MODEL_MAX_ATTEMPTS` | `5` | Positive retry-attempt bound, at most `5` |
+| `OPENAI_API_KEY` | no default | Personal-mode OpenAI credential; keep only in the ignored `.env` |
+| `ANTHROPIC_API_KEY` | no default | Personal-mode Anthropic credential; keep only in the ignored `.env` |
 | `STACKS_AWS_PROFILE` | no default | Optional shared AWS profile; all AWS commands use the default credential chain when unset |
-| `STACKS_AWS_REGION` | no default | Explicit Bedrock control-plane and runtime region |
-| `STACKS_BEDROCK_MODEL_ID` | no default | Foundation-model or inference-profile ID; no model is guessed |
-| `STACKS_BEDROCK_MAX_TOKENS` | no default | Required positive output-token limit for every invocation |
-| `STACKS_BEDROCK_MAX_ATTEMPTS` | `5` | Positive bound for retryable model failures |
+| `STACKS_AWS_REGION` | no default | Bedrock-only control-plane and runtime region |
 | `STACKS_INGEST_LEASE_DURATION` | `5m` | Positive extraction-claim duration, bounded to at most `1h` |
 | `STACKS_INGEST_ATTEMPT_TIMEOUT` | `4m` | Per-document attempt deadline; must leave at least `5s` before the extraction lease expires |
 | `STACKS_EXTRACTION_PROMPT_VERSION` | `extract-v2` | Versioned extraction prompt; v2 keeps model-proposed email non-authoritative |
@@ -83,6 +88,101 @@ by Compose and migrations, so they intentionally have no example values.
 used by repository integration tests. `STACKS_TEST_MIGRATION_DATABASE_URL` is
 the schema-capable admin-role input used only by isolated forward-migration
 upgrade tests. Both are used only by the integration-test target.
+
+## Model provider operation
+
+`STACKS_DATA_MODE`, `STACKS_MODEL_PROVIDER`, and `STACKS_MODEL_ID` have no
+defaults. Configure one provider deliberately; Stacks has no provider or model
+fallback. Direct OpenAI and Anthropic operation is permitted only in `personal`
+mode. `restricted` mode permits only Bedrock.
+
+For every personal-provider run, the folder selected by
+`STACKS_GOOGLE_FOLDER_ID` must be a synthetic-only disclosure boundary. Every
+in-scope direct-child Google Doc and every tab must contain synthetic test
+content. Do not copy company documents or other private source material into
+that folder. Stacks does not create this corpus or broaden the existing
+read-only Google OAuth scopes.
+
+`make doctor` is metadata/readiness-only and never invokes a model. It checks
+the database, a bounded representative Google Doc, provider credentials, and
+non-invoking model metadata; for restricted Bedrock it also inspects invocation
+logging. It does not prove that a paid runtime request will succeed.
+
+The paid runtime acceptance is a separate, explicit action. Before `make sync` or
+`make analyze`, obtain approval for paid provider calls, select only one
+provider, restrict the configured folder to the smallest synthetic corpus
+needed, and set deliberate `STACKS_MODEL_MAX_OUTPUT_TOKENS` and
+`STACKS_MODEL_MAX_ATTEMPTS` bounds. `make sync` and `make analyze` may invoke the
+selected model; `make doctor` does not.
+
+### Personal OpenAI operation
+
+Set these values in the ignored `.env`, replacing the placeholders with an
+explicit compatible model and a local secret:
+
+```dotenv
+STACKS_DATA_MODE=personal
+STACKS_MODEL_PROVIDER=openai
+STACKS_MODEL_ID=replace-with-explicit-openai-model
+STACKS_MODEL_MAX_OUTPUT_TOKENS=2048
+STACKS_MODEL_MAX_ATTEMPTS=1
+OPENAI_API_KEY=replace-with-local-secret
+```
+
+Run `make doctor` first. After separately approving the bounded paid runtime
+acceptance, run `make sync` and then `make analyze` through the normal workflow.
+Each OpenAI Responses request is stateless and sets `store: false`. That request
+setting disables Responses application-state storage; it is not a contractual
+Zero Data Retention agreement and does not establish an organization-level
+retention guarantee.
+
+### Personal Anthropic operation
+
+Set these values in the ignored `.env`, again using an explicit compatible
+model and a local secret:
+
+```dotenv
+STACKS_DATA_MODE=personal
+STACKS_MODEL_PROVIDER=anthropic
+STACKS_MODEL_ID=replace-with-explicit-anthropic-model
+STACKS_MODEL_MAX_OUTPUT_TOKENS=2048
+STACKS_MODEL_MAX_ATTEMPTS=1
+ANTHROPIC_API_KEY=replace-with-local-secret
+```
+
+Run `make doctor` first. After separately approving the bounded paid runtime
+acceptance, run `make sync` and then `make analyze`. Anthropic uses stateless
+Messages requests with native JSON-schema output. This implementation does not
+establish a contractual provider-retention guarantee.
+
+### Restricted Bedrock operation
+
+Set restricted mode, Bedrock, an explicit model or inference-profile ID, and an
+explicit region. `STACKS_AWS_PROFILE` is optional; when empty, the AWS SDK uses
+its default credential chain.
+
+```dotenv
+STACKS_DATA_MODE=restricted
+STACKS_MODEL_PROVIDER=bedrock
+STACKS_MODEL_ID=replace-with-explicit-bedrock-model-or-inference-profile
+STACKS_MODEL_MAX_OUTPUT_TOKENS=2048
+STACKS_MODEL_MAX_ATTEMPTS=1
+STACKS_AWS_PROFILE=
+STACKS_AWS_REGION=replace-with-explicit-region
+```
+
+Run `make doctor` to inspect readiness and the account-level Bedrock model
+invocation-logging configuration without invoking the model or changing AWS
+configuration. Restricted `sync` and `analyze` fail closed unless logging is
+confirmed `disabled`. `enabled`, `unknown`, access denied, timeout, or any
+inspection failure stops the command; restricted `sync` performs this check
+before Google authorization or source discovery. Only after the check succeeds
+and paid calls are explicitly approved should the model-invoking workflow run.
+
+Local tests and personal-provider acceptance do not validate Bedrock runtime
+quota, company Google Drive OAuth/IAM, Bedrock logging-inspection permission in
+the target account, or organization approval for company-IP processing. Keep
+those as separate acceptance gates.
 
 ## Database and command workflow
 
@@ -117,21 +217,22 @@ make analyze
 
 `stacks doctor` is read-only. It checks PostgreSQL connectivity and the complete
 required set of applied migrations; Google OAuth material, configured-folder
-access, and one representative all-tabs classification; AWS credentials;
-configured Bedrock model or inference-profile control-plane availability; and
-account-level model invocation logging when inspectable. It never runs OAuth,
-applies migrations, syncs or persists graph data, extracts content, invokes a
-model, changes configuration, or enables/disables logging. Missing or expired
-Google authorization directs the operator to `stacks auth google`.
+access, and one representative all-tabs classification; selected-provider
+credentials; non-invoking model metadata; and restricted Bedrock invocation
+logging. It never runs OAuth, applies migrations, syncs or persists graph data,
+extracts content, invokes a model, changes configuration, or enables/disables
+logging. Missing or expired Google authorization directs the operator to
+`stacks auth google`.
 
 Migration 9 grants the application role only the schema usage and table read
 access needed to inspect Goose migration status. It does not grant schema
 creation, migration ownership, or broader database administration rights.
 
 Doctor requires only the database, Google folder and OAuth paths, tab-title
-sets, AWS region, and model or inference-profile ID. An AWS profile is optional,
-and model invocation limits, retry settings, prompt versions, and pair IDs are
-not part of its read-only preflight contract.
+sets, explicit data mode, provider, model ID, and the selected provider's
+credential settings. An AWS profile is optional for Bedrock. Model invocation
+limits, retry settings, prompt versions, and pair IDs are not part of its
+read-only preflight contract.
 
 If AWS credential validation fails, refresh credentials in the active default
 credential chain or the explicitly configured shared profile. Doctor does not
@@ -139,11 +240,11 @@ assume that a profile is configured.
 
 Sync claims each exact source-version and extraction-configuration derivation
 for `STACKS_INGEST_LEASE_DURATION`. A concurrent sync reports that document as
-incomplete/busy without invoking Bedrock. Failed attempts release their claim;
-an interrupted process can be retried after the finite lease expires. Changing
-the Bedrock region, model ID, token limit, prompt version, or extraction schema
-creates a new auditable extraction run while retaining the immutable source
-version and earlier derivations.
+incomplete/busy without invoking the selected model. Failed attempts release
+their claim; an interrupted process can be retried after the finite lease
+expires. Changing the provider, Bedrock region, model ID, token limit, prompt
+version, or extraction schema creates a new auditable extraction run while
+retaining the immutable source version and earlier derivations.
 
 This build supports exactly `extract-v2` and `analyze-v1`. Explicit older or
 unknown prompt-version settings fail before Google, AWS, Bedrock, or PostgreSQL
@@ -174,11 +275,11 @@ derivation contract changed. A Drive revision-marker change alone therefore
 does not create a duplicate source version. The original revision remains
 immutable provenance.
 
-The Bedrock availability check does not invoke the model and therefore cannot
-prove runtime quota, throughput, or successful inference. An account with zero
-applicable quota can pass a control-plane availability check and still fail
-`sync` or `analyze`. Treat that as not live-validated until an authorized
-invocation succeeds.
+Doctor's provider availability checks do not invoke a model and therefore
+cannot prove runtime quota, throughput, compatible structured output, or
+successful inference. A credential and model metadata check can pass while
+`sync` or `analyze` still fails. Treat runtime behavior as not live-validated
+until an explicitly authorized invocation succeeds.
 
 ## Tab and evidence rules
 
@@ -238,14 +339,19 @@ earlier/later evidence are structural admission requirements, not proof of
 hidden state. Confidence describes extraction uncertainty and never selects
 truth or erases conflict.
 
-## Privacy and Bedrock disclosure
+## Privacy and model disclosure
 
-Sync and analysis send private transcript material to the configured Bedrock
-model boundary. Stacks does not enable Bedrock model invocation logging, but an
-AWS organization or account can configure it externally. When enabled, full
-model inputs and outputs may be captured in CloudWatch Logs or S3. Doctor
-reports `disabled`, `enabled`, or `unknown`; `unknown`, including an
-AccessDenied inspection result, must never be treated as safe.
+Sync and analysis send transcript material to the selected model provider.
+Personal OpenAI and Anthropic runs are therefore limited to the synthetic-only
+folder described above. OpenAI requests set `store: false`; Anthropic requests
+use stateless Messages. Neither behavior is evidence of a contractual retention
+guarantee.
+
+Stacks does not enable Bedrock model invocation logging, but an AWS organization
+or account can configure it externally. When enabled, full model inputs and
+outputs may be captured in CloudWatch Logs or S3. Doctor reports `disabled`,
+`enabled`, or `unknown`; `unknown`, including an AccessDenied inspection result,
+must never be treated as safe for restricted operation.
 
 Operational logs, metrics, and traces exclude transcript and notes text,
 prompts, raw model output, names, emails, Drive titles and URLs, credentials,
@@ -294,15 +400,22 @@ set -a; . ./.env; set +a
 make test-integration
 ```
 
-Live validation is separate from those checks. It requires doctor to pass;
-syncing at least two tabbed Gemini Docs; a repeated unchanged sync with no new
-versions or model work; resolving the configured pair; inspecting every
+Live validation is separate from those checks. Personal OpenAI and Anthropic
+acceptance must be run separately, with explicit paid-call approval and only
+the bounded synthetic personal corpus. Each run requires doctor to pass;
+syncing at least two dated tabbed Gemini Docs; a repeated unchanged sync with no
+new versions or model work; resolving the configured pair; inspecting every
 analysis citation and counterevidence result; correcting one identity; and
 confirming a new analysis uses the correction without erasing old provenance.
-Do not copy live names, emails, Drive URLs, transcript text, prompts, or model
-output into commits or reports. If credentials, permissions, model access, or
-quota block any step, report the implementation as test-complete but not
+Do not copy names, emails, Drive URLs, transcript text, prompts, or model output
+into commits or reports. If credentials, permissions, model access, or quota
+block any step, report the implementation as test-complete but not
 live-validated.
+
+Passing personal-provider acceptance still does not validate Bedrock runtime
+quota or inference, company Google Drive OAuth/IAM, Bedrock logging-inspection
+permissions in the company account, or approval to process company IP. Report
+those gates as unvalidated until each is tested in its intended environment.
 
 `make db-down` and `make obs-down` stop local services without deleting named
 volumes. Removing database volumes is deliberately outside the normal workflow.
