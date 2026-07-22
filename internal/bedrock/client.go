@@ -20,6 +20,8 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"stacks/internal/extract"
+	"stacks/internal/modelpolicy"
+	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
 )
 
@@ -28,18 +30,18 @@ const (
 	// amplification from an unexpectedly large runtime value.
 	MaxAttemptsLimit = 5
 
-	OutcomeSuccess        = "success"
-	OutcomeThrottled      = "throttled"
-	OutcomeTimeout        = "timeout"
-	OutcomeUnavailable    = "unavailable"
-	OutcomeInternal       = "internal_error"
-	OutcomeAuthentication = "authentication_error"
-	OutcomeAccessDenied   = "access_denied"
-	OutcomeNotFound       = "not_found"
-	OutcomeInvalidRequest = "invalid_request"
-	OutcomeInvalidOutput  = "invalid_output"
-	OutcomeCanceled       = "canceled"
-	OutcomeProviderError  = "provider_error"
+	OutcomeSuccess        = modeltelemetry.OutcomeSuccess
+	OutcomeThrottled      = modeltelemetry.OutcomeThrottled
+	OutcomeTimeout        = modeltelemetry.OutcomeTimeout
+	OutcomeUnavailable    = modeltelemetry.OutcomeUnavailable
+	OutcomeInternal       = modeltelemetry.OutcomeInternal
+	OutcomeAuthentication = modeltelemetry.OutcomeAuthentication
+	OutcomeAccessDenied   = modeltelemetry.OutcomeAccessDenied
+	OutcomeNotFound       = modeltelemetry.OutcomeNotFound
+	OutcomeInvalidRequest = modeltelemetry.OutcomeInvalidRequest
+	OutcomeInvalidOutput  = modeltelemetry.OutcomeInvalidOutput
+	OutcomeCanceled       = modeltelemetry.OutcomeCanceled
+	OutcomeProviderError  = modeltelemetry.OutcomeProviderError
 )
 
 var (
@@ -55,38 +57,20 @@ const (
 	serviceUnavailableErrorCode            = "ServiceUnavailableException"
 	internalServerErrorCode                = "InternalServerException"
 	maxLatencyMilliseconds           int64 = (1<<63 - 1) / int64(time.Millisecond)
-	invocationSpanName                     = "stacks.bedrock.converse"
+	invocationSpanName                     = "stacks.model.generate"
 )
 
 type converseAPI interface {
 	Converse(context.Context, *bedrockruntime.ConverseInput, ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error)
 }
 
-// InvocationObservation is the bounded telemetry emitted for one completed
-// Generate call. It deliberately excludes request and response text.
-type InvocationObservation struct {
-	ModelID         string
-	PromptVersion   string
-	Outcome         string
-	InputTokens     int64
-	OutputTokens    int64
-	TotalTokens     int64
-	WallLatency     time.Duration
-	ProviderLatency time.Duration
-	Attempts        int
-}
-
-// InvocationRecorder receives privacy-safe invocation telemetry.
-type InvocationRecorder interface {
-	Record(context.Context, InvocationObservation)
-}
-
 // Options contains required, validated runtime policy.
 type Options struct {
 	ModelID     string
+	DataMode    modelpolicy.DataMode
 	MaxTokens   int
 	MaxAttempts int
-	Recorder    InvocationRecorder
+	Recorder    modeltelemetry.Recorder
 	Tracer      trace.Tracer
 }
 
@@ -96,9 +80,10 @@ type Options struct {
 type Client struct {
 	api       converseAPI
 	modelID   string
+	dataMode  modelpolicy.DataMode
 	maxTokens int32
 	retryer   aws.Retryer
-	recorder  InvocationRecorder
+	recorder  modeltelemetry.Recorder
 	tracer    trace.Tracer
 	now       func() time.Time
 }
@@ -133,6 +118,9 @@ func newClient(api converseAPI, options Options, retryer aws.Retryer) (*Client, 
 	if modelID == "" {
 		return nil, fmt.Errorf("create Bedrock client: model ID is required")
 	}
+	if !options.DataMode.ValidForNewRun() {
+		return nil, fmt.Errorf("create Bedrock client: data mode is invalid")
+	}
 	if options.MaxTokens <= 0 || options.MaxTokens > math.MaxInt32 {
 		return nil, fmt.Errorf("create Bedrock client: maximum output tokens are invalid")
 	}
@@ -144,7 +132,7 @@ func newClient(api converseAPI, options Options, retryer aws.Retryer) (*Client, 
 		tracer = tracenoop.NewTracerProvider().Tracer("stacks")
 	}
 	return &Client{
-		api: api, modelID: modelID, maxTokens: int32(options.MaxTokens),
+		api: api, modelID: modelID, dataMode: options.DataMode, maxTokens: int32(options.MaxTokens),
 		retryer: retryer, recorder: options.Recorder, tracer: tracer, now: time.Now,
 	}, nil
 }
@@ -327,7 +315,12 @@ func (client *Client) record(ctx context.Context, started time.Time, promptVersi
 	if wallLatency < 0 {
 		wallLatency = 0
 	}
-	client.recorder.Record(ctx, InvocationObservation{
+	promptVersion = strings.TrimSpace(promptVersion)
+	if promptVersion == "" {
+		promptVersion = "invalid"
+	}
+	client.recorder.Record(ctx, modeltelemetry.Observation{
+		Provider: modelpolicy.ProviderBedrock, DataMode: client.dataMode,
 		ModelID: client.modelID, PromptVersion: promptVersion, Outcome: outcome,
 		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens,
 		WallLatency: wallLatency, ProviderLatency: providerLatency, Attempts: attempts,

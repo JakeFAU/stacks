@@ -13,9 +13,9 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
-	"stacks/internal/bedrock"
 	"stacks/internal/config"
 	"stacks/internal/extract"
+	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
 )
 
@@ -86,7 +86,7 @@ func TestPoCCommandProviderRegistersDoctorSyncAndAnalyzeWithoutConstructingLiveD
 	if err != nil {
 		t.Fatalf("create decision recorder: %v", err)
 	}
-	invocations, err := bedrock.NewMetricsInvocationRecorder(noop.NewMeterProvider().Meter("synthetic"))
+	invocations, err := modeltelemetry.NewMetricsRecorder(noop.NewMeterProvider().Meter("synthetic"))
 	if err != nil {
 		t.Fatalf("create invocation recorder: %v", err)
 	}

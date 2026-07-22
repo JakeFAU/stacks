@@ -25,6 +25,7 @@ import (
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
+	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
 	"stacks/internal/source/drive"
 	"stacks/internal/storage"
@@ -70,7 +71,7 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			invocations, err := bedrock.NewMetricsInvocationRecorder(runtime.MeterProvider().Meter("stacks"))
+			invocations, err := modeltelemetry.NewMetricsRecorder(runtime.MeterProvider().Meter("stacks"))
 			if err != nil {
 				return nil, err
 			}
@@ -99,7 +100,7 @@ func pocCommandProvider(
 	stdout, _ io.Writer,
 	tracer trace.Tracer,
 	decisions *observability.DecisionRecorder,
-	invocations bedrock.InvocationRecorder,
+	invocations modeltelemetry.Recorder,
 ) (map[string]cli.Command, error) {
 	return map[string]cli.Command{
 		string(config.CommandAuth): cli.AuthCommand{Google: drive.NewAuthorizer(
@@ -143,7 +144,7 @@ func pocCommandProvider(
 				return err
 			}
 			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
-				ModelID: settings.PoC.Model.ModelID, MaxTokens: settings.PoC.Model.MaxOutputTokens,
+				DataMode: settings.PoC.Model.DataMode, ModelID: settings.PoC.Model.ModelID, MaxTokens: settings.PoC.Model.MaxOutputTokens,
 				MaxAttempts: settings.PoC.Model.MaxAttempts, Recorder: invocations, Tracer: tracer,
 			})
 			if err != nil {
@@ -190,7 +191,7 @@ func pocCommandProvider(
 				return err
 			}
 			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
-				ModelID: settings.PoC.Model.ModelID, MaxTokens: settings.PoC.Model.MaxOutputTokens,
+				DataMode: settings.PoC.Model.DataMode, ModelID: settings.PoC.Model.ModelID, MaxTokens: settings.PoC.Model.MaxOutputTokens,
 				MaxAttempts: settings.PoC.Model.MaxAttempts, Recorder: invocations, Tracer: tracer,
 			})
 			if err != nil {

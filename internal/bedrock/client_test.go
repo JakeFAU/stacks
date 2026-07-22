@@ -20,6 +20,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"stacks/internal/extract"
+	"stacks/internal/modelpolicy"
+	"stacks/internal/modeltelemetry"
 )
 
 const (
@@ -65,7 +67,7 @@ func TestGenerateBuildsStructuredConverseRequestAndCapturesUsage(t *testing.T) {
 		t.Fatalf("telemetry observations = %d, want 1", len(recorder.observations))
 	}
 	observation := recorder.observations[0]
-	if observation.ModelID != testModelID || observation.PromptVersion != testPromptVersion || observation.Outcome != OutcomeSuccess || observation.InputTokens != 11 || observation.OutputTokens != 7 || observation.TotalTokens != 18 || observation.ProviderLatency != 47*time.Millisecond || observation.Attempts != 1 {
+	if observation.Provider != modelpolicy.ProviderBedrock || observation.DataMode != modelpolicy.DataModePersonal || observation.ModelID != testModelID || observation.PromptVersion != testPromptVersion || observation.Outcome != OutcomeSuccess || observation.InputTokens != 11 || observation.OutputTokens != 7 || observation.TotalTokens != 18 || observation.ProviderLatency != 47*time.Millisecond || observation.Attempts != 1 {
 		t.Errorf("telemetry observation = %+v", observation)
 	}
 }
@@ -91,7 +93,7 @@ func TestGenerateRecordsWallAndProviderLatencyAndExplicitSuccessSpan(t *testing.
 		t.Fatalf("invocation latency = %#v, want wall=75ms provider=47ms", got)
 	}
 	spans := exporter.GetSpans()
-	if len(spans) != 1 || spans[0].Name != invocationSpanName || spans[0].Status.Code != codes.Ok {
+	if len(spans) != 1 || spans[0].Name != "stacks.model.generate" || spans[0].Status.Code != codes.Ok {
 		t.Fatalf("invocation spans = %#v, want one explicit OK span", spans)
 	}
 }
@@ -115,7 +117,7 @@ func TestGenerateRecordsRealBoundedWallLatencyForProviderFailure(t *testing.T) {
 
 func TestNewFromConfigRequiresExplicitRegion(t *testing.T) {
 	_, err := NewFromConfig(aws.Config{}, Options{
-		ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3,
+		DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3,
 	})
 	if err == nil || !strings.Contains(err.Error(), "region") {
 		t.Fatalf("NewFromConfig() error = %v, want explicit region rejection", err)
@@ -124,10 +126,19 @@ func TestNewFromConfigRequiresExplicitRegion(t *testing.T) {
 
 func TestNewFromConfigRejectsPaddedRegion(t *testing.T) {
 	_, err := NewFromConfig(aws.Config{Region: " us-east-1 "}, Options{
-		ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3,
+		DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3,
 	})
 	if err == nil || !strings.Contains(err.Error(), "region") {
 		t.Fatalf("NewFromConfig() error = %v, want padded region rejection", err)
+	}
+}
+
+func TestNewFromConfigRequiresDataModeValidForNewInvocation(t *testing.T) {
+	_, err := NewFromConfig(aws.Config{Region: "us-east-1"}, Options{
+		DataMode: modelpolicy.DataModeLegacy, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3,
+	})
+	if err == nil || !strings.Contains(err.Error(), "data mode") {
+		t.Fatalf("NewFromConfig() error = %v, want invalid data mode rejection", err)
 	}
 }
 
@@ -146,7 +157,7 @@ func TestNewFromConfigEnforcesHardAttemptLimit(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := NewFromConfig(aws.Config{Region: "us-east-1"}, Options{
-				ModelID: testModelID, MaxTokens: 321, MaxAttempts: test.maxAttempts,
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: test.maxAttempts,
 			})
 			if (err != nil) != test.wantError {
 				t.Fatalf("NewFromConfig() error = %v, wantError %t", err, test.wantError)
@@ -179,7 +190,7 @@ func TestGenerateRejectsUnknownOrMutatedPromptContract(t *testing.T) {
 			if len(api.inputs) != 0 {
 				t.Fatalf("Converse calls = %d, want 0", len(api.inputs))
 			}
-			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != OutcomeInvalidRequest || recorder.observations[0].PromptVersion != "" {
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != OutcomeInvalidRequest || recorder.observations[0].PromptVersion != "invalid" {
 				t.Fatalf("telemetry = %+v, want bounded invalid request", recorder.observations)
 			}
 		})
@@ -299,7 +310,7 @@ func TestGenerateDoesNotRetryErrorsOutsideExactAllowlist(t *testing.T) {
 	for name, providerErr := range tests {
 		t.Run(name, func(t *testing.T) {
 			api := &fakeConverseAPI{errors: []error{providerErr}}
-			client, err := newWithAPI(api, Options{ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3})
+			client, err := newWithAPI(api, Options{DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3})
 			if err != nil {
 				t.Fatalf("newWithAPI() error = %v", err)
 			}
@@ -368,7 +379,7 @@ func TestGenerateRetriesEveryAllowlistedBedrockFailure(t *testing.T) {
 				errors:  []error{&smithy.GenericAPIError{Code: code, Message: testPrivateInput}, nil},
 				outputs: []*bedrockruntime.ConverseOutput{nil, successfulOutput(`{}`)},
 			}
-			client, err := newWithAPI(api, Options{ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3})
+			client, err := newWithAPI(api, Options{DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3})
 			if err != nil {
 				t.Fatalf("newWithAPI() error = %v", err)
 			}
@@ -538,17 +549,17 @@ func (fake *fakeConverseAPI) Converse(_ context.Context, input *bedrockruntime.C
 }
 
 type recordingInvocationRecorder struct {
-	observations []InvocationObservation
+	observations []modeltelemetry.Observation
 }
 
-func (recorder *recordingInvocationRecorder) Record(_ context.Context, observation InvocationObservation) {
+func (recorder *recordingInvocationRecorder) Record(_ context.Context, observation modeltelemetry.Observation) {
 	recorder.observations = append(recorder.observations, observation)
 }
 
-func newTestClient(t *testing.T, api converseAPI, recorder InvocationRecorder, maxAttempts int) *Client {
+func newTestClient(t *testing.T, api converseAPI, recorder modeltelemetry.Recorder, maxAttempts int) *Client {
 	t.Helper()
 	client, err := newClient(api, Options{
-		ModelID: testModelID, MaxTokens: 321, MaxAttempts: maxAttempts, Recorder: recorder,
+		DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: maxAttempts, Recorder: recorder,
 	}, &zeroRetryer{maxAttempts: maxAttempts})
 	if err != nil {
 		t.Fatalf("newClient() error = %v", err)
