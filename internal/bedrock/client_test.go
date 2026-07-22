@@ -3,7 +3,10 @@ package bedrock
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -11,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"stacks/internal/extract"
 )
 
@@ -26,13 +30,7 @@ func TestGenerateBuildsStructuredConverseRequestAndCapturesUsage(t *testing.T) {
 	recorder := &recordingInvocationRecorder{}
 	client := newTestClient(t, api, recorder, 3)
 
-	response, err := client.Generate(context.Background(), extract.Request{
-		PromptVersion: testPromptVersion,
-		SystemPrompt:  "bounded-system-prompt",
-		Input:         testPrivateInput,
-		SchemaName:    extract.ExtractionSchemaName,
-		JSONSchema:    extract.ExtractionJSONSchema(),
-	})
+	response, err := client.Generate(context.Background(), validRequest())
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
@@ -77,6 +75,95 @@ func TestNewFromConfigRequiresExplicitRegion(t *testing.T) {
 	}
 }
 
+func TestNewFromConfigRejectsPaddedRegion(t *testing.T) {
+	_, err := NewFromConfig(aws.Config{Region: " us-east-1 "}, Options{
+		ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3,
+	})
+	if err == nil || !strings.Contains(err.Error(), "region") {
+		t.Fatalf("NewFromConfig() error = %v, want padded region rejection", err)
+	}
+}
+
+func TestNewFromConfigEnforcesHardAttemptLimit(t *testing.T) {
+	tests := []struct {
+		name        string
+		maxAttempts int
+		wantError   bool
+	}{
+		{name: "negative", maxAttempts: -1, wantError: true},
+		{name: "zero", maxAttempts: 0, wantError: true},
+		{name: "one", maxAttempts: 1},
+		{name: "hard maximum", maxAttempts: MaxAttemptsLimit},
+		{name: "above hard maximum", maxAttempts: MaxAttemptsLimit + 1, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NewFromConfig(aws.Config{Region: "us-east-1"}, Options{
+				ModelID: testModelID, MaxTokens: 321, MaxAttempts: test.maxAttempts,
+			})
+			if (err != nil) != test.wantError {
+				t.Fatalf("NewFromConfig() error = %v, wantError %t", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestGenerateRejectsUnknownOrMutatedPromptContract(t *testing.T) {
+	tests := map[string]func(*extract.Request){
+		"unknown version": func(request *extract.Request) { request.PromptVersion = "unknown-v1" },
+		"mutated prompt":  func(request *extract.Request) { request.SystemPrompt = "mutated" },
+		"mutated schema name": func(request *extract.Request) {
+			request.SchemaName = "mutated_schema"
+		},
+		"mutated schema": func(request *extract.Request) { request.JSONSchema = []byte(`{}`) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{successfulOutput(`{}`)}}
+			recorder := &recordingInvocationRecorder{}
+			client := newTestClient(t, api, recorder, 3)
+			request := validRequest()
+			mutate(&request)
+
+			_, err := client.Generate(context.Background(), request)
+			if err == nil || !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("Generate() error = %v, want invalid reviewed contract", err)
+			}
+			if len(api.inputs) != 0 {
+				t.Fatalf("Converse calls = %d, want 0", len(api.inputs))
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != OutcomeInvalidRequest || recorder.observations[0].PromptVersion != "" {
+				t.Fatalf("telemetry = %+v, want bounded invalid request", recorder.observations)
+			}
+		})
+	}
+}
+
+func TestGenerateUsesReviewedAnalysisContract(t *testing.T) {
+	contract, err := extract.PromptContract(extract.AnalysisPromptVersion)
+	if err != nil {
+		t.Fatalf("PromptContract() error = %v", err)
+	}
+	api := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{successfulOutput(`{}`)}}
+	client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
+
+	response, err := client.Generate(context.Background(), extract.Request{
+		PromptVersion: contract.Version,
+		SystemPrompt:  contract.SystemPrompt,
+		Input:         testPrivateInput,
+		SchemaName:    contract.SchemaName,
+		JSONSchema:    contract.JSONSchema,
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	input := api.inputs[0]
+	format := input.OutputConfig.TextFormat.Structure.(*types.OutputFormatStructureMemberJsonSchema)
+	if response.PromptVersion != extract.AnalysisPromptVersion || aws.ToString(format.Value.Name) != extract.AnalysisSchemaName || aws.ToString(format.Value.Schema) != string(extract.AnalysisJSONSchema()) {
+		t.Fatalf("analysis contract was not preserved")
+	}
+}
+
 func TestGenerateRetriesThrottlingWithinConfiguredBound(t *testing.T) {
 	throttled := &smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateInput}
 	api := &fakeConverseAPI{errors: []error{throttled, throttled, throttled, throttled}}
@@ -113,6 +200,67 @@ func TestGenerateDoesNotRetryAccessDenied(t *testing.T) {
 	}
 }
 
+func TestGenerateDoesNotRetryErrorsOutsideExactAllowlist(t *testing.T) {
+	tests := map[string]error{
+		"connection failure": &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET},
+		"request timeout":    &smithy.GenericAPIError{Code: "RequestTimeout", Message: testPrivateInput},
+		"other throttling": &smithy.GenericAPIError{
+			Code: "ProvisionedThroughputExceededException", Message: testPrivateInput,
+		},
+		"HTTP server error": &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusInternalServerError}},
+			Err:      errors.New("synthetic transport failure"),
+		},
+		"network timeout": syntheticTimeoutError{},
+	}
+	for name, providerErr := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeConverseAPI{errors: []error{providerErr}}
+			client, err := newWithAPI(api, Options{ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3})
+			if err != nil {
+				t.Fatalf("newWithAPI() error = %v", err)
+			}
+			client.retryer = &noDelayRetryer{Retryer: client.retryer}
+
+			if _, err := client.Generate(context.Background(), validRequest()); err == nil {
+				t.Fatal("Generate() error = nil")
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want exact-policy single attempt", len(api.inputs))
+			}
+		})
+	}
+}
+
+func TestGenerateRetriesEveryAllowlistedBedrockFailure(t *testing.T) {
+	tests := map[string]string{
+		"throttling":          "ThrottlingException",
+		"model timeout":       modelTimeoutErrorCode,
+		"service unavailable": serviceUnavailableErrorCode,
+		"internal service":    internalServerErrorCode,
+	}
+	for name, code := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeConverseAPI{
+				errors:  []error{&smithy.GenericAPIError{Code: code, Message: testPrivateInput}, nil},
+				outputs: []*bedrockruntime.ConverseOutput{nil, successfulOutput(`{}`)},
+			}
+			client, err := newWithAPI(api, Options{ModelID: testModelID, MaxTokens: 321, MaxAttempts: 3})
+			if err != nil {
+				t.Fatalf("newWithAPI() error = %v", err)
+			}
+			client.retryer = &noDelayRetryer{Retryer: client.retryer}
+
+			if _, err := client.Generate(context.Background(), validRequest()); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+			if len(api.inputs) != 2 {
+				t.Fatalf("Converse calls = %d, want one bounded retry", len(api.inputs))
+			}
+		})
+	}
+}
+
 func TestGenerateHonorsCancellationBeforeRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	api := &fakeConverseAPI{call: func() error {
@@ -145,6 +293,17 @@ func TestGenerateRejectsUnsupportedStopReasonWithoutLeakingOutput(t *testing.T) 
 	}
 	if got := recorder.observations[0]; got.InputTokens != 11 || got.OutputTokens != 7 || got.Latency != 47*time.Millisecond || got.Outcome != OutcomeInvalidOutput {
 		t.Fatalf("invalid-output telemetry = %+v, want provider usage without private output", got)
+	}
+}
+
+func TestGenerateRejectsNonAssistantResponseRole(t *testing.T) {
+	output := successfulOutput(`{}`)
+	message := output.Output.(*types.ConverseOutputMemberMessage)
+	message.Value.Role = types.ConversationRoleUser
+	client := newTestClient(t, &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{output}}, &recordingInvocationRecorder{}, 3)
+
+	if _, err := client.Generate(context.Background(), validRequest()); err == nil || !errors.Is(err, ErrInvalidOutput) {
+		t.Fatalf("Generate() error = %v, want assistant-role validation", err)
 	}
 }
 
@@ -204,12 +363,16 @@ func assertStructuredOutput(t *testing.T, config *types.OutputConfig) {
 }
 
 func validRequest() extract.Request {
+	contract, err := extract.PromptContract(extract.ExtractionPromptVersion)
+	if err != nil {
+		panic(err)
+	}
 	return extract.Request{
-		PromptVersion: testPromptVersion,
-		SystemPrompt:  "bounded-system-prompt",
+		PromptVersion: contract.Version,
+		SystemPrompt:  contract.SystemPrompt,
 		Input:         testPrivateInput,
-		SchemaName:    extract.ExtractionSchemaName,
-		JSONSchema:    extract.ExtractionJSONSchema(),
+		SchemaName:    contract.SchemaName,
+		JSONSchema:    contract.JSONSchema,
 	}
 }
 
@@ -259,7 +422,7 @@ func (recorder *recordingInvocationRecorder) Record(_ context.Context, observati
 	recorder.observations = append(recorder.observations, observation)
 }
 
-func newTestClient(t *testing.T, api ConverseAPI, recorder InvocationRecorder, maxAttempts int) *Client {
+func newTestClient(t *testing.T, api converseAPI, recorder InvocationRecorder, maxAttempts int) *Client {
 	t.Helper()
 	client, err := newClient(api, Options{
 		ModelID: testModelID, MaxTokens: 321, MaxAttempts: maxAttempts, Recorder: recorder,
@@ -274,7 +437,7 @@ type zeroRetryer struct {
 	maxAttempts int
 }
 
-func (retryer *zeroRetryer) IsErrorRetryable(err error) bool { return isTransient(err) }
+func (retryer *zeroRetryer) IsErrorRetryable(err error) bool { return isAllowlistedRetry(err) }
 func (retryer *zeroRetryer) MaxAttempts() int                { return retryer.maxAttempts }
 func (retryer *zeroRetryer) RetryDelay(int, error) (time.Duration, error) {
 	return 0, nil
@@ -290,3 +453,17 @@ func (retryer *zeroRetryer) GetAttemptToken(context.Context) (func(error) error,
 }
 
 var _ aws.RetryerV2 = (*zeroRetryer)(nil)
+
+type noDelayRetryer struct {
+	aws.Retryer
+}
+
+func (retryer *noDelayRetryer) RetryDelay(int, error) (time.Duration, error) {
+	return 0, nil
+}
+
+type syntheticTimeoutError struct{}
+
+func (syntheticTimeoutError) Error() string   { return "synthetic timeout" }
+func (syntheticTimeoutError) Timeout() bool   { return true }
+func (syntheticTimeoutError) Temporary() bool { return true }

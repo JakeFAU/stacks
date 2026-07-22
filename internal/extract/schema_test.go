@@ -43,6 +43,38 @@ func TestPromptVersionsAreEmbeddedAndExplicit(t *testing.T) {
 	}
 }
 
+func TestPromptContractReturnsIsolatedReviewedPairings(t *testing.T) {
+	tests := []struct {
+		version    string
+		schemaName string
+	}{
+		{version: ExtractionPromptVersion, schemaName: ExtractionSchemaName},
+		{version: AnalysisPromptVersion, schemaName: AnalysisSchemaName},
+	}
+	for _, test := range tests {
+		first, err := PromptContract(test.version)
+		if err != nil {
+			t.Fatalf("PromptContract(%q) error = %v", test.version, err)
+		}
+		if first.Version != test.version || first.SystemPrompt == "" || first.SchemaName != test.schemaName || len(first.JSONSchema) == 0 {
+			t.Fatalf("PromptContract(%q) = %+v", test.version, first)
+		}
+		first.SystemPrompt = "mutated"
+		first.JSONSchema[0] = 'x'
+
+		second, err := PromptContract(test.version)
+		if err != nil {
+			t.Fatalf("second PromptContract(%q) error = %v", test.version, err)
+		}
+		if second.SystemPrompt == "mutated" || second.JSONSchema[0] == 'x' {
+			t.Fatalf("PromptContract(%q) returned mutable shared state", test.version)
+		}
+	}
+	if _, err := PromptContract("unknown-v1"); err == nil {
+		t.Fatal("PromptContract(unknown) error = nil")
+	}
+}
+
 func TestDecodeAndValidateExtractionRejectsUnknownProperties(t *testing.T) {
 	raw := []byte(`{"meeting_date":"","citations":[],"people":[],"statements":[],"signals":[],"private_payload":"must not pass"}`)
 	_, err := DecodeAndValidateExtraction(validSubmittedText(), raw)

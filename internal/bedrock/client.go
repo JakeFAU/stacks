@@ -1,6 +1,7 @@
 package bedrock
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,10 @@ import (
 )
 
 const (
+	// MaxAttemptsLimit matches the configured PoC default and prevents retry
+	// amplification from an unexpectedly large runtime value.
+	MaxAttemptsLimit = 5
+
 	OutcomeSuccess        = "success"
 	OutcomeThrottled      = "throttled"
 	OutcomeTimeout        = "timeout"
@@ -45,8 +50,7 @@ const (
 	maxLatencyMilliseconds      int64 = (1<<63 - 1) / int64(time.Millisecond)
 )
 
-// ConverseAPI is the narrow AWS Runtime surface used by Client.
-type ConverseAPI interface {
+type converseAPI interface {
 	Converse(context.Context, *bedrockruntime.ConverseInput, ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error)
 }
 
@@ -79,7 +83,7 @@ type Options struct {
 // output. It owns retries so the wrapped SDK client must not add another retry
 // layer.
 type Client struct {
-	api       ConverseAPI
+	api       converseAPI
 	modelID   string
 	maxTokens int32
 	retryer   aws.Retryer
@@ -88,33 +92,27 @@ type Client struct {
 
 var _ extract.Model = (*Client)(nil)
 
-// New creates a Bedrock model boundary around a Converse client.
-func New(api ConverseAPI, options Options) (*Client, error) {
-	retryer := awsretry.NewAdaptiveMode(func(adaptive *awsretry.AdaptiveModeOptions) {
+func newWithAPI(api converseAPI, options Options) (*Client, error) {
+	adaptiveRetryer := awsretry.NewAdaptiveMode(func(adaptive *awsretry.AdaptiveModeOptions) {
 		adaptive.StandardOptions = append(adaptive.StandardOptions, func(standard *awsretry.StandardOptions) {
 			standard.MaxAttempts = options.MaxAttempts
 		})
 	})
-	configuredRetryer := awsretry.AddWithErrorCodes(
-		retryer,
-		modelTimeoutErrorCode,
-		serviceUnavailableErrorCode,
-		internalServerErrorCode,
-	)
-	return newClient(api, options, configuredRetryer)
+	return newClient(api, options, &exactAdaptiveRetryer{RetryerV2: adaptiveRetryer})
 }
 
 // NewFromConfig creates a Runtime client with SDK retries disabled because
 // Client owns the bounded adaptive retry lifecycle.
 func NewFromConfig(configuration aws.Config, options Options) (*Client, error) {
-	if strings.TrimSpace(configuration.Region) == "" {
+	region := strings.TrimSpace(configuration.Region)
+	if region == "" || region != configuration.Region {
 		return nil, fmt.Errorf("create Bedrock client: AWS region is required")
 	}
 	configuration.Retryer = func() aws.Retryer { return aws.NopRetryer{} }
-	return New(bedrockruntime.NewFromConfig(configuration), options)
+	return newWithAPI(bedrockruntime.NewFromConfig(configuration), options)
 }
 
-func newClient(api ConverseAPI, options Options, retryer aws.Retryer) (*Client, error) {
+func newClient(api converseAPI, options Options, retryer aws.Retryer) (*Client, error) {
 	if api == nil || retryer == nil {
 		return nil, fmt.Errorf("create Bedrock client: dependencies are required")
 	}
@@ -125,7 +123,7 @@ func newClient(api ConverseAPI, options Options, retryer aws.Retryer) (*Client, 
 	if options.MaxTokens <= 0 || options.MaxTokens > math.MaxInt32 {
 		return nil, fmt.Errorf("create Bedrock client: maximum output tokens are invalid")
 	}
-	if options.MaxAttempts <= 0 || retryer.MaxAttempts() != options.MaxAttempts {
+	if options.MaxAttempts <= 0 || options.MaxAttempts > MaxAttemptsLimit || retryer.MaxAttempts() != options.MaxAttempts {
 		return nil, fmt.Errorf("create Bedrock client: maximum attempts are invalid")
 	}
 	return &Client{
@@ -140,7 +138,7 @@ func newClient(api ConverseAPI, options Options, retryer aws.Retryer) (*Client, 
 func (client *Client) Generate(ctx context.Context, request extract.Request) (extract.Response, error) {
 	input, err := client.converseInput(request)
 	if err != nil {
-		client.record(ctx, request.PromptVersion, OutcomeInvalidRequest, extract.Usage{}, 0, 0)
+		client.record(ctx, "", OutcomeInvalidRequest, extract.Usage{}, 0, 0)
 		return extract.Response{}, err
 	}
 
@@ -238,7 +236,11 @@ func boundedMetadata(output *bedrockruntime.ConverseOutput) (extract.Usage, time
 }
 
 func (client *Client) converseInput(request extract.Request) (*bedrockruntime.ConverseInput, error) {
-	if strings.TrimSpace(request.PromptVersion) == "" || strings.TrimSpace(request.SystemPrompt) == "" || request.Input == "" || strings.TrimSpace(request.SchemaName) == "" || !json.Valid(request.JSONSchema) {
+	contract, err := extract.PromptContract(request.PromptVersion)
+	if err != nil || request.SystemPrompt != contract.SystemPrompt || request.SchemaName != contract.SchemaName || !bytes.Equal(request.JSONSchema, contract.JSONSchema) {
+		return nil, ErrInvalidRequest
+	}
+	if request.Input == "" || !json.Valid(request.JSONSchema) {
 		return nil, ErrInvalidRequest
 	}
 	schema := string(request.JSONSchema)
@@ -271,7 +273,7 @@ func (client *Client) response(promptVersion string, output *bedrockruntime.Conv
 		return extract.Response{}, ErrInvalidOutput
 	}
 	message, ok := output.Output.(*types.ConverseOutputMemberMessage)
-	if !ok || len(message.Value.Content) != 1 {
+	if !ok || message.Value.Role != types.ConversationRoleAssistant || len(message.Value.Content) != 1 {
 		return extract.Response{}, ErrInvalidOutput
 	}
 	text, ok := message.Value.Content[0].(*types.ContentBlockMemberText)
@@ -328,7 +330,7 @@ func wait(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func isTransient(err error) bool {
+func isAllowlistedRetry(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
@@ -341,8 +343,15 @@ func isTransient(err error) bool {
 			return false
 		}
 	}
-	var networkError net.Error
-	return errors.As(err, &networkError) && networkError.Timeout()
+	return false
+}
+
+type exactAdaptiveRetryer struct {
+	aws.RetryerV2
+}
+
+func (retryer *exactAdaptiveRetryer) IsErrorRetryable(err error) bool {
+	return isAllowlistedRetry(err)
 }
 
 func outcomeForError(err error) string {

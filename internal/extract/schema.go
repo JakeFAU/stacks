@@ -27,6 +27,15 @@ type Model interface {
 	Generate(context.Context, Request) (Response, error)
 }
 
+// Contract is one reviewed prompt and schema pairing. JSONSchema is an
+// isolated copy so callers cannot alter the embedded contract.
+type Contract struct {
+	Version      string
+	SystemPrompt string
+	SchemaName   string
+	JSONSchema   []byte
+}
+
 // Request contains one private model input and its public, versioned contract.
 // Callers must not place Input or SystemPrompt in telemetry or errors.
 type Request struct {
@@ -57,13 +66,29 @@ type Response struct {
 
 // Prompt returns the embedded, reviewable prompt for an exact version.
 func Prompt(version string) (string, error) {
+	contract, err := PromptContract(version)
+	if err != nil {
+		return "", err
+	}
+	return contract.SystemPrompt, nil
+}
+
+// PromptContract returns the exact reviewed prompt and schema pairing for a
+// supported version.
+func PromptContract(version string) (Contract, error) {
 	switch version {
 	case ExtractionPromptVersion:
-		return extractionPrompt, nil
+		return Contract{
+			Version: version, SystemPrompt: extractionPrompt,
+			SchemaName: ExtractionSchemaName, JSONSchema: ExtractionJSONSchema(),
+		}, nil
 	case AnalysisPromptVersion:
-		return analysisPrompt, nil
+		return Contract{
+			Version: version, SystemPrompt: analysisPrompt,
+			SchemaName: AnalysisSchemaName, JSONSchema: AnalysisJSONSchema(),
+		}, nil
 	default:
-		return "", fmt.Errorf("prompt version is not supported")
+		return Contract{}, fmt.Errorf("prompt version is not supported")
 	}
 }
 

@@ -104,6 +104,16 @@ func TestValidateExtractionRejectsUnknownReferences(t *testing.T) {
 	}
 }
 
+func TestValidateExtractionRequiresSpeakerTypedReference(t *testing.T) {
+	output := validExtraction()
+	output.People[0].Role = MentionRoleReference
+
+	err := ValidateExtraction(validSubmittedText(), output)
+	if err == nil || !strings.Contains(err.Error(), "speaker") {
+		t.Fatalf("ValidateExtraction() error = %v, want typed speaker reference rejection", err)
+	}
+}
+
 func TestValidateExtractionRejectsInvalidDates(t *testing.T) {
 	tests := map[string]func(*ExtractionOutput){
 		"meeting date":   func(output *ExtractionOutput) { output.MeetingDate = "2026-02-30" },

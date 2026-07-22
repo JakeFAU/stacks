@@ -234,7 +234,7 @@ func ValidateExtraction(submitted SubmittedText, output ExtractionOutput) error 
 		citations[citation.ID] = citation
 	}
 
-	people := make(map[string]struct{}, len(output.People))
+	people := make(map[string]string, len(output.People))
 	for index, person := range output.People {
 		if strings.TrimSpace(person.ID) == "" || strings.TrimSpace(person.Surface) == "" {
 			return fmt.Errorf("person mention %d required fields are missing", index)
@@ -248,7 +248,7 @@ func ValidateExtraction(submitted SubmittedText, output ExtractionOutput) error 
 		if err := validateReferences("person mention", index, person.CitationIDs, citations); err != nil {
 			return err
 		}
-		people[person.ID] = struct{}{}
+		people[person.ID] = person.Role
 	}
 
 	statements := make(map[string]struct{}, len(output.Statements))
@@ -259,8 +259,12 @@ func ValidateExtraction(submitted SubmittedText, output ExtractionOutput) error 
 		if _, exists := statements[statement.ID]; exists {
 			return fmt.Errorf("statement %d ID is duplicated", index)
 		}
-		if _, exists := people[statement.SpeakerMentionID]; !exists {
+		role, exists := people[statement.SpeakerMentionID]
+		if !exists {
 			return fmt.Errorf("statement %d has an unknown reference", index)
+		}
+		if role != MentionRoleSpeaker {
+			return fmt.Errorf("statement %d speaker reference is invalid", index)
 		}
 		if _, exists := people[statement.SubjectMentionID]; !exists {
 			return fmt.Errorf("statement %d has an unknown reference", index)
