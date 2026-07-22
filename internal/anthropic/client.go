@@ -45,8 +45,9 @@ const (
 	OutcomeCanceled       = modeltelemetry.OutcomeCanceled
 	OutcomeProviderError  = modeltelemetry.OutcomeProviderError
 
-	invocationSpanName = "stacks.model.generate"
-	baseRetryDelay     = 100 * time.Millisecond
+	invocationSpanName   = "stacks.model.generate"
+	baseRetryDelay       = 100 * time.Millisecond
+	httpStatusUpperBound = 600
 )
 
 var (
@@ -271,7 +272,8 @@ func isRetryable(err error) bool {
 	}
 	var apiErr *anthropicsdk.Error
 	if errors.As(err, &apiErr) {
-		return apiErr.StatusCode == http.StatusRequestTimeout || apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode >= http.StatusInternalServerError
+		return apiErr.StatusCode == http.StatusRequestTimeout || apiErr.StatusCode == http.StatusTooManyRequests ||
+			apiErr.StatusCode >= http.StatusInternalServerError && apiErr.StatusCode < httpStatusUpperBound
 	}
 	return isRetryableTransport(err)
 }
@@ -281,8 +283,12 @@ func isRetryableTransport(err error) bool {
 	if !errors.As(err, &transportErr) || transportErr.Err == nil {
 		return false
 	}
-	var networkErr net.Error
-	if errors.As(transportErr.Err, &networkErr) && networkErr.Timeout() {
+	var dnsErr *net.DNSError
+	if errors.As(transportErr.Err, &dnsErr) {
+		return false
+	}
+	var operationErr *net.OpError
+	if errors.As(transportErr.Err, &operationErr) && operationErr.Timeout() {
 		return true
 	}
 	return errors.Is(transportErr.Err, syscall.ECONNRESET)
@@ -328,7 +334,7 @@ func outcomeForHTTPStatus(status int) string {
 		return OutcomeInvalidRequest
 	case status == http.StatusInternalServerError:
 		return OutcomeInternal
-	case status >= http.StatusInternalServerError:
+	case status >= http.StatusInternalServerError && status < httpStatusUpperBound:
 		return OutcomeUnavailable
 	default:
 		return OutcomeProviderError

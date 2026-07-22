@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -223,7 +224,7 @@ func TestGenerateRejectsEveryNonCanonicalResponseShape(t *testing.T) {
 }
 
 func TestGenerateRetriesOnlyRetryableHTTPStatusesToExactBound(t *testing.T) {
-	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, httpStatusUpperBound - 1} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			providerErr := syntheticAPIError(t, status)
 			api := &fakeMessagesAPI{errors: []error{providerErr, providerErr, providerErr, providerErr}}
@@ -259,9 +260,9 @@ func TestGenerateRetriesOnlyExplicitTransientTransportFailures(t *testing.T) {
 			wantAttempts: 2, wantOutcome: OutcomeSuccess, wantSuccess: true,
 		},
 		{
-			name: "live context network timeout",
+			name: "live context connection timeout",
 			transportErr: &url.Error{Op: "Post", URL: "https://api.anthropic.com/v1/messages", Err: &net.OpError{
-				Op: "read", Net: "tcp", Err: syntheticTimeoutError{},
+				Op: "dial", Net: "tcp", Err: syntheticTimeoutError{},
 			}},
 			wantAttempts: 2, wantOutcome: OutcomeSuccess, wantSuccess: true,
 		},
@@ -276,6 +277,18 @@ func TestGenerateRetriesOnlyExplicitTransientTransportFailures(t *testing.T) {
 				Err: "no such host", Name: "api.anthropic.com", IsNotFound: true,
 			}},
 			wantAttempts: 1, wantOutcome: OutcomeProviderError,
+		},
+		{
+			name: "timed out DNS failure",
+			transportErr: &url.Error{Op: "Post", URL: "https://api.anthropic.com/v1/messages", Err: &net.DNSError{
+				Err: "i/o timeout", Name: "api.anthropic.com", IsTimeout: true,
+			}},
+			wantAttempts: 1, wantOutcome: OutcomeTimeout,
+		},
+		{
+			name:         "TLS handshake timeout",
+			transportErr: &url.Error{Op: "Post", URL: "https://api.anthropic.com/v1/messages", Err: syntheticTLSHandshakeTimeoutError{}},
+			wantAttempts: 1, wantOutcome: OutcomeTimeout,
 		},
 		{
 			name:         "redirect policy failure",
@@ -322,16 +335,18 @@ func TestGenerateRetriesOnlyExplicitTransientTransportFailures(t *testing.T) {
 
 func TestGenerateTreatsNonRetryableHTTPStatusesAsTerminal(t *testing.T) {
 	tests := []struct {
+		name   string
 		status int
 		want   error
 	}{
-		{status: http.StatusBadRequest, want: ErrInvocation},
-		{status: http.StatusUnauthorized, want: extract.ErrAuthentication},
-		{status: http.StatusForbidden, want: extract.ErrAuthorization},
-		{status: http.StatusNotFound, want: ErrInvocation},
+		{name: http.StatusText(http.StatusBadRequest), status: http.StatusBadRequest, want: ErrInvocation},
+		{name: http.StatusText(http.StatusUnauthorized), status: http.StatusUnauthorized, want: extract.ErrAuthentication},
+		{name: http.StatusText(http.StatusForbidden), status: http.StatusForbidden, want: extract.ErrAuthorization},
+		{name: http.StatusText(http.StatusNotFound), status: http.StatusNotFound, want: ErrInvocation},
+		{name: "non-HTTP 600 status", status: httpStatusUpperBound, want: ErrInvocation},
 	}
 	for _, test := range tests {
-		t.Run(http.StatusText(test.status), func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			api := &fakeMessagesAPI{errors: []error{syntheticAPIError(t, test.status)}}
 			client := newTestClient(t, api, &recordingInvocationRecorder{}, 5)
 			_, err := client.Generate(context.Background(), validRequest())
@@ -342,6 +357,40 @@ func TestGenerateTreatsNonRetryableHTTPStatusesAsTerminal(t *testing.T) {
 				t.Fatalf("Messages calls = %d, want terminal single attempt", len(api.params))
 			}
 			assertNoPrivateData(t, err)
+		})
+	}
+}
+
+func TestGenerateRejectsUsageArithmeticOverflowWithoutRetry(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         int64
+		cacheCreation int64
+		cacheRead     int64
+		output        int64
+	}{
+		{name: "input plus cache creation", input: math.MaxInt64, cacheCreation: 1},
+		{name: "plus cache read", input: math.MaxInt64 - 1, cacheCreation: 1, cacheRead: 1},
+		{name: "plus output", input: math.MaxInt64 - 2, cacheCreation: 1, cacheRead: 1, output: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			output := decodedMessage(t, messageJSON(
+				testModelID,
+				"end_turn",
+				textContentJSON(`{}`),
+				usageJSON(test.input, test.cacheCreation, test.cacheRead, test.output),
+			))
+			api := &fakeMessagesAPI{outputs: []*anthropicsdk.Message{output}}
+			client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
+
+			_, err := client.Generate(context.Background(), validRequest())
+			if !errors.Is(err, ErrInvalidOutput) {
+				t.Fatalf("Generate() error = %v, want invalid output", err)
+			}
+			if len(api.params) != 1 {
+				t.Fatalf("Messages calls = %d, want terminal single attempt", len(api.params))
+			}
 		})
 	}
 }
@@ -642,3 +691,9 @@ type syntheticTimeoutError struct{}
 func (syntheticTimeoutError) Error() string   { return "synthetic timeout" }
 func (syntheticTimeoutError) Timeout() bool   { return true }
 func (syntheticTimeoutError) Temporary() bool { return true }
+
+type syntheticTLSHandshakeTimeoutError struct{}
+
+func (syntheticTLSHandshakeTimeoutError) Error() string   { return "net/http: TLS handshake timeout" }
+func (syntheticTLSHandshakeTimeoutError) Timeout() bool   { return true }
+func (syntheticTLSHandshakeTimeoutError) Temporary() bool { return true }
