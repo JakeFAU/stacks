@@ -223,6 +223,59 @@ func TestSyncReturnsBusyWithoutInvokingModelForActiveDerivationLease(t *testing.
 	}
 }
 
+func TestSyncCancelsAttemptBeforeLeaseExpiryAndReleasesClaim(t *testing.T) {
+	document := syntheticDocument("document-attempt-deadline", "Leader assigns follow-up.")
+	repository := newMemoryRepository()
+	model := &deadlineBlockingModel{}
+	service := testServiceWithSource(&memorySource{
+		listed:  []source.Document{{Provider: "drive", ID: document.ID}},
+		fetched: map[string]source.Document{document.ID: document},
+	}, repository, model)
+	service.LeaseDuration = 6 * time.Second
+	service.AttemptTimeout = 50 * time.Millisecond
+
+	parent, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	summary, err := service.Sync(parent)
+	if err != nil {
+		t.Fatalf("Sync() error = %v, want bounded per-document timeout", err)
+	}
+	if model.calls != 1 || model.deadline.IsZero() {
+		t.Fatalf("model calls/deadline = %d/%v, want one deadline-bounded call", model.calls, model.deadline)
+	}
+	if len(summary.Results) != 1 || summary.Results[0].Outcome != OutcomeIncomplete || summary.Results[0].FailureCode != FailureModel {
+		t.Fatalf("summary = %#v, want released incomplete model failure", summary)
+	}
+	for _, state := range repository.versions {
+		if state.Status != VersionStatusIncomplete || state.LeaseOwner != "" || !model.deadline.Before(repository.lastLeaseExpiresAt) {
+			t.Fatalf("state/deadline/lease = %#v/%v/%v, want released owner and deadline before lease", state, model.deadline, repository.lastLeaseExpiresAt)
+		}
+	}
+
+	service.Model = &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
+	retry, err := service.Sync(context.Background())
+	if err != nil || retry.Completed != 1 {
+		t.Fatalf("retry Sync() = (%#v, %v), want immediate successful retry", retry, err)
+	}
+}
+
+func TestAttemptContextRejectsLeaseWithoutConfiguredCleanupWindow(t *testing.T) {
+	service := &Service{
+		LeaseDuration:  time.Minute,
+		AttemptTimeout: 20 * time.Second,
+	}
+
+	attemptCtx, cancel, err := service.attemptContext(context.Background(), VersionState{
+		LeaseExpiresAt: time.Now().Add(30 * time.Second),
+	})
+	if cancel != nil {
+		cancel()
+	}
+	if attemptCtx != nil || err == nil {
+		t.Fatalf("attemptContext() = (%v, %v), want no attempt after the configured cleanup window", attemptCtx, err)
+	}
+}
+
 func TestSyncCreatesNewVersionWhenOneTabChanges(t *testing.T) {
 	repository := newMemoryRepository()
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t), validEmptyResponse(t)}}
@@ -673,17 +726,18 @@ func testService(document source.Document, repository *memoryRepository, model *
 
 func testServiceWithSource(sourceBoundary source.Source, repository *memoryRepository, model extract.Model) *Service {
 	return &Service{
-		Source:        sourceBoundary,
-		Model:         model,
-		Resolver:      entity.Resolver{},
-		Repository:    repository,
-		CollectionID:  "synthetic-folder",
-		PromptVersion: extract.ExtractionPromptVersion,
-		Region:        "us-east-1",
-		ModelID:       "synthetic-model",
-		MaxTokens:     256,
-		LeaseDuration: 5 * time.Minute,
-		Now:           func() time.Time { return recordedAt },
+		Source:         sourceBoundary,
+		Model:          model,
+		Resolver:       entity.Resolver{},
+		Repository:     repository,
+		CollectionID:   "synthetic-folder",
+		PromptVersion:  extract.ExtractionPromptVersion,
+		Region:         "us-east-1",
+		ModelID:        "synthetic-model",
+		MaxTokens:      256,
+		LeaseDuration:  5 * time.Minute,
+		AttemptTimeout: 4 * time.Minute,
+		Now:            func() time.Time { return recordedAt },
 	}
 }
 
@@ -809,6 +863,18 @@ type recordingModel struct {
 	calls     int
 }
 
+type deadlineBlockingModel struct {
+	calls    int
+	deadline time.Time
+}
+
+func (model *deadlineBlockingModel) Generate(ctx context.Context, _ extract.Request) (extract.Response, error) {
+	model.calls++
+	model.deadline, _ = ctx.Deadline()
+	<-ctx.Done()
+	return extract.Response{}, ctx.Err()
+}
+
 type recordingDecisionRecorder struct {
 	observations []observability.DecisionObservation
 }
@@ -846,6 +912,7 @@ type memoryRepository struct {
 	persistedObservations int
 	persistedSignals      int
 	prepareClaims         int
+	lastLeaseExpiresAt    time.Time
 }
 
 func newMemoryRepository() *memoryRepository {
@@ -863,12 +930,14 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version kn
 	state, exists := repository.versions[key]
 	if !exists {
 		repository.prepareClaims++
+		leaseExpiresAt := time.Now().Add(leaseDuration)
 		state = VersionState{
 			ID:               "version-" + version.Digest().String()[:12],
 			DerivationID:     "derivation-" + fmt.Sprintf("%x", derivation.Digest[:6]),
 			DerivationDigest: derivation.Digest, Status: VersionStatusPending,
-			LeaseOwner: fmt.Sprintf("owner-%d", repository.prepareClaims),
+			LeaseOwner: fmt.Sprintf("owner-%d", repository.prepareClaims), LeaseExpiresAt: leaseExpiresAt,
 		}
+		repository.lastLeaseExpiresAt = leaseExpiresAt
 	} else if state.Status == VersionStatusPending && state.LeaseOwner != "" {
 		busy := state
 		busy.Status = VersionStatusBusy
@@ -877,10 +946,13 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version kn
 		return busy, nil
 	} else if state.Status != VersionStatusComplete {
 		repository.prepareClaims++
+		leaseExpiresAt := time.Now().Add(leaseDuration)
 		state.Status = VersionStatusPending
 		state.RetryCount++
 		state.FailureCode = ""
 		state.LeaseOwner = fmt.Sprintf("owner-%d", repository.prepareClaims)
+		state.LeaseExpiresAt = leaseExpiresAt
+		repository.lastLeaseExpiresAt = leaseExpiresAt
 	}
 	repository.versions[key] = state
 	return state, nil
@@ -903,6 +975,7 @@ func (repository *memoryRepository) CompleteVersion(_ context.Context, completio
 			state.Status = VersionStatusComplete
 			state.FailureCode = ""
 			state.LeaseOwner = ""
+			state.LeaseExpiresAt = time.Time{}
 			repository.versions[key] = state
 			break
 		}
@@ -928,6 +1001,7 @@ func (repository *memoryRepository) RecordFailure(_ context.Context, derivationI
 			state.Status = status
 			state.FailureCode = code
 			state.LeaseOwner = ""
+			state.LeaseExpiresAt = time.Time{}
 			repository.versions[key] = state
 			return nil
 		}

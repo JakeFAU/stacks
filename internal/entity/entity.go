@@ -2,6 +2,7 @@
 package entity
 
 import (
+	"net/mail"
 	"strings"
 	"time"
 
@@ -46,7 +47,8 @@ type EntitySnapshot struct {
 // Mention is the private source-grounded surface supplied to a resolver.
 // It must be kept out of logs and telemetry by callers.
 type Mention struct {
-	Surface string
+	Name  string
+	Email string
 }
 
 // Candidate is a reviewable possible identity. It never represents accepted
@@ -76,4 +78,16 @@ func NormalizeName(value string) string {
 // such as dots because email local parts are not person names.
 func NormalizeEmail(value string) string {
 	return strings.ToLower(strings.TrimSpace(norm.NFKC.String(value)))
+}
+
+// ValidEmail reports whether value is one plain mailbox address. Display-name
+// forms are rejected because resolver inputs carry names and emails in
+// separate typed fields.
+func ValidEmail(value string) bool {
+	normalized := NormalizeEmail(value)
+	if normalized == "" || strings.Count(normalized, "@") != 1 || strings.ContainsAny(normalized, "\r\n\t ") {
+		return false
+	}
+	parsed, err := mail.ParseAddress(normalized)
+	return err == nil && parsed.Name == "" && NormalizeEmail(parsed.Address) == normalized
 }

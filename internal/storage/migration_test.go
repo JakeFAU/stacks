@@ -146,15 +146,42 @@ func TestFinalIntegrationMigrationAddsOwnedExtractionLeases(t *testing.T) {
 	}
 }
 
-func TestFinalIntegrationMigrationScrubsLegacyModelNarrative(t *testing.T) {
+func TestFinalIntegrationMigrationPreservesLegacyModelNarrativeForAudit(t *testing.T) {
 	migration := readFinalIntegrationMigration(t)
-	for _, required := range []string{
+	for _, forbidden := range []string{
 		"UPDATE stacks.interaction_signals SET rationale = ''",
-		"UPDATE stacks.analysis_runs",
 		"SET hypothesis = '', report_json = NULL",
 	} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("final integration migration destructively rewrites immutable audit payload %q", forbidden)
+		}
+	}
+}
+
+func TestLegacyAdmissionMigrationMarksPreFixDerivedRowsNonAdmissible(t *testing.T) {
+	migration := readLegacyAdmissionMigration(t)
+	for _, required := range []string{
+		"ALTER TABLE stacks.extraction_runs",
+		"ALTER TABLE stacks.mentions",
+		"ALTER TABLE stacks.resolution_decisions",
+		"ALTER TABLE stacks.observations",
+		"ALTER TABLE stacks.interaction_signals",
+		"ALTER TABLE stacks.analysis_runs",
+		"ADD COLUMN currently_admissible boolean NOT NULL DEFAULT false",
+		"ALTER COLUMN currently_admissible SET DEFAULT true",
+	} {
 		if !strings.Contains(migration, required) {
-			t.Fatalf("final integration migration is missing legacy narrative scrub %q", required)
+			t.Fatalf("legacy admission migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"SET rationale =",
+		"SET hypothesis =",
+		"SET report_json =",
+		"DELETE FROM",
+	} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("legacy admission migration destructively rewrites audit history with %q", forbidden)
 		}
 	}
 }
@@ -172,6 +199,16 @@ func readManagerConfidenceMigration(t *testing.T) string {
 func readFinalIntegrationMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00005_manager_confidence_final_fixes.sql")
+	migration, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", path, err)
+	}
+	return string(migration)
+}
+
+func readLegacyAdmissionMigration(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join("..", "..", "db", "migrations", "00006_legacy_admission_boundary.sql")
 	migration, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration %q: %v", path, err)

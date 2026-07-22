@@ -71,6 +71,7 @@ implemented.
 | `STACKS_BEDROCK_MAX_TOKENS` | no default | Required positive output-token limit for every invocation |
 | `STACKS_BEDROCK_MAX_ATTEMPTS` | `5` | Positive bound for retryable model failures |
 | `STACKS_INGEST_LEASE_DURATION` | `5m` | Positive extraction-claim duration, bounded to at most `1h` |
+| `STACKS_INGEST_ATTEMPT_TIMEOUT` | `4m` | Per-document attempt deadline; must leave at least `5s` before the extraction lease expires |
 | `STACKS_EXTRACTION_PROMPT_VERSION` | `extract-v1` | Versioned extraction prompt |
 | `STACKS_ANALYSIS_PROMPT_VERSION` | `analyze-v1` | Versioned pair-analysis prompt |
 | `STACKS_EMPLOYEE_ENTITY_ID` | no default | Accepted employee entity used by `analyze` |
@@ -137,6 +138,19 @@ an interrupted process can be retried after the finite lease expires. Changing
 the Bedrock region, model ID, token limit, prompt version, or extraction schema
 creates a new auditable extraction run while retaining the immutable source
 version and earlier derivations.
+
+Every claimed model-and-persistence attempt is canceled no later than
+`STACKS_INGEST_ATTEMPT_TIMEOUT`, with a required cleanup margin before the
+claim expires. The bounded failure state releases the claim while it is still
+owned, so another sync cannot begin duplicate model work merely because a long
+attempt reached the lease boundary.
+
+The legacy-admission migration preserves all pre-fix model payloads and
+provenance for audit, but excludes those old mentions, aliases, observations,
+signals, and reports from current resolution and analysis. Run `sync` again to
+produce a post-fix extraction derivation. An explicit review correction may
+re-admit the identity decision, but an ungrounded legacy model surface never
+becomes an authoritative alias and legacy signals remain excluded.
 
 The Bedrock availability check does not invoke the model and therefore cannot
 prove runtime quota, throughput, or successful inference. An account with zero

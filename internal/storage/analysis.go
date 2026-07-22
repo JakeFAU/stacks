@@ -163,6 +163,7 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairIdentity(ctx context.Context, 
 		JOIN stacks.entities AS entity ON entity.id = decision.entity_id
 		WHERE decision.superseded_by_id IS NULL
 		  AND decision.outcome IN ('accepted', 'created')
+		  AND decision.currently_admissible
 		  AND entity.kind = 'person'
 		  AND decision.entity_id = ANY($2::uuid[])
 		ORDER BY CASE WHEN decision.entity_id = $1::uuid THEN 0 ELSE 1 END,
@@ -205,6 +206,7 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 			JOIN stacks.resolution_decisions AS decision ON decision.proposal_id = proposal.id
 			WHERE decision.superseded_by_id IS NULL
 			  AND decision.outcome IN ('accepted', 'created')
+			  AND decision.currently_admissible
 		), eligible_signals AS (
 			SELECT signal.id AS signal_id,
 			       signal.digest AS signal_digest,
@@ -234,10 +236,14 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 			       object_decision.digest AS object_decision_digest
 			FROM stacks.interaction_signals AS signal
 			JOIN stacks.observations AS observation ON observation.id = signal.observation_id
+			LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = observation.extraction_run_id
 			JOIN effective_decisions AS subject_decision ON subject_decision.mention_id = observation.subject_mention_id
 			JOIN effective_decisions AS object_decision ON object_decision.mention_id = observation.object_mention_id
 			WHERE subject_decision.entity_id = $2::uuid
 			  AND object_decision.entity_id = $1::uuid
+			  AND signal.currently_admissible
+			  AND observation.currently_admissible
+			  AND (observation.extraction_run_id IS NULL OR extraction_run.currently_admissible)
 			  AND EXISTS (
 					SELECT 1
 					FROM stacks.signal_evidence AS supporting
@@ -509,8 +515,9 @@ func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, comp
 	result, err := transaction.Exec(ctx, `
 		INSERT INTO stacks.analysis_runs
 			(id, employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version, policy_version,
-			 state, recorded_at, completed_at, hypothesis, report_state, bedrock_region, model_id, max_output_tokens, report_json)
-		VALUES ($1, $2, $3, $4, $5, $6, 'complete', $7, $7, $8, $9, $10, $11, $12, $13)
+			 state, recorded_at, completed_at, hypothesis, report_state, bedrock_region, model_id, max_output_tokens, report_json,
+			 currently_admissible)
+		VALUES ($1, $2, $3, $4, $5, $6, 'complete', $7, $7, $8, $9, $10, $11, $12, $13, true)
 		ON CONFLICT (input_digest) DO NOTHING`,
 		completion.Report.ID, completion.Identity.EmployeeEntityID, completion.Identity.ManagerEntityID,
 		wantDigest[:], completion.Identity.PromptVersion, completion.Identity.PolicyVersion,
@@ -575,8 +582,8 @@ func (repository *AnalysisRepository) Complete(ctx context.Context, input Analys
 	var run AnalysisRun
 	err = transaction.QueryRow(ctx, `
 		INSERT INTO stacks.analysis_runs
-			(employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version, policy_version, state, recorded_at, completed_at)
-		VALUES ($1, $2, $3, $4, $5, 'complete', $6, $6)
+			(employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version, policy_version, state, recorded_at, completed_at, currently_admissible)
+		VALUES ($1, $2, $3, $4, $5, 'complete', $6, $6, true)
 		ON CONFLICT (input_digest) DO NOTHING
 		RETURNING id`,
 		input.EmployeeEntityID, input.ManagerEntityID, digest[:], input.AnalysisPromptVersion, input.PolicyVersion, time.Now().UTC()).Scan(&run.ID)
@@ -733,11 +740,11 @@ func validatePersistedAnalysisInput(ctx context.Context, transaction pgx.Tx, inp
 	case AnalysisInputKindDocumentTab:
 		query = `SELECT content_digest FROM stacks.document_tabs WHERE id = $1`
 	case AnalysisInputKindObservation:
-		query = `SELECT digest FROM stacks.observations WHERE id = $1`
+		query = `SELECT digest FROM stacks.observations WHERE id = $1 AND currently_admissible`
 	case AnalysisInputKindSignal:
-		query = `SELECT digest FROM stacks.interaction_signals WHERE id = $1`
+		query = `SELECT digest FROM stacks.interaction_signals WHERE id = $1 AND currently_admissible`
 	case AnalysisInputKindResolutionDecision:
-		query = `SELECT digest FROM stacks.resolution_decisions WHERE id = $1`
+		query = `SELECT digest FROM stacks.resolution_decisions WHERE id = $1 AND currently_admissible`
 	default:
 		return fmt.Errorf("kind is invalid")
 	}
@@ -803,6 +810,7 @@ func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalys
 			WHERE id = $1
 			  AND superseded_by_id IS NULL
 			  AND outcome IN ('accepted', 'created')
+			  AND currently_admissible
 			FOR SHARE`, input.ID).Scan(&storedDigest, &entityID)
 		if err == pgx.ErrNoRows {
 			return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)
@@ -828,7 +836,8 @@ func findCompletedAnalysis(ctx context.Context, queryer completedAnalysisQueryer
 	err := queryer.QueryRow(ctx, `
 		SELECT id::text, report_json
 		FROM stacks.analysis_runs
-		WHERE input_digest = $1 AND state = 'complete' AND report_json IS NOT NULL`, digest[:]).Scan(&reportID, &reportJSON)
+		WHERE input_digest = $1 AND state = 'complete' AND report_json IS NOT NULL
+		  AND currently_admissible`, digest[:]).Scan(&reportID, &reportJSON)
 	if err == pgx.ErrNoRows {
 		return analysisdomain.Report{}, false, nil
 	}

@@ -237,14 +237,16 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 	err = transaction.QueryRow(ctx, `
 		INSERT INTO stacks.extraction_runs
 			(document_version_id, derivation_digest, model_id, bedrock_region,
-			 max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			 max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at,
+			 currently_admissible)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
 		ON CONFLICT (document_version_id, derivation_digest) DO NOTHING
 		RETURNING id`, stored.ID, derivation.Digest[:], derivation.ModelID, derivation.Region,
 		derivation.MaxTokens, derivation.PromptVersion, derivation.SchemaDigest[:], claimOwner, leaseExpiresAt, claimedAt).Scan(&state.DerivationID)
 	if err == nil {
 		state.Status = ingest.VersionStatusPending
 		state.LeaseOwner = claimOwner
+		state.LeaseExpiresAt = leaseExpiresAt
 	} else if err == pgx.ErrNoRows {
 		var status string
 		var failureCode *string
@@ -290,6 +292,7 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 			state.Status = ingest.VersionStatusPending
 			state.FailureCode = ""
 			state.LeaseOwner = claimOwner
+			state.LeaseExpiresAt = leaseExpiresAt
 		}
 	} else {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion derivation: %w", err)
@@ -440,13 +443,15 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, derivatio
 		if normalizedName == "" {
 			normalizedName = entity.NormalizeName(record.Surface)
 		}
-		if normalizedName != entity.NormalizeName(record.Surface) || record.NormalizedEmail != entity.NormalizeEmail(record.NormalizedEmail) {
+		if normalizedName != entity.NormalizeName(record.Surface) || record.NormalizedEmail != entity.NormalizeEmail(record.NormalizedEmail) ||
+			(record.NormalizedEmail != "" && !entity.ValidEmail(record.NormalizedEmail)) {
 			return nil, fmt.Errorf("persist ingestion mention: normalized identity is invalid")
 		}
 		err := transaction.QueryRow(ctx, `
 			INSERT INTO stacks.mentions
-				(extraction_run_id, evidence_span_id, surface, normalized_name, normalized_email, role, recorded_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+				(extraction_run_id, evidence_span_id, surface, normalized_name, normalized_email, role, recorded_at,
+				 currently_admissible)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, true)
 			ON CONFLICT (extraction_run_id, evidence_span_id, surface, role)
 				WHERE extraction_run_id IS NOT NULL
 			DO UPDATE
@@ -482,8 +487,8 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, derivatio
 			}, "")
 			if _, err := transaction.Exec(ctx, `
 				INSERT INTO stacks.resolution_decisions
-					(id, proposal_id, outcome, entity_id, digest, recorded_at)
-				VALUES ($1, $2, 'accepted', $3, $4, $5)
+					(id, proposal_id, outcome, entity_id, digest, recorded_at, currently_admissible)
+				VALUES ($1, $2, 'accepted', $3, $4, $5, true)
 				ON CONFLICT (id) DO NOTHING`, decisionID, proposalID, record.Resolution.EntityID, digest[:], time.Now().UTC()); err != nil {
 				return nil, fmt.Errorf("persist ingestion resolution decision: %w", err)
 			}

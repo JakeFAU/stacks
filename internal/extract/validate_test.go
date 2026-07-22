@@ -163,6 +163,62 @@ func TestValidateExtractionRejectsPersonEmailAbsentFromCitedEvidence(t *testing.
 	}
 }
 
+func TestValidateExtractionRejectsMalformedGroundedEmail(t *testing.T) {
+	const citedText = "speaker-a <speaker@@example.test> assigned"
+	submitted := SubmittedText{Tabs: []SubmittedTab{{
+		ID: "transcript-tab", Role: TabRoleTranscript,
+		Text: citedText + " the follow-up.",
+	}}}
+	output := validExtraction()
+	output.People[0].Email = "speaker@@example.test"
+	output.Citations[0] = Citation{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+		EndOffset: len(citedText), Quote: citedText,
+	}
+
+	err := ValidateExtraction(submitted, output)
+	if err == nil || !strings.Contains(err.Error(), "email") {
+		t.Fatalf("ValidateExtraction() error = %v, want malformed email rejection", err)
+	}
+}
+
+func TestValidateExtractionDoesNotGroundNameSolelyInsideEmailToken(t *testing.T) {
+	const citedText = "alex.chen@example.test assigned the follow-up."
+	submitted := SubmittedText{Tabs: []SubmittedTab{{
+		ID: "transcript-tab", Role: TabRoleTranscript, Text: citedText,
+	}}}
+	output := validExtraction()
+	output.People[0].Surface = "Alex"
+	output.People[0].Email = ""
+	output.Citations[0] = Citation{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+		EndOffset: len(citedText), Quote: citedText,
+	}
+
+	err := ValidateExtraction(submitted, output)
+	if err == nil || !strings.Contains(err.Error(), "surface") {
+		t.Fatalf("ValidateExtraction() error = %v, want email-token name grounding rejection", err)
+	}
+}
+
+func TestValidateExtractionGroundsNameWhenSeparateFromEmailToken(t *testing.T) {
+	const citedText = "Alex (alex.chen@example.test) assigned the follow-up."
+	submitted := SubmittedText{Tabs: []SubmittedTab{{
+		ID: "transcript-tab", Role: TabRoleTranscript, Text: citedText,
+	}}}
+	output := validExtraction()
+	output.People[0].Surface = "Alex"
+	output.People[0].Email = "alex.chen@example.test"
+	output.Citations[0] = Citation{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+		EndOffset: len(citedText), Quote: citedText,
+	}
+
+	if err := ValidateExtraction(submitted, output); err != nil {
+		t.Fatalf("ValidateExtraction() error = %v, want separately grounded name and email", err)
+	}
+}
+
 func TestValidateExtractionAcceptsNormalizedEmailExactlyPresentInCitedEvidence(t *testing.T) {
 	const citedText = "speaker-a <speaker@example.test> assigned"
 	submitted := SubmittedText{Tabs: []SubmittedTab{{

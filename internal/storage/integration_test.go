@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	analysisdomain "stacks/internal/analysis"
@@ -145,6 +148,384 @@ func TestExpiredExtractionClaimCanBeRecoveredByNewOwner(t *testing.T) {
 	if recovered.Status != ingest.VersionStatusPending || recovered.RetryCount != 1 ||
 		recovered.LeaseOwner == "" || recovered.LeaseOwner == first.LeaseOwner {
 		t.Fatalf("recovered state = %#v, want retry with a new active owner", recovered)
+	}
+}
+
+func TestPre00005LegacyRowsRemainAuditableButNotCurrentlyAdmissible(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	entities := NewEntityRepository(pool)
+	ingestion := NewIngestionRepository(pool)
+	analysisRepository := NewAnalysisRepository(pool)
+
+	employee, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Legacy Employee"})
+	if err != nil {
+		t.Fatalf("create legacy employee: %v", err)
+	}
+	manager, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Legacy Manager"})
+	if err != nil {
+		t.Fatalf("create legacy manager: %v", err)
+	}
+	version := testDocumentVersion(t, testIdentifier("document-pre-00005-upgrade"))
+	documents := NewDocumentRepository(pool)
+	if _, _, err := documents.PutDocumentVersion(ctx, version); err != nil {
+		t.Fatalf("put legacy source version: %v", err)
+	}
+	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, TabID: "tab-synthetic", StartOffset: 0,
+		EndOffset: len("Synthetic"), Quote: "Synthetic",
+	})
+	if err != nil {
+		t.Fatalf("new legacy evidence span: %v", err)
+	}
+	storedSpan, err := documents.PutEvidenceSpan(ctx, span)
+	if err != nil {
+		t.Fatalf("put legacy evidence span: %v", err)
+	}
+
+	managerMentionID := uuid.NewString()
+	employeeMentionID := uuid.NewString()
+	for _, mention := range []struct {
+		id      string
+		surface string
+		role    string
+	}{
+		{id: managerMentionID, surface: "Unsafe Model Manager", role: "speaker"},
+		{id: employeeMentionID, surface: "Unsafe Model Employee", role: "reference"},
+	} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO stacks.mentions
+				(id, evidence_span_id, surface, normalized_name, normalized_email, role, recorded_at, currently_admissible)
+			VALUES ($1, $2, $3, $4, '', $5, $6, false)`,
+			mention.id, storedSpan.ID, mention.surface, entity.NormalizeName(mention.surface), mention.role, time.Now().UTC()); err != nil {
+			t.Fatalf("seed pre-00005 mention: %v", err)
+		}
+	}
+
+	managerProposalID := uuid.NewString()
+	employeeProposalID := uuid.NewString()
+	managerDecisionID := uuid.NewString()
+	employeeDecisionID := uuid.NewString()
+	for _, resolution := range []struct {
+		proposalID string
+		mentionID  string
+		decisionID string
+		entityID   string
+	}{
+		{managerProposalID, managerMentionID, managerDecisionID, manager.ID},
+		{employeeProposalID, employeeMentionID, employeeDecisionID, employee.ID},
+	} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO stacks.resolution_proposals (id, mention_id, status, derivation, recorded_at)
+			VALUES ($1, $2, 'resolved', 'legacy_model_extraction', $3)`,
+			resolution.proposalID, resolution.mentionID, time.Now().UTC()); err != nil {
+			t.Fatalf("seed pre-00005 proposal: %v", err)
+		}
+		digest := sha256.Sum256([]byte(resolution.decisionID))
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO stacks.resolution_decisions
+				(id, proposal_id, outcome, entity_id, digest, recorded_at, currently_admissible)
+			VALUES ($1, $2, 'accepted', $3, $4, $5, false)`,
+			resolution.decisionID, resolution.proposalID, resolution.entityID, digest[:], time.Now().UTC()); err != nil {
+			t.Fatalf("seed pre-00005 decision: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO stacks.entity_alias_assertions
+				(decision_id, entity_id, normalized_value, alias_type, recorded_at)
+			VALUES ($1, $2, $3, 'name', $4)`,
+			resolution.decisionID, resolution.entityID, entity.NormalizeName("Unsafe Model Alias"), time.Now().UTC()); err != nil {
+			t.Fatalf("seed pre-00005 alias assertion: %v", err)
+		}
+	}
+
+	observationID := uuid.NewString()
+	observationDigest := sha256.Sum256([]byte("legacy observation " + observationID))
+	validTime := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO stacks.observations
+			(id, subject_mention_id, object_mention_id, predicate, valid_start, recorded_at,
+			 derivation, epistemic_status, digest, currently_admissible)
+		VALUES ($1, $2, $3, 'interaction_signal', $4, $5,
+		        'legacy_model_extraction', 'inferred', $6, false)`,
+		observationID, managerMentionID, employeeMentionID, validTime, time.Now().UTC(), observationDigest[:]); err != nil {
+		t.Fatalf("seed pre-00005 observation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO stacks.observation_evidence (observation_id, evidence_span_id) VALUES ($1, $2)`,
+		observationID, storedSpan.ID); err != nil {
+		t.Fatalf("seed pre-00005 observation evidence: %v", err)
+	}
+
+	const unsafeRationale = "The manager secretly distrusts the employee."
+	signalID := uuid.NewString()
+	signalDigest := sha256.Sum256([]byte("legacy signal " + signalID))
+	transaction, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("start legacy signal seed: %v", err)
+	}
+	if _, err := transaction.Exec(ctx, `
+		INSERT INTO stacks.interaction_signals
+			(id, observation_id, category, direction, extraction_model_id, prompt_version,
+			 rationale, confidence, digest, currently_admissible)
+		VALUES ($1, $2, 'delegation_autonomy', 'weakening', 'legacy-model', 'extract-legacy',
+		        $3, 0.9, $4, false)`, signalID, observationID, unsafeRationale, signalDigest[:]); err != nil {
+		_ = transaction.Rollback(ctx)
+		t.Fatalf("seed pre-00005 signal: %v", err)
+	}
+	if _, err := transaction.Exec(ctx, `
+		INSERT INTO stacks.signal_evidence (signal_id, evidence_span_id, role)
+		VALUES ($1, $2, 'supporting')`, signalID, storedSpan.ID); err != nil {
+		_ = transaction.Rollback(ctx)
+		t.Fatalf("seed pre-00005 signal evidence: %v", err)
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		t.Fatalf("commit pre-00005 signal: %v", err)
+	}
+
+	legacyAnalysisDigest := sha256.Sum256([]byte("legacy analysis " + uuid.NewString()))
+	legacyAnalysisID := uuid.NewString()
+	const unsafeHypothesis = "The manager has lost confidence."
+	const unsafeReport = `{"rationale":"private hidden-state assertion"}`
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO stacks.analysis_runs
+			(id, employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version,
+			 policy_version, state, recorded_at, completed_at, hypothesis, report_state, report_json,
+			 currently_admissible)
+		VALUES ($1, $2, $3, $4, 'analyze-legacy', 'policy-legacy', 'complete', $5, $5,
+		        $6, 'possible declining-confidence signal', $7::jsonb, false)`,
+		legacyAnalysisID, employee.ID, manager.ID, legacyAnalysisDigest[:], time.Now().UTC(), unsafeHypothesis, unsafeReport); err != nil {
+		t.Fatalf("seed pre-00005 analysis: %v", err)
+	}
+
+	var storedRationale, storedHypothesis string
+	var storedReport []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT signal.rationale, run.hypothesis, run.report_json
+		FROM stacks.interaction_signals AS signal
+		CROSS JOIN stacks.analysis_runs AS run
+		WHERE signal.id = $1 AND run.id = $2`, signalID, legacyAnalysisID).Scan(
+		&storedRationale, &storedHypothesis, &storedReport); err != nil {
+		t.Fatalf("load preserved legacy audit payload: %v", err)
+	}
+	if storedRationale != unsafeRationale || storedHypothesis != unsafeHypothesis || len(storedReport) == 0 {
+		t.Fatalf("legacy audit payload = %q/%q/%q, want unchanged", storedRationale, storedHypothesis, storedReport)
+	}
+
+	snapshots := snapshotsForTest(t, ingestion)
+	assertSnapshotAlias(t, snapshots, manager.ID, entity.NormalizeName("Unsafe Model Alias"), false)
+	pair, err := analysisRepository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	if err != nil {
+		t.Fatalf("load legacy pair inputs: %v", err)
+	}
+	if pair.Accepted || len(pair.Signals) != 0 {
+		t.Fatalf("legacy pair = %#v, want no currently admitted identities or signals", pair)
+	}
+	if _, found, err := findCompletedAnalysis(ctx, pool, legacyAnalysisDigest); err != nil || found {
+		t.Fatalf("find legacy analysis = (found %t, error %v), want preserved but non-renderable", found, err)
+	}
+
+	for _, correction := range []struct {
+		decisionID string
+		entityID   string
+	}{
+		{managerDecisionID, manager.ID},
+		{employeeDecisionID, employee.ID},
+	} {
+		if _, err := entities.CorrectReviewDecision(ctx, correction.decisionID, ResolutionDecisionInput{
+			Outcome: ResolutionOutcomeAccepted, EntityID: correction.entityID,
+		}); err != nil {
+			t.Fatalf("explicitly re-review legacy identity: %v", err)
+		}
+	}
+	assertSnapshotAlias(t, snapshotsForTest(t, ingestion), manager.ID, entity.NormalizeName("Unsafe Model Manager"), false)
+	pair, err = analysisRepository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	if err != nil {
+		t.Fatalf("load explicitly reviewed legacy pair: %v", err)
+	}
+	if !pair.Accepted || len(pair.Signals) != 0 {
+		t.Fatalf("explicitly reviewed legacy pair = %#v, want identities admitted but unsafe derived signals excluded", pair)
+	}
+}
+
+func TestLegacyAdmissionMigrationUpgradesPre00005RowsWithoutRewritingPayload(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	schemaName := "stacks_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := `"` + schemaName + `"`
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatalf("create isolated upgrade schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+	})
+
+	for _, migration := range []string{
+		"00002_manager_confidence_poc.sql",
+		"00003_ingestion_processing_state.sql",
+		"00004_temporal_pair_analysis.sql",
+	} {
+		applyMigrationToSchema(t, pool, quotedSchema, migration)
+	}
+
+	legacy := seedPre00005AuditRows(t, pool, quotedSchema)
+	applyMigrationToSchema(t, pool, quotedSchema, "00005_manager_confidence_final_fixes.sql")
+	applyMigrationToSchema(t, pool, quotedSchema, "00006_legacy_admission_boundary.sql")
+
+	var rationalePreserved, analysisPreserved bool
+	if err := pool.QueryRow(ctx, `
+		SELECT signal.rationale = $3,
+		       run.hypothesis = $4 AND run.report_json = $5::jsonb
+		FROM `+quotedSchema+`.interaction_signals AS signal
+		CROSS JOIN `+quotedSchema+`.analysis_runs AS run
+		WHERE signal.id = $1 AND run.id = $2`,
+		legacy.signalID, legacy.analysisID, legacy.rationale, legacy.hypothesis, legacy.reportJSON,
+	).Scan(&rationalePreserved, &analysisPreserved); err != nil {
+		t.Fatalf("load upgraded audit payload: %v", err)
+	}
+	if !rationalePreserved || !analysisPreserved {
+		t.Fatal("pre-00005 rationale, hypothesis, or report payload was rewritten")
+	}
+
+	for _, row := range []struct {
+		table string
+		id    string
+	}{
+		{table: "mentions", id: legacy.mentionID},
+		{table: "resolution_decisions", id: legacy.decisionID},
+		{table: "observations", id: legacy.observationID},
+		{table: "interaction_signals", id: legacy.signalID},
+		{table: "analysis_runs", id: legacy.analysisID},
+	} {
+		var admissible bool
+		if err := pool.QueryRow(ctx, "SELECT currently_admissible FROM "+quotedSchema+`."`+row.table+`" WHERE id = $1`, row.id).Scan(&admissible); err != nil {
+			t.Fatalf("load upgraded %s admission state: %v", row.table, err)
+		}
+		if admissible {
+			t.Fatalf("pre-00005 %s row remained currently admissible", row.table)
+		}
+	}
+
+	var totalAliases, admittedAliases int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), count(*) FILTER (WHERE decision.currently_admissible)
+		FROM `+quotedSchema+`.entity_alias_assertions AS assertion
+		JOIN `+quotedSchema+`.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		WHERE assertion.normalized_value IN ($1, $2)`, legacy.normalizedMention, legacy.normalizedAlias,
+	).Scan(&totalAliases, &admittedAliases); err != nil {
+		t.Fatalf("load upgraded alias admission state: %v", err)
+	}
+	if totalAliases == 0 || admittedAliases != 0 {
+		t.Fatalf("upgraded aliases total/admitted = %d/%d, want preserved but non-admissible", totalAliases, admittedAliases)
+	}
+
+	for _, table := range []string{
+		"extraction_runs", "mentions", "resolution_decisions", "observations", "interaction_signals", "analysis_runs",
+	} {
+		var columnDefault string
+		if err := pool.QueryRow(ctx, `
+			SELECT column_default
+			FROM information_schema.columns
+			WHERE table_schema = $1 AND table_name = $2 AND column_name = 'currently_admissible'`,
+			schemaName, table).Scan(&columnDefault); err != nil {
+			t.Fatalf("load post-fix %s admission default: %v", table, err)
+		}
+		if columnDefault != "true" {
+			t.Fatalf("post-fix %s admission default = %q, want true", table, columnDefault)
+		}
+	}
+}
+
+type pre00005AuditRows struct {
+	mentionID         string
+	decisionID        string
+	observationID     string
+	signalID          string
+	analysisID        string
+	normalizedMention string
+	normalizedAlias   string
+	rationale         string
+	hypothesis        string
+	reportJSON        string
+}
+
+func seedPre00005AuditRows(t *testing.T, pool *pgxpool.Pool, quotedSchema string) pre00005AuditRows {
+	t.Helper()
+	ctx := context.Background()
+	legacy := pre00005AuditRows{
+		mentionID:         uuid.NewString(),
+		decisionID:        uuid.NewString(),
+		observationID:     uuid.NewString(),
+		signalID:          uuid.NewString(),
+		analysisID:        uuid.NewString(),
+		normalizedMention: entity.NormalizeName("Unsafe Legacy Surface"),
+		normalizedAlias:   entity.NormalizeName("Unsafe Legacy Alias"),
+		rationale:         "Legacy private hidden-state rationale.",
+		hypothesis:        "Legacy private hidden-state hypothesis.",
+		reportJSON:        `{"rationale":"legacy private hidden-state report"}`,
+	}
+	sourceID := uuid.NewString()
+	versionID := uuid.NewString()
+	tabID := uuid.NewString()
+	spanID := uuid.NewString()
+	entityID := uuid.NewString()
+	proposalID := uuid.NewString()
+	recordedAt := time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC)
+	digest := func(value string) []byte {
+		sum := sha256.Sum256([]byte(value))
+		return sum[:]
+	}
+
+	statements := []struct {
+		operation string
+		query     string
+		arguments []any
+	}{
+		{"source document", "INSERT INTO " + quotedSchema + `.source_documents (id, provider, provider_document_id, recorded_at) VALUES ($1, 'drive', 'legacy-document', $2)`, []any{sourceID, recordedAt}},
+		{"document version", "INSERT INTO " + quotedSchema + `.document_versions (id, source_document_id, digest, recorded_at) VALUES ($1, $2, $3, $4)`, []any{versionID, sourceID, digest("version"), recordedAt}},
+		{"document tab", "INSERT INTO " + quotedSchema + `.document_tabs (id, document_version_id, provider_tab_id, title, title_path, display_order, role, content, content_digest) VALUES ($1, $2, 'legacy-tab', 'Transcript', ARRAY['Transcript'], 0, 'transcript', 'Unsafe Legacy Surface', $3)`, []any{tabID, versionID, digest("tab")}},
+		{"evidence span", "INSERT INTO " + quotedSchema + `.evidence_spans (id, document_tab_id, start_offset, end_offset, quote) VALUES ($1, $2, 0, 21, 'Unsafe Legacy Surface')`, []any{spanID, tabID}},
+		{"entity", "INSERT INTO " + quotedSchema + `.entities (id, kind, display_name, recorded_at) VALUES ($1, 'person', 'Synthetic Person', $2)`, []any{entityID, recordedAt}},
+		{"standalone alias", "INSERT INTO " + quotedSchema + `.entity_aliases (entity_id, normalized_value, alias_type, recorded_at) VALUES ($1, $2, 'name', $3)`, []any{entityID, legacy.normalizedAlias, recordedAt}},
+		{"mention", "INSERT INTO " + quotedSchema + `.mentions (id, evidence_span_id, surface, role, recorded_at) VALUES ($1, $2, 'Unsafe Legacy Surface', 'speaker', $3)`, []any{legacy.mentionID, spanID, recordedAt}},
+		{"proposal", "INSERT INTO " + quotedSchema + `.resolution_proposals (id, mention_id, status, derivation, recorded_at) VALUES ($1, $2, 'resolved', 'legacy_model', $3)`, []any{proposalID, legacy.mentionID, recordedAt}},
+		{"decision", "INSERT INTO " + quotedSchema + `.resolution_decisions (id, proposal_id, outcome, entity_id, digest, recorded_at) VALUES ($1, $2, 'accepted', $3, $4, $5)`, []any{legacy.decisionID, proposalID, entityID, digest("decision"), recordedAt}},
+		{"observation", "INSERT INTO " + quotedSchema + `.observations (id, subject_entity_id, subject_mention_id, predicate, recorded_at, derivation, epistemic_status, digest) VALUES ($1, $2, $3, 'interaction_signal', $4, 'legacy_model', 'inferred', $5)`, []any{legacy.observationID, entityID, legacy.mentionID, recordedAt, digest("observation")}},
+		{"observation evidence", "INSERT INTO " + quotedSchema + `.observation_evidence (observation_id, evidence_span_id) VALUES ($1, $2)`, []any{legacy.observationID, spanID}},
+		{"analysis", "INSERT INTO " + quotedSchema + `.analysis_runs (id, employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version, policy_version, state, recorded_at, completed_at, hypothesis, report_state, report_json) VALUES ($1, $2, $2, $3, 'legacy-prompt', 'legacy-policy', 'complete', $4, $4, $5, 'possible declining-confidence signal', $6::jsonb)`, []any{legacy.analysisID, entityID, digest("analysis"), recordedAt, legacy.hypothesis, legacy.reportJSON}},
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement.query, statement.arguments...); err != nil {
+			t.Fatalf("seed pre-00005 %s: %v", statement.operation, err)
+		}
+	}
+
+	transaction, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("start pre-00005 signal seed: %v", err)
+	}
+	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
+	if _, err := transaction.Exec(ctx, "INSERT INTO "+quotedSchema+`.interaction_signals (id, observation_id, category, direction, extraction_model_id, prompt_version, rationale, confidence, digest) VALUES ($1, $2, 'delegation_autonomy', 'weakening', 'legacy-model', 'legacy-prompt', $3, 0.9, $4)`, legacy.signalID, legacy.observationID, legacy.rationale, digest("signal")); err != nil {
+		t.Fatalf("seed pre-00005 signal: %v", err)
+	}
+	if _, err := transaction.Exec(ctx, "INSERT INTO "+quotedSchema+`.signal_evidence (signal_id, evidence_span_id, role) VALUES ($1, $2, 'supporting')`, legacy.signalID, spanID); err != nil {
+		t.Fatalf("seed pre-00005 signal evidence: %v", err)
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		t.Fatalf("commit pre-00005 signal seed: %v", err)
+	}
+	return legacy
+}
+
+func applyMigrationToSchema(t *testing.T, pool *pgxpool.Pool, quotedSchema, filename string) {
+	t.Helper()
+	path := filepath.Join("..", "..", "db", "migrations", filename)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", filename, err)
+	}
+	migration := strings.ReplaceAll(string(contents), "stacks.", quotedSchema+".")
+	if _, err := pool.Exec(context.Background(), migration, pgx.QueryExecModeSimpleProtocol); err != nil {
+		t.Fatalf("apply migration %q to isolated schema: %v", filename, err)
 	}
 }
 

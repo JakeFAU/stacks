@@ -11,6 +11,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv(ReadHeaderTimeoutEnvironmentVariable, "")
 	clearObservabilityEnvironment(t)
 	t.Setenv(IngestionLeaseDurationEnvironmentVariable, "")
+	t.Setenv(IngestionAttemptTimeoutEnvironmentVariable, "")
 
 	settings, err := Load()
 	if err != nil {
@@ -49,6 +50,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if settings.PoC.IngestionLeaseDuration != defaultIngestionLeaseDuration {
 		t.Errorf("PoC.IngestionLeaseDuration = %v, want %v", settings.PoC.IngestionLeaseDuration, defaultIngestionLeaseDuration)
+	}
+	if settings.PoC.IngestionAttemptTimeout != defaultIngestionAttemptTimeout {
+		t.Errorf("PoC.IngestionAttemptTimeout = %v, want %v", settings.PoC.IngestionAttemptTimeout, defaultIngestionAttemptTimeout)
 	}
 	if settings.PoC.ExtractionPromptVersion != defaultExtractionPromptVersion {
 		t.Errorf("PoC.ExtractionPromptVersion = %q, want %q", settings.PoC.ExtractionPromptVersion, defaultExtractionPromptVersion)
@@ -159,6 +163,7 @@ func TestLoadReadsPoCSettings(t *testing.T) {
 	t.Setenv(BedrockMaxTokensEnvironmentVariable, "1000")
 	t.Setenv(BedrockMaxAttemptsEnvironmentVariable, "3")
 	t.Setenv(IngestionLeaseDurationEnvironmentVariable, "2m")
+	t.Setenv(IngestionAttemptTimeoutEnvironmentVariable, "90s")
 	t.Setenv(ExtractionPromptVersionEnvironmentVariable, "extract-test-v1")
 	t.Setenv(AnalysisPromptVersionEnvironmentVariable, "analyze-test-v1")
 	t.Setenv(EmployeeEntityIDEnvironmentVariable, "employee-id")
@@ -172,6 +177,7 @@ func TestLoadReadsPoCSettings(t *testing.T) {
 	want := validPoCSettings()
 	want.BedrockMaxAttempts = 3
 	want.IngestionLeaseDuration = 2 * time.Minute
+	want.IngestionAttemptTimeout = 90 * time.Second
 	want.ExtractionPromptVersion = "extract-test-v1"
 	want.AnalysisPromptVersion = "analyze-test-v1"
 	want.TranscriptTitles = []string{"Transcript", "Meeting transcript"}
@@ -229,6 +235,36 @@ func TestLoadRejectsInvalidOrUnboundedIngestionLeaseDuration(t *testing.T) {
 				t.Fatal("Load() error = nil, want bounded positive lease duration rejection")
 			}
 		})
+	}
+}
+
+func TestLoadRejectsAttemptTimeoutThatCanOutliveLease(t *testing.T) {
+	tests := []struct {
+		name    string
+		lease   string
+		attempt string
+	}{
+		{name: "equal", lease: "1m", attempt: "1m"},
+		{name: "longer", lease: "1m", attempt: "2m"},
+		{name: "no cleanup margin", lease: "1m", attempt: "58s"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv(IngestionLeaseDurationEnvironmentVariable, testCase.lease)
+			t.Setenv(IngestionAttemptTimeoutEnvironmentVariable, testCase.attempt)
+			if _, err := Load(); err == nil {
+				t.Fatal("Load() error = nil, want attempt deadline safely below lease")
+			}
+		})
+	}
+}
+
+func TestPoCSettingsValidateSyncRequiresAttemptTimeoutBelowLease(t *testing.T) {
+	settings := validPoCSettings()
+	settings.IngestionAttemptTimeout = settings.IngestionLeaseDuration
+
+	if err := settings.Validate(CommandSync); err == nil {
+		t.Fatal("Validate(sync) error = nil, want attempt timeout below lease")
 	}
 }
 
@@ -337,6 +373,7 @@ func validPoCSettings() PoCSettings {
 		BedrockMaxTokens:        1000,
 		BedrockMaxAttempts:      5,
 		IngestionLeaseDuration:  defaultIngestionLeaseDuration,
+		IngestionAttemptTimeout: defaultIngestionAttemptTimeout,
 		ExtractionPromptVersion: "extract-v1",
 		AnalysisPromptVersion:   "analyze-v1",
 		EmployeeEntityID:        "employee-id",
@@ -355,6 +392,7 @@ func diffPoCSettings(got, want PoCSettings) string {
 		got.BedrockMaxTokens != want.BedrockMaxTokens ||
 		got.BedrockMaxAttempts != want.BedrockMaxAttempts ||
 		got.IngestionLeaseDuration != want.IngestionLeaseDuration ||
+		got.IngestionAttemptTimeout != want.IngestionAttemptTimeout ||
 		got.ExtractionPromptVersion != want.ExtractionPromptVersion ||
 		got.AnalysisPromptVersion != want.AnalysisPromptVersion ||
 		got.EmployeeEntityID != want.EmployeeEntityID ||

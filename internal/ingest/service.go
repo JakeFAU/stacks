@@ -38,7 +38,7 @@ const (
 	ingestionSpanName                 = "stacks.ingest.sync"
 	ingestionDecisionName             = "ingest_document"
 	interactionPredicate              = "interaction_signal"
-	extractionDerivationDigestVersion = "stacks.extraction-derivation.v2"
+	extractionDerivationDigestVersion = "stacks.extraction-derivation.v3"
 )
 
 // Outcome is the bounded per-document result exposed by sync.
@@ -83,6 +83,7 @@ type VersionState struct {
 	DerivationID     string
 	DerivationDigest [sha256.Size]byte
 	LeaseOwner       string
+	LeaseExpiresAt   time.Time
 	Status           VersionStatus
 	RetryCount       int
 	FailureCode      FailureCode
@@ -183,19 +184,20 @@ type DecisionRecorder interface {
 // Service coordinates one folder sync. Dependencies remain lazy at the
 // command boundary, so unrelated commands do not initialize them.
 type Service struct {
-	Source        source.Source
-	Model         extract.Model
-	Resolver      Resolver
-	Repository    Repository
-	CollectionID  string
-	PromptVersion string
-	Region        string
-	ModelID       string
-	MaxTokens     int
-	LeaseDuration time.Duration
-	Tracer        trace.Tracer
-	Decisions     DecisionRecorder
-	Now           func() time.Time
+	Source         source.Source
+	Model          extract.Model
+	Resolver       Resolver
+	Repository     Repository
+	CollectionID   string
+	PromptVersion  string
+	Region         string
+	ModelID        string
+	MaxTokens      int
+	LeaseDuration  time.Duration
+	AttemptTimeout time.Duration
+	Tracer         trace.Tracer
+	Decisions      DecisionRecorder
+	Now            func() time.Time
 }
 
 // Result is one privacy-safe per-document outcome.
@@ -334,14 +336,22 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 		result.FailureCode = FailureBusy
 		return result, nil
 	}
+	attemptCtx, cancelAttempt, err := service.attemptContext(ctx, state)
+	if err != nil {
+		return service.fail(ctx, result, VersionStatusIncomplete, FailureModel)
+	}
+	defer cancelAttempt()
 
 	submitted, request, err := extractionRequest(document.Tabs, document.MeetingTime, service.PromptVersion)
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidSource)
 	}
-	response, err := service.Model.Generate(ctx, request)
-	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+	response, err := service.Model.Generate(attemptCtx, request)
+	if cancellationErr := boundedAttemptCancellation(ctx, attemptCtx, err); cancellationErr != nil {
 		return Result{}, cancellationErr
+	}
+	if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+		return service.fail(ctx, result, VersionStatusIncomplete, FailureModel)
 	}
 	if authErr := boundedGlobalAuthentication(err); authErr != nil {
 		if _, failureErr := service.fail(ctx, result, VersionStatusIncomplete, FailureModel); failureErr != nil {
@@ -359,9 +369,12 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidOutput)
 	}
-	snapshots, err := service.Repository.EntitySnapshots(ctx)
-	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+	snapshots, err := service.Repository.EntitySnapshots(attemptCtx)
+	if cancellationErr := boundedAttemptCancellation(ctx, attemptCtx, err); cancellationErr != nil {
 		return Result{}, cancellationErr
+	}
+	if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+		return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
 	}
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
@@ -373,9 +386,12 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if err := ValidateForPersistence(completion); err != nil {
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidOutput)
 	}
-	if err := service.Repository.CompleteVersion(ctx, completion); err != nil {
-		if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+	if err := service.Repository.CompleteVersion(attemptCtx, completion); err != nil {
+		if cancellationErr := boundedAttemptCancellation(ctx, attemptCtx, err); cancellationErr != nil {
 			return Result{}, cancellationErr
+		}
+		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+			return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
 		}
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
 	}
@@ -404,10 +420,7 @@ func (service *Service) completion(
 
 	resolutions := make(map[string]entity.Resolution, len(output.People))
 	for _, person := range output.People {
-		resolution := service.Resolver.Resolve(entity.Mention{Surface: person.Email}, snapshots)
-		if person.Email == "" || (!resolution.AutoResolved && len(resolution.Candidates) == 0) {
-			resolution = service.Resolver.Resolve(entity.Mention{Surface: person.Surface}, snapshots)
-		}
+		resolution := service.Resolver.Resolve(entity.Mention{Name: person.Surface, Email: person.Email}, snapshots)
 		resolutions[person.ID] = resolution
 		completion.Mentions = append(completion.Mentions, MentionRecord{
 			Key: person.ID, EvidenceKey: person.CitationIDs[0], Surface: person.Surface,
@@ -662,6 +675,13 @@ func boundedCancellation(ctx context.Context, err error) error {
 	return nil
 }
 
+func boundedAttemptCancellation(parent, attempt context.Context, err error) error {
+	if parent.Err() == nil && attempt.Err() != nil {
+		return nil
+	}
+	return boundedCancellation(parent, err)
+}
+
 func boundedGlobalAuthentication(err error) error {
 	switch {
 	case errors.Is(err, source.ErrAuthentication):
@@ -682,10 +702,29 @@ func (service *Service) validate() error {
 		return fmt.Errorf("sync service dependencies are required")
 	}
 	if strings.TrimSpace(service.CollectionID) == "" || strings.TrimSpace(service.PromptVersion) == "" ||
-		strings.TrimSpace(service.Region) == "" || strings.TrimSpace(service.ModelID) == "" || service.MaxTokens <= 0 || service.LeaseDuration <= 0 {
+		strings.TrimSpace(service.Region) == "" || strings.TrimSpace(service.ModelID) == "" || service.MaxTokens <= 0 ||
+		service.LeaseDuration <= 0 || service.AttemptTimeout <= 0 || service.AttemptTimeout >= service.LeaseDuration {
 		return fmt.Errorf("sync collection and model configuration are required")
 	}
 	return nil
+}
+
+func (service *Service) attemptContext(ctx context.Context, state VersionState) (context.Context, context.CancelFunc, error) {
+	if state.LeaseExpiresAt.IsZero() {
+		return nil, nil, fmt.Errorf("sync extraction lease expiry is required")
+	}
+	now := time.Now()
+	deadline := now.Add(service.AttemptTimeout)
+	cleanupMargin := service.LeaseDuration - service.AttemptTimeout
+	latestDeadline := state.LeaseExpiresAt.Add(-cleanupMargin)
+	if latestDeadline.Before(deadline) {
+		deadline = latestDeadline
+	}
+	if !deadline.After(now) {
+		return nil, nil, fmt.Errorf("sync extraction lease has no attempt window")
+	}
+	attemptCtx, cancel := context.WithDeadline(ctx, deadline)
+	return attemptCtx, cancel, nil
 }
 
 func (service *Service) now() time.Time {

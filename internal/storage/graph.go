@@ -180,8 +180,8 @@ func putObservation(ctx context.Context, transaction pgx.Tx, input ObservationIn
 	var observation Observation
 	err := transaction.QueryRow(ctx, `
 		INSERT INTO stacks.observations
-			(id, extraction_run_id, subject_entity_id, object_entity_id, subject_mention_id, object_mention_id, predicate, valid_start, valid_end, recorded_at, derivation, epistemic_status, confidence, digest)
-		VALUES ($1::uuid, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, NULLIF($4, '')::uuid, NULLIF($5, '')::uuid, NULLIF($6, '')::uuid, $7, $8, $9, $10, $11, $12, $13, $14)
+			(id, extraction_run_id, subject_entity_id, object_entity_id, subject_mention_id, object_mention_id, predicate, valid_start, valid_end, recorded_at, derivation, epistemic_status, confidence, digest, currently_admissible)
+		VALUES ($1::uuid, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, NULLIF($4, '')::uuid, NULLIF($5, '')::uuid, NULLIF($6, '')::uuid, $7, $8, $9, $10, $11, $12, $13, $14, true)
 		ON CONFLICT (id) DO NOTHING
 		RETURNING id`,
 		input.ID, input.ExtractionRunID, input.SubjectEntityID, input.ObjectEntityID, input.SubjectMentionID, input.ObjectMentionID,
@@ -207,8 +207,8 @@ func putSignal(ctx context.Context, transaction pgx.Tx, input SignalInput, diges
 	var signal InteractionSignal
 	err := transaction.QueryRow(ctx, `
 		INSERT INTO stacks.interaction_signals
-			(id, observation_id, category, direction, extraction_model_id, prompt_version, rationale, confidence, digest)
-		VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9)
+			(id, observation_id, category, direction, extraction_model_id, prompt_version, rationale, confidence, digest, currently_admissible)
+		VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, true)
 		ON CONFLICT (id) DO NOTHING
 		RETURNING id`,
 		input.ID, input.ObservationID, input.Category, input.Direction, input.ExtractionModelID, input.PromptVersion, input.Rationale, input.Confidence, digest).Scan(&signal.ID)

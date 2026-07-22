@@ -26,3 +26,23 @@ func TestNormalizeEmailCanonicalizesUnicodeCaseWithoutNameRules(t *testing.T) {
 		t.Fatalf("NormalizeEmail() = %q, want %q", got, "riya.chen@synthetic.example")
 	}
 }
+
+func TestValidEmailRejectsMalformedOptionalIdentifiers(t *testing.T) {
+	for _, value := range []string{
+		"Riya Chen",
+		"riya@@synthetic.example",
+		"riya@",
+		"@synthetic.example",
+		"riya chen@synthetic.example",
+		"Display Name <riya@synthetic.example>",
+	} {
+		t.Run(value, func(t *testing.T) {
+			if ValidEmail(value) {
+				t.Fatalf("ValidEmail(%q) = true, want false", value)
+			}
+		})
+	}
+	if !ValidEmail("Riya.Chen@Synthetic.Example") {
+		t.Fatal("ValidEmail(valid address) = false")
+	}
+}

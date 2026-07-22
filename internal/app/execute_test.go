@@ -103,6 +103,7 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 		BedrockMaxTokens:        256,
 		BedrockMaxAttempts:      1,
 		IngestionLeaseDuration:  5 * time.Minute,
+		IngestionAttemptTimeout: 4 * time.Minute,
 		ExtractionPromptVersion: "extract-v1",
 		AnalysisPromptVersion:   "analyze-v1",
 	}}

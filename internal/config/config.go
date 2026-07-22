@@ -118,6 +118,17 @@ func Load() (Settings, error) {
 	if ingestionLeaseDuration > maximumIngestionLeaseDuration {
 		return Settings{}, fmt.Errorf("%s must be no greater than %s", IngestionLeaseDurationEnvironmentVariable, maximumIngestionLeaseDuration)
 	}
+	ingestionAttemptTimeout, err := durationEnvironment(
+		IngestionAttemptTimeoutEnvironmentVariable,
+		defaultIngestionAttemptTimeout,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+	if ingestionAttemptTimeout > ingestionLeaseDuration-minimumLeaseCleanupMargin {
+		return Settings{}, fmt.Errorf("%s must leave at least %s before %s expires",
+			IngestionAttemptTimeoutEnvironmentVariable, minimumLeaseCleanupMargin, IngestionLeaseDurationEnvironmentVariable)
+	}
 
 	return Settings{
 		HTTPAddress:       net.JoinHostPort(host, strconv.Itoa(port)),
@@ -144,6 +155,7 @@ func Load() (Settings, error) {
 			BedrockMaxTokens:        bedrockMaxTokens,
 			BedrockMaxAttempts:      bedrockMaxAttempts,
 			IngestionLeaseDuration:  ingestionLeaseDuration,
+			IngestionAttemptTimeout: ingestionAttemptTimeout,
 			ExtractionPromptVersion: environmentOrDefault(ExtractionPromptVersionEnvironmentVariable, defaultExtractionPromptVersion),
 			AnalysisPromptVersion:   environmentOrDefault(AnalysisPromptVersionEnvironmentVariable, defaultAnalysisPromptVersion),
 			EmployeeEntityID:        os.Getenv(EmployeeEntityIDEnvironmentVariable),

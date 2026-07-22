@@ -13,8 +13,11 @@ type Resolver struct{}
 // accepted exact email or accepted exact name alias. Every other match is kept
 // as a deterministic ranked candidate for review.
 func (Resolver) Resolve(mention Mention, snapshots []EntitySnapshot) Resolution {
-	normalizedName := NormalizeName(mention.Surface)
-	normalizedEmail := NormalizeEmail(mention.Surface)
+	normalizedName := NormalizeName(mention.Name)
+	normalizedEmail := NormalizeEmail(mention.Email)
+	if !ValidEmail(normalizedEmail) {
+		normalizedEmail = ""
+	}
 	exactMatches := matchingAcceptedIdentifiers(normalizedName, normalizedEmail, snapshots)
 	if len(exactMatches) == 1 {
 		return Resolution{EntityID: exactMatches[0], AutoResolved: true}

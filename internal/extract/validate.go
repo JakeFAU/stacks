@@ -11,7 +11,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"golang.org/x/text/unicode/norm"
+	"stacks/internal/entity"
 )
 
 type TabRole string
@@ -434,10 +434,10 @@ func validateOptionalReferences(kind string, index int, references []string, kno
 }
 
 func validateGroundedPerson(index int, person PersonMention, citations map[string]Citation) error {
-	normalizedSurface := normalizeIdentityName(person.Surface)
+	normalizedSurface := entity.NormalizeName(person.Surface)
 	surfaceGrounded := false
 	for _, citationID := range person.CitationIDs {
-		if containsBoundedIdentity(normalizeIdentityName(citations[citationID].Quote), normalizedSurface, isNameIdentityRune) {
+		if containsGroundedNameIdentity(entity.NormalizeName(citations[citationID].Quote), normalizedSurface) {
 			surfaceGrounded = true
 			break
 		}
@@ -446,12 +446,15 @@ func validateGroundedPerson(index int, person PersonMention, citations map[strin
 		return fmt.Errorf("person mention %d surface is not grounded in cited evidence", index)
 	}
 
-	normalizedEmail := normalizeIdentityEmail(person.Email)
+	normalizedEmail := entity.NormalizeEmail(person.Email)
 	if normalizedEmail == "" {
 		return nil
 	}
+	if !entity.ValidEmail(normalizedEmail) {
+		return fmt.Errorf("person mention %d email is invalid", index)
+	}
 	for _, citationID := range person.CitationIDs {
-		quote := strings.ToLower(norm.NFKC.String(citations[citationID].Quote))
+		quote := entity.NormalizeEmail(citations[citationID].Quote)
 		if containsBoundedEmailIdentity(quote, normalizedEmail) {
 			return nil
 		}
@@ -459,12 +462,53 @@ func validateGroundedPerson(index int, person PersonMention, citations map[strin
 	return fmt.Errorf("person mention %d email is not grounded in cited evidence", index)
 }
 
-func normalizeIdentityName(value string) string {
-	return strings.ToLower(strings.Join(strings.Fields(norm.NFKC.String(value)), " "))
+func containsGroundedNameIdentity(text, value string) bool {
+	if value == "" {
+		return false
+	}
+	for offset := 0; offset <= len(text)-len(value); {
+		index := strings.Index(text[offset:], value)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		end := index + len(value)
+		beforeMatches := false
+		if index > 0 {
+			before, _ := utf8.DecodeLastRuneInString(text[:index])
+			beforeMatches = isNameIdentityRune(before)
+		}
+		afterMatches := false
+		if end < len(text) {
+			after, _ := utf8.DecodeRuneInString(text[end:])
+			afterMatches = isNameIdentityRune(after)
+		}
+		if !beforeMatches && !afterMatches && !identityOccurrenceInsideEmailToken(text, index, end) {
+			return true
+		}
+		offset = end
+	}
+	return false
 }
 
-func normalizeIdentityEmail(value string) string {
-	return strings.ToLower(strings.TrimSpace(norm.NFKC.String(value)))
+func identityOccurrenceInsideEmailToken(text string, start, end int) bool {
+	left := start
+	for left > 0 {
+		value, width := utf8.DecodeLastRuneInString(text[:left])
+		if !isEmailRune(value) {
+			break
+		}
+		left -= width
+	}
+	right := end
+	for right < len(text) {
+		value, width := utf8.DecodeRuneInString(text[right:])
+		if !isEmailRune(value) {
+			break
+		}
+		right += width
+	}
+	return strings.Contains(text[left:right], "@")
 }
 
 func containsBoundedIdentity(text, value string, runeChecks ...func(rune) bool) bool {

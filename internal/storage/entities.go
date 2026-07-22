@@ -186,6 +186,7 @@ func (repository *IngestionRepository) EntitySnapshots(ctx context.Context) ([]e
 			  AND decision.entity_id = assertion.entity_id
 			  AND decision.outcome IN ('accepted', 'created')
 			  AND decision.superseded_by_id IS NULL
+			  AND decision.currently_admissible
 			ORDER BY alias_type, normalized_value`, snapshots[index].ID)
 		if err != nil {
 			return nil, fmt.Errorf("list ingestion entity aliases: %w", err)
@@ -247,8 +248,8 @@ func (repository *EntityRepository) PutAlias(ctx context.Context, input AliasInp
 	if strings.TrimSpace(input.EntityID) == "" || strings.TrimSpace(input.NormalizedValue) == "" {
 		return EntityAlias{}, fmt.Errorf("put entity alias: entity ID and normalized value are required")
 	}
-	if input.Type != "name" && input.Type != "email" {
-		return EntityAlias{}, fmt.Errorf("put entity alias for entity %q: type is invalid", input.EntityID)
+	if err := validateAliasInput(input); err != nil {
+		return EntityAlias{}, fmt.Errorf("put entity alias for entity %q: alias is invalid: %w", input.EntityID, err)
 	}
 	var alias EntityAlias
 	err := repository.pool.QueryRow(ctx, `
@@ -282,13 +283,16 @@ func (repository *EntityRepository) CreateMention(ctx context.Context, input Men
 	if input.Role != "speaker" && input.Role != "reference" {
 		return Mention{}, fmt.Errorf("create mention: role is invalid")
 	}
+	if strings.TrimSpace(input.Email) != "" && !entity.ValidEmail(input.Email) {
+		return Mention{}, fmt.Errorf("create mention: email is invalid")
+	}
 	normalizedName := entity.NormalizeName(input.Surface)
 	normalizedEmail := entity.NormalizeEmail(input.Email)
 	var mention Mention
 	err := repository.pool.QueryRow(ctx, `
 		INSERT INTO stacks.mentions
-			(evidence_span_id, surface, normalized_name, normalized_email, role, recorded_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+			(evidence_span_id, surface, normalized_name, normalized_email, role, recorded_at, currently_admissible)
+		VALUES ($1, $2, $3, $4, $5, $6, true)
 		ON CONFLICT (evidence_span_id, surface, role) WHERE extraction_run_id IS NULL DO UPDATE
 		SET normalized_name = EXCLUDED.normalized_name,
 			normalized_email = EXCLUDED.normalized_email
@@ -526,6 +530,7 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 		  AND decision.entity_id = assertion.entity_id
 		  AND decision.outcome IN ('accepted', 'created')
 		  AND decision.superseded_by_id IS NULL
+		  AND decision.currently_admissible
 		ORDER BY assertion.normalized_value`, entityID)
 	if err != nil {
 		return EntityDetail{}, fmt.Errorf("list aliases for entity %q: %w", entityID, err)
@@ -543,7 +548,8 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 	}
 	if err := repository.pool.QueryRow(ctx, `
 		SELECT count(*) FROM stacks.resolution_decisions
-		WHERE entity_id = $1 AND outcome IN ('accepted', 'created') AND superseded_by_id IS NULL`, entityID).Scan(&detail.MentionCount); err != nil {
+		WHERE entity_id = $1 AND outcome IN ('accepted', 'created')
+		  AND superseded_by_id IS NULL AND currently_admissible`, entityID).Scan(&detail.MentionCount); err != nil {
 		return EntityDetail{}, fmt.Errorf("count mentions for entity %q: %w", entityID, err)
 	}
 	evidence, err := repository.pool.Query(ctx, `
@@ -552,7 +558,8 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
-		WHERE decision.entity_id = $1 AND decision.outcome IN ('accepted', 'created') AND decision.superseded_by_id IS NULL
+		WHERE decision.entity_id = $1 AND decision.outcome IN ('accepted', 'created')
+		  AND decision.superseded_by_id IS NULL AND decision.currently_admissible
 		ORDER BY span.quote`, entityID)
 	if err != nil {
 		return EntityDetail{}, fmt.Errorf("list evidence for entity %q: %w", entityID, err)
@@ -748,8 +755,8 @@ func insertDecision(ctx context.Context, transaction pgx.Tx, id string, input Re
 	digest := resolutionDecisionDigest(input, supersedesID)
 	err := transaction.QueryRow(ctx, `
 		INSERT INTO stacks.resolution_decisions
-			(id, proposal_id, outcome, entity_id, supersedes_id, digest, recorded_at)
-		VALUES ($1, $2, $3, NULLIF($4, '')::uuid, NULLIF($5, '')::uuid, $6, $7)
+			(id, proposal_id, outcome, entity_id, supersedes_id, digest, recorded_at, currently_admissible)
+		VALUES ($1, $2, $3, NULLIF($4, '')::uuid, NULLIF($5, '')::uuid, $6, $7, true)
 		RETURNING id, proposal_id, COALESCE(supersedes_id::text, ''), outcome, COALESCE(entity_id::text, '')`,
 		id, input.ProposalID, string(input.Outcome), input.EntityID, supersedesID, digest[:], time.Now().UTC()).Scan(&decision.ID, &decision.ProposalID, &decision.SupersedesID, &decision.Outcome, &decision.EntityID)
 	if err != nil {
@@ -766,12 +773,16 @@ func insertMentionAliasAssertions(ctx context.Context, transaction pgx.Tx, decis
 		return nil
 	}
 	var normalizedName, normalizedEmail string
+	var mentionAdmissible bool
 	if err := transaction.QueryRow(ctx, `
-		SELECT mention.normalized_name, mention.normalized_email
+		SELECT mention.normalized_name, mention.normalized_email, mention.currently_admissible
 		FROM stacks.resolution_proposals AS proposal
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
-		WHERE proposal.id = $1`, decision.ProposalID).Scan(&normalizedName, &normalizedEmail); err != nil {
+		WHERE proposal.id = $1`, decision.ProposalID).Scan(&normalizedName, &normalizedEmail, &mentionAdmissible); err != nil {
 		return fmt.Errorf("load accepted aliases for resolution proposal %q: %w", decision.ProposalID, err)
+	}
+	if !mentionAdmissible {
+		return nil
 	}
 	for _, alias := range []AliasInput{
 		{EntityID: decision.EntityID, NormalizedValue: normalizedName, Type: "name"},
@@ -813,7 +824,7 @@ func validateAliasInput(alias AliasInput) error {
 			return fmt.Errorf("name alias is not normalized")
 		}
 	case "email":
-		if entity.NormalizeEmail(alias.NormalizedValue) != alias.NormalizedValue {
+		if entity.NormalizeEmail(alias.NormalizedValue) != alias.NormalizedValue || !entity.ValidEmail(alias.NormalizedValue) {
 			return fmt.Errorf("email alias is not normalized")
 		}
 	default:

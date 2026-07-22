@@ -26,6 +26,7 @@ const (
 	ingestionProcessingStateMigrationVersion int64 = 3
 	temporalPairAnalysisMigrationVersion     int64 = 4
 	managerConfidenceFinalFixesVersion       int64 = 5
+	legacyAdmissionBoundaryVersion           int64 = 6
 )
 
 const migrationSetQuery = `
@@ -109,6 +110,7 @@ func requiredMigrationVersions() []int64 {
 		ingestionProcessingStateMigrationVersion,
 		temporalPairAnalysisMigrationVersion,
 		managerConfidenceFinalFixesVersion,
+		legacyAdmissionBoundaryVersion,
 	}
 }
 

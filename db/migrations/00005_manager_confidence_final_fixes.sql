@@ -96,13 +96,5 @@ WHERE decision.superseded_by_id IS NULL
   AND decision.outcome IN ('accepted', 'created')
 ON CONFLICT (decision_id, normalized_value, alias_type) DO NOTHING;
 
--- Raw model-authored rationale is not trusted user-facing state. New writes
--- persist deterministic explanations, and historical prose is scrubbed.
-UPDATE stacks.interaction_signals SET rationale = '';
-
--- Cached legacy reports embed model-authored report and signal prose. Keep the
--- audited run and its input links, but force current code to recompute a safe
--- report instead of rendering or retaining that narrative payload.
-UPDATE stacks.analysis_runs
-SET hypothesis = '', report_json = NULL
-WHERE hypothesis <> '' OR report_json IS NOT NULL;
+-- Historical model-authored payloads remain immutable audit records. Migration
+-- 00006 marks pre-fix derived state non-admissible instead of rewriting it.

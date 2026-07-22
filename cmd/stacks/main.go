@@ -159,9 +159,10 @@ func pocCommandProvider(
 				Repository:   storage.NewIngestionRepository(pool),
 				CollectionID: settings.PoC.GoogleFolderID, PromptVersion: settings.PoC.ExtractionPromptVersion,
 				Region: strings.TrimSpace(settings.PoC.AWSRegion), ModelID: strings.TrimSpace(settings.PoC.BedrockModelID),
-				MaxTokens:     settings.PoC.BedrockMaxTokens,
-				LeaseDuration: settings.PoC.IngestionLeaseDuration,
-				Tracer:        tracer, Decisions: decisions, Now: time.Now,
+				MaxTokens:      settings.PoC.BedrockMaxTokens,
+				LeaseDuration:  settings.PoC.IngestionLeaseDuration,
+				AttemptTimeout: settings.PoC.IngestionAttemptTimeout,
+				Tracer:         tracer, Decisions: decisions, Now: time.Now,
 			}
 			return (cli.SyncCommand{Service: service, Output: stdout}).Run(ctx, args)
 		}),

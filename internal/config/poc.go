@@ -11,7 +11,9 @@ const (
 	defaultExtractionPromptVersion = "extract-v1"
 	defaultAnalysisPromptVersion   = "analyze-v1"
 	defaultIngestionLeaseDuration  = 5 * time.Minute
+	defaultIngestionAttemptTimeout = 4 * time.Minute
 	maximumIngestionLeaseDuration  = time.Hour
+	minimumLeaseCleanupMargin      = 5 * time.Second
 
 	DatabaseURLEnvironmentVariable             = "STACKS_DATABASE_URL"
 	GoogleFolderIDEnvironmentVariable          = "STACKS_GOOGLE_FOLDER_ID"
@@ -25,6 +27,7 @@ const (
 	BedrockMaxTokensEnvironmentVariable        = "STACKS_BEDROCK_MAX_TOKENS"
 	BedrockMaxAttemptsEnvironmentVariable      = "STACKS_BEDROCK_MAX_ATTEMPTS"
 	IngestionLeaseDurationEnvironmentVariable  = "STACKS_INGEST_LEASE_DURATION"
+	IngestionAttemptTimeoutEnvironmentVariable = "STACKS_INGEST_ATTEMPT_TIMEOUT"
 	ExtractionPromptVersionEnvironmentVariable = "STACKS_EXTRACTION_PROMPT_VERSION"
 	AnalysisPromptVersionEnvironmentVariable   = "STACKS_ANALYSIS_PROMPT_VERSION"
 	EmployeeEntityIDEnvironmentVariable        = "STACKS_EMPLOYEE_ENTITY_ID"
@@ -60,6 +63,7 @@ type PoCSettings struct {
 	BedrockMaxTokens        int
 	BedrockMaxAttempts      int
 	IngestionLeaseDuration  time.Duration
+	IngestionAttemptTimeout time.Duration
 	ExtractionPromptVersion string
 	AnalysisPromptVersion   string
 	EmployeeEntityID        string
@@ -129,6 +133,11 @@ func (settings PoCSettings) validateCorpusAndModel(command Command) error {
 	}
 	if settings.IngestionLeaseDuration <= 0 || settings.IngestionLeaseDuration > maximumIngestionLeaseDuration {
 		return fmt.Errorf("%s must be a positive duration no greater than %s", IngestionLeaseDurationEnvironmentVariable, maximumIngestionLeaseDuration)
+	}
+	if settings.IngestionAttemptTimeout <= 0 ||
+		settings.IngestionAttemptTimeout > settings.IngestionLeaseDuration-minimumLeaseCleanupMargin {
+		return fmt.Errorf("%s must leave at least %s before %s expires",
+			IngestionAttemptTimeoutEnvironmentVariable, minimumLeaseCleanupMargin, IngestionLeaseDurationEnvironmentVariable)
 	}
 	return settings.validateModelSettings(command)
 }

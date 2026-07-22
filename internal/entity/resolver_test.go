@@ -3,7 +3,7 @@ package entity
 import "testing"
 
 func TestResolverAutoResolvesAcceptedExactEmail(t *testing.T) {
-	resolution := Resolver{}.Resolve(Mention{Surface: "riya.chen@synthetic.example"}, []EntitySnapshot{{
+	resolution := Resolver{}.Resolve(Mention{Email: "riya.chen@synthetic.example"}, []EntitySnapshot{{
 		ID:   "person-1",
 		Kind: KindPerson,
 		Aliases: []Alias{{
@@ -21,7 +21,7 @@ func TestResolverAutoResolvesAcceptedExactEmail(t *testing.T) {
 }
 
 func TestResolverAutoResolvesUniqueAcceptedNameAlias(t *testing.T) {
-	resolution := Resolver{}.Resolve(Mention{Surface: "  RIYA\u00a0CHEN  "}, []EntitySnapshot{{
+	resolution := Resolver{}.Resolve(Mention{Name: "  RIYA\u00a0CHEN  "}, []EntitySnapshot{{
 		ID:   "person-1",
 		Kind: KindPerson,
 		Aliases: []Alias{{
@@ -36,7 +36,7 @@ func TestResolverAutoResolvesUniqueAcceptedNameAlias(t *testing.T) {
 }
 
 func TestResolverLeavesDuplicateAcceptedAliasPending(t *testing.T) {
-	resolution := Resolver{}.Resolve(Mention{Surface: "Riya Chen"}, []EntitySnapshot{
+	resolution := Resolver{}.Resolve(Mention{Name: "Riya Chen"}, []EntitySnapshot{
 		{ID: "person-1", Kind: KindPerson, Aliases: []Alias{{Type: AliasTypeName, Value: "Riya Chen"}}},
 		{ID: "person-2", Kind: KindPerson, Aliases: []Alias{{Type: AliasTypeName, Value: "Riya Chen"}}},
 	})
@@ -50,7 +50,7 @@ func TestResolverLeavesDuplicateAcceptedAliasPending(t *testing.T) {
 }
 
 func TestResolverRanksGuessesByConfidenceThenEntityIDWithoutResolving(t *testing.T) {
-	resolution := Resolver{}.Resolve(Mention{Surface: "Riya Chen"}, []EntitySnapshot{
+	resolution := Resolver{}.Resolve(Mention{Name: "Riya Chen"}, []EntitySnapshot{
 		{ID: "person-b", Kind: KindPerson, DisplayName: "Riya Chen"},
 		{ID: "person-a", Kind: KindPerson, DisplayName: "Riya Chen"},
 		{ID: "person-c", Kind: KindPerson, DisplayName: "Riya Chandra"},
@@ -68,7 +68,7 @@ func TestResolverRanksGuessesByConfidenceThenEntityIDWithoutResolving(t *testing
 }
 
 func TestResolverReturnsNoCandidateForUnrelatedMention(t *testing.T) {
-	resolution := Resolver{}.Resolve(Mention{Surface: "Unrelated Synthetic Person"}, []EntitySnapshot{{
+	resolution := Resolver{}.Resolve(Mention{Name: "Unrelated Synthetic Person"}, []EntitySnapshot{{
 		ID:          "person-1",
 		Kind:        KindPerson,
 		DisplayName: "Riya Chen",
@@ -79,5 +79,34 @@ func TestResolverReturnsNoCandidateForUnrelatedMention(t *testing.T) {
 	}
 	if len(resolution.Candidates) != 0 {
 		t.Fatalf("candidate count = %d, want 0", len(resolution.Candidates))
+	}
+}
+
+func TestResolverDoesNotTreatMalformedEmailAsName(t *testing.T) {
+	resolution := Resolver{}.Resolve(Mention{Email: "Riya Chen"}, []EntitySnapshot{{
+		ID:   "person-1",
+		Kind: KindPerson,
+		Aliases: []Alias{{
+			Type:  AliasTypeName,
+			Value: "Riya Chen",
+		}},
+	}})
+
+	if resolution.AutoResolved || resolution.EntityID != "" || len(resolution.Candidates) != 0 {
+		t.Fatalf("resolution = %#v, want malformed email rejected without name comparison", resolution)
+	}
+}
+
+func TestResolverComparesNameAndEmailOnlyToMatchingAliasTypes(t *testing.T) {
+	resolution := Resolver{}.Resolve(Mention{
+		Name:  "Riya Chen",
+		Email: "different@synthetic.example",
+	}, []EntitySnapshot{
+		{ID: "person-name", Kind: KindPerson, Aliases: []Alias{{Type: AliasTypeName, Value: "Riya Chen"}}},
+		{ID: "person-email", Kind: KindPerson, Aliases: []Alias{{Type: AliasTypeEmail, Value: "riya.chen@synthetic.example"}}},
+	})
+
+	if !resolution.AutoResolved || resolution.EntityID != "person-name" {
+		t.Fatalf("resolution = %#v, want exact typed name alias only", resolution)
 	}
 }
