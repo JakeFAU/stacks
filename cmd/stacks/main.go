@@ -18,7 +18,6 @@ import (
 
 	"stacks/internal/analysis"
 	"stacks/internal/app"
-	"stacks/internal/bedrock"
 	"stacks/internal/cli"
 	"stacks/internal/config"
 	"stacks/internal/doctor"
@@ -97,73 +96,149 @@ func main() {
 }
 
 func pocCommandProvider(
-	_ context.Context,
+	ctx context.Context,
 	settings config.Settings,
 	stdout, _ io.Writer,
 	tracer trace.Tracer,
 	decisions *observability.DecisionRecorder,
 	invocations modeltelemetry.Recorder,
 ) (map[string]cli.Command, error) {
-	return map[string]cli.Command{
-		string(config.CommandAuth): cli.AuthCommand{Google: drive.NewAuthorizer(
-			settings.PoC.GoogleOAuthClientFile,
-			settings.PoC.GoogleOAuthTokenFile,
-			stdout,
-		)},
-		string(config.CommandDoctor): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			database := doctor.NewPostgresProbe(settings.PoC.DatabaseURL)
-			defer database.Close()
-			google := doctor.NewGoogleProbe(
-				settings.PoC.GoogleOAuthClientFile,
-				settings.PoC.GoogleOAuthTokenFile,
-				settings.PoC.GoogleFolderID,
-				drive.NewTabClassifier(settings.PoC.TranscriptTitles, settings.PoC.NotesTitles),
+	return pocCommandProviderWithRuntime(ctx, settings, stdout, io.Discard, tracer, decisions, invocations, defaultPoCCommandRuntime())
+}
+
+type doctorDatabase interface {
+	doctor.Database
+	Close()
+}
+
+type pocCommandRuntime struct {
+	newAuthorizer           func(string, string, io.Writer) cli.GoogleAuthorizer
+	newDoctorDatabase       func(string) doctorDatabase
+	newDoctorGoogle         func(config.PoCSettings) doctor.Google
+	newDoctorProviderProbe  func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
+	newSource               func(context.Context, config.PoCSettings) (source.Source, error)
+	openIngestionRepository func(context.Context, string) (ingest.Repository, func(), error)
+	openAnalysisRepository  func(context.Context, string) (analysis.Repository, func(), error)
+	newModel                func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error)
+}
+
+func defaultPoCCommandRuntime() pocCommandRuntime {
+	return pocCommandRuntime{
+		newAuthorizer: func(clientFile, tokenFile string, output io.Writer) cli.GoogleAuthorizer {
+			return drive.NewAuthorizer(clientFile, tokenFile, output)
+		},
+		newDoctorDatabase: func(databaseURL string) doctorDatabase {
+			return doctor.NewPostgresProbe(databaseURL)
+		},
+		newDoctorGoogle: func(settings config.PoCSettings) doctor.Google {
+			return doctor.NewGoogleProbe(
+				settings.GoogleOAuthClientFile, settings.GoogleOAuthTokenFile, settings.GoogleFolderID,
+				drive.NewTabClassifier(settings.TranscriptTitles, settings.NotesTitles),
 			)
-			aws := doctor.NewAWSProbe(settings.PoC.Model.AWSProfile, settings.PoC.Model.AWSRegion, settings.PoC.Model.ModelID)
+		},
+		newDoctorProviderProbe: newDoctorProviderProbe,
+		newSource: func(ctx context.Context, settings config.PoCSettings) (source.Source, error) {
+			httpClient, err := drive.NewAuthorizedHTTPClient(ctx, settings.GoogleOAuthClientFile, settings.GoogleOAuthTokenFile)
+			if err != nil {
+				return nil, err
+			}
+			return drive.NewClient(ctx, httpClient, drive.NewTabClassifier(settings.TranscriptTitles, settings.NotesTitles))
+		},
+		openIngestionRepository: func(ctx context.Context, databaseURL string) (ingest.Repository, func(), error) {
+			pool, err := storage.Open(ctx, databaseURL)
+			if err != nil {
+				return nil, nil, err
+			}
+			return storage.NewIngestionRepository(pool), pool.Close, nil
+		},
+		openAnalysisRepository: func(ctx context.Context, databaseURL string) (analysis.Repository, func(), error) {
+			pool, err := storage.Open(ctx, databaseURL)
+			if err != nil {
+				return nil, nil, err
+			}
+			return storage.NewAnalysisRepository(pool), pool.Close, nil
+		},
+		newModel: newModelWithContext,
+	}
+}
+
+func pocCommandProviderWithRuntime(
+	_ context.Context,
+	settings config.Settings,
+	stdout, _ io.Writer,
+	tracer trace.Tracer,
+	decisions *observability.DecisionRecorder,
+	invocations modeltelemetry.Recorder,
+	runtime pocCommandRuntime,
+) (map[string]cli.Command, error) {
+	return map[string]cli.Command{
+		string(config.CommandAuth): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			if err := settings.PoC.Validate(config.CommandAuth); err != nil {
+				return err
+			}
+			if runtime.newAuthorizer == nil {
+				return errors.New("google authorization is not configured")
+			}
+			return (cli.AuthCommand{Google: runtime.newAuthorizer(
+				settings.PoC.GoogleOAuthClientFile, settings.PoC.GoogleOAuthTokenFile, stdout,
+			)}).Run(ctx, args)
+		}),
+		string(config.CommandDoctor): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			if err := settings.PoC.Validate(config.CommandDoctor); err != nil {
+				return err
+			}
+			if runtime.newDoctorDatabase == nil || runtime.newDoctorGoogle == nil || runtime.newDoctorProviderProbe == nil {
+				return errors.New("doctor command dependencies are not configured")
+			}
+			database := runtime.newDoctorDatabase(settings.PoC.DatabaseURL)
+			defer database.Close()
+			model, disclosure, err := runtime.newDoctorProviderProbe(settings.PoC.Model)
+			if err != nil {
+				return err
+			}
 			return (cli.DoctorCommand{
-				Service: doctor.Service{Database: database, Google: google, AWS: aws},
-				Output:  stdout,
+				Service: doctor.Service{
+					Database: database, Google: runtime.newDoctorGoogle(settings.PoC),
+					Invocation: modelInvocation(settings.PoC.Model), Model: model, Disclosure: disclosure,
+				},
+				Output: stdout,
 			}).Run(ctx, args)
 		}),
 		string(config.CommandSync): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			httpClient, err := drive.NewAuthorizedHTTPClient(
-				ctx,
-				settings.PoC.GoogleOAuthClientFile,
-				settings.PoC.GoogleOAuthTokenFile,
-			)
+			if err := settings.PoC.Validate(config.CommandSync); err != nil {
+				return err
+			}
+			if err := requireRestrictedDisclosure(ctx, settings.PoC.Model, runtime); err != nil {
+				return err
+			}
+			if runtime.newSource == nil || runtime.openIngestionRepository == nil || runtime.newModel == nil {
+				return errors.New("sync command dependencies are not configured")
+			}
+			sourceBoundary, err := runtime.newSource(ctx, settings.PoC)
 			if err != nil {
 				return err
 			}
-			sourceBoundary, err := drive.NewClient(ctx, httpClient, drive.NewTabClassifier(
-				settings.PoC.TranscriptTitles,
-				settings.PoC.NotesTitles,
-			))
+			repository, closeRepository, err := runtime.openIngestionRepository(ctx, settings.PoC.DatabaseURL)
 			if err != nil {
 				return err
 			}
-			awsConfiguration, err := loadAWSConfiguration(ctx, settings.PoC.Model.AWSProfile, settings.PoC.Model.AWSRegion)
+			if closeRepository != nil {
+				defer closeRepository()
+			}
+			model, err := runtime.newModel(ctx, settings.PoC.Model, invocations, tracer)
 			if err != nil {
 				return err
 			}
-			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
-				DataMode: settings.PoC.Model.DataMode, ModelID: settings.PoC.Model.ModelID, MaxTokens: settings.PoC.Model.MaxOutputTokens,
-				MaxAttempts: settings.PoC.Model.MaxAttempts, Recorder: invocations, Tracer: tracer,
-			})
-			if err != nil {
-				return err
-			}
-			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
-			if err != nil {
-				return err
-			}
-			defer pool.Close()
-			service := newBedrockIngestionService(
-				settings.PoC, sourceBoundary, model, storage.NewIngestionRepository(pool),
+			service := newIngestionService(
+				settings.PoC, sourceBoundary, model, repository,
 				tracer, decisions, time.Now,
 			)
 			return (cli.SyncCommand{Service: service, Output: stdout}).Run(ctx, args)
 		}),
 		string(config.CommandEntities): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			if err := settings.PoC.Validate(config.CommandEntities); err != nil {
+				return err
+			}
 			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
 			if err != nil {
 				return err
@@ -173,6 +248,9 @@ func pocCommandProvider(
 			return (cli.EntitiesCommand{Service: &cli.EntityService{Store: store}, Output: stdout}).Run(ctx, args)
 		}),
 		string(config.CommandReview): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			if err := settings.PoC.Validate(config.CommandReview); err != nil {
+				return err
+			}
 			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
 			if err != nil {
 				return err
@@ -182,24 +260,28 @@ func pocCommandProvider(
 			return (cli.ReviewCommand{Service: &cli.ReviewService{Store: store}, Output: stdout}).Run(ctx, args)
 		}),
 		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			awsConfiguration, err := loadAWSConfiguration(ctx, settings.PoC.Model.AWSProfile, settings.PoC.Model.AWSRegion)
+			if err := settings.PoC.Validate(config.CommandAnalyze); err != nil {
+				return err
+			}
+			if err := requireRestrictedDisclosure(ctx, settings.PoC.Model, runtime); err != nil {
+				return err
+			}
+			if runtime.openAnalysisRepository == nil || runtime.newModel == nil {
+				return errors.New("analyze command dependencies are not configured")
+			}
+			repository, closeRepository, err := runtime.openAnalysisRepository(ctx, settings.PoC.DatabaseURL)
 			if err != nil {
 				return err
 			}
-			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
-				DataMode: settings.PoC.Model.DataMode, ModelID: settings.PoC.Model.ModelID, MaxTokens: settings.PoC.Model.MaxOutputTokens,
-				MaxAttempts: settings.PoC.Model.MaxAttempts, Recorder: invocations, Tracer: tracer,
-			})
+			if closeRepository != nil {
+				defer closeRepository()
+			}
+			model, err := runtime.newModel(ctx, settings.PoC.Model, invocations, tracer)
 			if err != nil {
 				return err
 			}
-			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
-			if err != nil {
-				return err
-			}
-			defer pool.Close()
-			service := newBedrockAnalysisService(
-				settings.PoC, storage.NewAnalysisRepository(pool), model,
+			service := newAnalysisService(
+				settings.PoC, repository, model,
 				tracer, decisions, time.Now,
 			)
 			return (cli.AnalyzeCommand{
@@ -210,7 +292,29 @@ func pocCommandProvider(
 	}, nil
 }
 
-func newBedrockIngestionService(
+func requireRestrictedDisclosure(ctx context.Context, settings config.ModelSettings, runtime pocCommandRuntime) error {
+	if settings.DataMode == modelpolicy.DataModePersonal {
+		return nil
+	}
+	if runtime.newDoctorProviderProbe == nil {
+		return doctor.ErrDisclosureNotConfirmed
+	}
+	_, disclosure, err := runtime.newDoctorProviderProbe(settings)
+	if err != nil {
+		return err
+	}
+	return doctor.RequireRestrictedDisclosure(ctx, modelInvocation(settings), disclosure)
+}
+
+func modelInvocation(settings config.ModelSettings) modelpolicy.Invocation {
+	region := ""
+	if settings.Provider == modelpolicy.ProviderBedrock {
+		region = strings.TrimSpace(settings.AWSRegion)
+	}
+	return modelpolicy.Invocation{Provider: settings.Provider, DataMode: settings.DataMode, Region: region}
+}
+
+func newIngestionService(
 	settings config.PoCSettings,
 	sourceBoundary source.Source,
 	model extract.Model,
@@ -222,8 +326,8 @@ func newBedrockIngestionService(
 	return &ingest.Service{
 		Source: sourceBoundary, Model: model, Resolver: entity.Resolver{}, Repository: repository,
 		CollectionID: settings.GoogleFolderID, PromptVersion: settings.ExtractionPromptVersion,
-		Provider: modelpolicy.ProviderBedrock, DataMode: settings.Model.DataMode,
-		Region: strings.TrimSpace(settings.Model.AWSRegion), ModelID: strings.TrimSpace(settings.Model.ModelID),
+		Provider: settings.Model.Provider, DataMode: settings.Model.DataMode,
+		Region: modelInvocation(settings.Model).Region, ModelID: strings.TrimSpace(settings.Model.ModelID),
 		MaxTokens:      settings.Model.MaxOutputTokens,
 		LeaseDuration:  settings.IngestionLeaseDuration,
 		AttemptTimeout: settings.IngestionAttemptTimeout,
@@ -231,7 +335,7 @@ func newBedrockIngestionService(
 	}
 }
 
-func newBedrockAnalysisService(
+func newAnalysisService(
 	settings config.PoCSettings,
 	repository analysis.Repository,
 	model extract.Model,
@@ -241,8 +345,8 @@ func newBedrockAnalysisService(
 ) *analysis.Service {
 	return &analysis.Service{
 		Repository: repository, Model: model, PromptVersion: settings.AnalysisPromptVersion,
-		Provider: modelpolicy.ProviderBedrock, DataMode: settings.Model.DataMode,
-		Region: strings.TrimSpace(settings.Model.AWSRegion), ModelID: strings.TrimSpace(settings.Model.ModelID),
+		Provider: settings.Model.Provider, DataMode: settings.Model.DataMode,
+		Region: modelInvocation(settings.Model).Region, ModelID: strings.TrimSpace(settings.Model.ModelID),
 		MaxTokens: settings.Model.MaxOutputTokens, Tracer: tracer,
 		Decisions: decisions, Now: now,
 	}

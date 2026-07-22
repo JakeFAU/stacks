@@ -6,18 +6,24 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/smithy-go"
 	"go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
+	"stacks/internal/analysis"
 	"stacks/internal/config"
+	"stacks/internal/doctor"
 	"stacks/internal/extract"
+	"stacks/internal/ingest"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
+	"stacks/internal/source"
 )
 
 func TestAWSLoadOptionsUseDefaultCredentialChainWhenProfileIsAbsent(t *testing.T) {
@@ -31,6 +37,175 @@ func TestAWSLoadOptionsUseDefaultCredentialChainWhenProfileIsAbsent(t *testing.T
 	if loaded.Region != "us-east-1" || loaded.SharedConfigProfile != "" {
 		t.Fatalf("AWS load options = %#v, want region plus default credential chain", loaded)
 	}
+}
+
+func TestRestrictedSyncChecksDisclosureBeforeExternalConstruction(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
+	calls := []string{}
+	runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingDisabled)
+
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(), config.Settings{PoC: settings}, io.Discard, io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+	err = commands[string(config.CommandSync)].Run(context.Background(), nil)
+	if !errors.Is(err, errStopAfterModelConstruction) {
+		t.Fatalf("sync error = %v, want sentinel model-construction stop", err)
+	}
+	want := []string{"logging", "google", "postgres", "model", "close"}
+	if strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+}
+
+func TestRestrictedAnalyzeChecksDisclosureBeforeExternalConstruction(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandAnalyze, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
+	calls := []string{}
+	runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingDisabled)
+
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(), config.Settings{PoC: settings}, io.Discard, io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+	err = commands[string(config.CommandAnalyze)].Run(context.Background(), nil)
+	if !errors.Is(err, errStopAfterModelConstruction) {
+		t.Fatalf("analyze error = %v, want sentinel model-construction stop", err)
+	}
+	want := []string{"logging", "postgres", "model", "close"}
+	if strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+}
+
+func TestFailedRestrictedGateConstructsNoSourceStorageOrModel(t *testing.T) {
+	for _, command := range []config.Command{config.CommandSync, config.CommandAnalyze} {
+		t.Run(string(command), func(t *testing.T) {
+			settings := validCommandPoCSettings(command, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
+			calls := []string{}
+			runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingEnabled)
+			commands, err := pocCommandProviderWithRuntime(
+				context.Background(), config.Settings{PoC: settings}, io.Discard, io.Discard,
+				tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+			)
+			if err != nil {
+				t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+			}
+			err = commands[string(command)].Run(context.Background(), nil)
+			if !errors.Is(err, doctor.ErrDisclosureNotConfirmed) {
+				t.Fatalf("%s error = %v, want disclosure rejection", command, err)
+			}
+			if strings.Join(calls, ",") != "logging" {
+				t.Fatalf("calls = %v, want only disclosure inspection", calls)
+			}
+		})
+	}
+}
+
+func TestRestrictedDirectProvidersRejectBeforeExternalConstruction(t *testing.T) {
+	for _, command := range []config.Command{config.CommandSync, config.CommandAnalyze} {
+		for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
+			t.Run(string(command)+"/"+string(provider), func(t *testing.T) {
+				settings := validCommandPoCSettings(command, provider, modelpolicy.DataModeRestricted)
+				calls := []string{}
+				runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingDisabled)
+				commands, err := pocCommandProviderWithRuntime(
+					context.Background(), config.Settings{PoC: settings}, io.Discard, io.Discard,
+					tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+				)
+				if err != nil {
+					t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+				}
+				if err := commands[string(command)].Run(context.Background(), nil); err == nil {
+					t.Fatalf("%s error = nil, want static policy rejection", command)
+				}
+				if len(calls) != 0 {
+					t.Fatalf("calls = %v, want no external construction", calls)
+				}
+			})
+		}
+	}
+}
+
+func TestPersonalSyncPerformsNoDisclosureInspection(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal)
+	calls := []string{}
+	runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingEnabled)
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(), config.Settings{PoC: settings}, io.Discard, io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+	err = commands[string(config.CommandSync)].Run(context.Background(), nil)
+	if !errors.Is(err, errStopAfterModelConstruction) {
+		t.Fatalf("sync error = %v, want sentinel model-construction stop", err)
+	}
+	want := []string{"google", "postgres", "model", "close"}
+	if strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want no disclosure inspection and then %v", calls, want)
+	}
+}
+
+var errStopAfterModelConstruction = errors.New("stop after model construction")
+
+type recordingDisclosureProbe struct {
+	calls *[]string
+	state doctor.InvocationLoggingState
+}
+
+func (probe recordingDisclosureProbe) InvocationLogging(context.Context) (doctor.InvocationLoggingState, error) {
+	*probe.calls = append(*probe.calls, "logging")
+	return probe.state, nil
+}
+
+func boundaryOrderRuntime(calls *[]string, state doctor.InvocationLoggingState) pocCommandRuntime {
+	return pocCommandRuntime{
+		newDoctorProviderProbe: func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error) {
+			return nil, recordingDisclosureProbe{calls: calls, state: state}, nil
+		},
+		newSource: func(context.Context, config.PoCSettings) (source.Source, error) {
+			*calls = append(*calls, "google")
+			return nil, nil
+		},
+		openIngestionRepository: func(context.Context, string) (ingest.Repository, func(), error) {
+			*calls = append(*calls, "postgres")
+			return nil, func() { *calls = append(*calls, "close") }, nil
+		},
+		openAnalysisRepository: func(context.Context, string) (analysis.Repository, func(), error) {
+			*calls = append(*calls, "postgres")
+			return nil, func() { *calls = append(*calls, "close") }, nil
+		},
+		newModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error) {
+			*calls = append(*calls, "model")
+			return nil, errStopAfterModelConstruction
+		},
+	}
+}
+
+func validCommandPoCSettings(command config.Command, provider modelpolicy.Provider, mode modelpolicy.DataMode) config.PoCSettings {
+	settings := config.PoCSettings{
+		DatabaseURL: "postgres://synthetic", GoogleFolderID: "synthetic-folder",
+		GoogleOAuthClientFile: "/synthetic/client.json", GoogleOAuthTokenFile: "/synthetic/token.json",
+		TranscriptTitles: []string{"Transcript"}, NotesTitles: []string{"Notes"},
+		Model: config.ModelSettings{
+			Provider: provider, DataMode: mode, ModelID: "synthetic-model", MaxOutputTokens: 256, MaxAttempts: 1,
+			AWSRegion: "us-east-1", OpenAIAPIKey: "synthetic-openai-key", AnthropicAPIKey: "synthetic-anthropic-key",
+		},
+		IngestionLeaseDuration: 5 * time.Minute, IngestionAttemptTimeout: 4 * time.Minute,
+		ExtractionPromptVersion: extract.ExtractionPromptVersion, AnalysisPromptVersion: extract.AnalysisPromptVersion,
+	}
+	if command == config.CommandAnalyze {
+		settings.EmployeeEntityID = "employee-id"
+		settings.ManagerEntityID = "manager-id"
+	}
+	return settings
 }
 
 func TestValidateAWSConfigurationCredentialsReturnsBoundedAuthenticationFailure(t *testing.T) {
@@ -109,28 +284,32 @@ func TestPoCCommandProviderRegistersDoctorSyncAndAnalyzeWithoutConstructingLiveD
 	}
 }
 
-func TestBedrockCommandServicesReceiveInvocationPolicy(t *testing.T) {
+func TestCommandServicesReceiveSelectedInvocationPolicy(t *testing.T) {
 	tests := []struct {
 		name     string
+		provider modelpolicy.Provider
 		dataMode modelpolicy.DataMode
+		region   string
 	}{
-		{name: "personal", dataMode: modelpolicy.DataModePersonal},
-		{name: "restricted", dataMode: modelpolicy.DataModeRestricted},
+		{name: "bedrock personal", provider: modelpolicy.ProviderBedrock, dataMode: modelpolicy.DataModePersonal, region: "us-east-1"},
+		{name: "bedrock restricted", provider: modelpolicy.ProviderBedrock, dataMode: modelpolicy.DataModeRestricted, region: "us-east-1"},
+		{name: "openai", provider: modelpolicy.ProviderOpenAI, dataMode: modelpolicy.DataModePersonal},
+		{name: "anthropic", provider: modelpolicy.ProviderAnthropic, dataMode: modelpolicy.DataModePersonal},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			settings := config.PoCSettings{Model: config.ModelSettings{DataMode: test.dataMode}}
+			settings := config.PoCSettings{Model: config.ModelSettings{Provider: test.provider, DataMode: test.dataMode, AWSRegion: test.region}}
 			t.Run("sync", func(t *testing.T) {
-				ingestion := newBedrockIngestionService(settings, nil, nil, nil, nil, nil, nil)
-				if ingestion.Provider != modelpolicy.ProviderBedrock || ingestion.DataMode != test.dataMode {
-					t.Fatalf("ingestion provider/data mode = %q/%q, want %q/%q", ingestion.Provider, ingestion.DataMode, modelpolicy.ProviderBedrock, test.dataMode)
+				ingestion := newIngestionService(settings, nil, nil, nil, nil, nil, nil)
+				if ingestion.Provider != test.provider || ingestion.DataMode != test.dataMode || ingestion.Region != test.region {
+					t.Fatalf("ingestion invocation = %q/%q/%q, want %q/%q/%q", ingestion.Provider, ingestion.DataMode, ingestion.Region, test.provider, test.dataMode, test.region)
 				}
 			})
 			t.Run("analyze", func(t *testing.T) {
-				pairAnalysis := newBedrockAnalysisService(settings, nil, nil, nil, nil, nil)
-				if pairAnalysis.Provider != modelpolicy.ProviderBedrock || pairAnalysis.DataMode != test.dataMode {
-					t.Fatalf("analysis provider/data mode = %q/%q, want %q/%q", pairAnalysis.Provider, pairAnalysis.DataMode, modelpolicy.ProviderBedrock, test.dataMode)
+				pairAnalysis := newAnalysisService(settings, nil, nil, nil, nil, nil)
+				if pairAnalysis.Provider != test.provider || pairAnalysis.DataMode != test.dataMode || pairAnalysis.Region != test.region {
+					t.Fatalf("analysis invocation = %q/%q/%q, want %q/%q/%q", pairAnalysis.Provider, pairAnalysis.DataMode, pairAnalysis.Region, test.provider, test.dataMode, test.region)
 				}
 			})
 		})
