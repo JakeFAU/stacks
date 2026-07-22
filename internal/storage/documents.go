@@ -441,9 +441,11 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, derivatio
 		var mentionID string
 		normalizedName := record.NormalizedName
 		if normalizedName == "" {
-			normalizedName = entity.NormalizeName(record.Surface)
-		}
-		if normalizedName != entity.NormalizeName(record.Surface) || record.NormalizedEmail != entity.NormalizeEmail(record.NormalizedEmail) ||
+			if record.NormalizedEmail != "" || record.Resolution.AutoResolved || record.Resolution.EntityID != "" {
+				return nil, fmt.Errorf("persist ingestion mention: normalized identity is invalid")
+			}
+		} else if normalizedName != entity.NormalizeName(record.Surface) ||
+			record.NormalizedEmail != entity.NormalizeEmail(record.NormalizedEmail) ||
 			(record.NormalizedEmail != "" && !entity.ValidEmail(record.NormalizedEmail)) {
 			return nil, fmt.Errorf("persist ingestion mention: normalized identity is invalid")
 		}

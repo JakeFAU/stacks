@@ -67,6 +67,17 @@ type PersonMention struct {
 	CitationIDs []string `json:"citation_ids"`
 }
 
+// GroundedPersonIdentity is the deterministic identity evidence admitted from
+// one model proposal. Alias values are populated only when one exact cited
+// span associates the name with the optional email. A proposal grounded across
+// separate spans remains reviewable but cannot resolve or teach aliases.
+type GroundedPersonIdentity struct {
+	EvidenceCitationID string
+	NormalizedName     string
+	NormalizedEmail    string
+	AliasesAdmissible  bool
+}
+
 type AttributedStatement struct {
 	ID               string   `json:"id"`
 	SpeakerMentionID string   `json:"speaker_mention_id"`
@@ -393,23 +404,14 @@ func validateDate(field, value string) error {
 	return nil
 }
 
-func groundedMeetingDate(submitted SubmittedText, output ExtractionOutput) string {
+func groundedMeetingDate(submitted SubmittedText, _ ExtractionOutput) string {
 	if submitted.SourceMeetingTime != nil && !submitted.SourceMeetingTime.IsZero() {
 		return submitted.SourceMeetingTime.Format(time.DateOnly)
 	}
-	if output.MeetingDate == "" {
-		return ""
-	}
-	for _, citation := range output.Citations {
-		if containsExactDate(citation.Quote, output.MeetingDate) {
-			return output.MeetingDate
-		}
-	}
+	// No deterministic content-to-meeting-time contract is approved. A date in
+	// arbitrary cited text may be a deadline or another event, so model output
+	// cannot establish chronology by itself.
 	return ""
-}
-
-func containsExactDate(text, date string) bool {
-	return containsBoundedIdentity(text, date, isDateTokenRune)
 }
 
 func validateReferences(kind string, index int, references []string, known map[string]Citation) error {
@@ -434,32 +436,66 @@ func validateOptionalReferences(kind string, index int, references []string, kno
 }
 
 func validateGroundedPerson(index int, person PersonMention, citations map[string]Citation) error {
-	normalizedSurface := entity.NormalizeName(person.Surface)
-	surfaceGrounded := false
-	for _, citationID := range person.CitationIDs {
-		if containsGroundedNameIdentity(entity.NormalizeName(citations[citationID].Quote), normalizedSurface) {
-			surfaceGrounded = true
-			break
-		}
+	_, err := groundedPersonIdentity(person, citations)
+	if err != nil {
+		return fmt.Errorf("person mention %d %w", index, err)
 	}
-	if !surfaceGrounded {
-		return fmt.Errorf("person mention %d surface is not grounded in cited evidence", index)
+	return nil
+}
+
+// GroundPersonIdentity returns the one exact citation admitted for durable
+// identity evidence. Callers must pass an already schema-validated proposal.
+func GroundPersonIdentity(person PersonMention, citations []Citation) (GroundedPersonIdentity, error) {
+	byID := make(map[string]Citation, len(citations))
+	for _, citation := range citations {
+		byID[citation.ID] = citation
+	}
+	return groundedPersonIdentity(person, byID)
+}
+
+func groundedPersonIdentity(person PersonMention, citations map[string]Citation) (GroundedPersonIdentity, error) {
+	normalizedSurface := entity.NormalizeName(person.Surface)
+	if normalizedSurface == "" {
+		return GroundedPersonIdentity{}, fmt.Errorf("surface is not grounded in cited evidence")
+	}
+	normalizedEmail := entity.NormalizeEmail(person.Email)
+	if normalizedEmail != "" && !entity.ValidEmail(normalizedEmail) {
+		return GroundedPersonIdentity{}, fmt.Errorf("email is invalid")
 	}
 
-	normalizedEmail := entity.NormalizeEmail(person.Email)
-	if normalizedEmail == "" {
-		return nil
-	}
-	if !entity.ValidEmail(normalizedEmail) {
-		return fmt.Errorf("person mention %d email is invalid", index)
-	}
+	nameCitationID := ""
+	emailGrounded := normalizedEmail == ""
 	for _, citationID := range person.CitationIDs {
-		quote := entity.NormalizeEmail(citations[citationID].Quote)
-		if containsBoundedEmailIdentity(quote, normalizedEmail) {
-			return nil
+		citation, exists := citations[citationID]
+		if !exists {
+			return GroundedPersonIdentity{}, fmt.Errorf("has an unknown identity evidence reference")
+		}
+		quoteName := entity.NormalizeName(citation.Quote)
+		quoteEmail := entity.NormalizeEmail(citation.Quote)
+		nameGrounded := containsGroundedNameIdentity(quoteName, normalizedSurface)
+		thisEmailGrounded := normalizedEmail == "" || containsBoundedEmailIdentity(quoteEmail, normalizedEmail)
+		if nameGrounded && nameCitationID == "" {
+			nameCitationID = citationID
+		}
+		if normalizedEmail != "" && thisEmailGrounded {
+			emailGrounded = true
+		}
+		if nameGrounded && thisEmailGrounded {
+			return GroundedPersonIdentity{
+				EvidenceCitationID: citationID,
+				NormalizedName:     normalizedSurface,
+				NormalizedEmail:    normalizedEmail,
+				AliasesAdmissible:  true,
+			}, nil
 		}
 	}
-	return fmt.Errorf("person mention %d email is not grounded in cited evidence", index)
+	if nameCitationID == "" {
+		return GroundedPersonIdentity{}, fmt.Errorf("surface is not grounded in cited evidence")
+	}
+	if !emailGrounded {
+		return GroundedPersonIdentity{}, fmt.Errorf("email is not grounded in cited evidence")
+	}
+	return GroundedPersonIdentity{EvidenceCitationID: nameCitationID}, nil
 }
 
 func containsGroundedNameIdentity(text, value string) bool {
@@ -511,35 +547,6 @@ func identityOccurrenceInsideEmailToken(text string, start, end int) bool {
 	return strings.Contains(text[left:right], "@")
 }
 
-func containsBoundedIdentity(text, value string, runeChecks ...func(rune) bool) bool {
-	if value == "" {
-		return false
-	}
-	for offset := 0; offset <= len(text)-len(value); {
-		index := strings.Index(text[offset:], value)
-		if index < 0 {
-			return false
-		}
-		index += offset
-		beforeMatches := false
-		if index > 0 {
-			before, _ := utf8.DecodeLastRuneInString(text[:index])
-			beforeMatches = matchesAnyRuneCheck(before, runeChecks)
-		}
-		afterOffset := index + len(value)
-		afterMatches := false
-		if afterOffset < len(text) {
-			after, _ := utf8.DecodeRuneInString(text[afterOffset:])
-			afterMatches = matchesAnyRuneCheck(after, runeChecks)
-		}
-		if !beforeMatches && !afterMatches {
-			return true
-		}
-		offset = afterOffset
-	}
-	return false
-}
-
 func containsBoundedEmailIdentity(text, value string) bool {
 	if value == "" {
 		return false
@@ -582,15 +589,6 @@ func emailIdentityContinues(suffix string) bool {
 	return unicode.IsLetter(afterPeriod) || unicode.IsDigit(afterPeriod)
 }
 
-func matchesAnyRuneCheck(value rune, checks []func(rune) bool) bool {
-	for _, check := range checks {
-		if check(value) {
-			return true
-		}
-	}
-	return false
-}
-
 func isEmailRune(value rune) bool {
 	return unicode.IsLetter(value) || unicode.IsDigit(value) || strings.ContainsRune(".!#$%&'*+-/=?^_`{|}~@", value)
 }
@@ -598,10 +596,6 @@ func isEmailRune(value rune) bool {
 func isNameIdentityRune(value rune) bool {
 	return unicode.IsLetter(value) || unicode.IsDigit(value) || unicode.IsMark(value) ||
 		unicode.Is(unicode.Pd, value) || unicode.Is(unicode.Pc, value) || value == '\'' || value == '’'
-}
-
-func isDateTokenRune(value rune) bool {
-	return unicode.IsLetter(value) || unicode.IsDigit(value) || unicode.IsMark(value) || unicode.Is(unicode.Pc, value)
 }
 
 func hasTranscriptCitation(references []string, citations map[string]Citation, tabs map[string]SubmittedTab) bool {

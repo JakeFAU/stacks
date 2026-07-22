@@ -96,7 +96,7 @@ func TestDocumentVersionRetainsImmutableSourceProvenance(t *testing.T) {
 	}
 }
 
-func TestDocumentVersionDigestChangesWhenProviderRevisionChanges(t *testing.T) {
+func TestDocumentVersionDigestIgnoresProviderRevisionChurn(t *testing.T) {
 	firstInput := documentVersionInput([]source.Tab{sourceTab("t.transcript", "Transcript", "Alex: synthetic words")})
 	firstInput.ProviderRevision = "revision-1"
 	secondInput := firstInput
@@ -110,8 +110,21 @@ func TestDocumentVersionDigestChangesWhenProviderRevisionChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Digest() == second.Digest() {
-		t.Fatal("document digests are equal after provider revision changed")
+	if first.Digest() != second.Digest() {
+		t.Fatal("provider revision churn changed the immutable content identity")
+	}
+}
+
+func TestDocumentVersionAllowsMissingOptionalProviderRevision(t *testing.T) {
+	input := documentVersionInput([]source.Tab{sourceTab("t.transcript", "Transcript", "Alex: synthetic words")})
+	input.ProviderRevision = ""
+
+	version, err := NewDocumentVersion(input)
+	if err != nil {
+		t.Fatalf("NewDocumentVersion() error = %v, want view-only source without revision metadata", err)
+	}
+	if version.ProviderRevision() != "" {
+		t.Fatalf("ProviderRevision() = %q, want missing optional provenance retained", version.ProviderRevision())
 	}
 }
 

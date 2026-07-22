@@ -61,6 +61,100 @@ func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	}
 }
 
+func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	const (
+		alexEvidence = "Alex Reviewer led the review."
+		bobEvidence  = "Bob Builder uses bob.builder@synthetic.example."
+		transcript   = alexEvidence + " " + bobEvidence
+	)
+	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider:           "synthetic-drive",
+		ProviderDocumentID: testIdentifier("document-unassociated-identity"),
+		Title:              "Synthetic identity review",
+		Locator:            "https://docs.example.invalid/unassociated-identity",
+		ProviderVersion:    "synthetic-version-1",
+		ProviderRevision:   "",
+		ModifiedAt:         time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
+		RecordedAt:         time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
+		Tabs: []source.Tab{{
+			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
+			Role: source.TabRoleTranscript, Text: transcript,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("new unassociated identity version: %v", err)
+	}
+	alexSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, TabID: "tab-synthetic", StartOffset: 0,
+		EndOffset: len(alexEvidence), Quote: alexEvidence,
+	})
+	if err != nil {
+		t.Fatalf("new Alex evidence span: %v", err)
+	}
+	bobSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, TabID: "tab-synthetic", StartOffset: len(alexEvidence) + 1,
+		EndOffset: len(transcript), Quote: bobEvidence,
+	})
+	if err != nil {
+		t.Fatalf("new Bob evidence span: %v", err)
+	}
+	repository := NewIngestionRepository(pool)
+	state, err := repository.PrepareVersion(ctx, version, testExtractionDerivation(t, version), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare unassociated identity derivation: %v", err)
+	}
+	if err := repository.CompleteVersion(ctx, ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		Evidence: []ingest.EvidenceRecord{
+			{Key: "citation-alex", Span: alexSpan},
+			{Key: "citation-bob", Span: bobSpan},
+		},
+		Mentions: []ingest.MentionRecord{{
+			Key: "mention-alex", EvidenceKey: "citation-alex", Surface: "Alex Reviewer", Role: "speaker",
+		}},
+	}); err != nil {
+		t.Fatalf("complete pending unassociated identity: %v", err)
+	}
+
+	var proposalID, quote, normalizedName, normalizedEmail string
+	if err := pool.QueryRow(ctx, `
+		SELECT proposal.id::text, span.quote, mention.normalized_name, mention.normalized_email
+		FROM stacks.resolution_proposals AS proposal
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
+		WHERE mention.extraction_run_id = $1`, state.DerivationID).Scan(
+		&proposalID, &quote, &normalizedName, &normalizedEmail,
+	); err != nil {
+		t.Fatalf("load pending identity evidence: %v", err)
+	}
+	if quote != alexEvidence || normalizedName != "" || normalizedEmail != "" {
+		t.Fatalf("stored evidence/aliases = %q/%q/%q, want exact Alex evidence and no teachable aliases", quote, normalizedName, normalizedEmail)
+	}
+
+	acceptedEntityID := uuid.NewString()
+	entities := NewEntityRepository(pool)
+	if _, err := entities.CreateEntity(ctx, EntityInput{
+		ID: acceptedEntityID, Kind: "person", DisplayName: "Synthetic Reviewed Person",
+	}); err != nil {
+		t.Fatalf("create reviewed entity: %v", err)
+	}
+	if _, err := entities.RecordReviewDecision(ctx, ResolutionDecisionInput{
+		ProposalID: proposalID, Outcome: ResolutionOutcomeAccepted, EntityID: acceptedEntityID,
+	}); err != nil {
+		t.Fatalf("accept pending unassociated identity: %v", err)
+	}
+	var aliasAssertions int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM stacks.entity_alias_assertions WHERE entity_id = $1`, acceptedEntityID).Scan(&aliasAssertions); err != nil {
+		t.Fatalf("count unassociated identity aliases: %v", err)
+	}
+	if aliasAssertions != 0 {
+		t.Fatalf("alias assertion count = %d, want unassociated identity unable to teach aliases", aliasAssertions)
+	}
+}
+
 func TestConcurrentExtractionClaimAllowsOneActiveOwner(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	version := testDocumentVersion(t, testIdentifier("document-concurrent-claim"))

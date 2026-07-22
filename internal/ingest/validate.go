@@ -8,6 +8,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"stacks/internal/entity"
+	"stacks/internal/extract"
 )
 
 // ErrPersistenceCollision reports that distinct model records would collapse
@@ -26,7 +29,11 @@ func ValidateForPersistence(completion Completion) error {
 	if err != nil {
 		return err
 	}
-	mentionKeys, err := validateMentionIdentities(completion.Mentions, evidenceIdentities)
+	evidenceQuotes := make(map[string]string, len(completion.Evidence))
+	for _, record := range completion.Evidence {
+		evidenceQuotes[record.Key] = record.Span.Text()
+	}
+	mentionKeys, err := validateMentionIdentities(completion.Mentions, evidenceIdentities, evidenceQuotes)
 	if err != nil {
 		return err
 	}
@@ -68,12 +75,29 @@ func validateEvidenceIdentities(records []EvidenceRecord) (map[string][sha256.Si
 	return byKey, nil
 }
 
-func validateMentionIdentities(records []MentionRecord, evidence map[string][sha256.Size]byte) (map[string]struct{}, error) {
+func validateMentionIdentities(records []MentionRecord, evidence map[string][sha256.Size]byte, evidenceQuotes map[string]string) (map[string]struct{}, error) {
 	seenKeys := make(map[string]struct{}, len(records))
 	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
 	for _, record := range records {
 		evidenceIdentity, exists := evidence[record.EvidenceKey]
 		if !canonicalLocalIdentifier(record.Key) || !canonicalLocalIdentifier(record.EvidenceKey) || !exists {
+			return nil, ErrPersistenceReference
+		}
+		if record.NormalizedName == "" {
+			if record.NormalizedEmail != "" || record.Resolution.AutoResolved || record.Resolution.EntityID != "" {
+				return nil, ErrPersistenceReference
+			}
+		} else if record.NormalizedName != entity.NormalizeName(record.Surface) ||
+			record.NormalizedEmail != entity.NormalizeEmail(record.NormalizedEmail) ||
+			(record.NormalizedEmail != "" && !entity.ValidEmail(record.NormalizedEmail)) {
+			return nil, ErrPersistenceReference
+		}
+		groundedIdentity, err := extract.GroundPersonIdentity(extract.PersonMention{
+			Surface: record.Surface, Email: record.NormalizedEmail,
+			CitationIDs: []string{record.EvidenceKey},
+		}, []extract.Citation{{ID: record.EvidenceKey, Quote: evidenceQuotes[record.EvidenceKey]}})
+		if err != nil || (record.NormalizedName != "" &&
+			(!groundedIdentity.AliasesAdmissible || groundedIdentity.NormalizedName != record.NormalizedName || groundedIdentity.NormalizedEmail != record.NormalizedEmail)) {
 			return nil, ErrPersistenceReference
 		}
 		if _, exists := seenKeys[record.Key]; exists {

@@ -109,9 +109,12 @@ type EvidenceRecord struct {
 // MentionRecord is one source-grounded person mention and its deterministic
 // identity-resolution result.
 type MentionRecord struct {
-	Key             string
-	EvidenceKey     string
-	Surface         string
+	Key         string
+	EvidenceKey string
+	Surface     string
+	// Normalized identity fields are durable alias inputs only when the exact
+	// evidence span associates the name and optional email. Empty values keep a
+	// separately grounded proposal reviewable without teaching aliases.
 	NormalizedName  string
 	NormalizedEmail string
 	Role            string
@@ -420,11 +423,18 @@ func (service *Service) completion(
 
 	resolutions := make(map[string]entity.Resolution, len(output.People))
 	for _, person := range output.People {
-		resolution := service.Resolver.Resolve(entity.Mention{Name: person.Surface, Email: person.Email}, snapshots)
+		identity, err := extract.GroundPersonIdentity(person, output.Citations)
+		if err != nil {
+			return Completion{}, err
+		}
+		resolution := entity.Resolution{}
+		if identity.AliasesAdmissible {
+			resolution = service.Resolver.Resolve(entity.Mention{Name: person.Surface, Email: person.Email}, snapshots)
+		}
 		resolutions[person.ID] = resolution
 		completion.Mentions = append(completion.Mentions, MentionRecord{
-			Key: person.ID, EvidenceKey: person.CitationIDs[0], Surface: person.Surface,
-			NormalizedName: entity.NormalizeName(person.Surface), NormalizedEmail: entity.NormalizeEmail(person.Email),
+			Key: person.ID, EvidenceKey: identity.EvidenceCitationID, Surface: person.Surface,
+			NormalizedName: identity.NormalizedName, NormalizedEmail: identity.NormalizedEmail,
 			Role: person.Role, Resolution: resolution,
 		})
 	}

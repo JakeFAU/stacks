@@ -302,6 +302,52 @@ func TestSyncCreatesNewVersionWhenOneTabChanges(t *testing.T) {
 	}
 }
 
+func TestSyncTreatsProviderRevisionChurnAsUnchangedContent(t *testing.T) {
+	document := syntheticDocument("document-revision-churn", "Leader assigns follow-up.")
+	listed := document
+	listed.Tabs = nil
+	listed.Revision = ""
+	sourceBoundary := &memorySource{
+		listed:  []source.Document{listed},
+		fetched: map[string]source.Document{document.ID: document},
+	}
+	repository := newMemoryRepository()
+	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
+	service := testServiceWithSource(sourceBoundary, repository, model)
+
+	first, err := service.Sync(context.Background())
+	if err != nil || first.Completed != 1 {
+		t.Fatalf("first Sync() = (%#v, %v), want one completed version", first, err)
+	}
+	changedRevision := document
+	changedRevision.Revision = "revision-2"
+	sourceBoundary.fetched[document.ID] = changedRevision
+
+	second, err := service.Sync(context.Background())
+	if err != nil || second.Unchanged != 1 {
+		t.Fatalf("second Sync() = (%#v, %v), want unchanged content despite revision churn", second, err)
+	}
+	if model.calls != 1 || len(repository.versions) != 1 {
+		t.Fatalf("model calls/derivations = %d/%d, want 1/1", model.calls, len(repository.versions))
+	}
+}
+
+func TestSyncAcceptsViewOnlyDocumentWithoutProviderRevision(t *testing.T) {
+	document := syntheticDocument("document-view-only", "Leader assigns follow-up.")
+	document.Revision = ""
+	repository := newMemoryRepository()
+	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
+	service := testService(document, repository, model)
+
+	summary, err := service.Sync(context.Background())
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("Sync() = (%#v, %v), want view-only document completed without revision metadata", summary, err)
+	}
+	if model.calls != 1 || len(repository.versions) != 1 {
+		t.Fatalf("model calls/derivations = %d/%d, want 1/1", model.calls, len(repository.versions))
+	}
+}
+
 func TestSyncCreatesNewDerivationWithoutDuplicatingSourceVersionWhenConfigurationChanges(t *testing.T) {
 	document := syntheticDocument("document-config-change", "Leader assigns follow-up.")
 	repository := newMemoryRepository()
@@ -484,6 +530,118 @@ func TestSyncPreservesUnknownMeetingTime(t *testing.T) {
 	}
 	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart != nil {
 		t.Fatalf("observation valid time = %#v, want unknown", repository.lastCompletion.Observations)
+	}
+}
+
+func TestSyncCannotManufactureChronologyFromDeadlineCitation(t *testing.T) {
+	const transcript = "Leader assigns follow-up by 2026-07-20."
+	response := signalResponse(t, transcript, "2026-07-20")
+	repository := newMemoryRepository()
+	service := testService(
+		syntheticDocument("document-deadline-not-meeting-time", transcript),
+		repository,
+		&recordingModel{responses: []extract.Response{response}},
+	)
+
+	summary, err := service.Sync(context.Background())
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("Sync() = (%#v, %v), want one completed extraction", summary, err)
+	}
+	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart != nil {
+		t.Fatalf("observation valid time = %#v, want deadline citation unable to manufacture chronology", repository.lastCompletion.Observations)
+	}
+}
+
+func TestSyncKeepsSeparatelyCitedAlexNameAndBobEmailPendingWithoutTeachingAliases(t *testing.T) {
+	const (
+		alexEvidence = "Alex Reviewer led the review."
+		bobEvidence  = "Bob Builder uses bob.builder@synthetic.example."
+		transcript   = alexEvidence + " " + bobEvidence
+	)
+	output := extract.ExtractionOutput{
+		Citations: []extract.Citation{
+			{ID: "citation-alex", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(alexEvidence), Quote: alexEvidence},
+			{ID: "citation-bob", TabID: "transcript-tab", StartOffset: len(alexEvidence) + 1, EndOffset: len(transcript), Quote: bobEvidence},
+		},
+		People: []extract.PersonMention{{
+			ID: "mention-alex", Surface: "Alex Reviewer", Email: "bob.builder@synthetic.example",
+			Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-alex", "citation-bob"},
+		}},
+		Statements: []extract.AttributedStatement{},
+		Signals:    []extract.InteractionSignal{},
+	}
+	repository := newMemoryRepository()
+	repository.snapshots = []entity.EntitySnapshot{{
+		ID: "entity-bob", Kind: entity.KindPerson,
+		Aliases: []entity.Alias{{Type: entity.AliasTypeEmail, Value: "bob.builder@synthetic.example"}},
+	}}
+	service := testService(
+		syntheticDocument("document-separated-identity", transcript),
+		repository,
+		&recordingModel{responses: []extract.Response{extractionResponse(t, output)}},
+	)
+
+	summary, err := service.Sync(context.Background())
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("Sync() = (%#v, %v), want reviewable pending mention", summary, err)
+	}
+	if len(repository.lastCompletion.Mentions) != 1 {
+		t.Fatalf("mentions = %#v, want one durable mention", repository.lastCompletion.Mentions)
+	}
+	mention := repository.lastCompletion.Mentions[0]
+	if mention.Resolution.AutoResolved || mention.Resolution.EntityID != "" {
+		t.Fatalf("resolution = %#v, want Alex/Bob association pending", mention.Resolution)
+	}
+	if mention.EvidenceKey != "citation-alex" {
+		t.Fatalf("EvidenceKey = %q, want exact Alex identity evidence", mention.EvidenceKey)
+	}
+	if mention.NormalizedName != "" || mention.NormalizedEmail != "" {
+		t.Fatalf("durable aliases = %q/%q, want unassociated identity unable to teach aliases", mention.NormalizedName, mention.NormalizedEmail)
+	}
+}
+
+func TestSyncAutoResolvesAssociatedNameAndEmailUsingExactSharedEvidence(t *testing.T) {
+	const (
+		nameOnlyEvidence = "Alex Reviewer spoke earlier."
+		sharedEvidence   = "Alex Reviewer (alex.reviewer@synthetic.example) led the review."
+		transcript       = nameOnlyEvidence + " " + sharedEvidence
+	)
+	output := extract.ExtractionOutput{
+		Citations: []extract.Citation{
+			{ID: "citation-name", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(nameOnlyEvidence), Quote: nameOnlyEvidence},
+			{ID: "citation-shared", TabID: "transcript-tab", StartOffset: len(nameOnlyEvidence) + 1, EndOffset: len(transcript), Quote: sharedEvidence},
+		},
+		People: []extract.PersonMention{{
+			ID: "mention-alex", Surface: "Alex Reviewer", Email: "alex.reviewer@synthetic.example",
+			Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-name", "citation-shared"},
+		}},
+		Statements: []extract.AttributedStatement{},
+		Signals:    []extract.InteractionSignal{},
+	}
+	repository := newMemoryRepository()
+	repository.snapshots = []entity.EntitySnapshot{{
+		ID: "entity-alex", Kind: entity.KindPerson,
+		Aliases: []entity.Alias{{Type: entity.AliasTypeEmail, Value: "alex.reviewer@synthetic.example"}},
+	}}
+	service := testService(
+		syntheticDocument("document-associated-identity", transcript),
+		repository,
+		&recordingModel{responses: []extract.Response{extractionResponse(t, output)}},
+	)
+
+	summary, err := service.Sync(context.Background())
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("Sync() = (%#v, %v), want associated identity completed", summary, err)
+	}
+	mention := repository.lastCompletion.Mentions[0]
+	if !mention.Resolution.AutoResolved || mention.Resolution.EntityID != "entity-alex" {
+		t.Fatalf("resolution = %#v, want accepted associated email", mention.Resolution)
+	}
+	if mention.EvidenceKey != "citation-shared" {
+		t.Fatalf("EvidenceKey = %q, want exact shared name/email evidence", mention.EvidenceKey)
+	}
+	if mention.NormalizedName != "alex reviewer" || mention.NormalizedEmail != "alex.reviewer@synthetic.example" {
+		t.Fatalf("durable aliases = %q/%q, want exact grounded pair", mention.NormalizedName, mention.NormalizedEmail)
 	}
 }
 
@@ -765,16 +923,44 @@ func documentVersion(t *testing.T, document source.Document) knowledge.DocumentV
 
 func validEmptyResponse(t *testing.T) extract.Response {
 	t.Helper()
-	output, err := json.Marshal(extract.ExtractionOutput{
+	return extractionResponse(t, extract.ExtractionOutput{
 		Citations:  []extract.Citation{},
 		People:     []extract.PersonMention{},
 		Statements: []extract.AttributedStatement{},
 		Signals:    []extract.InteractionSignal{},
 	})
+}
+
+func extractionResponse(t *testing.T, extraction extract.ExtractionOutput) extract.Response {
+	t.Helper()
+	output, err := json.Marshal(extraction)
 	if err != nil {
-		t.Fatalf("marshal empty extraction: %v", err)
+		t.Fatalf("marshal extraction: %v", err)
 	}
 	return extract.Response{Output: output, ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion, Outcome: "success"}
+}
+
+func signalResponse(t *testing.T, transcript, meetingDate string) extract.Response {
+	t.Helper()
+	return extractionResponse(t, extract.ExtractionOutput{
+		MeetingDate: meetingDate,
+		Citations: []extract.Citation{{
+			ID: "citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript,
+		}},
+		People: []extract.PersonMention{
+			{ID: "mention-leader", Surface: "Leader", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-report", Surface: "follow-up", Role: extract.MentionRoleReference, CitationIDs: []string{"citation-1"}},
+		},
+		Statements: []extract.AttributedStatement{{
+			ID: "statement-1", SpeakerMentionID: "mention-leader", SubjectMentionID: "mention-report",
+			Predicate: "assigned", ObjectText: "follow-up", ValidDate: meetingDate, CitationIDs: []string{"citation-1"},
+		}},
+		Signals: []extract.InteractionSignal{{
+			ID: "signal-1", SubjectMentionID: "mention-leader", ObjectMentionID: "mention-report", StatementIDs: []string{"statement-1"},
+			Category: extract.SignalCategoryFutureResponsibility, Direction: extract.SignalDirectionStrengthening,
+			Rationale: "Synthetic rationale", Confidence: 0.8, SupportingCitationIDs: []string{"citation-1"}, ContradictingCitationIDs: []string{},
+		}},
+	})
 }
 
 func validSignalResponse(t *testing.T, meetingDate string) extract.Response {
@@ -900,6 +1086,7 @@ func (model *recordingModel) Generate(_ context.Context, request extract.Request
 type memoryRepository struct {
 	versions              map[string]VersionState
 	completions           map[string]Completion
+	snapshots             []entity.EntitySnapshot
 	lastCompletion        Completion
 	completionCalls       int
 	failCompletionOnce    bool
@@ -1010,7 +1197,7 @@ func (repository *memoryRepository) RecordFailure(_ context.Context, derivationI
 }
 
 func (repository *memoryRepository) EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error) {
-	return nil, repository.snapshotErr
+	return append([]entity.EntitySnapshot(nil), repository.snapshots...), repository.snapshotErr
 }
 
 func versionKey(version knowledge.DocumentVersion) string {

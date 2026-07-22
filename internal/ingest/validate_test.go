@@ -39,8 +39,8 @@ func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentit
 			completion: Completion{
 				VersionID: "version-1", Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 				Mentions: []MentionRecord{
-					{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Private Synthetic Person", Role: "speaker", Resolution: entity.Resolution{AutoResolved: true, EntityID: "entity-1"}},
-					{Key: "mention-2", EvidenceKey: "citation-1", Surface: "Private Synthetic Person", Role: "speaker", Resolution: entity.Resolution{AutoResolved: true, EntityID: "entity-1"}},
+					{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic", NormalizedName: "synthetic", Role: "speaker", Resolution: entity.Resolution{AutoResolved: true, EntityID: "entity-1"}},
+					{Key: "mention-2", EvidenceKey: "citation-1", Surface: "Synthetic", NormalizedName: "synthetic", Role: "speaker", Resolution: entity.Resolution{AutoResolved: true, EntityID: "entity-1"}},
 				},
 			},
 		},
@@ -86,12 +86,37 @@ func TestValidateForPersistenceAcceptsDistinctDurableIdentities(t *testing.T) {
 		VersionID: "version-1",
 		Evidence:  []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 		Mentions: []MentionRecord{
-			{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic Person One", Role: "speaker"},
-			{Key: "mention-2", EvidenceKey: "citation-1", Surface: "Synthetic Person Two", Role: "reference"},
+			{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic", Role: "speaker"},
+			{Key: "mention-2", EvidenceKey: "citation-1", Surface: "evidence", Role: "reference"},
 		},
 	}
 	if err := ValidateForPersistence(completion); err != nil {
 		t.Fatalf("ValidateForPersistence() error = %v", err)
+	}
+}
+
+func TestValidateForPersistenceRejectsIdentityNotGroundedInSelectedEvidence(t *testing.T) {
+	evidence := persistenceEvidence(t)
+	tests := []MentionRecord{
+		{
+			Key: "mention-1", EvidenceKey: "citation-1", Surface: "Invented Person",
+			Role: "speaker",
+		},
+		{
+			Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic",
+			NormalizedName: "synthetic", NormalizedEmail: "bob.builder@synthetic.example",
+			Role: "speaker",
+		},
+	}
+	for _, mention := range tests {
+		completion := Completion{
+			VersionID: "version-1",
+			Evidence:  []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+			Mentions:  []MentionRecord{mention},
+		}
+		if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
+			t.Fatalf("ValidateForPersistence() error = %v, want selected identity-evidence rejection", err)
+		}
 	}
 }
 
@@ -174,7 +199,7 @@ func persistenceEvidence(t *testing.T) knowledge.EvidenceSpan {
 	version := documentVersion(t, syntheticDocument("document-persistence-validation", "Synthetic evidence."))
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: version, TabID: "transcript-tab", StartOffset: 0,
-		EndOffset: len("Synthetic"), Quote: "Synthetic",
+		EndOffset: len("Synthetic evidence."), Quote: "Synthetic evidence.",
 	})
 	if err != nil {
 		t.Fatalf("NewEvidenceSpan() error = %v", err)

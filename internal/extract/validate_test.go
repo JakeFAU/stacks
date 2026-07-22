@@ -30,21 +30,41 @@ func TestDecodeExtractionDoesNotTrustInventedMeetingDate(t *testing.T) {
 	}
 }
 
-func TestDecodeExtractionAcceptsExactDateBearingCitation(t *testing.T) {
-	const citedText = "2026-07-21 speaker-a assigned"
+func TestDecodeExtractionDoesNotTreatUnusedDateCitationAsMeetingTime(t *testing.T) {
+	const unusedDateEvidence = "meeting archive label 2026-07-21"
 	submitted := SubmittedText{Tabs: []SubmittedTab{{
 		ID: "transcript-tab", Role: TabRoleTranscript,
-		Text: citedText + " the follow-up.",
+		Text: submittedTranscript + "\n" + unusedDateEvidence,
 	}}}
 	output := validExtraction()
+	output.MeetingDate = "2026-07-21"
+	output.Citations = append(output.Citations, Citation{
+		ID: "citation-unused-date", TabID: "transcript-tab", StartOffset: len(submittedTranscript) + 1,
+		EndOffset: len(submittedTranscript) + 1 + len(unusedDateEvidence), Quote: unusedDateEvidence,
+	})
+
+	got := decodeExtractionForTest(t, submitted, output)
+	if got.MeetingDate != "" {
+		t.Fatalf("MeetingDate = %q, want unknown without deterministic source meeting metadata", got.MeetingDate)
+	}
+}
+
+func TestDecodeExtractionDoesNotTreatDeadlineCitationAsMeetingTime(t *testing.T) {
+	const citedText = "speaker-a assigned a deadline of 2026-07-21"
+	submitted := SubmittedText{Tabs: []SubmittedTab{{
+		ID: "transcript-tab", Role: TabRoleTranscript,
+		Text: citedText + " for the follow-up.",
+	}}}
+	output := validExtraction()
+	output.MeetingDate = "2026-07-21"
 	output.Citations[0] = Citation{
 		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
 		EndOffset: len(citedText), Quote: citedText,
 	}
 
 	got := decodeExtractionForTest(t, submitted, output)
-	if got.MeetingDate != "2026-07-21" {
-		t.Fatalf("MeetingDate = %q, want exact cited date", got.MeetingDate)
+	if got.MeetingDate != "" {
+		t.Fatalf("MeetingDate = %q, want a deadline to remain distinct from source meeting time", got.MeetingDate)
 	}
 }
 

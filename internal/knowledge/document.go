@@ -28,8 +28,9 @@ type DocumentVersionInput struct {
 }
 
 // DocumentVersion is an immutable, tab-aware source document version. Its
-// digest covers immutable source provenance, ordered tab structure, and tab
-// content digests while excluding the local recorded time.
+// digest covers stable source provenance, ordered tab structure, and tab
+// content digests while excluding the local recorded time and the provider's
+// optional ephemeral revision marker.
 type DocumentVersion struct {
 	provider           string
 	providerDocumentID string
@@ -62,7 +63,7 @@ func NewDocumentVersion(input DocumentVersionInput) (DocumentVersion, error) {
 	locator := strings.TrimSpace(input.Locator)
 	providerVersion := strings.TrimSpace(input.ProviderVersion)
 	providerRevision := strings.TrimSpace(input.ProviderRevision)
-	if title == "" || locator == "" || providerVersion == "" || providerRevision == "" || input.ModifiedAt.IsZero() {
+	if title == "" || locator == "" || providerVersion == "" || input.ModifiedAt.IsZero() {
 		return DocumentVersion{}, fmt.Errorf("document source provenance is required")
 	}
 	if len(input.Tabs) == 0 {
@@ -218,7 +219,6 @@ func digestDocumentVersion(version DocumentVersion) ContentDigest {
 	writeString(hasher, version.title)
 	writeString(hasher, version.locator)
 	writeString(hasher, version.providerVersion)
-	writeString(hasher, version.providerRevision)
 	writeString(hasher, version.modifiedAt.UTC().Format(time.RFC3339Nano))
 	if version.sourceMeetingTime == nil {
 		writeString(hasher, "")
