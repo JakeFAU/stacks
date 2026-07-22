@@ -79,7 +79,8 @@ func TestInvocationValidateRequiresBedrockRegionOnly(t *testing.T) {
 	}{
 		{"bedrock missing region", Invocation{Provider: ProviderBedrock, DataMode: DataModePersonal}, true},
 		{"bedrock whitespace region", Invocation{Provider: ProviderBedrock, DataMode: DataModePersonal, Region: " \t"}, true},
-		{"bedrock trimmed region", Invocation{Provider: ProviderBedrock, DataMode: DataModePersonal, Region: " us-east-1 "}, false},
+		{"bedrock padded region", Invocation{Provider: ProviderBedrock, DataMode: DataModePersonal, Region: " us-east-1 "}, true},
+		{"bedrock trimmed region", Invocation{Provider: ProviderBedrock, DataMode: DataModePersonal, Region: "us-east-1"}, false},
 		{"openai region", Invocation{Provider: ProviderOpenAI, DataMode: DataModePersonal, Region: "us-east-1"}, true},
 		{"anthropic region", Invocation{Provider: ProviderAnthropic, DataMode: DataModePersonal, Region: "us-east-1"}, true},
 		{"openai no region", Invocation{Provider: ProviderOpenAI, DataMode: DataModePersonal}, false},

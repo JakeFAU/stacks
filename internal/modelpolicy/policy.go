@@ -69,7 +69,7 @@ func (invocation Invocation) Validate() error {
 
 	region := strings.TrimSpace(invocation.Region)
 	if invocation.Provider == ProviderBedrock {
-		if region == "" {
+		if region == "" || region != invocation.Region {
 			return fmt.Errorf("bedrock provider requires a region")
 		}
 		return nil
