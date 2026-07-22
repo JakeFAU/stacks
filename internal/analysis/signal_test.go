@@ -12,7 +12,7 @@ func TestAdmitConclusionRequiresTwoDatedMeetings(t *testing.T) {
 		PairAccepted: true,
 		Proposed:     StatusNoMaterialChange,
 		Signals: []Signal{{
-			ID: "signal-1", Category: CategoryDelegationAutonomy,
+			ID: "signal-1", MeetingID: "meeting-1", Category: CategoryDelegationAutonomy,
 			Direction: DirectionStrengthening, ValidTime: &meeting,
 		}},
 	})
@@ -29,8 +29,8 @@ func TestAdmitConclusionAcceptsCitedLaterWeakening(t *testing.T) {
 		PairAccepted: true,
 		Proposed:     StatusPossibleDecline,
 		Signals: []Signal{
-			{ID: "earlier", Category: CategoryDelegationAutonomy, Direction: DirectionStrengthening, ValidTime: &earlier},
-			{ID: "later", Category: CategoryScrutinyCorrection, Direction: DirectionWeakening, ValidTime: &later},
+			{ID: "earlier", MeetingID: "meeting-earlier", Category: CategoryDelegationAutonomy, Direction: DirectionStrengthening, ValidTime: &earlier},
+			{ID: "later", MeetingID: "meeting-later", Category: CategoryScrutinyCorrection, Direction: DirectionWeakening, ValidTime: &later},
 		},
 		SupportingSignalIDs: []string{"later", "earlier"},
 	})
@@ -47,8 +47,8 @@ func TestAdmitConclusionRejectsPendingPairIdentity(t *testing.T) {
 		PairAccepted: false,
 		Proposed:     StatusPossibleDecline,
 		Signals: []Signal{
-			{ID: "earlier", Direction: DirectionStrengthening, ValidTime: &earlier},
-			{ID: "later", Direction: DirectionWeakening, ValidTime: &later},
+			{ID: "earlier", MeetingID: "meeting-earlier", Direction: DirectionStrengthening, ValidTime: &earlier},
+			{ID: "later", MeetingID: "meeting-later", Direction: DirectionWeakening, ValidTime: &later},
 		},
 		SupportingSignalIDs: []string{"earlier", "later"},
 	})
@@ -64,8 +64,8 @@ func TestAdmitConclusionDoesNotUseUnknownTimeAsDatedMeeting(t *testing.T) {
 		PairAccepted: true,
 		Proposed:     StatusPossibleDecline,
 		Signals: []Signal{
-			{ID: "unknown", Direction: DirectionStrengthening},
-			{ID: "dated", Direction: DirectionWeakening, ValidTime: &dated},
+			{ID: "unknown", MeetingID: "meeting-unknown", Direction: DirectionStrengthening},
+			{ID: "dated", MeetingID: "meeting-dated", Direction: DirectionWeakening, ValidTime: &dated},
 		},
 		SupportingSignalIDs: []string{"unknown", "dated"},
 	})
@@ -82,8 +82,8 @@ func TestAdmitConclusionDowngradesUnsupportedDeclineToMixedWhenConflictExists(t 
 		PairAccepted: true,
 		Proposed:     StatusPossibleDecline,
 		Signals: []Signal{
-			{ID: "earlier", Direction: DirectionStrengthening, ValidTime: &earlier, Confidence: 0.1},
-			{ID: "later", Direction: DirectionWeakening, ValidTime: &later, Confidence: 0.99},
+			{ID: "earlier", MeetingID: "meeting-earlier", Direction: DirectionStrengthening, ValidTime: &earlier, Confidence: 0.1},
+			{ID: "later", MeetingID: "meeting-later", Direction: DirectionWeakening, ValidTime: &later, Confidence: 0.99},
 		},
 		SupportingSignalIDs: []string{"later"},
 	})
@@ -100,13 +100,74 @@ func TestAdmitConclusionPreservesConflictInsteadOfAcceptingNoChange(t *testing.T
 		PairAccepted: true,
 		Proposed:     StatusNoMaterialChange,
 		Signals: []Signal{
-			{ID: "earlier", Direction: DirectionStrengthening, ValidTime: &earlier, Confidence: 0.99},
-			{ID: "later", Direction: DirectionWeakening, ValidTime: &later, Confidence: 0.01},
+			{ID: "earlier", MeetingID: "meeting-earlier", Direction: DirectionStrengthening, ValidTime: &earlier, Confidence: 0.99},
+			{ID: "later", MeetingID: "meeting-later", Direction: DirectionWeakening, ValidTime: &later, Confidence: 0.01},
 		},
 	})
 
 	if status != StatusMixedOrConflicting {
 		t.Fatalf("AdmitConclusion() = %q, want conflict preserved independently of confidence", status)
+	}
+}
+
+func TestAdmitConclusionCountsDocumentRevisionsAsOneMeeting(t *testing.T) {
+	earlier := testMeetingDate(2026, time.June, 3)
+	laterRevision := testMeetingDate(2026, time.July, 8)
+	status := AdmitConclusion(AdmissionInput{
+		PairAccepted: true,
+		Proposed:     StatusPossibleDecline,
+		Signals: []Signal{
+			{ID: "revision-1", MeetingID: "meeting-stable", Direction: DirectionStrengthening, ValidTime: &earlier},
+			{ID: "revision-2", MeetingID: "meeting-stable", Direction: DirectionWeakening, ValidTime: &laterRevision},
+		},
+		SupportingSignalIDs: []string{"revision-1", "revision-2"},
+	})
+
+	if status != StatusInsufficientEvidence {
+		t.Fatalf("AdmitConclusion() = %q, want one source document counted as one meeting", status)
+	}
+}
+
+func TestAdmitConclusionCountsSameDateDocumentsButRequiresTimeOrderForDecline(t *testing.T) {
+	meetingDate := testMeetingDate(2026, time.July, 8)
+	signals := []Signal{
+		{ID: "meeting-a-signal", MeetingID: "meeting-a", Direction: DirectionStrengthening, ValidTime: &meetingDate},
+		{ID: "meeting-b-signal", MeetingID: "meeting-b", Direction: DirectionWeakening, ValidTime: &meetingDate},
+	}
+
+	if got := distinctMeetingCount(signals); got != 2 {
+		t.Fatalf("distinctMeetingCount() = %d, want 2 source documents", got)
+	}
+	status := AdmitConclusion(AdmissionInput{
+		PairAccepted: true,
+		Proposed:     StatusPossibleDecline,
+		Signals:      signals,
+		SupportingSignalIDs: []string{
+			"meeting-a-signal", "meeting-b-signal",
+		},
+	})
+	if status != StatusMixedOrConflicting {
+		t.Fatalf("AdmitConclusion() = %q, want no decline without earlier/later ordering", status)
+	}
+}
+
+func TestAdmitConclusionRequiresDifferentMeetingIdentitiesForDecline(t *testing.T) {
+	earlier := testMeetingDate(2026, time.June, 3)
+	later := testMeetingDate(2026, time.July, 8)
+	signals := []Signal{
+		{ID: "same-meeting-earlier", MeetingID: "meeting-stable", Direction: DirectionStrengthening, ValidTime: &earlier},
+		{ID: "same-meeting-later", MeetingID: "meeting-stable", Direction: DirectionWeakening, ValidTime: &later},
+		{ID: "other-meeting", MeetingID: "meeting-other", Direction: DirectionUnclear, ValidTime: &later},
+	}
+	status := AdmitConclusion(AdmissionInput{
+		PairAccepted:        true,
+		Proposed:            StatusPossibleDecline,
+		Signals:             signals,
+		SupportingSignalIDs: []string{"same-meeting-earlier", "same-meeting-later"},
+	})
+
+	if status != StatusMixedOrConflicting {
+		t.Fatalf("AdmitConclusion() = %q, want no decline from revisions of one meeting", status)
 	}
 }
 

@@ -350,14 +350,40 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 		t.Fatalf("create replacement manager: %v", err)
 	}
 
-	firstSubject, firstObject := createPendingPairSignal(t, pool, time.Date(2026, time.June, 3, 0, 0, 0, 0, time.UTC), "strengthening")
-	secondSubject, secondObject := createPendingPairSignal(t, pool, time.Date(2026, time.July, 8, 0, 0, 0, 0, time.UTC), "weakening")
 	pending, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
 	if err != nil {
 		t.Fatalf("load pending pair inputs: %v", err)
 	}
-	if !pending.Accepted || len(pending.Signals) != 0 {
-		t.Fatalf("pending pair snapshot = %#v, want accepted entities with no eligible guessed signals", pending)
+	if pending.Accepted || len(pending.Signals) != 0 {
+		t.Fatalf("pending pair snapshot = %#v, want unaccepted configured identities", pending)
+	}
+
+	acceptSyntheticIdentity(t, pool, employee.ID)
+	acceptSyntheticIdentity(t, pool, manager.ID)
+	acceptedEmpty, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	if err != nil {
+		t.Fatalf("load accepted empty pair inputs: %v", err)
+	}
+	if !acceptedEmpty.Accepted || len(acceptedEmpty.Signals) != 0 || countInputKind(acceptedEmpty.Inputs, analysisdomain.InputResolutionDecision) != 2 {
+		t.Fatalf("accepted empty pair snapshot = %#v, want two audited identity inputs and no signals", acceptedEmpty)
+	}
+	emptyIdentity := analysisdomain.AnalysisIdentity{
+		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
+		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1", Inputs: acceptedEmpty.Inputs,
+	}
+	emptyIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(emptyIdentity)
+	if err != nil {
+		t.Fatalf("compute accepted empty analysis identity: %v", err)
+	}
+
+	firstSubject, firstObject := createPendingPairSignal(t, pool, time.Date(2026, time.June, 3, 0, 0, 0, 0, time.UTC), "strengthening")
+	secondSubject, secondObject := createPendingPairSignal(t, pool, time.Date(2026, time.July, 8, 0, 0, 0, 0, time.UTC), "weakening")
+	acceptedWithPendingSignals, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	if err != nil {
+		t.Fatalf("load accepted pair with pending signals: %v", err)
+	}
+	if !acceptedWithPendingSignals.Accepted || len(acceptedWithPendingSignals.Signals) != 0 {
+		t.Fatalf("accepted pair with pending signals = %#v, want accepted pair and no eligible guessed signals", acceptedWithPendingSignals)
 	}
 
 	firstManagerDecision, err := entities.RecordDecision(ctx, ResolutionDecisionInput{ProposalID: firstSubject, Outcome: ResolutionOutcomeAccepted, EntityID: manager.ID})
@@ -377,8 +403,13 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	if err != nil {
 		t.Fatalf("load accepted pair inputs: %v", err)
 	}
-	if len(accepted.Signals) != 2 || countInputKind(accepted.Inputs, analysisdomain.InputResolutionDecision) != 4 {
-		t.Fatalf("accepted pair signals/decision inputs = %d/%d, want 2/4", len(accepted.Signals), countInputKind(accepted.Inputs, analysisdomain.InputResolutionDecision))
+	if len(accepted.Signals) != 2 || countInputKind(accepted.Inputs, analysisdomain.InputResolutionDecision) != 6 ||
+		countInputKind(accepted.Inputs, analysisdomain.InputSourceDocument) != 2 {
+		t.Fatalf("accepted pair signals/decision/meeting inputs = %d/%d/%d, want 2/6/2",
+			len(accepted.Signals), countInputKind(accepted.Inputs, analysisdomain.InputResolutionDecision), countInputKind(accepted.Inputs, analysisdomain.InputSourceDocument))
+	}
+	if accepted.Signals[0].MeetingID == "" || accepted.Signals[0].MeetingID == accepted.Signals[1].MeetingID {
+		t.Fatalf("meeting IDs = %q/%q, want stable distinct source-document identities", accepted.Signals[0].MeetingID, accepted.Signals[1].MeetingID)
 	}
 	acceptedIdentity := analysisdomain.AnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
@@ -387,6 +418,9 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	acceptedIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(acceptedIdentity)
 	if err != nil {
 		t.Fatalf("compute accepted analysis identity: %v", err)
+	}
+	if acceptedIdentity.InputDigest == emptyIdentity.InputDigest {
+		t.Fatal("later accepted signals reused the accepted-empty pair identity")
 	}
 	acceptedReport, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
 		Identity: acceptedIdentity,
@@ -436,6 +470,22 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	prior, found, err := repository.FindCompleted(ctx, acceptedIdentity.InputDigest)
 	if err != nil || !found || prior.ID != acceptedReport.ID || len(prior.Chronology) != 2 {
 		t.Fatalf("prior completed report after correction = (%#v, %t, %v)", prior, found, err)
+	}
+}
+
+func acceptSyntheticIdentity(t *testing.T, pool *pgxpool.Pool, entityID string) {
+	t.Helper()
+	repository := NewEntityRepository(pool)
+	proposal, err := repository.CreateResolutionProposal(context.Background(), ResolutionProposalInput{
+		MentionID: createSyntheticMention(t, pool),
+	})
+	if err != nil {
+		t.Fatalf("create synthetic identity proposal: %v", err)
+	}
+	if _, err := repository.RecordDecision(context.Background(), ResolutionDecisionInput{
+		ProposalID: proposal.ID, Outcome: ResolutionOutcomeAccepted, EntityID: entityID,
+	}); err != nil {
+		t.Fatalf("accept synthetic identity: %v", err)
 	}
 }
 

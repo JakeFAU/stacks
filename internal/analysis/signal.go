@@ -40,6 +40,7 @@ const (
 // ValidTime is source time; RecordedAt is when Stacks learned the signal.
 type Signal struct {
 	ID               string
+	MeetingID        string
 	ObservationID    string
 	Category         Category
 	Direction        Direction
@@ -144,11 +145,14 @@ func AdmitConclusion(input AdmissionInput) ReportStatus {
 }
 
 func distinctMeetingCount(signals []Signal) int {
-	dates := make(map[string]struct{}, len(signals))
+	meetings := make(map[string]struct{}, len(signals))
 	for _, signal := range signals {
-		dates[signal.ValidTime.UTC().Format(time.RFC3339Nano)] = struct{}{}
+		if signal.ValidTime == nil || signal.ValidTime.IsZero() || signal.MeetingID == "" {
+			continue
+		}
+		meetings[signal.MeetingID] = struct{}{}
 	}
-	return len(dates)
+	return len(meetings)
 }
 
 func supportsLaterWeakening(signals []Signal, supportingIDs []string) bool {
@@ -164,7 +168,8 @@ func supportsLaterWeakening(signals []Signal, supportingIDs []string) bool {
 			continue
 		}
 		for _, earlier := range signals[:laterIndex] {
-			if earlier.ValidTime.Equal(*later.ValidTime) {
+			if earlier.MeetingID == "" || later.MeetingID == "" || earlier.MeetingID == later.MeetingID ||
+				earlier.ValidTime == nil || !earlier.ValidTime.Before(*later.ValidTime) {
 				continue
 			}
 			if _, ok := supported[earlier.ID]; ok {

@@ -26,9 +26,10 @@ import (
 const (
 	// AnalysisPolicyVersion changes whenever deterministic admission semantics
 	// change, ensuring old completed runs remain distinguishable.
-	AnalysisPolicyVersion = "manager-confidence-policy-v1"
+	AnalysisPolicyVersion = "manager-confidence-policy-v2"
 	analysisSpanName      = "stacks.analysis.pair"
 	analysisDecisionName  = "pair_analysis"
+	temporalDigestScope   = "stacks.temporal-pair-analysis.v1"
 )
 
 var (
@@ -44,6 +45,7 @@ type InputKind string
 
 const (
 	InputDocumentVersion    InputKind = "document_version"
+	InputSourceDocument     InputKind = "source_document"
 	InputDocumentTab        InputKind = "document_tab"
 	InputObservation        InputKind = "observation"
 	InputSignal             InputKind = "signal"
@@ -196,9 +198,8 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 		PairAccepted: true, Proposed: proposal.Conclusion, Signals: chronology.Dated,
 		SupportingSignalIDs: proposal.SupportingSignalIDs,
 	})
-	report.Rationale = proposal.Rationale
-	report.Gaps = append(report.Gaps, proposal.Gaps...)
-	report.Counterevidence = collectCounterevidence(eligible, proposal.ContradictingSignalIDs)
+	applyAdmittedProposal(&report, proposal)
+	report.Counterevidence = collectSourceCounterevidence(eligible)
 	report.ModelID = response.ModelID
 	report.RecordedAt = service.now()
 	service.recordDecision(ctx, report.Status, len(chronology.Dated), len(proposal.SupportingSignalIDs), service.now().Sub(started))
@@ -207,8 +208,9 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 
 func (service *Service) baseReport(chronology Chronology) Report {
 	return Report{
-		Chronology:  append([]Signal(nil), chronology.Dated...),
-		UnknownTime: append([]Signal(nil), chronology.UnknownTime...),
+		Chronology:      append([]Signal(nil), chronology.Dated...),
+		UnknownTime:     append([]Signal(nil), chronology.UnknownTime...),
+		Counterevidence: collectSourceCounterevidence(append(append([]Signal(nil), chronology.Dated...), chronology.UnknownTime...)),
 		Limitations: []string{
 			"This report describes observable interaction patterns and does not claim access to private mental state.",
 			"Extraction confidence does not establish truth or resolve conflicting evidence.",
@@ -216,6 +218,25 @@ func (service *Service) baseReport(chronology Chronology) Report {
 		RecordedAt: service.now(), ModelID: service.ModelID, Region: service.Region,
 		MaxTokens: service.MaxTokens, PromptVersion: service.PromptVersion,
 		PolicyVersion: AnalysisPolicyVersion,
+	}
+}
+
+func applyAdmittedProposal(report *Report, proposal analysisProposal) {
+	if report.Status == proposal.Conclusion {
+		report.Rationale = proposal.Rationale
+		report.Gaps = append(report.Gaps, proposal.Gaps...)
+		return
+	}
+	report.Limitations = append(report.Limitations,
+		"The model-proposed status and explanatory prose were replaced because the cited evidence did not satisfy deterministic admission policy.")
+	switch report.Status {
+	case StatusMixedOrConflicting:
+		report.Rationale = "Deterministic policy found conflicting dated observations and did not admit the model-proposed directional conclusion."
+	case StatusInsufficientEvidence:
+		report.Rationale = "Deterministic policy did not find the cited earlier/later meeting comparison required to admit the model-proposed conclusion."
+		report.Gaps = append(report.Gaps, "The cited signals do not establish an earlier/later weakening comparison across distinct meetings.")
+	default:
+		report.Rationale = "Deterministic policy replaced a model-proposed conclusion that was not supported by the admitted evidence."
 	}
 }
 
@@ -318,7 +339,8 @@ func decodeAnalysisProposal(raw []byte, signals []Signal) (analysisProposal, err
 func eligibleSignals(signals []Signal) []Signal {
 	eligible := make([]Signal, 0, len(signals))
 	for _, signal := range signals {
-		if signal.Validated && signal.TranscriptBacked && validCategory(signal.Category) && validDirection(signal.Direction) {
+		if signal.Validated && signal.TranscriptBacked && strings.TrimSpace(signal.MeetingID) != "" &&
+			validCategory(signal.Category) && validDirection(signal.Direction) {
 			eligible = append(eligible, signal)
 		}
 	}
@@ -337,11 +359,8 @@ func signalsByID(signals []Signal, ids []string) []Signal {
 	return selected
 }
 
-func collectCounterevidence(signals []Signal, modelIDs []string) []Signal {
-	selected := make(map[string]struct{}, len(modelIDs))
-	for _, id := range modelIDs {
-		selected[id] = struct{}{}
-	}
+func collectSourceCounterevidence(signals []Signal) []Signal {
+	selected := make(map[string]struct{}, len(signals))
 	for _, signal := range signals {
 		if hasContradictingCitation(signal) {
 			selected[signal.ID] = struct{}{}
@@ -397,9 +416,6 @@ func ComputeInputDigest(identity AnalysisIdentity) ([sha256.Size]byte, error) {
 		strings.TrimSpace(identity.PromptVersion) == "" || strings.TrimSpace(identity.PolicyVersion) == "" {
 		return [sha256.Size]byte{}, fmt.Errorf("analysis identity fields are required")
 	}
-	if len(identity.Inputs) == 0 {
-		return [sha256.Size]byte{}, fmt.Errorf("analysis identity inputs are required")
-	}
 	employeeID, err := uuid.Parse(strings.TrimSpace(identity.EmployeeEntityID))
 	if err != nil {
 		return [sha256.Size]byte{}, fmt.Errorf("analysis employee entity ID is invalid")
@@ -409,6 +425,7 @@ func ComputeInputDigest(identity AnalysisIdentity) ([sha256.Size]byte, error) {
 		return [sha256.Size]byte{}, fmt.Errorf("analysis manager entity ID is invalid")
 	}
 	hasher := sha256.New()
+	writeDigestString(hasher, temporalDigestScope)
 	writeDigestString(hasher, employeeID.String())
 	writeDigestString(hasher, managerID.String())
 	writeDigestString(hasher, strings.TrimSpace(identity.PromptVersion))
@@ -439,7 +456,7 @@ func ComputeInputDigest(identity AnalysisIdentity) ([sha256.Size]byte, error) {
 
 func validInputKind(kind InputKind) bool {
 	switch kind {
-	case InputDocumentVersion, InputDocumentTab, InputObservation, InputSignal, InputResolutionDecision:
+	case InputDocumentVersion, InputSourceDocument, InputDocumentTab, InputObservation, InputSignal, InputResolutionDecision:
 		return true
 	default:
 		return false

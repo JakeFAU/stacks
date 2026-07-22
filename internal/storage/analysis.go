@@ -18,7 +18,11 @@ import (
 	analysisdomain "stacks/internal/analysis"
 )
 
-const analysisInputDigestLength = 32
+const (
+	analysisInputDigestLength = 32
+	legacyAnalysisDigestScope = "stacks.legacy-analysis-completion.v1"
+	meetingDigestScope        = "stacks.source-document-meeting.v1"
+)
 
 // AnalysisInput is the stable completed-analysis identity. Its digest is
 // computed by deterministic analysis policy from the ordered inputs and
@@ -36,6 +40,7 @@ type AnalysisInputKind string
 
 const (
 	AnalysisInputKindDocumentVersion    AnalysisInputKind = "document_version"
+	AnalysisInputKindSourceDocument     AnalysisInputKind = "source_document"
 	AnalysisInputKindDocumentTab        AnalysisInputKind = "document_tab"
 	AnalysisInputKindObservation        AnalysisInputKind = "observation"
 	AnalysisInputKindSignal             AnalysisInputKind = "signal"
@@ -60,6 +65,11 @@ type AnalysisRepository struct {
 	pool *pgxpool.Pool
 }
 
+type effectivePairDecision struct {
+	EntityID string
+	Input    analysisdomain.InputReference
+}
+
 var _ analysisdomain.Repository = (*AnalysisRepository)(nil)
 
 // NewAnalysisRepository creates an analysis repository backed by pool.
@@ -82,14 +92,45 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 	if err != nil || employeeID == managerID {
 		return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: manager entity ID is invalid")
 	}
-	var entityCount int
-	if err := repository.pool.QueryRow(ctx, `
-		SELECT count(*) FROM stacks.entities
-		WHERE id = ANY($1::uuid[]) AND kind = 'person'`, []string{employeeID, managerID}).Scan(&entityCount); err != nil {
-		return analysisdomain.PairSnapshot{}, fmt.Errorf("load configured pair entities: %w", err)
+	decisionRows, err := repository.pool.Query(ctx, `
+		SELECT decision.entity_id::text, decision.id::text, decision.digest
+		FROM stacks.resolution_decisions AS decision
+		JOIN stacks.entities AS entity ON entity.id = decision.entity_id
+		WHERE decision.superseded_by_id IS NULL
+		  AND decision.outcome IN ('accepted', 'created')
+		  AND entity.kind = 'person'
+		  AND decision.entity_id = ANY($2::uuid[])
+		ORDER BY CASE WHEN decision.entity_id = $1::uuid THEN 0 ELSE 1 END,
+		         decision.id`, employeeID, []string{employeeID, managerID})
+	if err != nil {
+		return analysisdomain.PairSnapshot{}, fmt.Errorf("query configured pair identity decisions: %w", err)
 	}
-	if entityCount != 2 {
-		return analysisdomain.PairSnapshot{Accepted: false}, nil
+	var decisions []effectivePairDecision
+	for decisionRows.Next() {
+		var entityID, decisionID string
+		var decisionDigest []byte
+		if err := decisionRows.Scan(&entityID, &decisionID, &decisionDigest); err != nil {
+			decisionRows.Close()
+			return analysisdomain.PairSnapshot{}, fmt.Errorf("scan configured pair identity decision: %w", err)
+		}
+		decisions = append(decisions, effectivePairDecision{
+			EntityID: entityID,
+			Input: analysisdomain.InputReference{
+				Kind: analysisdomain.InputResolutionDecision, ID: decisionID, Digest: digestArray(decisionDigest),
+			},
+		})
+	}
+	if err := decisionRows.Err(); err != nil {
+		decisionRows.Close()
+		return analysisdomain.PairSnapshot{}, fmt.Errorf("iterate configured pair identity decisions: %w", err)
+	}
+	decisionRows.Close()
+	snapshot, err := pairIdentitySnapshot(employeeID, managerID, decisions)
+	if err != nil {
+		return analysisdomain.PairSnapshot{}, err
+	}
+	if !snapshot.Accepted {
+		return snapshot, nil
 	}
 
 	rows, err := repository.pool.Query(ctx, `
@@ -108,8 +149,20 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 			       signal.confidence,
 			       observation.id AS observation_id,
 			       observation.digest AS observation_digest,
-			       observation.valid_start,
-			       observation.recorded_at,
+				       observation.valid_start,
+				       observation.recorded_at,
+				       (
+					SELECT supporting_version.source_document_id
+					FROM stacks.signal_evidence AS supporting
+					JOIN stacks.evidence_spans AS supporting_span ON supporting_span.id = supporting.evidence_span_id
+					JOIN stacks.document_tabs AS supporting_tab ON supporting_tab.id = supporting_span.document_tab_id
+					JOIN stacks.document_versions AS supporting_version ON supporting_version.id = supporting_tab.document_version_id
+					WHERE supporting.signal_id = signal.id
+					  AND supporting.role = 'supporting'
+					  AND supporting_tab.role = 'transcript'
+					ORDER BY supporting_version.source_document_id
+					LIMIT 1
+				       ) AS meeting_id,
 			       subject_decision.id AS subject_decision_id,
 			       subject_decision.digest AS subject_decision_digest,
 			       object_decision.id AS object_decision_id,
@@ -117,19 +170,29 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 			FROM stacks.interaction_signals AS signal
 			JOIN stacks.observations AS observation ON observation.id = signal.observation_id
 			JOIN effective_decisions AS subject_decision ON subject_decision.mention_id = observation.subject_mention_id
-			JOIN effective_decisions AS object_decision ON object_decision.mention_id = observation.object_mention_id
-			WHERE subject_decision.entity_id = $2::uuid
-			  AND object_decision.entity_id = $1::uuid
-			  AND EXISTS (
-				SELECT 1
-				FROM stacks.signal_evidence AS supporting
-				JOIN stacks.evidence_spans AS supporting_span ON supporting_span.id = supporting.evidence_span_id
-				JOIN stacks.document_tabs AS supporting_tab ON supporting_tab.id = supporting_span.document_tab_id
-				WHERE supporting.signal_id = signal.id
-				  AND supporting.role = 'supporting'
-				  AND supporting_tab.role = 'transcript'
-			  )
-		)
+				JOIN effective_decisions AS object_decision ON object_decision.mention_id = observation.object_mention_id
+				WHERE subject_decision.entity_id = $2::uuid
+				  AND object_decision.entity_id = $1::uuid
+				  AND EXISTS (
+					SELECT 1
+					FROM stacks.signal_evidence AS supporting
+					JOIN stacks.evidence_spans AS supporting_span ON supporting_span.id = supporting.evidence_span_id
+					JOIN stacks.document_tabs AS supporting_tab ON supporting_tab.id = supporting_span.document_tab_id
+					WHERE supporting.signal_id = signal.id
+					  AND supporting.role = 'supporting'
+					  AND supporting_tab.role = 'transcript'
+				  )
+				  AND 1 = (
+					SELECT count(DISTINCT supporting_version.source_document_id)
+					FROM stacks.signal_evidence AS supporting
+					JOIN stacks.evidence_spans AS supporting_span ON supporting_span.id = supporting.evidence_span_id
+					JOIN stacks.document_tabs AS supporting_tab ON supporting_tab.id = supporting_span.document_tab_id
+					JOIN stacks.document_versions AS supporting_version ON supporting_version.id = supporting_tab.document_version_id
+					WHERE supporting.signal_id = signal.id
+					  AND supporting.role = 'supporting'
+					  AND supporting_tab.role = 'transcript'
+				  )
+			)
 		SELECT eligible.signal_id::text,
 		       eligible.signal_digest,
 		       eligible.category,
@@ -139,7 +202,8 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 		       eligible.observation_id::text,
 		       eligible.observation_digest,
 		       eligible.valid_start,
-		       eligible.recorded_at,
+			       eligible.recorded_at,
+			       eligible.meeting_id::text,
 		       eligible.subject_decision_id::text,
 		       eligible.subject_decision_digest,
 		       eligible.object_decision_id::text,
@@ -171,15 +235,17 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 	}
 	defer rows.Close()
 
-	snapshot := analysisdomain.PairSnapshot{Accepted: true}
 	inputSeen := make(map[string]struct{})
+	for _, input := range snapshot.Inputs {
+		inputSeen[string(input.Kind)+"\x00"+input.ID] = struct{}{}
+	}
 	var current *analysisdomain.Signal
 	for rows.Next() {
 		var (
 			signalID, category, direction, rationale, observationID string
 			subjectDecisionID, objectDecisionID                     string
 			documentVersionID, documentTabID                        string
-			provider, providerDocumentID, providerTabID             string
+			meetingID, provider, providerDocumentID, providerTabID  string
 			evidenceID, quote, evidenceRole                         string
 			signalDigest, observationDigest                         []byte
 			subjectDecisionDigest, objectDecisionDigest             []byte
@@ -192,6 +258,7 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 		if err := rows.Scan(
 			&signalID, &signalDigest, &category, &direction, &rationale, &confidence,
 			&observationID, &observationDigest, &validTime, &recordedAt,
+			&meetingID,
 			&subjectDecisionID, &subjectDecisionDigest, &objectDecisionID, &objectDecisionDigest,
 			&documentVersionID, &documentDigest, &documentTabID, &tabDigest,
 			&provider, &providerDocumentID, &providerTabID, &evidenceID,
@@ -200,9 +267,14 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 			return analysisdomain.PairSnapshot{}, fmt.Errorf("scan pair analysis signal: %w", err)
 		}
 		if current == nil || current.ID != signalID {
+			meetingInput, err := meetingInputReference(meetingID)
+			if err != nil {
+				return analysisdomain.PairSnapshot{}, err
+			}
 			signalInputRefs, err := analysisInputReferences(
 				analysisdomain.InputReference{Kind: analysisdomain.InputResolutionDecision, ID: subjectDecisionID, Digest: digestArray(subjectDecisionDigest)},
 				analysisdomain.InputReference{Kind: analysisdomain.InputResolutionDecision, ID: objectDecisionID, Digest: digestArray(objectDecisionDigest)},
+				meetingInput,
 				analysisdomain.InputReference{Kind: analysisdomain.InputObservation, ID: observationID, Digest: digestArray(observationDigest)},
 				analysisdomain.InputReference{Kind: analysisdomain.InputSignal, ID: signalID, Digest: digestArray(signalDigest)},
 			)
@@ -210,7 +282,7 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 				return analysisdomain.PairSnapshot{}, err
 			}
 			snapshot.Signals = append(snapshot.Signals, analysisdomain.Signal{
-				ID: signalID, ObservationID: observationID,
+				ID: signalID, MeetingID: meetingInput.ID, ObservationID: observationID,
 				Category: analysisdomain.Category(category), Direction: analysisdomain.Direction(direction),
 				ValidTime: validTime, RecordedAt: recordedAt.UTC(), Rationale: rationale,
 				Confidence: confidence, Validated: true, TranscriptBacked: true,
@@ -235,6 +307,28 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 	if err := rows.Err(); err != nil {
 		return analysisdomain.PairSnapshot{}, fmt.Errorf("iterate pair analysis signals: %w", err)
 	}
+	return snapshot, nil
+}
+
+func pairIdentitySnapshot(employeeID, managerID string, decisions []effectivePairDecision) (analysisdomain.PairSnapshot, error) {
+	snapshot := analysisdomain.PairSnapshot{}
+	seenInputs := make(map[string]struct{}, len(decisions))
+	var employeeAccepted, managerAccepted bool
+	for index, decision := range decisions {
+		if decision.EntityID != employeeID && decision.EntityID != managerID {
+			return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: identity decision %d belongs to an unexpected entity", index)
+		}
+		if decision.Input.Kind != analysisdomain.InputResolutionDecision || decision.Input.Digest == ([sha256.Size]byte{}) {
+			return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: identity decision %d is invalid", index)
+		}
+		employeeAccepted = employeeAccepted || decision.EntityID == employeeID
+		managerAccepted = managerAccepted || decision.EntityID == managerID
+		appendAnalysisInput(&snapshot.Inputs, seenInputs, decision.Input)
+	}
+	if !employeeAccepted || !managerAccepted {
+		return analysisdomain.PairSnapshot{Accepted: false}, nil
+	}
+	snapshot.Accepted = true
 	return snapshot, nil
 }
 
@@ -436,6 +530,7 @@ func ComputeAnalysisDigest(input AnalysisInput) ([sha256.Size]byte, error) {
 		return [sha256.Size]byte{}, err
 	}
 	hasher := sha256.New()
+	writeAnalysisDigestString(hasher, legacyAnalysisDigestScope)
 	writeAnalysisDigestString(hasher, input.EmployeeEntityID)
 	writeAnalysisDigestString(hasher, input.ManagerEntityID)
 	writeAnalysisDigestString(hasher, input.AnalysisPromptVersion)
@@ -482,6 +577,21 @@ func canonicalUUID(value string) (string, error) {
 }
 
 func validatePersistedAnalysisInput(ctx context.Context, transaction pgx.Tx, input AnalysisInputReference) error {
+	if input.Kind == AnalysisInputKindSourceDocument {
+		var storedID string
+		err := transaction.QueryRow(ctx, `SELECT id::text FROM stacks.source_documents WHERE id = $1`, input.ID).Scan(&storedID)
+		if err == pgx.ErrNoRows {
+			return fmt.Errorf("%s %q does not exist", input.Kind, input.ID)
+		}
+		if err != nil {
+			return fmt.Errorf("load %s %q: %w", input.Kind, input.ID, err)
+		}
+		stored, err := meetingInputReference(storedID)
+		if err != nil || string(stored.Digest[:]) != string(input.Digest) {
+			return fmt.Errorf("%s %q digest does not match", input.Kind, input.ID)
+		}
+		return nil
+	}
 	query := ""
 	switch input.Kind {
 	case AnalysisInputKindDocumentVersion:
@@ -513,11 +623,24 @@ func validatePersistedAnalysisInput(ctx context.Context, transaction pgx.Tx, inp
 
 func validAnalysisInputKind(kind AnalysisInputKind) bool {
 	switch kind {
-	case AnalysisInputKindDocumentVersion, AnalysisInputKindDocumentTab, AnalysisInputKindObservation, AnalysisInputKindSignal, AnalysisInputKindResolutionDecision:
+	case AnalysisInputKindDocumentVersion, AnalysisInputKindSourceDocument, AnalysisInputKindDocumentTab, AnalysisInputKindObservation, AnalysisInputKindSignal, AnalysisInputKindResolutionDecision:
 		return true
 	default:
 		return false
 	}
+}
+
+func meetingInputReference(sourceDocumentID string) (analysisdomain.InputReference, error) {
+	canonicalID, err := canonicalUUID(sourceDocumentID)
+	if err != nil {
+		return analysisdomain.InputReference{}, fmt.Errorf("load pair analysis inputs: source document ID is invalid")
+	}
+	hasher := sha256.New()
+	writeAnalysisDigestString(hasher, meetingDigestScope)
+	writeAnalysisDigestString(hasher, canonicalID)
+	var digest [sha256.Size]byte
+	copy(digest[:], hasher.Sum(nil))
+	return analysisdomain.InputReference{Kind: analysisdomain.InputSourceDocument, ID: canonicalID, Digest: digest}, nil
 }
 
 type completedAnalysisQueryer interface {

@@ -18,6 +18,9 @@ ALTER TABLE stacks.analysis_runs
         CHECK (max_output_tokens IS NULL OR max_output_tokens > 0);
 
 ALTER TABLE stacks.analysis_inputs
+    DROP CONSTRAINT analysis_inputs_input_kind_check,
+    ADD CONSTRAINT analysis_inputs_input_kind_check
+        CHECK (input_kind IN ('source_document', 'document_version', 'document_tab', 'observation', 'signal', 'resolution_decision')),
     DROP CONSTRAINT analysis_inputs_analysis_run_id_input_digest_key,
     ADD CONSTRAINT analysis_inputs_run_kind_input_unique
         UNIQUE (analysis_run_id, input_kind, input_id);

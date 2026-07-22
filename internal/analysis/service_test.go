@@ -51,6 +51,55 @@ func TestServiceReturnsInsufficientWithoutModelForFewerThanTwoDatedMeetings(t *t
 	}
 }
 
+func TestServiceTreatsTwoRevisionsOfOneSourceDocumentAsOneMeeting(t *testing.T) {
+	snapshot := acceptedPairSnapshot()
+	snapshot.Signals[1].MeetingID = snapshot.Signals[0].MeetingID
+	repository := &fakeRepository{snapshot: snapshot}
+	model := &fakeModel{}
+	service := testService(repository, model)
+
+	report, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if report.Status != StatusInsufficientEvidence || model.calls != 0 {
+		t.Fatalf("report/model = %q/%d, want insufficient/0 for one stable meeting", report.Status, model.calls)
+	}
+}
+
+func TestServicePersistsAndCachesAcceptedPairWithNoEligibleSignals(t *testing.T) {
+	repository := &fakeRepository{snapshot: PairSnapshot{Accepted: true}}
+	model := &fakeModel{}
+	service := testService(repository, model)
+
+	first, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("first Analyze() error = %v", err)
+	}
+	if first.Status != StatusInsufficientEvidence || model.calls != 0 || repository.completeCalls != 1 {
+		t.Fatalf("first report/model/complete = %q/%d/%d, want insufficient/0/1", first.Status, model.calls, repository.completeCalls)
+	}
+	repository.cached = first
+	second, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("second Analyze() error = %v", err)
+	}
+	if second.ID != first.ID || model.calls != 0 || repository.completeCalls != 1 {
+		t.Fatalf("cached report/model/complete = %q/%d/%d, want same/0/1", second.ID, model.calls, repository.completeCalls)
+	}
+
+	repository.snapshot = acceptedPairSnapshot()
+	repository.cached = Report{}
+	model.output = analysisOutput(StatusNoMaterialChange, []string{"signal-earlier"}, nil)
+	third, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("third Analyze() error = %v", err)
+	}
+	if third.InputDigest == first.InputDigest || model.calls != 1 {
+		t.Fatalf("accepted signals digest/model calls = %x/%d, want new identity and one model call", third.InputDigest, model.calls)
+	}
+}
+
 func TestServiceRecordsInsufficientEvidenceDecisionWithoutModel(t *testing.T) {
 	snapshot := acceptedPairSnapshot()
 	snapshot.Signals = snapshot.Signals[:1]
@@ -178,12 +227,17 @@ func TestServicePendingAcceptanceAndCorrectionChangeEligibilityWithoutReingest(t
 
 func TestServiceSendsOnlyValidatedTranscriptBackedSignalsAndPreservesCounterevidence(t *testing.T) {
 	snapshot := acceptedPairSnapshot()
+	snapshot.Signals[0].Citations = append(snapshot.Signals[0].Citations, Citation{
+		ID: "signal-earlier-counter", Role: CitationContradicting, Quote: "Synthetic counterevidence.",
+	})
 	unknown := testSignal("signal-unknown", nil, DirectionUnclear)
 	notesOnly := testSignal("signal-notes", ptrTime(testMeetingDate(2026, time.July, 15)), DirectionWeakening)
 	notesOnly.TranscriptBacked = false
 	invalid := testSignal("signal-invalid", ptrTime(testMeetingDate(2026, time.July, 16)), DirectionWeakening)
 	invalid.Validated = false
-	snapshot.Signals = append(snapshot.Signals, unknown, notesOnly, invalid)
+	unidentifiedMeeting := testSignal("signal-unidentified-meeting", ptrTime(testMeetingDate(2026, time.July, 17)), DirectionWeakening)
+	unidentifiedMeeting.MeetingID = ""
+	snapshot.Signals = append(snapshot.Signals, unknown, notesOnly, invalid, unidentifiedMeeting)
 	repository := &fakeRepository{snapshot: snapshot}
 	model := &fakeModel{output: analysisOutput(
 		StatusMixedOrConflicting,
@@ -220,7 +274,8 @@ func TestServiceSendsOnlyValidatedTranscriptBackedSignalsAndPreservesCounterevid
 
 func TestServiceDowngradesUnsupportedModelDeclineAndRecordsBoundedDecision(t *testing.T) {
 	repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
-	model := &fakeModel{output: analysisOutput(StatusPossibleDecline, []string{"signal-later"}, nil)}
+	modelRationale := "The manager has lost confidence and no longer trusts the employee."
+	model := &fakeModel{output: analysisOutputWithRationale(StatusPossibleDecline, modelRationale, []string{"signal-later"}, []string{"signal-earlier"})}
 	decisions := &fakeDecisionRecorder{}
 	service := testService(repository, model)
 	service.Decisions = decisions
@@ -232,12 +287,49 @@ func TestServiceDowngradesUnsupportedModelDeclineAndRecordsBoundedDecision(t *te
 	if report.Status != StatusMixedOrConflicting {
 		t.Fatalf("report status = %q, want deterministic downgrade", report.Status)
 	}
+	reportProse := strings.ToLower(strings.Join(append(append([]string{report.Rationale}, report.Limitations...), report.Gaps...), " "))
+	if strings.Contains(reportProse, strings.ToLower(modelRationale)) || strings.Contains(reportProse, "lost confidence") ||
+		strings.Contains(reportProse, "no longer trusts") {
+		t.Fatalf("downgraded report retained rejected private-state prose: %q", reportProse)
+	}
+	if !strings.Contains(strings.ToLower(report.Rationale), "policy") {
+		t.Fatalf("downgraded rationale = %q, want deterministic policy rationale", report.Rationale)
+	}
+	if got := signalIDs(report.Counterevidence); len(got) != 0 {
+		t.Fatalf("counterevidence IDs = %#v, want model-only unsupported reference excluded", got)
+	}
 	if len(decisions.observations) != 1 {
 		t.Fatalf("decision observations = %d, want 1", len(decisions.observations))
 	}
 	observation := decisions.observations[0]
 	if observation.Name != analysisDecisionName || observation.Outcome != string(StatusMixedOrConflicting) || observation.InputSize != 2 || observation.OutputSize != 1 {
 		t.Fatalf("decision observation = %#v", observation)
+	}
+}
+
+func TestServicePreservesSourceCounterevidenceInSparseReport(t *testing.T) {
+	knownDate := testMeetingDate(2026, time.July, 8)
+	dated := testSignal("signal-dated-counter", &knownDate, DirectionWeakening)
+	dated.Citations = append(dated.Citations, Citation{ID: "dated-counter", Role: CitationContradicting, Quote: "Synthetic dated counterevidence."})
+	unknown := testSignal("signal-unknown-counter", nil, DirectionUnclear)
+	unknown.Citations = append(unknown.Citations, Citation{ID: "unknown-counter", Role: CitationContradicting, Quote: "Synthetic unknown-time counterevidence."})
+	repository := &fakeRepository{snapshot: PairSnapshot{
+		Accepted: true,
+		Inputs:   append(append([]InputReference(nil), dated.Inputs...), unknown.Inputs...),
+		Signals:  []Signal{unknown, dated},
+	}}
+	model := &fakeModel{}
+	service := testService(repository, model)
+
+	report, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if report.Status != StatusInsufficientEvidence || model.calls != 0 {
+		t.Fatalf("report/model = %q/%d, want insufficient/0", report.Status, model.calls)
+	}
+	if got := signalIDs(report.Counterevidence); !slices.Equal(got, []string{"signal-dated-counter", "signal-unknown-counter"}) {
+		t.Fatalf("sparse counterevidence IDs = %#v, want dated then unknown source-linked evidence", got)
 	}
 }
 
@@ -331,6 +423,26 @@ func TestComputeInputDigestRejectsRepeatedInputIdentity(t *testing.T) {
 	}
 }
 
+func TestComputeInputDigestAllowsPairIdentityWithoutSignalInputs(t *testing.T) {
+	first, err := ComputeInputDigest(AnalysisIdentity{
+		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
+		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
+	})
+	if err != nil {
+		t.Fatalf("ComputeInputDigest() error = %v", err)
+	}
+	second, err := ComputeInputDigest(AnalysisIdentity{
+		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
+		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
+	})
+	if err != nil {
+		t.Fatalf("repeated ComputeInputDigest() error = %v", err)
+	}
+	if first == ([sha256.Size]byte{}) || first != second {
+		t.Fatalf("empty-input identity = %x/%x, want stable non-zero digest", first, second)
+	}
+}
+
 const (
 	testEmployeeID           = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	testManagerID            = "11111111-2222-3333-4444-555555555555"
@@ -367,7 +479,7 @@ func testSignal(id string, validTime *time.Time, direction Direction) Signal {
 	documentDigest := sha256.Sum256([]byte(id + "-document"))
 	tabDigest := sha256.Sum256([]byte(id + "-tab"))
 	return Signal{
-		ID: id, ObservationID: id + "-observation", Category: CategoryDelegationAutonomy,
+		ID: id, MeetingID: id + "-meeting", ObservationID: id + "-observation", Category: CategoryDelegationAutonomy,
 		Direction: direction, ValidTime: validTime,
 		RecordedAt: time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC),
 		Rationale:  "Synthetic observable interaction rationale.", Confidence: 0.5,
@@ -387,6 +499,10 @@ func testSignal(id string, validTime *time.Time, direction Direction) Signal {
 }
 
 func analysisOutput(status ReportStatus, supporting, contradicting []string) json.RawMessage {
+	return analysisOutputWithRationale(status, "A bounded synthesis of observable changes.", supporting, contradicting)
+}
+
+func analysisOutputWithRationale(status ReportStatus, rationale string, supporting, contradicting []string) json.RawMessage {
 	if supporting == nil {
 		supporting = []string{}
 	}
@@ -395,7 +511,7 @@ func analysisOutput(status ReportStatus, supporting, contradicting []string) jso
 	}
 	output, _ := json.Marshal(map[string]any{
 		"conclusion":               status,
-		"rationale":                "A bounded synthesis of observable changes.",
+		"rationale":                rationale,
 		"supporting_signal_ids":    supporting,
 		"contradicting_signal_ids": contradicting,
 		"gaps":                     []string{"No direct observation outside scheduled meetings."},

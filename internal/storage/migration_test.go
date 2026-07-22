@@ -68,6 +68,7 @@ func TestAnalysisMigrationAddsAuditedMentionLinksAndBoundedRunMetadata(t *testin
 		"model_id text",
 		"max_output_tokens integer",
 		"report_json jsonb",
+		"'source_document'",
 	} {
 		if !strings.Contains(migration, required) {
 			t.Fatalf("analysis migration is missing %q", required)
