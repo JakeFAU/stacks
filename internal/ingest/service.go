@@ -526,7 +526,10 @@ func mergeSourceDocument(listed, fetched source.Document) (source.Document, erro
 		return source.Document{}, fmt.Errorf("source document provider is inconsistent")
 	}
 	if fetched.Title == "" {
+		// MeetingTime is derived from the title at the source boundary, so both
+		// values must come from the same provider snapshot.
 		fetched.Title = listed.Title
+		fetched.MeetingTime = listed.MeetingTime
 	}
 	if fetched.Locator == "" {
 		fetched.Locator = listed.Locator
@@ -536,9 +539,6 @@ func mergeSourceDocument(listed, fetched source.Document) (source.Document, erro
 	}
 	if !listed.ModifiedAt.IsZero() {
 		fetched.ModifiedAt = listed.ModifiedAt
-	}
-	if fetched.MeetingTime == nil {
-		fetched.MeetingTime = listed.MeetingTime
 	}
 	return fetched, nil
 }

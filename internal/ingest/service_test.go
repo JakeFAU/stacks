@@ -533,6 +533,71 @@ func TestSyncPreservesUnknownMeetingTime(t *testing.T) {
 	}
 }
 
+func TestSyncDoesNotCombineFetchedTitleWithListedTitleMeetingTime(t *testing.T) {
+	listedMeetingTime := time.Date(2026, time.July, 20, 0, 0, 0, 0, time.UTC)
+	listed := syntheticDocument("document-renamed", "Leader assigns follow-up.")
+	listed.Title = "[2026-07-20] Weekly"
+	listed.MeetingTime = &listedMeetingTime
+	listed.Tabs = nil
+	listed.Revision = ""
+	fetched := syntheticDocument(listed.ID, "Leader assigns follow-up.")
+	fetched.Title = "Weekly"
+	fetched.MeetingTime = nil
+
+	repository := newMemoryRepository()
+	service := testServiceWithSource(&memorySource{
+		listed:  []source.Document{listed},
+		fetched: map[string]source.Document{listed.ID: fetched},
+	}, repository, &recordingModel{responses: []extract.Response{validSignalResponse(t, "")}})
+
+	summary, err := service.Sync(context.Background())
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("Sync() = (%#v, %v), want one completed renamed document", summary, err)
+	}
+	if got := repository.lastPreparedVersion.Title(); got != "Weekly" {
+		t.Fatalf("persisted title = %q, want fetched title", got)
+	}
+	if got := repository.lastPreparedVersion.SourceMeetingTime(); got != nil {
+		t.Fatalf("persisted meeting time = %v, want unknown for fetched undated title", got)
+	}
+	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart != nil {
+		t.Fatalf("observation valid time = %#v, want stale listed date excluded from chronology", repository.lastCompletion.Observations)
+	}
+}
+
+func TestSyncInheritsListedTitleAndMeetingTimeWhenFetchedTitleIsAbsent(t *testing.T) {
+	listedMeetingTime := time.Date(2026, time.July, 20, 0, 0, 0, 0, time.UTC)
+	listed := syntheticDocument("document-title-fallback", "Leader assigns follow-up.")
+	listed.Title = "[2026-07-20] Weekly"
+	listed.MeetingTime = &listedMeetingTime
+	listed.Tabs = nil
+	listed.Revision = ""
+	fetched := syntheticDocument(listed.ID, "Leader assigns follow-up.")
+	fetched.Title = ""
+	fetched.MeetingTime = nil
+
+	repository := newMemoryRepository()
+	service := testServiceWithSource(&memorySource{
+		listed:  []source.Document{listed},
+		fetched: map[string]source.Document{listed.ID: fetched},
+	}, repository, &recordingModel{responses: []extract.Response{validSignalResponse(t, "")}})
+
+	summary, err := service.Sync(context.Background())
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("Sync() = (%#v, %v), want one completed fallback document", summary, err)
+	}
+	if got := repository.lastPreparedVersion.Title(); got != listed.Title {
+		t.Fatalf("persisted title = %q, want listed fallback %q", got, listed.Title)
+	}
+	if got := repository.lastPreparedVersion.SourceMeetingTime(); got == nil || !got.Equal(listedMeetingTime) {
+		t.Fatalf("persisted meeting time = %v, want listed fallback %v", got, listedMeetingTime)
+	}
+	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart == nil ||
+		!repository.lastCompletion.Observations[0].ValidStart.Equal(listedMeetingTime) {
+		t.Fatalf("observation valid time = %#v, want coherent listed title time", repository.lastCompletion.Observations)
+	}
+}
+
 func TestSyncCannotManufactureChronologyFromDeadlineCitation(t *testing.T) {
 	const transcript = "Leader assigns follow-up by 2026-07-20."
 	response := signalResponse(t, transcript, "2026-07-20")
@@ -1112,6 +1177,7 @@ type memoryRepository struct {
 	versions              map[string]VersionState
 	completions           map[string]Completion
 	snapshots             []entity.EntitySnapshot
+	lastPreparedVersion   knowledge.DocumentVersion
 	lastCompletion        Completion
 	completionCalls       int
 	failCompletionOnce    bool
@@ -1135,6 +1201,7 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version kn
 	if repository.prepareErr != nil {
 		return VersionState{}, repository.prepareErr
 	}
+	repository.lastPreparedVersion = version
 	if leaseDuration <= 0 {
 		return VersionState{}, errors.New("synthetic invalid lease duration")
 	}
