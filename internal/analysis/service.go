@@ -26,7 +26,7 @@ import (
 const (
 	// AnalysisPolicyVersion changes whenever deterministic admission semantics
 	// change, ensuring old completed runs remain distinguishable.
-	AnalysisPolicyVersion = "manager-confidence-policy-v5"
+	AnalysisPolicyVersion = "manager-confidence-policy-v6"
 	analysisSpanName      = "stacks.analysis.pair"
 	analysisDecisionName  = "pair_analysis"
 	temporalDigestScope   = "stacks.temporal-pair-analysis.v1"

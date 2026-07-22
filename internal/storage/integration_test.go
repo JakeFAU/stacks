@@ -641,6 +641,328 @@ func TestCompatibilityAdmissionMigrationUpgradesFullyMigrated00006Database(t *te
 	}
 }
 
+func TestSnapshotCoherenceAdmissionMigrationQuarantinesHybridRowsAndSafeResyncUsesFetchedTime(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	schemaName := "stacks_snapshot_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := `"` + schemaName + `"`
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatalf("create isolated snapshot-coherence schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+	})
+
+	for _, migration := range []string{
+		"00002_manager_confidence_poc.sql",
+		"00003_ingestion_processing_state.sql",
+		"00004_temporal_pair_analysis.sql",
+		"00005_manager_confidence_final_fixes.sql",
+		"00006_legacy_admission_boundary.sql",
+		"00007_compatibility_admission_boundary.sql",
+	} {
+		applyMigrationToSchema(t, pool, quotedSchema, migration)
+	}
+
+	meetingTime := time.Date(2026, time.July, 20, 0, 0, 0, 0, time.UTC)
+	listed := snapshotCoherenceDocument("snapshot-coherence-document", "[2026-07-20] Weekly")
+	listed.MeetingTime = &meetingTime
+	listed.Tabs = nil
+	listed.Revision = ""
+	fetched := snapshotCoherenceDocument(listed.ID, "Weekly")
+	fetched.MeetingTime = nil
+	hybrid := fetched
+	hybrid.MeetingTime = &meetingTime
+	hybridVersion := snapshotCoherenceVersion(t, hybrid)
+	unsafe := seedPost00007HybridRows(t, pool, quotedSchema, hybridVersion)
+
+	applyMigrationToSchema(t, pool, quotedSchema, "00008_snapshot_coherence_admission_boundary.sql")
+
+	for _, row := range []struct {
+		table string
+		id    string
+	}{
+		{table: "extraction_runs", id: unsafe.extractionRunID},
+		{table: "mentions", id: unsafe.mentionID},
+		{table: "resolution_decisions", id: unsafe.decisionID},
+		{table: "observations", id: unsafe.observationID},
+		{table: "interaction_signals", id: unsafe.signalID},
+		{table: "analysis_runs", id: unsafe.analysisID},
+	} {
+		var admissible bool
+		if err := pool.QueryRow(ctx, "SELECT currently_admissible FROM "+quotedSchema+`."`+row.table+`" WHERE id = $1`, row.id).Scan(&admissible); err != nil {
+			t.Fatalf("load snapshot-upgraded %s admission state: %v", row.table, err)
+		}
+		if admissible {
+			t.Fatalf("snapshot-incoherent %s row remained currently admissible", row.table)
+		}
+	}
+	var admittedAliases int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM `+quotedSchema+`.entity_alias_assertions AS assertion
+		JOIN `+quotedSchema+`.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		WHERE assertion.decision_id = $1 AND decision.currently_admissible`, unsafe.decisionID,
+	).Scan(&admittedAliases); err != nil {
+		t.Fatalf("count snapshot-incoherent current aliases: %v", err)
+	}
+	if admittedAliases != 0 {
+		t.Fatalf("snapshot-incoherent current aliases = %d, want zero", admittedAliases)
+	}
+
+	var preservedTitle, preservedRationale, preservedHypothesis string
+	var preservedMeetingTime time.Time
+	var preservedReport bool
+	if err := pool.QueryRow(ctx, `
+		SELECT version.title, version.source_meeting_time, signal.rationale,
+		       analysis.hypothesis, analysis.report_json = $4::jsonb
+		FROM `+quotedSchema+`.document_versions AS version
+		CROSS JOIN `+quotedSchema+`.interaction_signals AS signal
+		CROSS JOIN `+quotedSchema+`.analysis_runs AS analysis
+		WHERE version.id = $1 AND signal.id = $2 AND analysis.id = $3`,
+		unsafe.versionID, unsafe.signalID, unsafe.analysisID, unsafe.reportJSON,
+	).Scan(&preservedTitle, &preservedMeetingTime, &preservedRationale, &preservedHypothesis, &preservedReport); err != nil {
+		t.Fatalf("load preserved snapshot-incoherent audit payload: %v", err)
+	}
+	if preservedTitle != "Weekly" || !preservedMeetingTime.Equal(meetingTime) ||
+		preservedRationale != unsafe.rationale || preservedHypothesis != unsafe.hypothesis ||
+		!preservedReport {
+		t.Fatalf("migration rewrote hybrid audit payload: title=%q time=%v rationale=%q hypothesis=%q report_preserved=%t",
+			preservedTitle, preservedMeetingTime, preservedRationale, preservedHypothesis, preservedReport)
+	}
+
+	repository := &snapshotCoherenceRepository{pool: pool, quotedSchema: quotedSchema}
+	model := &snapshotCoherenceModel{}
+	service := ingest.Service{
+		Source: &snapshotCoherenceSource{listed: listed, fetched: fetched},
+		Model:  model, Resolver: entity.Resolver{}, Repository: repository,
+		CollectionID: "synthetic-folder", PromptVersion: extract.ExtractionPromptVersion,
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		LeaseDuration: 5 * time.Minute, AttemptTimeout: 4 * time.Minute,
+		Now: func() time.Time { return time.Date(2026, time.July, 22, 2, 0, 0, 0, time.UTC) },
+	}
+	summary, err := service.Sync(ctx)
+	if err != nil || summary.Completed != 1 || model.calls != 1 {
+		t.Fatalf("safe post-upgrade Sync() = (%#v, %v), model calls=%d, want one new completed derivation", summary, err, model.calls)
+	}
+	if repository.preparedVersion.Title() != "Weekly" || repository.preparedVersion.SourceMeetingTime() != nil {
+		t.Fatalf("safe resync version title/time = %q/%v, want fetched undated snapshot",
+			repository.preparedVersion.Title(), repository.preparedVersion.SourceMeetingTime())
+	}
+	if repository.versionID == unsafe.versionID {
+		t.Fatal("safe resync reused the hybrid source version")
+	}
+	var safeMeetingTime *time.Time
+	var safeRunAdmissible bool
+	if err := pool.QueryRow(ctx, `
+		SELECT version.source_meeting_time, run.currently_admissible
+		FROM `+quotedSchema+`.document_versions AS version
+		JOIN `+quotedSchema+`.extraction_runs AS run ON run.document_version_id = version.id
+		WHERE version.id = $1 AND run.id = $2`, repository.versionID, repository.derivationID,
+	).Scan(&safeMeetingTime, &safeRunAdmissible); err != nil {
+		t.Fatalf("load safe resync state: %v", err)
+	}
+	if safeMeetingTime != nil || !safeRunAdmissible {
+		t.Fatalf("safe resync meeting time/admission = %v/%t, want unknown/current", safeMeetingTime, safeRunAdmissible)
+	}
+}
+
+type post00007HybridRows struct {
+	versionID       string
+	extractionRunID string
+	mentionID       string
+	decisionID      string
+	observationID   string
+	signalID        string
+	analysisID      string
+	rationale       string
+	hypothesis      string
+	reportJSON      string
+}
+
+func seedPost00007HybridRows(t *testing.T, pool *pgxpool.Pool, quotedSchema string, version knowledge.DocumentVersion) post00007HybridRows {
+	t.Helper()
+	ctx := context.Background()
+	rows := post00007HybridRows{
+		versionID: uuid.NewString(), extractionRunID: uuid.NewString(), mentionID: uuid.NewString(),
+		decisionID: uuid.NewString(), observationID: uuid.NewString(), signalID: uuid.NewString(), analysisID: uuid.NewString(),
+		rationale: "Preserved synthetic rationale.", hypothesis: "Preserved synthetic hypothesis.",
+		reportJSON: `{"rationale":"preserved synthetic report"}`,
+	}
+	sourceID := uuid.NewString()
+	tabID := uuid.NewString()
+	spanID := uuid.NewString()
+	entityID := uuid.NewString()
+	proposalID := uuid.NewString()
+	ownerID := uuid.NewString()
+	recordedAt := time.Date(2026, time.July, 22, 1, 0, 0, 0, time.UTC)
+	digest := func(value string) []byte {
+		sum := sha256.Sum256([]byte(value))
+		return sum[:]
+	}
+	versionDigest := version.Digest()
+	tab := version.Tabs()[0]
+	tabDigest := sha256.Sum256([]byte(tab.Text))
+	schemaDigest := sha256.Sum256(extract.ExtractionJSONSchema())
+	meetingTime := version.SourceMeetingTime()
+
+	statements := []struct {
+		operation string
+		query     string
+		arguments []any
+	}{
+		{"source", "INSERT INTO " + quotedSchema + `.source_documents (id, provider, provider_document_id, title, locator, recorded_at) VALUES ($1, $2, $3, $4, $5, $6)`, []any{sourceID, version.Provider(), version.ProviderDocumentID(), version.Title(), version.Locator(), recordedAt}},
+		{"hybrid version", "INSERT INTO " + quotedSchema + `.document_versions (id, source_document_id, digest, content_digest_v2, title, locator, provider_version, provider_revision, provider_modified_at, source_meeting_time, recorded_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10)`, []any{rows.versionID, sourceID, versionDigest[:], version.Title(), version.Locator(), version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt(), meetingTime, recordedAt}},
+		{"tab", "INSERT INTO " + quotedSchema + `.document_tabs (id, document_version_id, provider_tab_id, title, title_path, display_order, role, content, content_digest) VALUES ($1, $2, $3, $4, $5, 0, 'transcript', $6, $7)`, []any{tabID, rows.versionID, tab.ID, tab.Title, tab.Path, tab.Text, tabDigest[:]}},
+		{"span", "INSERT INTO " + quotedSchema + `.evidence_spans (id, document_tab_id, start_offset, end_offset, quote) VALUES ($1, $2, 0, $3, $4)`, []any{spanID, tabID, len(tab.Text), tab.Text}},
+		{"entity", "INSERT INTO " + quotedSchema + `.entities (id, kind, display_name, recorded_at) VALUES ($1, 'person', 'Synthetic Person', $2)`, []any{entityID, recordedAt}},
+		{"v4 run", "INSERT INTO " + quotedSchema + `.extraction_runs (id, document_version_id, derivation_digest, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, processing_status, completed_by_owner, recorded_at, completed_at, currently_admissible) VALUES ($1, $2, $3, 'synthetic-model', 'us-east-1', 256, 'extract-v2', $4, 'complete', $5, $6, $6, true)`, []any{rows.extractionRunID, rows.versionID, digest("snapshot-merge-v4"), schemaDigest[:], ownerID, recordedAt}},
+		{"mention", "INSERT INTO " + quotedSchema + `.mentions (id, evidence_span_id, extraction_run_id, surface, normalized_name, role, recorded_at, currently_admissible) VALUES ($1, $2, $3, 'Synthetic', 'synthetic', 'speaker', $4, true)`, []any{rows.mentionID, spanID, rows.extractionRunID, recordedAt}},
+		{"proposal", "INSERT INTO " + quotedSchema + `.resolution_proposals (id, mention_id, status, derivation, recorded_at) VALUES ($1, $2, 'resolved', 'model_extraction', $3)`, []any{proposalID, rows.mentionID, recordedAt}},
+		{"decision", "INSERT INTO " + quotedSchema + `.resolution_decisions (id, proposal_id, outcome, entity_id, digest, recorded_at, currently_admissible) VALUES ($1, $2, 'accepted', $3, $4, $5, true)`, []any{rows.decisionID, proposalID, entityID, digest("snapshot-decision"), recordedAt}},
+		{"alias", "INSERT INTO " + quotedSchema + `.entity_alias_assertions (decision_id, entity_id, normalized_value, alias_type, recorded_at) VALUES ($1, $2, 'synthetic', 'name', $3)`, []any{rows.decisionID, entityID, recordedAt}},
+		{"observation", "INSERT INTO " + quotedSchema + `.observations (id, extraction_run_id, subject_entity_id, object_entity_id, subject_mention_id, object_mention_id, predicate, valid_start, recorded_at, derivation, epistemic_status, digest, currently_admissible) VALUES ($1, $2, $3, $3, $4, $4, 'interaction_signal', $5, $6, 'model_extraction', 'inferred', $7, true)`, []any{rows.observationID, rows.extractionRunID, entityID, rows.mentionID, meetingTime, recordedAt, digest("snapshot-observation")}},
+		{"observation evidence", "INSERT INTO " + quotedSchema + `.observation_evidence (observation_id, evidence_span_id) VALUES ($1, $2)`, []any{rows.observationID, spanID}},
+		{"analysis", "INSERT INTO " + quotedSchema + `.analysis_runs (id, employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version, policy_version, state, recorded_at, completed_at, hypothesis, report_state, report_json, currently_admissible) VALUES ($1, $2, $2, $3, 'analyze-v1', 'manager-confidence-policy-v5', 'complete', $4, $4, $5, 'possible declining-confidence signal', $6::jsonb, true)`, []any{rows.analysisID, entityID, digest("snapshot-analysis-v5"), recordedAt, rows.hypothesis, rows.reportJSON}},
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement.query, statement.arguments...); err != nil {
+			t.Fatalf("seed post-00007 hybrid %s: %v", statement.operation, err)
+		}
+	}
+
+	transaction, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("start post-00007 hybrid signal seed: %v", err)
+	}
+	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
+	if _, err := transaction.Exec(ctx, "INSERT INTO "+quotedSchema+`.interaction_signals (id, observation_id, category, direction, extraction_model_id, prompt_version, rationale, confidence, digest, currently_admissible) VALUES ($1, $2, 'delegation_autonomy', 'weakening', 'synthetic-model', 'extract-v2', $3, 0.8, $4, true)`, rows.signalID, rows.observationID, rows.rationale, digest("snapshot-signal")); err != nil {
+		t.Fatalf("seed post-00007 hybrid signal: %v", err)
+	}
+	if _, err := transaction.Exec(ctx, "INSERT INTO "+quotedSchema+`.signal_evidence (signal_id, evidence_span_id, role) VALUES ($1, $2, 'supporting')`, rows.signalID, spanID); err != nil {
+		t.Fatalf("seed post-00007 hybrid signal evidence: %v", err)
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		t.Fatalf("commit post-00007 hybrid signal: %v", err)
+	}
+	return rows
+}
+
+type snapshotCoherenceSource struct {
+	listed  source.Document
+	fetched source.Document
+}
+
+func (boundary *snapshotCoherenceSource) List(context.Context, string) ([]source.Document, error) {
+	return []source.Document{boundary.listed}, nil
+}
+
+func (boundary *snapshotCoherenceSource) Get(context.Context, string) (source.Document, error) {
+	return boundary.fetched, nil
+}
+
+type snapshotCoherenceModel struct{ calls int }
+
+func (model *snapshotCoherenceModel) Generate(context.Context, extract.Request) (extract.Response, error) {
+	model.calls++
+	return extract.Response{
+		Output:  []byte(`{"meeting_date":"","citations":[],"people":[],"statements":[],"signals":[]}`),
+		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion, Outcome: "success",
+	}, nil
+}
+
+type snapshotCoherenceRepository struct {
+	pool            *pgxpool.Pool
+	quotedSchema    string
+	preparedVersion knowledge.DocumentVersion
+	versionID       string
+	derivationID    string
+	leaseOwner      string
+}
+
+func (repository *snapshotCoherenceRepository) PrepareVersion(ctx context.Context, version knowledge.DocumentVersion, derivation ingest.DerivationIdentity, leaseDuration time.Duration) (ingest.VersionState, error) {
+	wantDigest, err := ingest.ComputeDerivationDigest(version, derivation)
+	if err != nil || wantDigest != derivation.Digest || leaseDuration <= 0 {
+		return ingest.VersionState{}, errors.New("snapshot-coherence derivation is invalid")
+	}
+	repository.preparedVersion = version
+	repository.versionID = uuid.NewString()
+	repository.derivationID = uuid.NewString()
+	repository.leaseOwner = uuid.NewString()
+	var sourceID string
+	err = repository.pool.QueryRow(ctx, "SELECT id FROM "+repository.quotedSchema+`.source_documents WHERE provider = $1 AND provider_document_id = $2`, version.Provider(), version.ProviderDocumentID()).Scan(&sourceID)
+	if err != nil {
+		return ingest.VersionState{}, err
+	}
+	versionDigest := version.Digest()
+	if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.document_versions (id, source_document_id, digest, content_digest_v2, title, locator, provider_version, provider_revision, provider_modified_at, source_meeting_time, recorded_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10)`, repository.versionID, sourceID, versionDigest[:], version.Title(), version.Locator(), version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt(), version.SourceMeetingTime(), version.RecordedAt()); err != nil {
+		return ingest.VersionState{}, err
+	}
+	for _, tab := range version.Tabs() {
+		tabDigest := sha256.Sum256([]byte(tab.Text))
+		if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.document_tabs (document_version_id, provider_tab_id, title, parent_provider_tab_id, title_path, display_order, role, content, content_digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, repository.versionID, tab.ID, tab.Title, tab.ParentID, tab.Path, tab.Order, string(tab.Role), tab.Text, tabDigest[:]); err != nil {
+			return ingest.VersionState{}, err
+		}
+	}
+	leaseExpiresAt := time.Now().UTC().Add(leaseDuration)
+	if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.extraction_runs (id, document_version_id, derivation_digest, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at, currently_admissible) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)`, repository.derivationID, repository.versionID, derivation.Digest[:], derivation.ModelID, derivation.Region, derivation.MaxTokens, derivation.PromptVersion, derivation.SchemaDigest[:], repository.leaseOwner, leaseExpiresAt, time.Now().UTC()); err != nil {
+		return ingest.VersionState{}, err
+	}
+	return ingest.VersionState{
+		ID: repository.versionID, DerivationID: repository.derivationID, DerivationDigest: derivation.Digest,
+		LeaseOwner: repository.leaseOwner, LeaseExpiresAt: leaseExpiresAt, Status: ingest.VersionStatusPending,
+	}, nil
+}
+
+func (repository *snapshotCoherenceRepository) CompleteVersion(ctx context.Context, completion ingest.Completion) error {
+	if completion.VersionID != repository.versionID || completion.DerivationID != repository.derivationID || completion.LeaseOwner != repository.leaseOwner ||
+		len(completion.Evidence) != 0 || len(completion.Mentions) != 0 || len(completion.Observations) != 0 || len(completion.Signals) != 0 {
+		return errors.New("snapshot-coherence completion is invalid")
+	}
+	result, err := repository.pool.Exec(ctx, "UPDATE "+repository.quotedSchema+`.extraction_runs SET processing_status = 'complete', completed_by_owner = $2, completed_at = $3, lease_owner = NULL, lease_expires_at = NULL WHERE id = $1 AND lease_owner = $2`, repository.derivationID, repository.leaseOwner, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("snapshot-coherence lease is not owned")
+	}
+	return nil
+}
+
+func (*snapshotCoherenceRepository) RecordFailure(context.Context, string, string, ingest.VersionStatus, ingest.FailureCode) error {
+	return errors.New("snapshot-coherence sync unexpectedly failed")
+}
+
+func (*snapshotCoherenceRepository) EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error) {
+	return nil, nil
+}
+
+func snapshotCoherenceDocument(id, title string) source.Document {
+	return source.Document{
+		Provider: "drive", ID: id, Title: title,
+		Locator: "https://example.invalid/snapshot-coherence-document", Version: "version-1", Revision: "revision-1",
+		ModifiedAt: time.Date(2026, time.July, 22, 0, 0, 0, 0, time.UTC),
+		Tabs: []source.Tab{{
+			ID: "transcript-tab", Title: "Transcript", Path: []string{"Transcript"}, Order: 0,
+			Role: source.TabRoleTranscript, Text: "Synthetic meeting content.",
+		}},
+	}
+}
+
+func snapshotCoherenceVersion(t *testing.T, document source.Document) knowledge.DocumentVersion {
+	t.Helper()
+	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider: document.Provider, ProviderDocumentID: document.ID, Title: document.Title,
+		Locator: document.Locator, ProviderVersion: document.Version, ProviderRevision: document.Revision,
+		ModifiedAt: document.ModifiedAt, SourceMeetingTime: document.MeetingTime,
+		RecordedAt: time.Date(2026, time.July, 22, 1, 0, 0, 0, time.UTC), Tabs: document.Tabs,
+	})
+	if err != nil {
+		t.Fatalf("build snapshot-coherence version: %v", err)
+	}
+	return version
+}
+
 type post00006UnsafeRows struct {
 	extractionRunID string
 	mentionID       string

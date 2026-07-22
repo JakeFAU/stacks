@@ -1349,8 +1349,8 @@ func TestComputeDerivationDigestChangesWithMaterialExtractionConfiguration(t *te
 }
 
 func TestExtractionDerivationNamespaceAdvancesPastSupersededIdentitySemantics(t *testing.T) {
-	if extractionDerivationDigestVersion != "stacks.extraction-derivation.v4" {
-		t.Fatalf("extractionDerivationDigestVersion = %q, want v4", extractionDerivationDigestVersion)
+	if extractionDerivationDigestVersion != "stacks.extraction-derivation.v5" {
+		t.Fatalf("extractionDerivationDigestVersion = %q, want snapshot-coherent v5", extractionDerivationDigestVersion)
 	}
 }
 

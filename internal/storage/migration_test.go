@@ -218,6 +218,36 @@ func TestCompatibilityAdmissionMigrationInvalidatesSupersededSemanticsWithoutRew
 	}
 }
 
+func TestSnapshotCoherenceAdmissionMigrationRetiresPriorCurrentStateWithoutRewritingAudit(t *testing.T) {
+	migration := readSnapshotCoherenceAdmissionMigration(t)
+	for _, required := range []string{
+		"UPDATE stacks.extraction_runs",
+		"UPDATE stacks.mentions",
+		"UPDATE stacks.resolution_decisions",
+		"UPDATE stacks.observations",
+		"UPDATE stacks.interaction_signals",
+		"UPDATE stacks.analysis_runs",
+		"SET currently_admissible = false",
+	} {
+		if !strings.Contains(migration, required) {
+			t.Fatalf("snapshot-coherence admission migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"SET source_meeting_time =",
+		"SET title =",
+		"SET rationale =",
+		"SET hypothesis =",
+		"SET report_json =",
+		"DELETE FROM",
+		"-- +goose Down",
+	} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("snapshot-coherence admission migration rewrites immutable audit history with %q", forbidden)
+		}
+	}
+}
+
 func readManagerConfidenceMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00002_manager_confidence_poc.sql")
@@ -251,6 +281,16 @@ func readLegacyAdmissionMigration(t *testing.T) string {
 func readCompatibilityAdmissionMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00007_compatibility_admission_boundary.sql")
+	migration, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", path, err)
+	}
+	return string(migration)
+}
+
+func readSnapshotCoherenceAdmissionMigration(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join("..", "..", "db", "migrations", "00008_snapshot_coherence_admission_boundary.sql")
 	migration, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration %q: %v", path, err)

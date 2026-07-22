@@ -153,10 +153,13 @@ attempt reached the lease boundary.
 The admission-boundary migrations preserve every pre-fix model payload and its
 provenance for audit, but exclude superseded extraction runs, mentions,
 decisions and their aliases, observations, signals, and reports from current
-resolution and analysis. Migration 7 specifically retires work created before
-the `extract-v2` prompt/schema, v4 extraction namespace, and v5 analysis policy.
-Run `sync` again to produce a current derivation; old proposals and corrections
-cannot re-admit their retired model mentions.
+resolution and analysis. Migration 7 retires work created before the
+`extract-v2` prompt/schema, v4 extraction namespace, and v5 analysis policy.
+Migration 8 also retires rows that could have paired a fetched undated title
+with a stale date from an earlier Drive listing. Current sync uses the v5
+extraction namespace and analysis uses policy v6. Run `sync` again to produce a
+current snapshot-coherent derivation, then review pair identities again; old
+proposals and corrections cannot re-admit their retired model mentions.
 
 The first post-upgrade sync also recognizes the exact revision-inclusive digest
 used by older builds, attaches the revision-free stable content identity to the
@@ -193,6 +196,12 @@ marker, malformed dates, or multiple bracketed ISO dates remain temporally
 unknown. Drive creation or modification times, model output, deadlines, and
 other dates in transcript or notes content are never substituted for the
 meeting date.
+
+Drive list and fetch metadata are treated as snapshots rather than freely
+interchangeable fields. When the fetched document has a title, its title and
+title-derived meeting time are used together, including an unknown time after
+a rename. Only a fetch response with no title falls back to both the listed
+title and its listed meeting time.
 
 ## Review, corrections, and bounded conclusions
 

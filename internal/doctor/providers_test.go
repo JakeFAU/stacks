@@ -15,7 +15,7 @@ import (
 
 func TestPostgresProbeChecksRequiredMigrationWithoutApplyingIt(t *testing.T) {
 	connection := &fakePostgresConnection{
-		appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7},
+		appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7, 8},
 	}
 	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
 		return connection, nil
@@ -88,6 +88,22 @@ func TestPostgresProbeRequiresCompatibilityAdmissionMigration(t *testing.T) {
 	}
 	if current {
 		t.Fatal("MigrationsCurrent() = true, want migration 7 required")
+	}
+}
+
+func TestPostgresProbeRequiresSnapshotCoherenceAdmissionMigration(t *testing.T) {
+	connection := &fakePostgresConnection{appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7}}
+	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
+		return connection, nil
+	})
+	defer probe.Close()
+
+	current, err := probe.MigrationsCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("MigrationsCurrent() error = %v", err)
+	}
+	if current {
+		t.Fatal("MigrationsCurrent() = true, want migration 8 required")
 	}
 }
 

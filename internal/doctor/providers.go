@@ -21,13 +21,14 @@ import (
 )
 
 const (
-	enableVectorMigrationVersion             int64 = 1
-	managerConfidenceMigrationVersion        int64 = 2
-	ingestionProcessingStateMigrationVersion int64 = 3
-	temporalPairAnalysisMigrationVersion     int64 = 4
-	managerConfidenceFinalFixesVersion       int64 = 5
-	legacyAdmissionBoundaryVersion           int64 = 6
-	compatibilityAdmissionBoundaryVersion    int64 = 7
+	enableVectorMigrationVersion              int64 = 1
+	managerConfidenceMigrationVersion         int64 = 2
+	ingestionProcessingStateMigrationVersion  int64 = 3
+	temporalPairAnalysisMigrationVersion      int64 = 4
+	managerConfidenceFinalFixesVersion        int64 = 5
+	legacyAdmissionBoundaryVersion            int64 = 6
+	compatibilityAdmissionBoundaryVersion     int64 = 7
+	snapshotCoherenceAdmissionBoundaryVersion int64 = 8
 )
 
 const migrationSetQuery = `
@@ -113,6 +114,7 @@ func requiredMigrationVersions() []int64 {
 		managerConfidenceFinalFixesVersion,
 		legacyAdmissionBoundaryVersion,
 		compatibilityAdmissionBoundaryVersion,
+		snapshotCoherenceAdmissionBoundaryVersion,
 	}
 }
 

@@ -38,7 +38,7 @@ const (
 	ingestionSpanName                 = "stacks.ingest.sync"
 	ingestionDecisionName             = "ingest_document"
 	interactionPredicate              = "interaction_signal"
-	extractionDerivationDigestVersion = "stacks.extraction-derivation.v4"
+	extractionDerivationDigestVersion = "stacks.extraction-derivation.v5"
 )
 
 // Outcome is the bounded per-document result exposed by sync.

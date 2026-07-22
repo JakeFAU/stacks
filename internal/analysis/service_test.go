@@ -663,8 +663,8 @@ func TestComputeInputDigestChangesWithMaterialModelConfiguration(t *testing.T) {
 }
 
 func TestAnalysisPolicyVersionChangesForSafeExplanationSemantics(t *testing.T) {
-	if AnalysisPolicyVersion != "manager-confidence-policy-v5" {
-		t.Fatalf("AnalysisPolicyVersion = %q, want cache-invalidating identity-association policy version", AnalysisPolicyVersion)
+	if AnalysisPolicyVersion != "manager-confidence-policy-v6" {
+		t.Fatalf("AnalysisPolicyVersion = %q, want snapshot-coherent cache-invalidating policy version", AnalysisPolicyVersion)
 	}
 }
 
