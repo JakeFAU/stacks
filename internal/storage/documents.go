@@ -211,11 +211,15 @@ func (repository *DocumentRepository) findCompatibleDocumentVersion(
 
 func (repository *DocumentRepository) putTab(ctx context.Context, documentVersionID string, tab source.Tab) error {
 	contentDigest := sha256.Sum256([]byte(tab.Text))
+	titlePath := tab.Path
+	if titlePath == nil {
+		titlePath = []string{}
+	}
 	_, err := repository.query.Exec(ctx, `
 		INSERT INTO stacks.document_tabs
 			(document_version_id, provider_tab_id, title, parent_provider_tab_id, title_path, display_order, role, content, content_digest)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		documentVersionID, tab.ID, tab.Title, tab.ParentID, tab.Path, tab.Order, string(tab.Role), tab.Text, contentDigest[:])
+		documentVersionID, tab.ID, tab.Title, tab.ParentID, titlePath, tab.Order, string(tab.Role), tab.Text, contentDigest[:])
 	if err != nil {
 		return fmt.Errorf("persist tab %q: %w", tab.ID, err)
 	}

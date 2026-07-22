@@ -75,7 +75,10 @@ test:
 
 test-integration:
 	@test -n "$$STACKS_TEST_DATABASE_URL" || (echo "STACKS_TEST_DATABASE_URL is required" >&2; exit 1)
-	STACKS_TEST_DATABASE_URL="$$STACKS_TEST_DATABASE_URL" go test ./internal/storage
+	@test -n "$$STACKS_TEST_MIGRATION_DATABASE_URL" || (echo "STACKS_TEST_MIGRATION_DATABASE_URL is required" >&2; exit 1)
+	STACKS_TEST_DATABASE_URL="$$STACKS_TEST_DATABASE_URL" \
+		STACKS_TEST_MIGRATION_DATABASE_URL="$$STACKS_TEST_MIGRATION_DATABASE_URL" \
+		go test ./internal/storage ./internal/doctor
 
 staticcheck:
 	go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...

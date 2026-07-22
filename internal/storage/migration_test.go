@@ -248,6 +248,28 @@ func TestSnapshotCoherenceAdmissionMigrationRetiresPriorCurrentStateWithoutRewri
 	}
 }
 
+func TestDoctorInspectionMigrationGrantsOnlyMigrationStatusReadAccess(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "migrations", "00009_doctor_migration_inspection.sql")
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", path, err)
+	}
+	migration := string(contents)
+	for _, required := range []string{
+		"GRANT USAGE ON SCHEMA public TO stacks_app",
+		"GRANT SELECT ON TABLE public.goose_db_version TO stacks_app",
+	} {
+		if !strings.Contains(migration, required) {
+			t.Fatalf("doctor inspection migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"GRANT CREATE", "GRANT ALL", "-- +goose Down"} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("doctor inspection migration broadens privileges with %q", forbidden)
+		}
+	}
+}
+
 func readManagerConfidenceMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00002_manager_confidence_poc.sql")

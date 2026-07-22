@@ -825,7 +825,7 @@ func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalys
 			  AND decision.currently_admissible
 			  AND mention.currently_admissible
 			  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
-			FOR SHARE`, input.ID).Scan(&storedDigest, &entityID)
+			FOR SHARE OF decision`, input.ID).Scan(&storedDigest, &entityID)
 		if err == pgx.ErrNoRows {
 			return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)
 		}

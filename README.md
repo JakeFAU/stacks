@@ -79,8 +79,10 @@ implemented.
 
 `STACKS_DB_ADMIN_PASSWORD` and `STACKS_DB_APP_PASSWORD` are local secrets used
 by Compose and migrations, so they intentionally have no example values.
-`STACKS_TEST_DATABASE_URL` is a credential-bearing test input used only by the
-integration-test target.
+`STACKS_TEST_DATABASE_URL` is the credential-bearing application-role input
+used by repository integration tests. `STACKS_TEST_MIGRATION_DATABASE_URL` is
+the schema-capable admin-role input used only by isolated forward-migration
+upgrade tests. Both are used only by the integration-test target.
 
 ## Database and command workflow
 
@@ -121,6 +123,10 @@ account-level model invocation logging when inspectable. It never runs OAuth,
 applies migrations, syncs or persists graph data, extracts content, invokes a
 model, changes configuration, or enables/disables logging. Missing or expired
 Google authorization directs the operator to `stacks auth google`.
+
+Migration 9 grants the application role only the schema usage and table read
+access needed to inspect Goose migration status. It does not grant schema
+creation, migration ownership, or broader database administration rights.
 
 Doctor requires only the database, Google folder and OAuth paths, tab-title
 sets, AWS region, and model or inference-profile ID. An AWS profile is optional,
@@ -285,7 +291,7 @@ With the local database configured and running, also run:
 make db-up
 make db-migrate
 set -a; . ./.env; set +a
-STACKS_TEST_DATABASE_URL="$STACKS_DATABASE_URL" make test-integration
+make test-integration
 ```
 
 Live validation is separate from those checks. It requires doctor to pass;

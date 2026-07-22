@@ -23,7 +23,10 @@ import (
 	"stacks/internal/source"
 )
 
-const testDatabaseURLEnvironmentVariable = "STACKS_TEST_DATABASE_URL"
+const (
+	testDatabaseURLEnvironmentVariable          = "STACKS_TEST_DATABASE_URL"
+	testMigrationDatabaseURLEnvironmentVariable = "STACKS_TEST_MIGRATION_DATABASE_URL"
+)
 
 func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	pool := openIntegrationDatabase(t)
@@ -444,13 +447,13 @@ func TestPre00005LegacyRowsRemainAuditableButNotCurrentlyAdmissible(t *testing.T
 	if err != nil {
 		t.Fatalf("load explicitly reviewed legacy pair: %v", err)
 	}
-	if !pair.Accepted || len(pair.Signals) != 0 {
-		t.Fatalf("explicitly reviewed legacy pair = %#v, want identities admitted but unsafe derived signals excluded", pair)
+	if pair.Accepted || len(pair.Signals) != 0 {
+		t.Fatalf("explicitly reviewed legacy pair = %#v, want retired mentions and unsafe derived signals to remain quarantined", pair)
 	}
 }
 
 func TestLegacyAdmissionMigrationUpgradesPre00005RowsWithoutRewritingPayload(t *testing.T) {
-	pool := openIntegrationDatabase(t)
+	pool := openMigrationIntegrationDatabase(t)
 	ctx := context.Background()
 	schemaName := "stacks_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	quotedSchema := `"` + schemaName + `"`
@@ -538,7 +541,7 @@ func TestLegacyAdmissionMigrationUpgradesPre00005RowsWithoutRewritingPayload(t *
 }
 
 func TestCompatibilityAdmissionMigrationUpgradesFullyMigrated00006Database(t *testing.T) {
-	pool := openIntegrationDatabase(t)
+	pool := openMigrationIntegrationDatabase(t)
 	ctx := context.Background()
 	schemaName := "stacks_compat_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	quotedSchema := `"` + schemaName + `"`
@@ -642,7 +645,7 @@ func TestCompatibilityAdmissionMigrationUpgradesFullyMigrated00006Database(t *te
 }
 
 func TestSnapshotCoherenceAdmissionMigrationQuarantinesHybridRowsAndSafeResyncUsesFetchedTime(t *testing.T) {
-	pool := openIntegrationDatabase(t)
+	pool := openMigrationIntegrationDatabase(t)
 	ctx := context.Background()
 	schemaName := "stacks_snapshot_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	quotedSchema := `"` + schemaName + `"`
@@ -1980,10 +1983,18 @@ func TestCompleteSignalRejectsNotesOnlyEvidence(t *testing.T) {
 }
 
 func openIntegrationDatabase(t *testing.T) *pgxpool.Pool {
+	return openIntegrationDatabaseFromEnvironment(t, testDatabaseURLEnvironmentVariable)
+}
+
+func openMigrationIntegrationDatabase(t *testing.T) *pgxpool.Pool {
+	return openIntegrationDatabaseFromEnvironment(t, testMigrationDatabaseURLEnvironmentVariable)
+}
+
+func openIntegrationDatabaseFromEnvironment(t *testing.T, environmentVariable string) *pgxpool.Pool {
 	t.Helper()
-	databaseURL := os.Getenv(testDatabaseURLEnvironmentVariable)
+	databaseURL := os.Getenv(environmentVariable)
 	if databaseURL == "" {
-		t.Skipf("%s is not set", testDatabaseURLEnvironmentVariable)
+		t.Skipf("%s is not set", environmentVariable)
 	}
 
 	pool, err := Open(context.Background(), databaseURL)

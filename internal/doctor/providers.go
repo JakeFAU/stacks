@@ -29,6 +29,7 @@ const (
 	legacyAdmissionBoundaryVersion            int64 = 6
 	compatibilityAdmissionBoundaryVersion     int64 = 7
 	snapshotCoherenceAdmissionBoundaryVersion int64 = 8
+	doctorMigrationInspectionVersion          int64 = 9
 )
 
 const migrationSetQuery = `
@@ -115,6 +116,7 @@ func requiredMigrationVersions() []int64 {
 		legacyAdmissionBoundaryVersion,
 		compatibilityAdmissionBoundaryVersion,
 		snapshotCoherenceAdmissionBoundaryVersion,
+		doctorMigrationInspectionVersion,
 	}
 }
 
