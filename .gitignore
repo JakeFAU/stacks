@@ -1,13 +1,31 @@
-# Build output
+# Go build output
 /bin/
 /stacks
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
 *.out
+*.prof
+
+# Local Go workspace files
+go.work
+go.work.sum
 
 # Local configuration
 .env
+.env.*
+!.env.example
+
+# Local linked worktrees
+/.worktrees/
 
 # Editor and OS files
 .DS_Store
 .idea/
 .vscode/
 
+# Worktree
+./worktrees/
