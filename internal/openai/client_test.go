@@ -251,8 +251,12 @@ func TestGenerateRejectsEveryNonCanonicalResponseShape(t *testing.T) {
 }
 
 func TestGenerateRetriesOnlyRetryableHTTPStatusesToExactBound(t *testing.T) {
-	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 599} {
+		name := http.StatusText(status)
+		if name == "" {
+			name = fmt.Sprintf("status %d", status)
+		}
+		t.Run(name, func(t *testing.T) {
 			providerErr := syntheticAPIError(t, status)
 			api := &fakeResponsesAPI{errors: []error{providerErr, providerErr, providerErr, providerErr}}
 			recorder := &recordingInvocationRecorder{}
@@ -289,9 +293,9 @@ func TestGenerateRetriesOnlyExplicitTransientTransportFailures(t *testing.T) {
 			wantAttempts: 2, wantOutcome: OutcomeSuccess, wantSuccess: true,
 		},
 		{
-			name: "live context network timeout",
+			name: "live context connection timeout",
 			transportErr: &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: &net.OpError{
-				Op: "read", Net: "tcp", Err: syntheticTimeoutError{},
+				Op: "dial", Net: "tcp", Err: syntheticTimeoutError{},
 			}},
 			wantAttempts: 2, wantOutcome: OutcomeSuccess, wantSuccess: true,
 		},
@@ -306,6 +310,18 @@ func TestGenerateRetriesOnlyExplicitTransientTransportFailures(t *testing.T) {
 				Err: "no such host", Name: "api.openai.com", IsNotFound: true,
 			}},
 			wantAttempts: 1, wantOutcome: OutcomeProviderError,
+		},
+		{
+			name: "timed out DNS failure",
+			transportErr: &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: &net.DNSError{
+				Err: "i/o timeout", Name: "api.openai.com", IsTimeout: true,
+			}},
+			wantAttempts: 1, wantOutcome: OutcomeTimeout,
+		},
+		{
+			name:         "TLS handshake timeout",
+			transportErr: &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: syntheticTLSHandshakeTimeoutError{}},
+			wantAttempts: 1, wantOutcome: OutcomeTimeout,
 		},
 		{
 			name:         "redirect policy failure",
@@ -342,6 +358,25 @@ func TestGenerateRetriesOnlyExplicitTransientTransportFailures(t *testing.T) {
 			}
 			assertOneObservation(t, recorder, test.wantOutcome, test.wantAttempts)
 		})
+	}
+}
+
+func TestGenerateTreatsStatus600AsTerminalProviderError(t *testing.T) {
+	providerErr := syntheticAPIError(t, 600)
+	api := &fakeResponsesAPI{errors: []error{providerErr, providerErr, providerErr, providerErr, providerErr}}
+	recorder := &recordingInvocationRecorder{}
+	client := newTestClient(t, api, recorder, 5)
+
+	_, err := client.Generate(context.Background(), validRequest())
+	if !errors.Is(err, ErrInvocation) {
+		t.Fatalf("Generate() error = %v, want terminal invocation failure", err)
+	}
+	if len(api.params) != 1 {
+		t.Fatalf("Responses calls = %d, want 1", len(api.params))
+	}
+	assertOneObservation(t, recorder, OutcomeProviderError, 1)
+	if got := outcomeForHTTPStatus(600); got != OutcomeProviderError {
+		t.Fatalf("outcomeForHTTPStatus(600) = %q, want %q", got, OutcomeProviderError)
 	}
 }
 
@@ -664,3 +699,9 @@ type syntheticTimeoutError struct{}
 func (syntheticTimeoutError) Error() string   { return "synthetic timeout" }
 func (syntheticTimeoutError) Timeout() bool   { return true }
 func (syntheticTimeoutError) Temporary() bool { return true }
+
+type syntheticTLSHandshakeTimeoutError struct{}
+
+func (syntheticTLSHandshakeTimeoutError) Error() string   { return "net/http: TLS handshake timeout" }
+func (syntheticTLSHandshakeTimeoutError) Timeout() bool   { return true }
+func (syntheticTLSHandshakeTimeoutError) Temporary() bool { return true }
