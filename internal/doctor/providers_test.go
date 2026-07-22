@@ -34,7 +34,7 @@ func TestPostgresProbeChecksRequiredMigrationWithoutApplyingIt(t *testing.T) {
 	}
 }
 
-func TestGoogleProbeLoadsAuthorizationOnceAndUsesBoundedRepresentativeLookup(t *testing.T) {
+func TestGoogleProbeChecksFolderBeforeUsingBoundedRepresentativeLookup(t *testing.T) {
 	sourceBoundary := &fakeSource{documents: []source.Document{
 		{ID: "document-1"},
 		{ID: "document-2"},
@@ -48,18 +48,21 @@ func TestGoogleProbeLoadsAuthorizationOnceAndUsesBoundedRepresentativeLookup(t *
 	if err := probe.CheckAuthorization(context.Background()); err != nil {
 		t.Fatalf("CheckAuthorization() error = %v", err)
 	}
-	documents, err := probe.ListFolder(context.Background())
+	if err := probe.CheckFolder(context.Background()); err != nil {
+		t.Fatalf("CheckFolder() error = %v", err)
+	}
+	document, found, err := probe.GetRepresentative(context.Background())
 	if err != nil {
-		t.Fatalf("ListFolder() error = %v", err)
+		t.Fatalf("GetRepresentative() error = %v", err)
 	}
-	if len(documents) != 1 || documents[0].ID != "document-1" {
-		t.Fatalf("ListFolder() = %#v, want first representative only", documents)
+	if !found || document.ID != "document-1" {
+		t.Fatalf("GetRepresentative() = (%#v, %t), want document-1, true", document, found)
 	}
-	if _, err := probe.GetDocument(context.Background(), documents[0].ID); err != nil {
+	if _, err := probe.GetDocument(context.Background(), document.ID); err != nil {
 		t.Fatalf("GetDocument() error = %v", err)
 	}
-	if factoryCalls != 1 || sourceBoundary.representativeCalls != 1 || sourceBoundary.listCalls != 0 || sourceBoundary.getCalls != 1 || sourceBoundary.mutationCalls != 0 {
-		t.Fatalf("calls = factory:%d representative:%d list:%d get:%d mutation:%d, want 1/1/0/1/0", factoryCalls, sourceBoundary.representativeCalls, sourceBoundary.listCalls, sourceBoundary.getCalls, sourceBoundary.mutationCalls)
+	if factoryCalls != 1 || sourceBoundary.collectionCalls != 1 || sourceBoundary.representativeCalls != 1 || sourceBoundary.listCalls != 0 || sourceBoundary.getCalls != 1 || sourceBoundary.mutationCalls != 0 {
+		t.Fatalf("calls = factory:%d folder:%d representative:%d list:%d get:%d mutation:%d, want 1/1/1/0/1/0", factoryCalls, sourceBoundary.collectionCalls, sourceBoundary.representativeCalls, sourceBoundary.listCalls, sourceBoundary.getCalls, sourceBoundary.mutationCalls)
 	}
 }
 
@@ -261,10 +264,16 @@ func (row fakePostgresRow) Scan(destinations ...any) error {
 type fakeSource struct {
 	documents           []source.Document
 	document            source.Document
+	collectionCalls     int
 	representativeCalls int
 	listCalls           int
 	getCalls            int
 	mutationCalls       int
+}
+
+func (fake *fakeSource) CheckCollection(context.Context, string) error {
+	fake.collectionCalls++
+	return nil
 }
 
 func (fake *fakeSource) GetRepresentative(context.Context, string) (source.Document, bool, error) {

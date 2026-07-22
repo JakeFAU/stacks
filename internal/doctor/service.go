@@ -81,7 +81,8 @@ type Database interface {
 // Google exposes only authorization validation and bounded source inspection.
 type Google interface {
 	CheckAuthorization(context.Context) error
-	ListFolder(context.Context) ([]source.Document, error)
+	CheckFolder(context.Context) error
+	GetRepresentative(context.Context) (source.Document, bool, error)
 	GetDocument(context.Context, string) (source.Document, error)
 }
 
@@ -146,7 +147,7 @@ func (service Service) Check(ctx context.Context) Report {
 			report.Checks = appendGoogleUnavailable(report.Checks, "Google authorization is missing, expired, or invalid")
 		} else {
 			report.Checks = append(report.Checks, ok(CheckGoogleAuthorization, "Google OAuth configuration and token are readable"))
-			documents, err := service.Google.ListFolder(ctx)
+			err := service.Google.CheckFolder(ctx)
 			if stop(&report, ctx, CheckGoogleFolder, err) {
 				return report
 			}
@@ -157,10 +158,16 @@ func (service Service) Check(ctx context.Context) Report {
 				)
 			} else {
 				report.Checks = append(report.Checks, ok(CheckGoogleFolder, "configured Google Drive folder is readable"))
-				if len(documents) == 0 {
+				representative, found, err := service.Google.GetRepresentative(ctx)
+				if stop(&report, ctx, CheckGoogleTabs, err) {
+					return report
+				}
+				if err != nil {
+					report.Checks = append(report.Checks, failed(CheckGoogleTabs, "representative Google Doc lookup failed", "verify folder contents and Google Drive access"))
+				} else if !found {
 					report.Checks = append(report.Checks, failed(CheckGoogleTabs, "no supported Google Docs are available for representative tab inspection", "add an in-scope Google Doc or verify folder configuration"))
 				} else {
-					document, err := service.Google.GetDocument(ctx, documents[0].ID)
+					document, err := service.Google.GetDocument(ctx, representative.ID)
 					if stop(&report, ctx, CheckGoogleTabs, err) {
 						return report
 					}
@@ -265,7 +272,7 @@ func appendGoogleUnavailable(checks []Check, authorizationMessage string) []Chec
 
 func appendAWSUnavailable(checks []Check, credentialsMessage string) []Check {
 	return append(checks,
-		failed(CheckAWSCredentials, credentialsMessage, "refresh the configured AWS profile credentials"),
+		failed(CheckAWSCredentials, credentialsMessage, "refresh AWS credentials or the configured profile"),
 		failed(CheckBedrockModel, "not checked because AWS credentials are unavailable", "restore AWS credentials"),
 		loggingCheck(InvocationLoggingUnknown),
 	)

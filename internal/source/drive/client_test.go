@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,77 @@ func TestListFollowsDrivePagination(t *testing.T) {
 	}
 	if requests != 2 || len(documents) != 2 {
 		t.Fatalf("List() made %d requests and returned %d documents, want 2 and 2", requests, len(documents))
+	}
+}
+
+func TestCheckCollectionRequestsOnlyFolderIdentityAndMIMEType(t *testing.T) {
+	const folderID = "private-folder-id"
+	var gotPath string
+	var gotQuery url.Values
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		gotPath = request.URL.Path
+		gotQuery = request.URL.Query()
+		return jsonResponse(request, `{"id":"private-folder-id","mimeType":"application/vnd.google-apps.folder","name":"private folder title"}`), nil
+	})}
+	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+
+	if err := client.CheckCollection(context.Background(), folderID); err != nil {
+		t.Fatalf("CheckCollection() error = %v", err)
+	}
+	if gotPath != "/files/private-folder-id" {
+		t.Errorf("Drive path = %q, want files.get path", gotPath)
+	}
+	if got := gotQuery.Get("fields"); got != "id,mimeType" {
+		t.Errorf("fields = %q, want only folder identity and MIME type", got)
+	}
+	if strings.Contains(gotQuery.Get("fields"), "name") {
+		t.Fatalf("fields = %q, must not request private folder title", gotQuery.Get("fields"))
+	}
+}
+
+func TestCheckCollectionRejectsNonFolderWithoutDisclosingMetadata(t *testing.T) {
+	const secretFolderID = "secret-not-a-folder-id"
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return jsonResponse(request, `{"id":"`+secretFolderID+`","mimeType":"application/vnd.google-apps.document"}`), nil
+	})}
+	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+
+	err := client.CheckCollection(context.Background(), secretFolderID)
+	if err == nil {
+		t.Fatal("CheckCollection() error = nil, want non-folder error")
+	}
+	if err.Error() != "configured Google Drive collection is not a folder" {
+		t.Fatalf("CheckCollection() error = %q, want bounded non-folder error", err)
+	}
+	if strings.Contains(err.Error(), secretFolderID) || strings.Contains(err.Error(), "application/vnd.google-apps.document") {
+		t.Fatalf("CheckCollection() error disclosed provider metadata: %v", err)
+	}
+}
+
+func TestCheckCollectionBoundsMissingAndDeniedErrors(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			const (
+				secretFolderID = "secret-folder-id"
+				secretDetail   = "private provider detail"
+			)
+			httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return jsonStatusResponse(request, status, `{"error":{"code":`+strconv.Itoa(status)+`,"message":"`+secretDetail+`"}}`), nil
+			})}
+			client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+
+			err := client.CheckCollection(context.Background(), secretFolderID)
+			if err == nil {
+				t.Fatal("CheckCollection() error = nil, want provider error")
+			}
+			want := "inspect Google Drive folder: Google API returned HTTP " + strconv.Itoa(status)
+			if err.Error() != want {
+				t.Fatalf("CheckCollection() error = %q, want %q", err, want)
+			}
+			if strings.Contains(err.Error(), secretFolderID) || strings.Contains(err.Error(), secretDetail) {
+				t.Fatalf("CheckCollection() error disclosed private values: %v", err)
+			}
+		})
 	}
 }
 
@@ -261,8 +333,12 @@ func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error)
 }
 
 func jsonResponse(request *http.Request, body string) *http.Response {
+	return jsonStatusResponse(request, http.StatusOK, body)
+}
+
+func jsonStatusResponse(request *http.Request, status int, body string) *http.Response {
 	return &http.Response{
-		StatusCode: http.StatusOK,
+		StatusCode: status,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Request:    request,

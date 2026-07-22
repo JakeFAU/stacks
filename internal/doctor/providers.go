@@ -166,20 +166,21 @@ func (probe *GoogleProbe) CheckAuthorization(ctx context.Context) error {
 	return nil
 }
 
-// ListFolder verifies the configured folder and retains only one representative
-// document for the subsequent all-tabs check.
-func (probe *GoogleProbe) ListFolder(ctx context.Context) ([]source.Document, error) {
+// CheckFolder verifies the configured folder through a minimal metadata read.
+func (probe *GoogleProbe) CheckFolder(ctx context.Context) error {
 	if probe.source == nil {
-		return nil, errors.New("Google authorization has not been checked")
+		return errors.New("Google authorization has not been checked")
 	}
-	document, found, err := probe.source.GetRepresentative(ctx, probe.folderID)
-	if err != nil {
-		return nil, err
+	return probe.source.CheckCollection(ctx, probe.folderID)
+}
+
+// GetRepresentative returns at most one direct Google Doc for the subsequent
+// all-tabs check.
+func (probe *GoogleProbe) GetRepresentative(ctx context.Context) (source.Document, bool, error) {
+	if probe.source == nil {
+		return source.Document{}, false, errors.New("Google authorization has not been checked")
 	}
-	if !found {
-		return nil, nil
-	}
-	return []source.Document{document}, nil
+	return probe.source.GetRepresentative(ctx, probe.folderID)
 }
 
 // GetDocument retrieves the representative document through the source's

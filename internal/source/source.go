@@ -15,10 +15,11 @@ type Source interface {
 	Get(ctx context.Context, documentID string) (Document, error)
 }
 
-// RepresentativeSource finds at most one supported document in a collection.
-// It exists for bounded read-only preflight checks that must not enumerate an
-// entire provider collection.
+// RepresentativeSource verifies a collection and finds at most one supported
+// document within it. It exists for bounded read-only preflight checks that
+// must not enumerate an entire provider collection.
 type RepresentativeSource interface {
+	CheckCollection(ctx context.Context, collectionID string) error
 	GetRepresentative(ctx context.Context, collectionID string) (Document, bool, error)
 	Get(ctx context.Context, documentID string) (Document, error)
 }

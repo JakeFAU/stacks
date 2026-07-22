@@ -125,6 +125,10 @@ sets, AWS region, and model or inference-profile ID. An AWS profile is optional
 for doctor, and model invocation limits, retry settings, prompt versions, and
 pair IDs are not part of its read-only preflight contract.
 
+If AWS credential validation fails, refresh credentials in the active default
+credential chain or the explicitly configured shared profile. Doctor does not
+assume that a profile is configured.
+
 The Bedrock availability check does not invoke the model and therefore cannot
 prove runtime quota, throughput, or successful inference. An account with zero
 applicable quota can pass a control-plane availability check and still fail

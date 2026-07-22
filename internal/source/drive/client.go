@@ -21,7 +21,9 @@ import (
 const (
 	driveProvider        = "drive"
 	googleDocumentMIME   = "application/vnd.google-apps.document"
+	googleFolderMIME     = "application/vnd.google-apps.folder"
 	driveDocumentFields  = "nextPageToken,files(id,name,modifiedTime,version,webViewLink)"
+	collectionFields     = "id,mimeType"
 	representativeFields = "files(id)"
 	representativeLimit  = 1
 	docsLocatorFormat    = "https://docs.google.com/document/d/%s/edit"
@@ -97,6 +99,22 @@ func (client *Client) List(ctx context.Context, folderID string) ([]source.Docum
 		}
 	}
 	return documents, nil
+}
+
+// CheckCollection verifies that collectionID is an accessible Google Drive
+// folder without retrieving provider-controlled names or other metadata.
+func (client *Client) CheckCollection(ctx context.Context, collectionID string) error {
+	file, err := client.drive.Files.Get(collectionID).
+		Fields(googleapi.Field(collectionFields)).
+		Context(ctx).
+		Do()
+	if err != nil {
+		return sanitizedGoogleError(ctx, "inspect Google Drive folder", err)
+	}
+	if file == nil || file.MimeType != googleFolderMIME {
+		return errors.New("configured Google Drive collection is not a folder")
+	}
+	return nil
 }
 
 // GetRepresentative returns at most one supported direct child without

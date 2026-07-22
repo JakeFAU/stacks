@@ -12,7 +12,8 @@ import (
 func TestDoctorChecksEveryReadOnlyDependencyWithoutMutation(t *testing.T) {
 	database := &fakeDatabase{migrationsCurrent: true}
 	google := &fakeGoogle{
-		documents: []source.Document{{ID: "synthetic-document"}},
+		representative:      source.Document{ID: "synthetic-document"},
+		representativeFound: true,
 		document: source.Document{Tabs: []source.Tab{
 			{Role: source.TabRoleGeminiNotes},
 			{Role: source.TabRoleTranscript},
@@ -37,6 +38,9 @@ func TestDoctorChecksEveryReadOnlyDependencyWithoutMutation(t *testing.T) {
 	if database.applyMigrationsCalls != 0 || google.authorizeCalls != 0 || google.syncCalls != 0 || aws.invokeCalls != 0 || aws.configureLoggingCalls != 0 {
 		t.Fatalf("mutation calls = database:%d authorize:%d sync:%d invoke:%d logging:%d, want all zero",
 			database.applyMigrationsCalls, google.authorizeCalls, google.syncCalls, aws.invokeCalls, aws.configureLoggingCalls)
+	}
+	if google.folderCalls != 1 || google.representativeCalls != 1 || google.getCalls != 1 {
+		t.Fatalf("Google read calls = folder:%d representative:%d document:%d, want 1/1/1", google.folderCalls, google.representativeCalls, google.getCalls)
 	}
 }
 
@@ -78,8 +82,38 @@ func TestDoctorDirectsMissingOrExpiredGoogleAuthorizationToAuthCommand(t *testin
 	}
 	assertCheck(t, report, CheckGoogleFolder, StatusFailed, "not checked because Google authorization is unavailable")
 	assertCheck(t, report, CheckGoogleTabs, StatusFailed, "not checked because Google authorization is unavailable")
-	if google.listCalls != 0 || google.getCalls != 0 || strings.Contains(check.Message, "private") {
-		t.Fatalf("dependent calls/leak = list:%d get:%d message:%q", google.listCalls, google.getCalls, check.Message)
+	if google.folderCalls != 0 || google.representativeCalls != 0 || google.getCalls != 0 || strings.Contains(check.Message, "private") {
+		t.Fatalf("dependent calls/leak = folder:%d representative:%d get:%d message:%q", google.folderCalls, google.representativeCalls, google.getCalls, check.Message)
+	}
+}
+
+func TestDoctorBoundsFolderFailureAndSkipsRepresentativeLookup(t *testing.T) {
+	google := &fakeGoogle{folderErr: errors.New("private folder ID and provider detail")}
+	report := (Service{
+		Database: &fakeDatabase{migrationsCurrent: true},
+		Google:   google,
+		AWS:      &fakeAWS{loggingState: InvocationLoggingDisabled},
+	}).Check(context.Background())
+
+	check := assertCheck(t, report, CheckGoogleFolder, StatusFailed, "configured Google Drive folder is unavailable")
+	if check.Remediation != "verify folder access and STACKS_GOOGLE_FOLDER_ID" {
+		t.Fatalf("folder remediation = %q, want bounded configuration guidance", check.Remediation)
+	}
+	assertCheck(t, report, CheckGoogleTabs, StatusFailed, "not checked because the Google Drive folder is unavailable")
+	if google.folderCalls != 1 || google.representativeCalls != 0 || google.getCalls != 0 {
+		t.Fatalf("Google calls = folder:%d representative:%d document:%d, want 1/0/0", google.folderCalls, google.representativeCalls, google.getCalls)
+	}
+	if strings.Contains(check.Message, "private") || strings.Contains(check.Remediation, "private") {
+		t.Fatalf("folder check disclosed provider detail: %#v", check)
+	}
+}
+
+func TestDoctorCredentialRemediationSupportsDefaultChainOrConfiguredProfile(t *testing.T) {
+	report := healthyService(&fakeAWS{credentialsErr: errors.New("private AWS identity")}).Check(context.Background())
+
+	check := assertCheck(t, report, CheckAWSCredentials, StatusFailed, "AWS credentials are unavailable or expired")
+	if check.Remediation != "refresh AWS credentials or the configured profile" {
+		t.Fatalf("AWS remediation = %q, want credential-chain-neutral guidance", check.Remediation)
 	}
 }
 
@@ -140,18 +174,30 @@ func TestDoctorStopsAfterSuccessfulCallThatCancelsContext(t *testing.T) {
 				google := &fakeGoogle{authorization: func(context.Context) error { cancel(); return nil }}
 				aws := &fakeAWS{}
 				return Service{Database: &fakeDatabase{migrationsCurrent: true}, Google: google, AWS: aws}, func(t *testing.T) {
-					if google.listCalls != 0 || google.getCalls != 0 || aws.credentialsCalls != 0 {
-						t.Fatalf("downstream calls = folder:%d document:%d aws:%d, want zero", google.listCalls, google.getCalls, aws.credentialsCalls)
+					if google.folderCalls != 0 || google.representativeCalls != 0 || google.getCalls != 0 || aws.credentialsCalls != 0 {
+						t.Fatalf("downstream calls = folder:%d representative:%d document:%d aws:%d, want zero", google.folderCalls, google.representativeCalls, google.getCalls, aws.credentialsCalls)
 					}
 				}
 			},
 		},
 		{
-			name: "Google folder",
+			name: "Google folder metadata",
 			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
-				google := &fakeGoogle{list: func(context.Context) ([]source.Document, error) {
+				google := &fakeGoogle{folder: func(context.Context) error { cancel(); return nil }}
+				aws := &fakeAWS{}
+				return Service{Database: &fakeDatabase{migrationsCurrent: true}, Google: google, AWS: aws}, func(t *testing.T) {
+					if google.representativeCalls != 0 || google.getCalls != 0 || aws.credentialsCalls != 0 {
+						t.Fatalf("downstream calls = representative:%d document:%d aws:%d, want zero", google.representativeCalls, google.getCalls, aws.credentialsCalls)
+					}
+				}
+			},
+		},
+		{
+			name: "Google representative",
+			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
+				google := &fakeGoogle{representativeLookup: func(context.Context) (source.Document, bool, error) {
 					cancel()
-					return []source.Document{{ID: "synthetic-document"}}, nil
+					return source.Document{ID: "synthetic-document"}, true, nil
 				}}
 				aws := &fakeAWS{}
 				return Service{Database: &fakeDatabase{migrationsCurrent: true}, Google: google, AWS: aws}, func(t *testing.T) {
@@ -165,7 +211,8 @@ func TestDoctorStopsAfterSuccessfulCallThatCancelsContext(t *testing.T) {
 			name: "Google document",
 			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
 				google := &fakeGoogle{
-					documents: []source.Document{{ID: "synthetic-document"}},
+					representative:      source.Document{ID: "synthetic-document"},
+					representativeFound: true,
 					get: func(context.Context, string) (source.Document, error) {
 						cancel()
 						return source.Document{Tabs: []source.Tab{{Role: source.TabRoleTranscript}}}, nil
@@ -232,8 +279,9 @@ func healthyService(aws AWS) Service {
 	return Service{
 		Database: &fakeDatabase{migrationsCurrent: true},
 		Google: &fakeGoogle{
-			documents: []source.Document{{ID: "synthetic-document"}},
-			document:  source.Document{Tabs: []source.Tab{{Role: source.TabRoleTranscript}}},
+			representative:      source.Document{ID: "synthetic-document"},
+			representativeFound: true,
+			document:            source.Document{Tabs: []source.Tab{{Role: source.TabRoleTranscript}}},
 		},
 		AWS: aws,
 	}
@@ -286,19 +334,23 @@ func (fake *fakeDatabase) ApplyMigrations(context.Context) error {
 }
 
 type fakeGoogle struct {
-	authorization      func(context.Context) error
-	list               func(context.Context) ([]source.Document, error)
-	get                func(context.Context, string) (source.Document, error)
-	authorizationErr   error
-	listErr            error
-	getErr             error
-	documents          []source.Document
-	document           source.Document
-	authorizationCalls int
-	listCalls          int
-	getCalls           int
-	authorizeCalls     int
-	syncCalls          int
+	authorization        func(context.Context) error
+	folder               func(context.Context) error
+	representativeLookup func(context.Context) (source.Document, bool, error)
+	get                  func(context.Context, string) (source.Document, error)
+	authorizationErr     error
+	folderErr            error
+	representativeErr    error
+	getErr               error
+	representative       source.Document
+	representativeFound  bool
+	document             source.Document
+	authorizationCalls   int
+	folderCalls          int
+	representativeCalls  int
+	getCalls             int
+	authorizeCalls       int
+	syncCalls            int
 }
 
 func (fake *fakeGoogle) CheckAuthorization(ctx context.Context) error {
@@ -309,12 +361,20 @@ func (fake *fakeGoogle) CheckAuthorization(ctx context.Context) error {
 	return fake.authorizationErr
 }
 
-func (fake *fakeGoogle) ListFolder(ctx context.Context) ([]source.Document, error) {
-	fake.listCalls++
-	if fake.list != nil {
-		return fake.list(ctx)
+func (fake *fakeGoogle) CheckFolder(ctx context.Context) error {
+	fake.folderCalls++
+	if fake.folder != nil {
+		return fake.folder(ctx)
 	}
-	return fake.documents, fake.listErr
+	return fake.folderErr
+}
+
+func (fake *fakeGoogle) GetRepresentative(ctx context.Context) (source.Document, bool, error) {
+	fake.representativeCalls++
+	if fake.representativeLookup != nil {
+		return fake.representativeLookup(ctx)
+	}
+	return fake.representative, fake.representativeFound, fake.representativeErr
 }
 
 func (fake *fakeGoogle) GetDocument(ctx context.Context, documentID string) (source.Document, error) {
