@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	openaisdk "github.com/openai/openai-go/v3"
@@ -255,19 +256,23 @@ func isRetryable(err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
 	var apiErr *openaisdk.Error
 	if errors.As(err, &apiErr) {
 		return apiErr.StatusCode == http.StatusRequestTimeout || apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode >= http.StatusInternalServerError
 	}
+	return isRetryableTransport(err)
+}
+
+func isRetryableTransport(err error) bool {
 	var transportErr *url.Error
-	if errors.As(err, &transportErr) {
-		return true
+	if !errors.As(err, &transportErr) || transportErr.Err == nil {
+		return false
 	}
 	var networkErr net.Error
-	return errors.As(err, &networkErr) && networkErr.Timeout()
+	if errors.As(transportErr.Err, &networkErr) && networkErr.Timeout() {
+		return true
+	}
+	return errors.Is(transportErr.Err, syscall.ECONNRESET)
 }
 
 func outcomeForError(err error) string {
@@ -286,11 +291,10 @@ func outcomeForError(err error) string {
 		if transportErr.Timeout() {
 			return OutcomeTimeout
 		}
-		return OutcomeUnavailable
-	}
-	var networkErr net.Error
-	if errors.As(err, &networkErr) && networkErr.Timeout() {
-		return OutcomeTimeout
+		if isRetryableTransport(transportErr) {
+			return OutcomeUnavailable
+		}
+		return OutcomeProviderError
 	}
 	return OutcomeProviderError
 }

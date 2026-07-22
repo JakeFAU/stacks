@@ -2,14 +2,17 @@ package openai
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -270,25 +273,74 @@ func TestGenerateRetriesOnlyRetryableHTTPStatusesToExactBound(t *testing.T) {
 	}
 }
 
-func TestGenerateRetriesRetryableTransportFailure(t *testing.T) {
-	tests := map[string]error{
-		"timeout":          &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: syntheticTimeoutError{}},
-		"connection reset": &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: errors.New("connection reset")},
+func TestGenerateRetriesOnlyExplicitTransientTransportFailures(t *testing.T) {
+	tests := []struct {
+		name         string
+		transportErr error
+		wantAttempts int
+		wantOutcome  string
+		wantSuccess  bool
+	}{
+		{
+			name: "connection reset",
+			transportErr: &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: &net.OpError{
+				Op: "read", Net: "tcp", Err: syscall.ECONNRESET,
+			}},
+			wantAttempts: 2, wantOutcome: OutcomeSuccess, wantSuccess: true,
+		},
+		{
+			name: "live context network timeout",
+			transportErr: &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: &net.OpError{
+				Op: "read", Net: "tcp", Err: syntheticTimeoutError{},
+			}},
+			wantAttempts: 2, wantOutcome: OutcomeSuccess, wantSuccess: true,
+		},
+		{
+			name:         "permanent TLS certificate validation",
+			transportErr: &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: x509.UnknownAuthorityError{}},
+			wantAttempts: 1, wantOutcome: OutcomeProviderError,
+		},
+		{
+			name: "permanent DNS failure",
+			transportErr: &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: &net.DNSError{
+				Err: "no such host", Name: "api.openai.com", IsNotFound: true,
+			}},
+			wantAttempts: 1, wantOutcome: OutcomeProviderError,
+		},
+		{
+			name:         "redirect policy failure",
+			transportErr: &url.Error{Op: "Get", URL: "https://api.openai.com/v1/responses", Err: errors.New("stopped after redirects")},
+			wantAttempts: 1, wantOutcome: OutcomeProviderError,
+		},
+		{
+			name:         "non-transport provider deadline",
+			transportErr: fmt.Errorf("provider wrapper: %w", context.DeadlineExceeded),
+			wantAttempts: 1, wantOutcome: OutcomeTimeout,
+		},
 	}
-	for name, transportErr := range tests {
-		t.Run(name, func(t *testing.T) {
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := &recordingInvocationRecorder{}
 			api := &fakeResponsesAPI{
-				errors:  []error{transportErr, nil},
+				errors:  []error{test.transportErr, nil},
 				outputs: []*responses.Response{nil, successfulResponse(t, `{}`)},
 			}
-			client := newTestClient(t, api, &recordingInvocationRecorder{}, 2)
+			client := newTestClient(t, api, recorder, 3)
 
-			if _, err := client.Generate(context.Background(), validRequest()); err != nil {
+			_, err := client.Generate(context.Background(), validRequest())
+			if test.wantSuccess && err != nil {
 				t.Fatalf("Generate() error = %v", err)
 			}
-			if len(api.params) != 2 {
-				t.Fatalf("Responses calls = %d, want 2", len(api.params))
+			if !test.wantSuccess && !errors.Is(err, ErrInvocation) {
+				t.Fatalf("Generate() error = %v, want terminal invocation failure", err)
 			}
+			if !test.wantSuccess && strings.Contains(err.Error(), test.transportErr.Error()) {
+				t.Fatalf("Generate() error leaks transport details: %v", err)
+			}
+			if len(api.params) != test.wantAttempts {
+				t.Fatalf("Responses calls = %d, want %d", len(api.params), test.wantAttempts)
+			}
+			assertOneObservation(t, recorder, test.wantOutcome, test.wantAttempts)
 		})
 	}
 }
