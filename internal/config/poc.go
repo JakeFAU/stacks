@@ -6,10 +6,11 @@ import (
 	"time"
 
 	"stacks/internal/extract"
+	"stacks/internal/modelpolicy"
 )
 
 const (
-	defaultBedrockMaxAttempts      = 5
+	defaultModelMaxAttempts        = 5
 	defaultExtractionPromptVersion = extract.ExtractionPromptVersion
 	defaultAnalysisPromptVersion   = extract.AnalysisPromptVersion
 	defaultIngestionLeaseDuration  = 5 * time.Minute
@@ -25,6 +26,19 @@ const (
 	NotesTitlesEnvironmentVariable             = "STACKS_NOTES_TITLES"
 	AWSProfileEnvironmentVariable              = "STACKS_AWS_PROFILE"
 	AWSRegionEnvironmentVariable               = "STACKS_AWS_REGION"
+	DataModeEnvironmentVariable                = "STACKS_DATA_MODE"
+	ModelProviderEnvironmentVariable           = "STACKS_MODEL_PROVIDER"
+	ModelIDEnvironmentVariable                 = "STACKS_MODEL_ID"
+	ModelMaxTokensEnvironmentVariable          = "STACKS_MODEL_MAX_OUTPUT_TOKENS"
+	ModelMaxAttemptsEnvironmentVariable        = "STACKS_MODEL_MAX_ATTEMPTS"
+	OpenAIAPIKeyEnvironmentVariable            = "OPENAI_API_KEY"
+	AnthropicAPIKeyEnvironmentVariable         = "ANTHROPIC_API_KEY"
+	OpenAIBaseURLEnvironmentVariable           = "OPENAI_BASE_URL"
+	OpenAIOrganizationIDEnvironmentVariable    = "OPENAI_ORG_ID"
+	OpenAIProjectIDEnvironmentVariable         = "OPENAI_PROJECT_ID"
+	AnthropicBaseURLEnvironmentVariable        = "ANTHROPIC_BASE_URL"
+	AnthropicAuthTokenEnvironmentVariable      = "ANTHROPIC_AUTH_TOKEN"
+	AnthropicProfileEnvironmentVariable        = "ANTHROPIC_PROFILE"
 	BedrockModelIDEnvironmentVariable          = "STACKS_BEDROCK_MODEL_ID"
 	BedrockMaxTokensEnvironmentVariable        = "STACKS_BEDROCK_MAX_TOKENS"
 	BedrockMaxAttemptsEnvironmentVariable      = "STACKS_BEDROCK_MAX_ATTEMPTS"
@@ -35,6 +49,18 @@ const (
 	EmployeeEntityIDEnvironmentVariable        = "STACKS_EMPLOYEE_ENTITY_ID"
 	ManagerEntityIDEnvironmentVariable         = "STACKS_MANAGER_ENTITY_ID"
 )
+
+var unsupportedModelEnvironmentNames = []string{
+	BedrockModelIDEnvironmentVariable,
+	BedrockMaxTokensEnvironmentVariable,
+	BedrockMaxAttemptsEnvironmentVariable,
+	OpenAIBaseURLEnvironmentVariable,
+	OpenAIOrganizationIDEnvironmentVariable,
+	OpenAIProjectIDEnvironmentVariable,
+	AnthropicBaseURLEnvironmentVariable,
+	AnthropicAuthTokenEnvironmentVariable,
+	AnthropicProfileEnvironmentVariable,
+}
 
 // Command identifies a top-level Stacks command for configuration validation.
 type Command string
@@ -49,6 +75,21 @@ const (
 	CommandAnalyze  Command = "analyze"
 )
 
+// ModelSettings holds the explicitly selected model invocation boundary and
+// credentials. Credential values remain in memory and are never formatted in
+// validation errors.
+type ModelSettings struct {
+	Provider        modelpolicy.Provider
+	DataMode        modelpolicy.DataMode
+	ModelID         string
+	MaxOutputTokens int
+	MaxAttempts     int
+	AWSProfile      string
+	AWSRegion       string
+	OpenAIAPIKey    string
+	AnthropicAPIKey string
+}
+
 // PoCSettings holds the command-specific settings for the manager-confidence
 // proof of concept. Values are loaded without command validation so serving
 // health traffic remains possible before the PoC is configured.
@@ -59,11 +100,8 @@ type PoCSettings struct {
 	GoogleOAuthTokenFile    string
 	TranscriptTitles        []string
 	NotesTitles             []string
-	AWSProfile              string
-	AWSRegion               string
-	BedrockModelID          string
-	BedrockMaxTokens        int
-	BedrockMaxAttempts      int
+	Model                   ModelSettings
+	LegacyModelEnvironment  []string
 	IngestionLeaseDuration  time.Duration
 	IngestionAttemptTimeout time.Duration
 	ExtractionPromptVersion string
@@ -92,8 +130,6 @@ func (settings PoCSettings) Validate(command Command) error {
 	case CommandAnalyze:
 		if err := settings.validateRequired(command,
 			DatabaseURLEnvironmentVariable,
-			AWSRegionEnvironmentVariable,
-			BedrockModelIDEnvironmentVariable,
 			EmployeeEntityIDEnvironmentVariable,
 			ManagerEntityIDEnvironmentVariable,
 		); err != nil {
@@ -111,12 +147,13 @@ func (settings PoCSettings) validateDoctor(command Command) error {
 		GoogleFolderIDEnvironmentVariable,
 		GoogleOAuthClientFileEnvironmentVariable,
 		GoogleOAuthTokenFileEnvironmentVariable,
-		AWSRegionEnvironmentVariable,
-		BedrockModelIDEnvironmentVariable,
 	); err != nil {
 		return err
 	}
-	return settings.validateCorpusTitles()
+	if err := settings.validateCorpusTitles(); err != nil {
+		return err
+	}
+	return settings.validateModelSettings(command)
 }
 
 func (settings PoCSettings) validateCorpusAndModel(command Command) error {
@@ -125,8 +162,6 @@ func (settings PoCSettings) validateCorpusAndModel(command Command) error {
 		GoogleFolderIDEnvironmentVariable,
 		GoogleOAuthClientFileEnvironmentVariable,
 		GoogleOAuthTokenFileEnvironmentVariable,
-		AWSRegionEnvironmentVariable,
-		BedrockModelIDEnvironmentVariable,
 	); err != nil {
 		return err
 	}
@@ -151,18 +186,38 @@ func (settings PoCSettings) validateCorpusTitles() error {
 	if len(normalizedTitleSet(settings.NotesTitles)) == 0 {
 		return fmt.Errorf("%s must include at least one title", NotesTitlesEnvironmentVariable)
 	}
-	if err := validateDistinctTabTitles(settings.TranscriptTitles, settings.NotesTitles); err != nil {
-		return err
-	}
-	return nil
+	return validateDistinctTabTitles(settings.TranscriptTitles, settings.NotesTitles)
 }
 
 func (settings PoCSettings) validateModelSettings(command Command) error {
-	if settings.BedrockMaxTokens <= 0 {
-		return fmt.Errorf("%s must be a positive integer", BedrockMaxTokensEnvironmentVariable)
+	if err := settings.validateUnsupportedModelEnvironment(command); err != nil {
+		return err
 	}
-	if settings.BedrockMaxAttempts <= 0 {
-		return fmt.Errorf("%s must be a positive integer", BedrockMaxAttemptsEnvironmentVariable)
+	if err := settings.validateRequired(command,
+		DataModeEnvironmentVariable,
+		ModelProviderEnvironmentVariable,
+		ModelIDEnvironmentVariable,
+	); err != nil {
+		return err
+	}
+	if err := settings.Model.validateCredentials(command); err != nil {
+		return err
+	}
+	if err := (modelpolicy.Invocation{
+		Provider: settings.Model.Provider,
+		DataMode: settings.Model.DataMode,
+		Region:   settings.Model.invocationRegion(),
+	}).Validate(); err != nil {
+		return fmt.Errorf("model policy: %w", err)
+	}
+	if command == CommandDoctor {
+		return nil
+	}
+	if settings.Model.MaxOutputTokens <= 0 {
+		return fmt.Errorf("%s must be a positive integer", ModelMaxTokensEnvironmentVariable)
+	}
+	if settings.Model.MaxAttempts <= 0 || settings.Model.MaxAttempts > defaultModelMaxAttempts {
+		return fmt.Errorf("%s must be a positive integer no greater than %d", ModelMaxAttemptsEnvironmentVariable, defaultModelMaxAttempts)
 	}
 	if err := settings.validateRequired(command,
 		ExtractionPromptVersionEnvironmentVariable,
@@ -177,6 +232,47 @@ func (settings PoCSettings) validateModelSettings(command Command) error {
 	if settings.AnalysisPromptVersion != extract.AnalysisPromptVersion {
 		return fmt.Errorf("%s must be %q; update it and run stacks sync before analysis",
 			AnalysisPromptVersionEnvironmentVariable, extract.AnalysisPromptVersion)
+	}
+	return nil
+}
+
+func (settings PoCSettings) validateUnsupportedModelEnvironment(command Command) error {
+	unsupported := make([]string, 0, len(settings.LegacyModelEnvironment))
+	for _, name := range unsupportedModelEnvironmentNames {
+		for _, configured := range settings.LegacyModelEnvironment {
+			if configured == name {
+				unsupported = append(unsupported, name)
+				break
+			}
+		}
+	}
+	if len(unsupported) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s are unsupported for %s", strings.Join(unsupported, ", "), command)
+}
+
+func (settings ModelSettings) invocationRegion() string {
+	if settings.Provider == modelpolicy.ProviderBedrock {
+		return settings.AWSRegion
+	}
+	return ""
+}
+
+func (settings ModelSettings) validateCredentials(command Command) error {
+	switch settings.Provider {
+	case modelpolicy.ProviderBedrock:
+		if strings.TrimSpace(settings.AWSRegion) == "" {
+			return fmt.Errorf("%s is required for %s", AWSRegionEnvironmentVariable, command)
+		}
+	case modelpolicy.ProviderOpenAI:
+		if strings.TrimSpace(settings.OpenAIAPIKey) == "" {
+			return fmt.Errorf("%s is required for %s", OpenAIAPIKeyEnvironmentVariable, command)
+		}
+	case modelpolicy.ProviderAnthropic:
+		if strings.TrimSpace(settings.AnthropicAPIKey) == "" {
+			return fmt.Errorf("%s is required for %s", AnthropicAPIKeyEnvironmentVariable, command)
+		}
 	}
 	return nil
 }
@@ -200,12 +296,12 @@ func (settings PoCSettings) valueForEnvironment(name string) string {
 		return settings.GoogleOAuthClientFile
 	case GoogleOAuthTokenFileEnvironmentVariable:
 		return settings.GoogleOAuthTokenFile
-	case AWSProfileEnvironmentVariable:
-		return settings.AWSProfile
-	case AWSRegionEnvironmentVariable:
-		return settings.AWSRegion
-	case BedrockModelIDEnvironmentVariable:
-		return settings.BedrockModelID
+	case DataModeEnvironmentVariable:
+		return string(settings.Model.DataMode)
+	case ModelProviderEnvironmentVariable:
+		return string(settings.Model.Provider)
+	case ModelIDEnvironmentVariable:
+		return settings.Model.ModelID
 	case ExtractionPromptVersionEnvironmentVariable:
 		return settings.ExtractionPromptVersion
 	case AnalysisPromptVersionEnvironmentVariable:

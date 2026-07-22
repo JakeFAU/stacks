@@ -116,7 +116,7 @@ func pocCommandProvider(
 				settings.PoC.GoogleFolderID,
 				drive.NewTabClassifier(settings.PoC.TranscriptTitles, settings.PoC.NotesTitles),
 			)
-			aws := doctor.NewAWSProbe(settings.PoC.AWSProfile, settings.PoC.AWSRegion, settings.PoC.BedrockModelID)
+			aws := doctor.NewAWSProbe(settings.PoC.Model.AWSProfile, settings.PoC.Model.AWSRegion, settings.PoC.Model.ModelID)
 			return (cli.DoctorCommand{
 				Service: doctor.Service{Database: database, Google: google, AWS: aws},
 				Output:  stdout,
@@ -138,13 +138,13 @@ func pocCommandProvider(
 			if err != nil {
 				return err
 			}
-			awsConfiguration, err := loadAWSConfiguration(ctx, settings.PoC.AWSProfile, settings.PoC.AWSRegion)
+			awsConfiguration, err := loadAWSConfiguration(ctx, settings.PoC.Model.AWSProfile, settings.PoC.Model.AWSRegion)
 			if err != nil {
 				return err
 			}
 			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
-				ModelID: settings.PoC.BedrockModelID, MaxTokens: settings.PoC.BedrockMaxTokens,
-				MaxAttempts: settings.PoC.BedrockMaxAttempts, Recorder: invocations, Tracer: tracer,
+				ModelID: settings.PoC.Model.ModelID, MaxTokens: settings.PoC.Model.MaxOutputTokens,
+				MaxAttempts: settings.PoC.Model.MaxAttempts, Recorder: invocations, Tracer: tracer,
 			})
 			if err != nil {
 				return err
@@ -158,8 +158,8 @@ func pocCommandProvider(
 				Source: sourceBoundary, Model: model, Resolver: entity.Resolver{},
 				Repository:   storage.NewIngestionRepository(pool),
 				CollectionID: settings.PoC.GoogleFolderID, PromptVersion: settings.PoC.ExtractionPromptVersion,
-				Region: strings.TrimSpace(settings.PoC.AWSRegion), ModelID: strings.TrimSpace(settings.PoC.BedrockModelID),
-				MaxTokens:      settings.PoC.BedrockMaxTokens,
+				Region: strings.TrimSpace(settings.PoC.Model.AWSRegion), ModelID: strings.TrimSpace(settings.PoC.Model.ModelID),
+				MaxTokens:      settings.PoC.Model.MaxOutputTokens,
 				LeaseDuration:  settings.PoC.IngestionLeaseDuration,
 				AttemptTimeout: settings.PoC.IngestionAttemptTimeout,
 				Tracer:         tracer, Decisions: decisions, Now: time.Now,
@@ -185,13 +185,13 @@ func pocCommandProvider(
 			return (cli.ReviewCommand{Service: &cli.ReviewService{Store: store}, Output: stdout}).Run(ctx, args)
 		}),
 		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			awsConfiguration, err := loadAWSConfiguration(ctx, settings.PoC.AWSProfile, settings.PoC.AWSRegion)
+			awsConfiguration, err := loadAWSConfiguration(ctx, settings.PoC.Model.AWSProfile, settings.PoC.Model.AWSRegion)
 			if err != nil {
 				return err
 			}
 			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
-				ModelID: settings.PoC.BedrockModelID, MaxTokens: settings.PoC.BedrockMaxTokens,
-				MaxAttempts: settings.PoC.BedrockMaxAttempts, Recorder: invocations, Tracer: tracer,
+				ModelID: settings.PoC.Model.ModelID, MaxTokens: settings.PoC.Model.MaxOutputTokens,
+				MaxAttempts: settings.PoC.Model.MaxAttempts, Recorder: invocations, Tracer: tracer,
 			})
 			if err != nil {
 				return err
@@ -204,8 +204,8 @@ func pocCommandProvider(
 			service := &analysis.Service{
 				Repository: storage.NewAnalysisRepository(pool), Model: model,
 				PromptVersion: settings.PoC.AnalysisPromptVersion,
-				Region:        strings.TrimSpace(settings.PoC.AWSRegion), ModelID: strings.TrimSpace(settings.PoC.BedrockModelID),
-				MaxTokens: settings.PoC.BedrockMaxTokens, Tracer: tracer,
+				Region:        strings.TrimSpace(settings.PoC.Model.AWSRegion), ModelID: strings.TrimSpace(settings.PoC.Model.ModelID),
+				MaxTokens: settings.PoC.Model.MaxOutputTokens, Tracer: tracer,
 				Decisions: decisions, Now: time.Now,
 			}
 			return (cli.AnalyzeCommand{

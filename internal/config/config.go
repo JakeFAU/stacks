@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"stacks/internal/modelpolicy"
 )
 
 const (
@@ -97,13 +99,13 @@ func Load() (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	bedrockMaxTokens, err := optionalPositiveIntegerEnvironment(BedrockMaxTokensEnvironmentVariable)
+	modelMaxOutputTokens, err := optionalPositiveIntegerEnvironment(ModelMaxTokensEnvironmentVariable)
 	if err != nil {
 		return Settings{}, err
 	}
-	bedrockMaxAttempts, err := positiveIntegerEnvironment(
-		BedrockMaxAttemptsEnvironmentVariable,
-		defaultBedrockMaxAttempts,
+	modelMaxAttempts, err := positiveIntegerEnvironment(
+		ModelMaxAttemptsEnvironmentVariable,
+		defaultModelMaxAttempts,
 	)
 	if err != nil {
 		return Settings{}, err
@@ -143,17 +145,24 @@ func Load() (Settings, error) {
 			TraceSampleRatio:     traceSampleRatio,
 		},
 		PoC: PoCSettings{
-			DatabaseURL:             os.Getenv(DatabaseURLEnvironmentVariable),
-			GoogleFolderID:          os.Getenv(GoogleFolderIDEnvironmentVariable),
-			GoogleOAuthClientFile:   os.Getenv(GoogleOAuthClientFileEnvironmentVariable),
-			GoogleOAuthTokenFile:    os.Getenv(GoogleOAuthTokenFileEnvironmentVariable),
-			TranscriptTitles:        titleSetEnvironment(TranscriptTitlesEnvironmentVariable),
-			NotesTitles:             titleSetEnvironment(NotesTitlesEnvironmentVariable),
-			AWSProfile:              os.Getenv(AWSProfileEnvironmentVariable),
-			AWSRegion:               os.Getenv(AWSRegionEnvironmentVariable),
-			BedrockModelID:          os.Getenv(BedrockModelIDEnvironmentVariable),
-			BedrockMaxTokens:        bedrockMaxTokens,
-			BedrockMaxAttempts:      bedrockMaxAttempts,
+			DatabaseURL:           os.Getenv(DatabaseURLEnvironmentVariable),
+			GoogleFolderID:        os.Getenv(GoogleFolderIDEnvironmentVariable),
+			GoogleOAuthClientFile: os.Getenv(GoogleOAuthClientFileEnvironmentVariable),
+			GoogleOAuthTokenFile:  os.Getenv(GoogleOAuthTokenFileEnvironmentVariable),
+			TranscriptTitles:      titleSetEnvironment(TranscriptTitlesEnvironmentVariable),
+			NotesTitles:           titleSetEnvironment(NotesTitlesEnvironmentVariable),
+			Model: ModelSettings{
+				DataMode:        modelpolicy.DataMode(os.Getenv(DataModeEnvironmentVariable)),
+				Provider:        modelpolicy.Provider(os.Getenv(ModelProviderEnvironmentVariable)),
+				ModelID:         os.Getenv(ModelIDEnvironmentVariable),
+				MaxOutputTokens: modelMaxOutputTokens,
+				MaxAttempts:     modelMaxAttempts,
+				AWSProfile:      os.Getenv(AWSProfileEnvironmentVariable),
+				AWSRegion:       os.Getenv(AWSRegionEnvironmentVariable),
+				OpenAIAPIKey:    os.Getenv(OpenAIAPIKeyEnvironmentVariable),
+				AnthropicAPIKey: os.Getenv(AnthropicAPIKeyEnvironmentVariable),
+			},
+			LegacyModelEnvironment:  configuredUnsupportedModelEnvironment(),
 			IngestionLeaseDuration:  ingestionLeaseDuration,
 			IngestionAttemptTimeout: ingestionAttemptTimeout,
 			ExtractionPromptVersion: environmentOrDefault(ExtractionPromptVersionEnvironmentVariable, defaultExtractionPromptVersion),
@@ -169,6 +178,16 @@ func environmentOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func configuredUnsupportedModelEnvironment() []string {
+	configured := make([]string, 0, len(unsupportedModelEnvironmentNames))
+	for _, name := range unsupportedModelEnvironmentNames {
+		if value, present := os.LookupEnv(name); present && value != "" {
+			configured = append(configured, name)
+		}
+	}
+	return configured
 }
 
 func positiveIntegerEnvironment(name string, fallback int) (int, error) {

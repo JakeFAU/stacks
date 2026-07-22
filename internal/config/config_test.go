@@ -11,6 +11,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv(HTTPPortEnvironmentVariable, "")
 	t.Setenv(ReadHeaderTimeoutEnvironmentVariable, "")
 	clearObservabilityEnvironment(t)
+	clearModelEnvironment(t)
 	t.Setenv(IngestionLeaseDurationEnvironmentVariable, "")
 	t.Setenv(IngestionAttemptTimeoutEnvironmentVariable, "")
 
@@ -46,8 +47,11 @@ func TestLoadDefaults(t *testing.T) {
 	if settings.Telemetry.TraceSampleRatio != 1 {
 		t.Errorf("Telemetry.TraceSampleRatio = %v, want 1", settings.Telemetry.TraceSampleRatio)
 	}
-	if settings.PoC.BedrockMaxAttempts != defaultBedrockMaxAttempts {
-		t.Errorf("PoC.BedrockMaxAttempts = %d, want %d", settings.PoC.BedrockMaxAttempts, defaultBedrockMaxAttempts)
+	if settings.PoC.Model.MaxAttempts != defaultModelMaxAttempts {
+		t.Errorf("PoC.Model.MaxAttempts = %d, want %d", settings.PoC.Model.MaxAttempts, defaultModelMaxAttempts)
+	}
+	if settings.PoC.Model.DataMode != "" || settings.PoC.Model.Provider != "" || settings.PoC.Model.ModelID != "" {
+		t.Error("PoC.Model selected a data mode, provider, or model ID without explicit configuration")
 	}
 	if settings.PoC.IngestionLeaseDuration != defaultIngestionLeaseDuration {
 		t.Errorf("PoC.IngestionLeaseDuration = %v, want %v", settings.PoC.IngestionLeaseDuration, defaultIngestionLeaseDuration)
@@ -160,9 +164,11 @@ func TestLoadReadsPoCSettings(t *testing.T) {
 	t.Setenv(NotesTitlesEnvironmentVariable, "Meeting notes")
 	t.Setenv(AWSProfileEnvironmentVariable, "stacks")
 	t.Setenv(AWSRegionEnvironmentVariable, "us-east-1")
-	t.Setenv(BedrockModelIDEnvironmentVariable, "model-id")
-	t.Setenv(BedrockMaxTokensEnvironmentVariable, "1000")
-	t.Setenv(BedrockMaxAttemptsEnvironmentVariable, "3")
+	t.Setenv(DataModeEnvironmentVariable, "personal")
+	t.Setenv(ModelProviderEnvironmentVariable, "bedrock")
+	t.Setenv(ModelIDEnvironmentVariable, "model-id")
+	t.Setenv(ModelMaxTokensEnvironmentVariable, "1000")
+	t.Setenv(ModelMaxAttemptsEnvironmentVariable, "3")
 	t.Setenv(IngestionLeaseDurationEnvironmentVariable, "2m")
 	t.Setenv(IngestionAttemptTimeoutEnvironmentVariable, "90s")
 	t.Setenv(ExtractionPromptVersionEnvironmentVariable, "extract-test-v1")
@@ -176,7 +182,7 @@ func TestLoadReadsPoCSettings(t *testing.T) {
 	}
 
 	want := validPoCSettings()
-	want.BedrockMaxAttempts = 3
+	want.Model.MaxAttempts = 3
 	want.IngestionLeaseDuration = 2 * time.Minute
 	want.IngestionAttemptTimeout = 90 * time.Second
 	want.ExtractionPromptVersion = "extract-test-v1"
@@ -198,10 +204,11 @@ func TestPoCSettingsValidateSyncRequiresCorpusAndDisclosureSettings(t *testing.T
 		{name: "Google OAuth token file", invalidate: func(settings *PoCSettings) { settings.GoogleOAuthTokenFile = "" }},
 		{name: "transcript titles", invalidate: func(settings *PoCSettings) { settings.TranscriptTitles = nil }},
 		{name: "notes titles", invalidate: func(settings *PoCSettings) { settings.NotesTitles = nil }},
-		{name: "AWS region", invalidate: func(settings *PoCSettings) { settings.AWSRegion = "" }},
-		{name: "Bedrock model ID", invalidate: func(settings *PoCSettings) { settings.BedrockModelID = "" }},
-		{name: "Bedrock max tokens", invalidate: func(settings *PoCSettings) { settings.BedrockMaxTokens = 0 }},
-		{name: "Bedrock max attempts", invalidate: func(settings *PoCSettings) { settings.BedrockMaxAttempts = 0 }},
+		{name: "model data mode", invalidate: func(settings *PoCSettings) { settings.Model.DataMode = "" }},
+		{name: "model provider", invalidate: func(settings *PoCSettings) { settings.Model.Provider = "" }},
+		{name: "model ID", invalidate: func(settings *PoCSettings) { settings.Model.ModelID = "" }},
+		{name: "model max tokens", invalidate: func(settings *PoCSettings) { settings.Model.MaxOutputTokens = 0 }},
+		{name: "model max attempts", invalidate: func(settings *PoCSettings) { settings.Model.MaxAttempts = 0 }},
 		{name: "extraction prompt version", invalidate: func(settings *PoCSettings) { settings.ExtractionPromptVersion = "" }},
 		{name: "analysis prompt version", invalidate: func(settings *PoCSettings) { settings.AnalysisPromptVersion = "" }},
 	}
@@ -220,7 +227,7 @@ func TestPoCSettingsValidateSyncRequiresCorpusAndDisclosureSettings(t *testing.T
 
 func TestPoCSettingsValidateAllowsDefaultAWSCredentialChainForSyncAndAnalyze(t *testing.T) {
 	settings := validPoCSettings()
-	settings.AWSProfile = ""
+	settings.Model.AWSProfile = ""
 	for _, command := range []Command{CommandSync, CommandAnalyze} {
 		if err := settings.Validate(command); err != nil {
 			t.Errorf("Validate(%q) error = %v, want optional AWS profile", command, err)
@@ -340,8 +347,8 @@ func TestPoCSettingsValidateRejectsWhitespaceOnlyRequiredSettings(t *testing.T) 
 		{name: "Google folder ID", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.GoogleFolderID = " \t " }},
 		{name: "Google OAuth client file", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.GoogleOAuthClientFile = " \t " }},
 		{name: "Google OAuth token file", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.GoogleOAuthTokenFile = " \t " }},
-		{name: "AWS region", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.AWSRegion = " \t " }},
-		{name: "Bedrock model ID", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.BedrockModelID = " \t " }},
+		{name: "AWS region", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.Model.AWSRegion = " \t " }},
+		{name: "model ID", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.Model.ModelID = " \t " }},
 		{name: "extraction prompt version", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.ExtractionPromptVersion = " \t " }},
 		{name: "analysis prompt version", command: CommandSync, invalidate: func(settings *PoCSettings) { settings.AnalysisPromptVersion = " \t " }},
 		{name: "employee entity ID", command: CommandAnalyze, invalidate: func(settings *PoCSettings) { settings.EmployeeEntityID = " \t " }},
@@ -371,18 +378,14 @@ func TestPoCSettingsValidateRejectsOverlappingNormalizedTabTitles(t *testing.T) 
 	}
 }
 
-func TestPoCSettingsValidateDoctorUsesOnlyReadOnlyPreflightSettings(t *testing.T) {
+func TestPoCSettingsValidateDoctorDoesNotRequireAnalysisSettings(t *testing.T) {
 	settings := validPoCSettings()
-	settings.AWSProfile = ""
-	settings.BedrockMaxTokens = 0
-	settings.BedrockMaxAttempts = 0
-	settings.ExtractionPromptVersion = ""
-	settings.AnalysisPromptVersion = ""
+	settings.Model.AWSProfile = ""
 	settings.EmployeeEntityID = ""
 	settings.ManagerEntityID = ""
 
 	if err := settings.Validate(CommandDoctor); err != nil {
-		t.Fatalf("Validate(doctor) error = %v, want optional profile and no invocation/analysis settings", err)
+		t.Fatalf("Validate(doctor) error = %v, want optional profile and no analysis entity settings", err)
 	}
 }
 
@@ -397,8 +400,9 @@ func TestPoCSettingsValidateDoctorRequiresEveryPreflightSetting(t *testing.T) {
 		{name: "Google token file", invalidate: func(settings *PoCSettings) { settings.GoogleOAuthTokenFile = "" }},
 		{name: "transcript titles", invalidate: func(settings *PoCSettings) { settings.TranscriptTitles = nil }},
 		{name: "notes titles", invalidate: func(settings *PoCSettings) { settings.NotesTitles = nil }},
-		{name: "AWS region", invalidate: func(settings *PoCSettings) { settings.AWSRegion = "" }},
-		{name: "Bedrock model", invalidate: func(settings *PoCSettings) { settings.BedrockModelID = "" }},
+		{name: "model mode", invalidate: func(settings *PoCSettings) { settings.Model.DataMode = "" }},
+		{name: "model provider", invalidate: func(settings *PoCSettings) { settings.Model.Provider = "" }},
+		{name: "model ID", invalidate: func(settings *PoCSettings) { settings.Model.ModelID = "" }},
 	}
 
 	for _, testCase := range tests {
@@ -414,17 +418,21 @@ func TestPoCSettingsValidateDoctorRequiresEveryPreflightSetting(t *testing.T) {
 
 func validPoCSettings() PoCSettings {
 	return PoCSettings{
-		DatabaseURL:             "postgres://stacks:test@localhost:5432/stacks",
-		GoogleFolderID:          "folder-id",
-		GoogleOAuthClientFile:   "/tmp/client.json",
-		GoogleOAuthTokenFile:    "/tmp/token.json",
-		TranscriptTitles:        []string{"Transcript"},
-		NotesTitles:             []string{"Meeting notes"},
-		AWSProfile:              "stacks",
-		AWSRegion:               "us-east-1",
-		BedrockModelID:          "model-id",
-		BedrockMaxTokens:        1000,
-		BedrockMaxAttempts:      5,
+		DatabaseURL:           "postgres://stacks:test@localhost:5432/stacks",
+		GoogleFolderID:        "folder-id",
+		GoogleOAuthClientFile: "/tmp/client.json",
+		GoogleOAuthTokenFile:  "/tmp/token.json",
+		TranscriptTitles:      []string{"Transcript"},
+		NotesTitles:           []string{"Meeting notes"},
+		Model: ModelSettings{
+			DataMode:        "personal",
+			Provider:        "bedrock",
+			ModelID:         "model-id",
+			MaxOutputTokens: 1000,
+			MaxAttempts:     defaultModelMaxAttempts,
+			AWSProfile:      "stacks",
+			AWSRegion:       "us-east-1",
+		},
 		IngestionLeaseDuration:  defaultIngestionLeaseDuration,
 		IngestionAttemptTimeout: defaultIngestionAttemptTimeout,
 		ExtractionPromptVersion: "extract-v2",
@@ -439,11 +447,7 @@ func diffPoCSettings(got, want PoCSettings) string {
 		got.GoogleFolderID != want.GoogleFolderID ||
 		got.GoogleOAuthClientFile != want.GoogleOAuthClientFile ||
 		got.GoogleOAuthTokenFile != want.GoogleOAuthTokenFile ||
-		got.AWSProfile != want.AWSProfile ||
-		got.AWSRegion != want.AWSRegion ||
-		got.BedrockModelID != want.BedrockModelID ||
-		got.BedrockMaxTokens != want.BedrockMaxTokens ||
-		got.BedrockMaxAttempts != want.BedrockMaxAttempts ||
+		got.Model != want.Model ||
 		got.IngestionLeaseDuration != want.IngestionLeaseDuration ||
 		got.IngestionAttemptTimeout != want.IngestionAttemptTimeout ||
 		got.ExtractionPromptVersion != want.ExtractionPromptVersion ||

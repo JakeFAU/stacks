@@ -92,17 +92,16 @@ func TestExecuteRoutesGoogleAuthWithRemainingArguments(t *testing.T) {
 
 func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 	settings := config.Settings{PoC: config.PoCSettings{
-		DatabaseURL:             "postgres://synthetic",
-		GoogleFolderID:          "synthetic-folder",
-		GoogleOAuthClientFile:   "/synthetic/client.json",
-		GoogleOAuthTokenFile:    "/synthetic/token.json",
-		TranscriptTitles:        []string{"Transcript"},
-		NotesTitles:             []string{"Notes"},
-		AWSProfile:              "synthetic-profile",
-		AWSRegion:               "us-east-1",
-		BedrockModelID:          "synthetic-model",
-		BedrockMaxTokens:        256,
-		BedrockMaxAttempts:      1,
+		DatabaseURL:           "postgres://synthetic",
+		GoogleFolderID:        "synthetic-folder",
+		GoogleOAuthClientFile: "/synthetic/client.json",
+		GoogleOAuthTokenFile:  "/synthetic/token.json",
+		TranscriptTitles:      []string{"Transcript"},
+		NotesTitles:           []string{"Notes"},
+		Model: config.ModelSettings{
+			DataMode: "personal", Provider: "bedrock", ModelID: "synthetic-model",
+			MaxOutputTokens: 256, MaxAttempts: 1, AWSProfile: "synthetic-profile", AWSRegion: "us-east-1",
+		},
 		IngestionLeaseDuration:  5 * time.Minute,
 		IngestionAttemptTimeout: 4 * time.Minute,
 		ExtractionPromptVersion: "extract-v2",
@@ -140,8 +139,10 @@ func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
 		GoogleOAuthTokenFile:  "/synthetic/token.json",
 		TranscriptTitles:      []string{"Transcript"},
 		NotesTitles:           []string{"Notes"},
-		AWSRegion:             "us-east-1",
-		BedrockModelID:        "synthetic-model",
+		Model: config.ModelSettings{
+			DataMode: "personal", Provider: "bedrock", ModelID: "synthetic-model",
+			MaxOutputTokens: 256, MaxAttempts: 1, AWSRegion: "us-east-1",
+		},
 	}}
 	providerCalls := 0
 	doctorCalls := 0
@@ -169,8 +170,11 @@ func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
 
 func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
 	settings := config.Settings{PoC: config.PoCSettings{
-		DatabaseURL: "postgres://synthetic", AWSProfile: "synthetic-profile", AWSRegion: "us-east-1",
-		BedrockModelID: "synthetic-model", BedrockMaxTokens: 256, BedrockMaxAttempts: 1,
+		DatabaseURL: "postgres://synthetic",
+		Model: config.ModelSettings{
+			DataMode: "personal", Provider: "bedrock", ModelID: "synthetic-model",
+			MaxOutputTokens: 256, MaxAttempts: 1, AWSProfile: "synthetic-profile", AWSRegion: "us-east-1",
+		},
 		ExtractionPromptVersion: "extract-v2", AnalysisPromptVersion: "analyze-v1",
 		EmployeeEntityID: "employee-id", ManagerEntityID: "manager-id",
 	}}
@@ -247,8 +251,11 @@ func validSyncSettingsForExecute(extractionVersion, analysisVersion string) conf
 	return config.PoCSettings{
 		DatabaseURL: "postgres://synthetic", GoogleFolderID: "synthetic-folder",
 		GoogleOAuthClientFile: "/synthetic/client.json", GoogleOAuthTokenFile: "/synthetic/token.json",
-		TranscriptTitles: []string{"Transcript"}, NotesTitles: []string{"Notes"}, AWSRegion: "us-east-1",
-		BedrockModelID: "synthetic-model", BedrockMaxTokens: 256, BedrockMaxAttempts: 1,
+		TranscriptTitles: []string{"Transcript"}, NotesTitles: []string{"Notes"},
+		Model: config.ModelSettings{
+			DataMode: "personal", Provider: "bedrock", ModelID: "synthetic-model",
+			MaxOutputTokens: 256, MaxAttempts: 1, AWSRegion: "us-east-1",
+		},
 		IngestionLeaseDuration: 5 * time.Minute, IngestionAttemptTimeout: 4 * time.Minute,
 		ExtractionPromptVersion: extractionVersion, AnalysisPromptVersion: analysisVersion,
 	}
