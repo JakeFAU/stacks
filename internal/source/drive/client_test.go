@@ -102,9 +102,12 @@ func TestListRedactsTransportErrors(t *testing.T) {
 }
 
 func TestListRedactsInvalidModifiedTime(t *testing.T) {
-	const secret = "secret-invalid-modified-time"
+	const (
+		secretDocumentID = "secret-provider-document-id"
+		secretModifiedAt = "secret-invalid-modified-time"
+	)
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		return jsonResponse(request, `{"files":[{"id":"document-1","modifiedTime":"`+secret+`"}]}`), nil
+		return jsonResponse(request, `{"files":[{"id":"`+secretDocumentID+`","modifiedTime":"`+secretModifiedAt+`"}]}`), nil
 	})}
 	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
 
@@ -112,8 +115,43 @@ func TestListRedactsInvalidModifiedTime(t *testing.T) {
 	if err == nil {
 		t.Fatal("List() error = nil, want invalid modified time error")
 	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("List() error disclosed invalid provider value: %v", err)
+	if strings.Contains(err.Error(), secretDocumentID) || strings.Contains(err.Error(), secretModifiedAt) {
+		t.Fatalf("List() error disclosed provider-controlled values: %v", err)
+	}
+}
+
+func TestGetRedactsDocumentIDFromFetchErrors(t *testing.T) {
+	const (
+		secretDocumentID = "secret-fetch-document-id"
+		secretDetail     = "secret-provider-error-detail"
+	)
+	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New(secretDetail)
+	})}
+	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+
+	_, err := client.Get(context.Background(), secretDocumentID)
+	if err == nil {
+		t.Fatal("Get() error = nil, want fetch error")
+	}
+	if strings.Contains(err.Error(), secretDocumentID) || strings.Contains(err.Error(), secretDetail) {
+		t.Fatalf("Get() error disclosed provider-controlled values: %v", err)
+	}
+}
+
+func TestGetRedactsDocumentIDFromTabConversionErrors(t *testing.T) {
+	const secretDocumentID = "secret-conversion-document-id"
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return jsonResponse(request, `{"documentId":"`+secretDocumentID+`","tabs":[]}`), nil
+	})}
+	client := newTestClient(t, httpClient, NewTabClassifier([]string{"Transcript"}, nil))
+
+	_, err := client.Get(context.Background(), secretDocumentID)
+	if err == nil {
+		t.Fatal("Get() error = nil, want tab conversion error")
+	}
+	if strings.Contains(err.Error(), secretDocumentID) {
+		t.Fatalf("Get() error disclosed provider document ID: %v", err)
 	}
 }
 
@@ -180,7 +218,7 @@ func newTestClient(t *testing.T, httpClient *http.Client, classifier TabClassifi
 	if err != nil {
 		t.Fatalf("create Docs service: %v", err)
 	}
-	return NewClient(driveService, docsService, classifier)
+	return newClient(driveService, docsService, classifier)
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

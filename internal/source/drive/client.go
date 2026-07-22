@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"google.golang.org/api/docs/v1"
 	googledrive "google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 
 	"stacks/internal/source"
 )
@@ -33,8 +35,21 @@ type Client struct {
 
 var _ source.Source = (*Client)(nil)
 
-// NewClient constructs a Google Drive and Docs source.
-func NewClient(driveService *googledrive.Service, docsService *docs.Service, classifier TabClassifier) *Client {
+// NewClient constructs a Google Drive and Docs source without exposing
+// provider SDK types at the package boundary.
+func NewClient(ctx context.Context, httpClient *http.Client, classifier TabClassifier) (*Client, error) {
+	driveService, err := googledrive.NewService(ctx, option.WithHTTPClient(httpClient))
+	if err != nil {
+		return nil, fmt.Errorf("construct Google Drive client: %w", err)
+	}
+	docsService, err := docs.NewService(ctx, option.WithHTTPClient(httpClient))
+	if err != nil {
+		return nil, fmt.Errorf("construct Google Docs client: %w", err)
+	}
+	return newClient(driveService, docsService, classifier), nil
+}
+
+func newClient(driveService *googledrive.Service, docsService *docs.Service, classifier TabClassifier) *Client {
 	return &Client{drive: driveService, docs: docsService, classifier: classifier}
 }
 
@@ -60,7 +75,7 @@ func (client *Client) List(ctx context.Context, folderID string) ([]source.Docum
 			if file == nil {
 				continue
 			}
-			modifiedAt, err := parseModifiedTime(file.Id, file.ModifiedTime)
+			modifiedAt, err := parseModifiedTime(file.ModifiedTime)
 			if err != nil {
 				return nil, err
 			}
@@ -89,12 +104,12 @@ func (client *Client) Get(ctx context.Context, documentID string) (source.Docume
 		Context(ctx).
 		Do()
 	if err != nil {
-		return source.Document{}, sanitizedGoogleError(ctx, fmt.Sprintf("get Google Doc %q", documentID), err)
+		return source.Document{}, sanitizedGoogleError(ctx, "get Google Doc", err)
 	}
 
 	tabs, err := FlattenTabs(document.Tabs, client.classifier)
 	if err != nil {
-		return source.Document{}, fmt.Errorf("convert Google Doc %q tabs: %w", documentID, err)
+		return source.Document{}, fmt.Errorf("convert Google Doc tabs: %w", err)
 	}
 	return source.Document{
 		Provider: driveProvider,
@@ -121,13 +136,13 @@ func escapeDriveQueryValue(value string) string {
 	return strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value)
 }
 
-func parseModifiedTime(documentID, value string) (time.Time, error) {
+func parseModifiedTime(value string) (time.Time, error) {
 	if value == "" {
 		return time.Time{}, nil
 	}
 	modifiedAt, err := time.Parse(time.RFC3339, value)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("parse Google Doc %q modified time: invalid timestamp", documentID)
+		return time.Time{}, errors.New("parse Google Doc modified time: invalid timestamp")
 	}
 	return modifiedAt, nil
 }

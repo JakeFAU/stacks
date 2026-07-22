@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -116,6 +117,12 @@ func (authorizer *Authorizer) Authorize(ctx context.Context) error {
 	}
 	token, err := config.Exchange(exchangeContext, callback.code)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return fmt.Errorf("exchange Google authorization code: %w", context.Canceled)
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("exchange Google authorization code: %w", context.DeadlineExceeded)
+		}
 		return errors.New("exchange Google authorization code: token endpoint rejected authorization")
 	}
 	if token.RefreshToken == "" {
@@ -136,6 +143,15 @@ type oauthCallback struct {
 }
 
 func oauthCallbackHandler(wantState string, result chan<- oauthCallback) http.Handler {
+	var publishOnce sync.Once
+	publish := func(callback oauthCallback) {
+		publishOnce.Do(func() {
+			select {
+			case result <- callback:
+			default:
+			}
+		})
+	}
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != oauthCallbackPath {
 			http.NotFound(writer, request)
@@ -143,23 +159,23 @@ func oauthCallbackHandler(wantState string, result chan<- oauthCallback) http.Ha
 		}
 		if request.URL.Query().Get("state") != wantState {
 			http.Error(writer, "Google OAuth state mismatch", http.StatusBadRequest)
-			result <- oauthCallback{err: errors.New("google OAuth state mismatch")}
+			publish(oauthCallback{err: errors.New("google OAuth state mismatch")})
 			return
 		}
 		if request.URL.Query().Get("error") != "" {
 			http.Error(writer, "Google authorization was rejected", http.StatusBadRequest)
-			result <- oauthCallback{err: errors.New("google authorization was rejected")}
+			publish(oauthCallback{err: errors.New("google authorization was rejected")})
 			return
 		}
 		code := request.URL.Query().Get("code")
 		if code == "" {
 			http.Error(writer, "Google authorization code is missing", http.StatusBadRequest)
-			result <- oauthCallback{err: errors.New("google authorization code is missing")}
+			publish(oauthCallback{err: errors.New("google authorization code is missing")})
 			return
 		}
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(writer, "Authorization received. You may close this window.\n")
-		result <- oauthCallback{code: code}
+		publish(oauthCallback{code: code})
 	})
 }
 
@@ -170,11 +186,21 @@ func loadInstalledOAuthConfig(path string) (*oauth2.Config, error) {
 	}
 	var envelope struct {
 		Installed json.RawMessage `json:"installed"`
+		Web       json.RawMessage `json:"web"`
 	}
 	if err := json.Unmarshal(contents, &envelope); err != nil || len(envelope.Installed) == 0 {
 		return nil, errors.New("parse Google OAuth client configuration: installed application credentials are required")
 	}
-	config, err := google.ConfigFromJSON(contents, googleReadOnlyScopes...)
+	if len(envelope.Web) != 0 {
+		return nil, errors.New("parse Google OAuth client configuration: web credentials are not supported")
+	}
+	installedOnly, err := json.Marshal(struct {
+		Installed json.RawMessage `json:"installed"`
+	}{Installed: envelope.Installed})
+	if err != nil {
+		return nil, errors.New("parse Google OAuth client configuration")
+	}
+	config, err := google.ConfigFromJSON(installedOnly, googleReadOnlyScopes...)
 	if err != nil {
 		return nil, errors.New("parse Google OAuth client configuration")
 	}

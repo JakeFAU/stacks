@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -179,6 +180,93 @@ func TestAuthorizerRedactsTokenEndpointResponse(t *testing.T) {
 	}
 }
 
+func TestAuthorizerPreservesTokenExchangeCancellation(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: context.Canceled},
+		{name: "deadline exceeded", err: context.DeadlineExceeded},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, test.err
+			})
+			fixture := newAuthorizationFixture(t, transport)
+			result := fixture.start(t)
+			parsed := parseURL(t, fixture.authorizationURL(t))
+			fixture.callback(t, parseURL(t, parsed.Query().Get("redirect_uri")), "synthetic-code", parsed.Query().Get("state"))
+
+			err := <-result
+			if !errors.Is(err, test.err) {
+				t.Fatalf("Authorize() error = %v, want errors.Is(_, %v)", err, test.err)
+			}
+		})
+	}
+}
+
+func TestOAuthCallbackHandlerPublishesOnlyFirstCallback(t *testing.T) {
+	results := make(chan oauthCallback, 1)
+	handler := oauthCallbackHandler("matching-state", results)
+
+	first := newOAuthCallbackRequest(t, "first-code", "matching-state")
+	handler.ServeHTTP(httptest.NewRecorder(), first)
+
+	second := newOAuthCallbackRequest(t, "second-code", "matching-state")
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		handler.ServeHTTP(httptest.NewRecorder(), second)
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("duplicate OAuth callback blocked its handler")
+	}
+
+	result := <-results
+	if result.code != "first-code" {
+		t.Fatalf("published callback code = %q, want first-code", result.code)
+	}
+	select {
+	case duplicate := <-results:
+		t.Fatalf("published duplicate callback: %#v", duplicate)
+	default:
+	}
+}
+
+func TestLoadInstalledOAuthConfigRejectsWebCredentials(t *testing.T) {
+	clientFile := filepath.Join(t.TempDir(), "client.json")
+	contents := `{"web":{"client_id":"web-client","client_secret":"web-secret","redirect_uris":["https://example.test/callback"],"auth_uri":"https://accounts.google.test/auth","token_uri":"https://oauth.google.test/token"}}`
+	if err := os.WriteFile(clientFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := loadInstalledOAuthConfig(clientFile); err == nil {
+		t.Fatal("loadInstalledOAuthConfig() error = nil, want web credential rejection")
+	}
+}
+
+func TestLoadInstalledOAuthConfigRejectsMixedWebAndInstalledCredentials(t *testing.T) {
+	clientFile := filepath.Join(t.TempDir(), "client.json")
+	contents := `{
+		"web":{"client_id":"secret-web-client","client_secret":"secret-web-value","redirect_uris":["https://example.test/callback"],"auth_uri":"https://accounts.google.test/web-auth","token_uri":"https://oauth.google.test/web-token"},
+		"installed":{"client_id":"installed-client","client_secret":"installed-secret","redirect_uris":["http://127.0.0.1"],"auth_uri":"https://accounts.google.test/installed-auth","token_uri":"https://oauth.google.test/installed-token"}
+	}`
+	if err := os.WriteFile(clientFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadInstalledOAuthConfig(clientFile)
+	if err == nil {
+		t.Fatal("loadInstalledOAuthConfig() error = nil, want mixed credential rejection")
+	}
+	if strings.Contains(err.Error(), "secret-web") || strings.Contains(err.Error(), "installed-secret") {
+		t.Fatalf("loadInstalledOAuthConfig() disclosed credential values: %v", err)
+	}
+}
+
 type authorizationFixture struct {
 	authorizer     *Authorizer
 	listener       *pipeListener
@@ -300,6 +388,16 @@ func parseURL(t *testing.T, value string) *url.URL {
 		t.Fatalf("parse URL %q: %v", value, err)
 	}
 	return parsed
+}
+
+func newOAuthCallbackRequest(t *testing.T, code, state string) *http.Request {
+	t.Helper()
+	requestURL := "http://127.0.0.1" + oauthCallbackPath + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
+	request, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
 }
 
 type notifyingBuffer struct {

@@ -82,7 +82,7 @@ func flattenTab(
 	}
 	title := strings.TrimSpace(tab.TabProperties.Title)
 	if title == "" {
-		return fmt.Errorf("document tab %q title is required", id)
+		return fmt.Errorf("document tab title is required")
 	}
 
 	path := append(append([]string(nil), parentPath...), title)

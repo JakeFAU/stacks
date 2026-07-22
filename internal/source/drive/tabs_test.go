@@ -78,6 +78,19 @@ func TestFlattenTabsRejectsMissingTranscript(t *testing.T) {
 	}
 }
 
+func TestFlattenTabsRedactsProviderTabIDFromErrors(t *testing.T) {
+	const secretTabID = "secret-provider-tab-id"
+	roots := []*docs.Tab{{TabProperties: &docs.TabProperties{TabId: secretTabID}}}
+
+	_, err := FlattenTabs(roots, NewTabClassifier([]string{"Transcript"}, nil))
+	if err == nil {
+		t.Fatal("FlattenTabs() error = nil, want missing title error")
+	}
+	if strings.Contains(err.Error(), secretTabID) {
+		t.Fatalf("FlattenTabs() error disclosed provider tab ID: %v", err)
+	}
+}
+
 func TestFlattenTabsExtractsParagraphTableAndTableOfContentsText(t *testing.T) {
 	root := tabWithContent("t.transcript", "Transcript", []*docs.StructuralElement{
 		paragraph("opening\n"),
