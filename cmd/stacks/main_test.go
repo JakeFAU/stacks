@@ -15,6 +15,7 @@ import (
 
 	"stacks/internal/config"
 	"stacks/internal/extract"
+	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
 )
@@ -105,5 +106,33 @@ func TestPoCCommandProviderRegistersDoctorSyncAndAnalyzeWithoutConstructingLiveD
 	}
 	if commands[string(config.CommandAnalyze)] == nil {
 		t.Fatal("analyze command is not registered")
+	}
+}
+
+func TestBedrockCommandServicesReceiveInvocationPolicy(t *testing.T) {
+	tests := []struct {
+		name     string
+		dataMode modelpolicy.DataMode
+	}{
+		{name: "personal", dataMode: modelpolicy.DataModePersonal},
+		{name: "restricted", dataMode: modelpolicy.DataModeRestricted},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := config.PoCSettings{Model: config.ModelSettings{DataMode: test.dataMode}}
+			t.Run("sync", func(t *testing.T) {
+				ingestion := newBedrockIngestionService(settings, nil, nil, nil, nil, nil, nil)
+				if ingestion.Provider != modelpolicy.ProviderBedrock || ingestion.DataMode != test.dataMode {
+					t.Fatalf("ingestion provider/data mode = %q/%q, want %q/%q", ingestion.Provider, ingestion.DataMode, modelpolicy.ProviderBedrock, test.dataMode)
+				}
+			})
+			t.Run("analyze", func(t *testing.T) {
+				pairAnalysis := newBedrockAnalysisService(settings, nil, nil, nil, nil, nil)
+				if pairAnalysis.Provider != modelpolicy.ProviderBedrock || pairAnalysis.DataMode != test.dataMode {
+					t.Fatalf("analysis provider/data mode = %q/%q, want %q/%q", pairAnalysis.Provider, pairAnalysis.DataMode, modelpolicy.ProviderBedrock, test.dataMode)
+				}
+			})
+		})
 	}
 }

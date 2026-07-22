@@ -25,8 +25,10 @@ import (
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
+	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
+	"stacks/internal/source"
 	"stacks/internal/source/drive"
 	"stacks/internal/storage"
 )
@@ -155,16 +157,10 @@ func pocCommandProvider(
 				return err
 			}
 			defer pool.Close()
-			service := &ingest.Service{
-				Source: sourceBoundary, Model: model, Resolver: entity.Resolver{},
-				Repository:   storage.NewIngestionRepository(pool),
-				CollectionID: settings.PoC.GoogleFolderID, PromptVersion: settings.PoC.ExtractionPromptVersion,
-				Region: strings.TrimSpace(settings.PoC.Model.AWSRegion), ModelID: strings.TrimSpace(settings.PoC.Model.ModelID),
-				MaxTokens:      settings.PoC.Model.MaxOutputTokens,
-				LeaseDuration:  settings.PoC.IngestionLeaseDuration,
-				AttemptTimeout: settings.PoC.IngestionAttemptTimeout,
-				Tracer:         tracer, Decisions: decisions, Now: time.Now,
-			}
+			service := newBedrockIngestionService(
+				settings.PoC, sourceBoundary, model, storage.NewIngestionRepository(pool),
+				tracer, decisions, time.Now,
+			)
 			return (cli.SyncCommand{Service: service, Output: stdout}).Run(ctx, args)
 		}),
 		string(config.CommandEntities): cli.CommandFunc(func(ctx context.Context, args []string) error {
@@ -202,19 +198,54 @@ func pocCommandProvider(
 				return err
 			}
 			defer pool.Close()
-			service := &analysis.Service{
-				Repository: storage.NewAnalysisRepository(pool), Model: model,
-				PromptVersion: settings.PoC.AnalysisPromptVersion,
-				Region:        strings.TrimSpace(settings.PoC.Model.AWSRegion), ModelID: strings.TrimSpace(settings.PoC.Model.ModelID),
-				MaxTokens: settings.PoC.Model.MaxOutputTokens, Tracer: tracer,
-				Decisions: decisions, Now: time.Now,
-			}
+			service := newBedrockAnalysisService(
+				settings.PoC, storage.NewAnalysisRepository(pool), model,
+				tracer, decisions, time.Now,
+			)
 			return (cli.AnalyzeCommand{
 				Service: service, EmployeeID: settings.PoC.EmployeeEntityID,
 				ManagerID: settings.PoC.ManagerEntityID, Output: stdout,
 			}).Run(ctx, args)
 		}),
 	}, nil
+}
+
+func newBedrockIngestionService(
+	settings config.PoCSettings,
+	sourceBoundary source.Source,
+	model extract.Model,
+	repository ingest.Repository,
+	tracer trace.Tracer,
+	decisions ingest.DecisionRecorder,
+	now func() time.Time,
+) *ingest.Service {
+	return &ingest.Service{
+		Source: sourceBoundary, Model: model, Resolver: entity.Resolver{}, Repository: repository,
+		CollectionID: settings.GoogleFolderID, PromptVersion: settings.ExtractionPromptVersion,
+		Provider: modelpolicy.ProviderBedrock, DataMode: settings.Model.DataMode,
+		Region: strings.TrimSpace(settings.Model.AWSRegion), ModelID: strings.TrimSpace(settings.Model.ModelID),
+		MaxTokens:      settings.Model.MaxOutputTokens,
+		LeaseDuration:  settings.IngestionLeaseDuration,
+		AttemptTimeout: settings.IngestionAttemptTimeout,
+		Tracer:         tracer, Decisions: decisions, Now: now,
+	}
+}
+
+func newBedrockAnalysisService(
+	settings config.PoCSettings,
+	repository analysis.Repository,
+	model extract.Model,
+	tracer trace.Tracer,
+	decisions analysis.DecisionRecorder,
+	now func() time.Time,
+) *analysis.Service {
+	return &analysis.Service{
+		Repository: repository, Model: model, PromptVersion: settings.AnalysisPromptVersion,
+		Provider: modelpolicy.ProviderBedrock, DataMode: settings.Model.DataMode,
+		Region: strings.TrimSpace(settings.Model.AWSRegion), ModelID: strings.TrimSpace(settings.Model.ModelID),
+		MaxTokens: settings.Model.MaxOutputTokens, Tracer: tracer,
+		Decisions: decisions, Now: now,
+	}
 }
 
 func awsLoadOptions(profile, region string) []func(*awsconfig.LoadOptions) error {
