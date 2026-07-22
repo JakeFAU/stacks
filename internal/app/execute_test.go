@@ -87,3 +87,43 @@ func TestExecuteRoutesGoogleAuthWithRemainingArguments(t *testing.T) {
 		t.Fatalf("auth command args = %#v, want %#v", gotArgs, []string{"google"})
 	}
 }
+
+func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
+	settings := config.Settings{PoC: config.PoCSettings{
+		DatabaseURL:             "postgres://synthetic",
+		GoogleFolderID:          "synthetic-folder",
+		GoogleOAuthClientFile:   "/synthetic/client.json",
+		GoogleOAuthTokenFile:    "/synthetic/token.json",
+		TranscriptTitles:        []string{"Transcript"},
+		NotesTitles:             []string{"Notes"},
+		AWSProfile:              "synthetic-profile",
+		AWSRegion:               "us-east-1",
+		BedrockModelID:          "synthetic-model",
+		BedrockMaxTokens:        256,
+		BedrockMaxAttempts:      1,
+		ExtractionPromptVersion: "extract-v1",
+		AnalysisPromptVersion:   "analyze-v1",
+	}}
+	providerCalls := 0
+	syncCalls := 0
+	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+		providerCalls++
+		return map[string]cli.Command{"sync": cli.CommandFunc(func(_ context.Context, args []string) error {
+			syncCalls++
+			if len(args) != 0 {
+				return fmt.Errorf("sync received unexpected arguments")
+			}
+			return nil
+		})}, nil
+	})
+
+	err := Execute(context.Background(), []string{"sync"}, settings,
+		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
+		provider, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if providerCalls != 1 || syncCalls != 1 {
+		t.Fatalf("provider/sync calls = %d/%d, want 1/1", providerCalls, syncCalls)
+	}
+}

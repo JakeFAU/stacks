@@ -37,6 +37,23 @@ func TestManagerConfidenceMigrationProtectsPLpgSQLAndUpdatedSignalEvidence(t *te
 	}
 }
 
+func TestIngestionMigrationAddsOnlyBoundedForwardProcessingState(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "migrations", "00003_ingestion_processing_state.sql")
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", path, err)
+	}
+	migration := string(contents)
+	for _, required := range []string{"failure_code text", "retry_count integer NOT NULL DEFAULT 0", "failure_code IN (", "retry_count >= 0"} {
+		if !strings.Contains(migration, required) {
+			t.Fatalf("ingestion migration is missing %q", required)
+		}
+	}
+	if strings.Contains(migration, "-- +goose Down") {
+		t.Fatal("ingestion migration is not forward-only")
+	}
+}
+
 func readManagerConfidenceMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00002_manager_confidence_poc.sql")

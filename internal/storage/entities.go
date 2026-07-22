@@ -10,6 +10,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"stacks/internal/entity"
 )
 
 // EntityInput is the minimum durable identity record. Name normalization and
@@ -144,6 +146,60 @@ type EntityRepository struct {
 // NewEntityRepository creates an identity repository backed by pool.
 func NewEntityRepository(pool *pgxpool.Pool) *EntityRepository {
 	return &EntityRepository{pool: pool}
+}
+
+// EntitySnapshots returns canonical entities with accepted aliases only for
+// deterministic ingestion-time resolution. Private display names and aliases
+// never leave this in-process boundary through logs or telemetry.
+func (repository *IngestionRepository) EntitySnapshots(ctx context.Context) ([]entity.EntitySnapshot, error) {
+	if repository == nil || repository.pool == nil {
+		return nil, fmt.Errorf("list ingestion entity snapshots: repository is not configured")
+	}
+	rows, err := repository.pool.Query(ctx, `
+		SELECT id::text, kind, display_name, recorded_at
+		FROM stacks.entities
+		ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list ingestion entity snapshots: %w", err)
+	}
+	defer rows.Close()
+	var snapshots []entity.EntitySnapshot
+	for rows.Next() {
+		var snapshot entity.EntitySnapshot
+		var kind string
+		if err := rows.Scan(&snapshot.ID, &kind, &snapshot.DisplayName, &snapshot.RecordedAt); err != nil {
+			return nil, fmt.Errorf("scan ingestion entity snapshot: %w", err)
+		}
+		snapshot.Kind = entity.Kind(kind)
+		snapshots = append(snapshots, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate ingestion entity snapshots: %w", err)
+	}
+	for index := range snapshots {
+		aliases, err := repository.pool.Query(ctx, `
+			SELECT alias_type, normalized_value
+			FROM stacks.entity_aliases
+			WHERE entity_id = $1
+			ORDER BY alias_type, normalized_value`, snapshots[index].ID)
+		if err != nil {
+			return nil, fmt.Errorf("list ingestion entity aliases: %w", err)
+		}
+		for aliases.Next() {
+			var aliasType, value string
+			if err := aliases.Scan(&aliasType, &value); err != nil {
+				aliases.Close()
+				return nil, fmt.Errorf("scan ingestion entity alias: %w", err)
+			}
+			snapshots[index].Aliases = append(snapshots[index].Aliases, entity.Alias{Type: entity.AliasType(aliasType), Value: value})
+		}
+		if err := aliases.Err(); err != nil {
+			aliases.Close()
+			return nil, fmt.Errorf("iterate ingestion entity aliases: %w", err)
+		}
+		aliases.Close()
+	}
+	return snapshots, nil
 }
 
 // CreateEntity persists a canonical entity.

@@ -52,6 +52,37 @@ func NewAuthorizer(clientFile, tokenFile string, output io.Writer) *Authorizer {
 	}
 }
 
+// NewAuthorizedHTTPClient loads the configured installed-application client
+// and owner-only refresh token for non-interactive Drive and Docs commands.
+// Token contents are never included in returned errors.
+func NewAuthorizedHTTPClient(ctx context.Context, clientFile, tokenFile string) (*http.Client, error) {
+	config, err := loadInstalledOAuthConfig(clientFile)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(tokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("read Google OAuth token: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return nil, errors.New("read Google OAuth token: file must be regular and owner-only")
+	}
+	file, err := os.Open(tokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("read Google OAuth token: %w", err)
+	}
+	defer file.Close()
+	var token oauth2.Token
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&token); err != nil {
+		return nil, errors.New("parse Google OAuth token")
+	}
+	if token.RefreshToken == "" {
+		return nil, errors.New("parse Google OAuth token: refresh token is missing")
+	}
+	return config.Client(ctx, &token), nil
+}
+
 // Authorize waits for one loopback callback, exchanges its matching code, and
 // stores the resulting token without printing credentials.
 func (authorizer *Authorizer) Authorize(ctx context.Context) error {

@@ -8,11 +8,16 @@ import (
 	"syscall"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"stacks/internal/app"
+	"stacks/internal/bedrock"
 	"stacks/internal/cli"
 	"stacks/internal/config"
+	"stacks/internal/entity"
+	"stacks/internal/ingest"
 	"stacks/internal/observability"
 	"stacks/internal/source/drive"
 	"stacks/internal/storage"
@@ -49,7 +54,13 @@ func main() {
 		app.RuntimeFunc(func(ctx context.Context, settings config.Settings) error {
 			return app.Run(ctx, settings, logger, runtime.TracerProvider(), runtime.MeterProvider())
 		}),
-		app.CommandProviderFunc(pocCommandProvider),
+		app.CommandProviderFunc(func(ctx context.Context, settings config.Settings, stdout, stderr io.Writer) (map[string]cli.Command, error) {
+			decisions, err := runtime.DecisionRecorder()
+			if err != nil {
+				return nil, err
+			}
+			return pocCommandProvider(ctx, settings, stdout, stderr, runtime.TracerProvider().Tracer("stacks"), decisions)
+		}),
 		os.Stdout,
 		os.Stderr,
 	)
@@ -67,13 +78,63 @@ func main() {
 	}
 }
 
-func pocCommandProvider(_ context.Context, settings config.Settings, stdout, _ io.Writer) (map[string]cli.Command, error) {
+func pocCommandProvider(
+	_ context.Context,
+	settings config.Settings,
+	stdout, _ io.Writer,
+	tracer trace.Tracer,
+	decisions *observability.DecisionRecorder,
+) (map[string]cli.Command, error) {
 	return map[string]cli.Command{
 		string(config.CommandAuth): cli.AuthCommand{Google: drive.NewAuthorizer(
 			settings.PoC.GoogleOAuthClientFile,
 			settings.PoC.GoogleOAuthTokenFile,
 			stdout,
 		)},
+		string(config.CommandSync): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			httpClient, err := drive.NewAuthorizedHTTPClient(
+				ctx,
+				settings.PoC.GoogleOAuthClientFile,
+				settings.PoC.GoogleOAuthTokenFile,
+			)
+			if err != nil {
+				return err
+			}
+			sourceBoundary, err := drive.NewClient(ctx, httpClient, drive.NewTabClassifier(
+				settings.PoC.TranscriptTitles,
+				settings.PoC.NotesTitles,
+			))
+			if err != nil {
+				return err
+			}
+			awsConfiguration, err := awsconfig.LoadDefaultConfig(
+				ctx,
+				awsconfig.WithRegion(settings.PoC.AWSRegion),
+				awsconfig.WithSharedConfigProfile(settings.PoC.AWSProfile),
+			)
+			if err != nil {
+				return err
+			}
+			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
+				ModelID: settings.PoC.BedrockModelID, MaxTokens: settings.PoC.BedrockMaxTokens,
+				MaxAttempts: settings.PoC.BedrockMaxAttempts,
+			})
+			if err != nil {
+				return err
+			}
+			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			service := &ingest.Service{
+				Source: sourceBoundary, Model: model, Resolver: entity.Resolver{},
+				Repository:   storage.NewIngestionRepository(pool),
+				CollectionID: settings.PoC.GoogleFolderID, PromptVersion: settings.PoC.ExtractionPromptVersion,
+				Tracer: tracer, Decisions: decisions, Now: time.Now,
+			}
+			return (cli.SyncCommand{Service: service, Output: stdout}).Run(ctx, args)
+		}),
 		string(config.CommandEntities): cli.CommandFunc(func(ctx context.Context, args []string) error {
 			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
 			if err != nil {

@@ -267,6 +267,28 @@ func TestLoadInstalledOAuthConfigRejectsMixedWebAndInstalledCredentials(t *testi
 	}
 }
 
+func TestNewAuthorizedHTTPClientLoadsStoredRefreshTokenWithoutNetwork(t *testing.T) {
+	directory := t.TempDir()
+	clientFile := filepath.Join(directory, "client.json")
+	tokenFile := filepath.Join(directory, "token.json")
+	clientJSON := `{"installed":{"client_id":"synthetic-client-id","client_secret":"synthetic-client-secret","redirect_uris":["http://127.0.0.1"],"auth_uri":"https://accounts.google.test/auth","token_uri":"https://oauth.google.test/token"}}`
+	tokenJSON := `{"access_token":"synthetic-access","token_type":"Bearer","refresh_token":"synthetic-refresh","expiry":"2099-07-21T12:00:00Z"}`
+	if err := os.WriteFile(clientFile, []byte(clientJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokenFile, []byte(tokenJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := NewAuthorizedHTTPClient(context.Background(), clientFile, tokenFile)
+	if err != nil {
+		t.Fatalf("NewAuthorizedHTTPClient() error = %v", err)
+	}
+	if client == nil {
+		t.Fatal("NewAuthorizedHTTPClient() = nil")
+	}
+}
+
 type authorizationFixture struct {
 	authorizer     *Authorizer
 	listener       *pipeListener

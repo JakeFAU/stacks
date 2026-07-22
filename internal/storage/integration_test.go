@@ -10,11 +10,47 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"stacks/internal/ingest"
 	"stacks/internal/knowledge"
 	"stacks/internal/source"
 )
 
 const testDatabaseURLEnvironmentVariable = "STACKS_TEST_DATABASE_URL"
+
+func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewIngestionRepository(pool)
+	ctx := context.Background()
+	version := testDocumentVersion(t, testIdentifier("document-ingestion-state"))
+
+	first, err := repository.PrepareVersion(ctx, version)
+	if err != nil {
+		t.Fatalf("prepare first ingestion attempt: %v", err)
+	}
+	if first.Status != ingest.VersionStatusPending || first.RetryCount != 0 {
+		t.Fatalf("first state = %#v, want pending retry_count=0", first)
+	}
+	if err := repository.RecordFailure(ctx, first.ID, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
+		t.Fatalf("record incomplete attempt: %v", err)
+	}
+	second, err := repository.PrepareVersion(ctx, version)
+	if err != nil {
+		t.Fatalf("prepare retry: %v", err)
+	}
+	if second.ID != first.ID || second.Status != ingest.VersionStatusPending || second.RetryCount != 1 || second.FailureCode != "" {
+		t.Fatalf("retry state = %#v, want same pending version with retry_count=1", second)
+	}
+	if err := repository.CompleteVersion(ctx, ingest.Completion{VersionID: second.ID}); err != nil {
+		t.Fatalf("complete retry: %v", err)
+	}
+	complete, err := repository.PrepareVersion(ctx, version)
+	if err != nil {
+		t.Fatalf("prepare completed version: %v", err)
+	}
+	if complete.Status != ingest.VersionStatusComplete || complete.RetryCount != 1 {
+		t.Fatalf("completed state = %#v, want complete retry_count=1", complete)
+	}
+}
 
 func TestPutDocumentVersionIsIdempotent(t *testing.T) {
 	pool := openIntegrationDatabase(t)
