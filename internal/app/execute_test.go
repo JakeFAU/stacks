@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,7 +105,7 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 		BedrockMaxAttempts:      1,
 		IngestionLeaseDuration:  5 * time.Minute,
 		IngestionAttemptTimeout: 4 * time.Minute,
-		ExtractionPromptVersion: "extract-v1",
+		ExtractionPromptVersion: "extract-v2",
 		AnalysisPromptVersion:   "analyze-v1",
 	}}
 	providerCalls := 0
@@ -170,7 +171,7 @@ func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
 	settings := config.Settings{PoC: config.PoCSettings{
 		DatabaseURL: "postgres://synthetic", AWSProfile: "synthetic-profile", AWSRegion: "us-east-1",
 		BedrockModelID: "synthetic-model", BedrockMaxTokens: 256, BedrockMaxAttempts: 1,
-		ExtractionPromptVersion: "extract-v1", AnalysisPromptVersion: "analyze-v1",
+		ExtractionPromptVersion: "extract-v2", AnalysisPromptVersion: "analyze-v1",
 		EmployeeEntityID: "employee-id", ManagerEntityID: "manager-id",
 	}}
 	providerCalls := 0
@@ -195,4 +196,67 @@ func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
 	if providerCalls != 1 || analyzeCalls != 1 {
 		t.Fatalf("provider/analyze calls = %d/%d, want 1/1", providerCalls, analyzeCalls)
 	}
+}
+
+func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments []string
+		settings  config.PoCSettings
+	}{
+		{
+			name: "sync legacy extraction", arguments: []string{"sync"},
+			settings: validSyncSettingsForExecute("extract-v1", "analyze-v1"),
+		},
+		{
+			name: "analyze legacy extraction", arguments: []string{"analyze"},
+			settings: validAnalyzeSettingsForExecute("extract-v1", "analyze-v1"),
+		},
+		{
+			name: "sync legacy analysis", arguments: []string{"sync"},
+			settings: validSyncSettingsForExecute("extract-v2", "analyze-v0"),
+		},
+		{
+			name: "analyze legacy analysis", arguments: []string{"analyze"},
+			settings: validAnalyzeSettingsForExecute("extract-v2", "analyze-v0"),
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			providerCalls := 0
+			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+				providerCalls++
+				return nil, fmt.Errorf("provider must not be constructed")
+			})
+
+			err := Execute(context.Background(), testCase.arguments, config.Settings{PoC: testCase.settings},
+				RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
+				provider, io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), "run stacks sync") {
+				t.Fatalf("Execute() error = %v, want actionable prompt upgrade rejection", err)
+			}
+			if providerCalls != 0 {
+				t.Fatalf("command provider calls = %d, want 0 before provider/database boundaries", providerCalls)
+			}
+		})
+	}
+}
+
+func validSyncSettingsForExecute(extractionVersion, analysisVersion string) config.PoCSettings {
+	return config.PoCSettings{
+		DatabaseURL: "postgres://synthetic", GoogleFolderID: "synthetic-folder",
+		GoogleOAuthClientFile: "/synthetic/client.json", GoogleOAuthTokenFile: "/synthetic/token.json",
+		TranscriptTitles: []string{"Transcript"}, NotesTitles: []string{"Notes"}, AWSRegion: "us-east-1",
+		BedrockModelID: "synthetic-model", BedrockMaxTokens: 256, BedrockMaxAttempts: 1,
+		IngestionLeaseDuration: 5 * time.Minute, IngestionAttemptTimeout: 4 * time.Minute,
+		ExtractionPromptVersion: extractionVersion, AnalysisPromptVersion: analysisVersion,
+	}
+}
+
+func validAnalyzeSettingsForExecute(extractionVersion, analysisVersion string) config.PoCSettings {
+	settings := validSyncSettingsForExecute(extractionVersion, analysisVersion)
+	settings.EmployeeEntityID = "employee-id"
+	settings.ManagerEntityID = "manager-id"
+	return settings
 }

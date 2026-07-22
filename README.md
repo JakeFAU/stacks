@@ -139,6 +139,11 @@ the Bedrock region, model ID, token limit, prompt version, or extraction schema
 creates a new auditable extraction run while retaining the immutable source
 version and earlier derivations.
 
+This build supports exactly `extract-v2` and `analyze-v1`. Explicit older or
+unknown prompt-version settings fail before Google, AWS, Bedrock, or PostgreSQL
+dependencies are constructed. Update both settings to the versions above and
+run `sync` again before analysis so current derivations replace retired work.
+
 Every claimed model-and-persistence attempt is canceled no later than
 `STACKS_INGEST_ATTEMPT_TIMEOUT`, with a required cleanup margin before the
 claim expires. The bounded failure state releases the claim while it is still
@@ -179,6 +184,15 @@ two sets may not overlap. Each analyzed document must classify exactly one
 transcript tab. Missing or multiple transcript matches are visible failures.
 Gemini notes are preserved as secondary model-derived material, but a signal
 cannot rely on notes alone: its citations must map exactly to transcript text.
+
+Source-valid meeting dates use one explicit Drive title contract. A dated
+document title must begin with exactly one valid bracketed ISO date followed by
+a space and a non-empty description, for example `[2026-07-20] Weekly review`.
+The date is stored as the meeting date at UTC midnight. Titles with no leading
+marker, malformed dates, or multiple bracketed ISO dates remain temporally
+unknown. Drive creation or modification times, model output, deadlines, and
+other dates in transcript or notes content are never substituted for the
+meeting date.
 
 ## Review, corrections, and bounded conclusions
 

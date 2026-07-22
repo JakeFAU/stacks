@@ -27,6 +27,7 @@ const (
 	representativeFields = "files(id)"
 	representativeLimit  = 1
 	docsLocatorFormat    = "https://docs.google.com/document/d/%s/edit"
+	meetingDateTokenSize = len("[2006-01-02]")
 )
 
 // Client reads direct Google Doc children from Drive and retrieves complete
@@ -85,12 +86,13 @@ func (client *Client) List(ctx context.Context, folderID string) ([]source.Docum
 				return nil, err
 			}
 			documents = append(documents, source.Document{
-				Provider:   driveProvider,
-				ID:         file.Id,
-				Title:      file.Name,
-				Locator:    file.WebViewLink,
-				Version:    strconv.FormatInt(file.Version, 10),
-				ModifiedAt: modifiedAt,
+				Provider:    driveProvider,
+				ID:          file.Id,
+				Title:       file.Name,
+				Locator:     file.WebViewLink,
+				Version:     strconv.FormatInt(file.Version, 10),
+				ModifiedAt:  modifiedAt,
+				MeetingTime: meetingTimeFromTitle(file.Name),
 			})
 		}
 		pageToken = files.NextPageToken
@@ -155,13 +157,52 @@ func (client *Client) Get(ctx context.Context, documentID string) (source.Docume
 		return source.Document{}, fmt.Errorf("convert Google Doc tabs: %w", err)
 	}
 	return source.Document{
-		Provider: driveProvider,
-		ID:       document.DocumentId,
-		Title:    document.Title,
-		Locator:  fmt.Sprintf(docsLocatorFormat, url.PathEscape(document.DocumentId)),
-		Revision: document.RevisionId,
-		Tabs:     tabs,
+		Provider:    driveProvider,
+		ID:          document.DocumentId,
+		Title:       document.Title,
+		Locator:     fmt.Sprintf(docsLocatorFormat, url.PathEscape(document.DocumentId)),
+		Revision:    document.RevisionId,
+		MeetingTime: meetingTimeFromTitle(document.Title),
+		Tabs:        tabs,
 	}, nil
+}
+
+// meetingTimeFromTitle implements the Drive source-time contract. A meeting
+// title is dated only when it starts with exactly one valid [YYYY-MM-DD] token,
+// followed by one space and a non-empty description. Any other or ambiguous
+// title leaves source-valid time unknown.
+func meetingTimeFromTitle(title string) *time.Time {
+	if len(title) <= meetingDateTokenSize+1 || title[0] != '[' || title[meetingDateTokenSize-1] != ']' ||
+		title[meetingDateTokenSize] != ' ' || strings.TrimSpace(title[meetingDateTokenSize+1:]) == "" {
+		return nil
+	}
+
+	meetingDate, ok := parseMeetingDateToken(title[:meetingDateTokenSize])
+	if !ok {
+		return nil
+	}
+	validDateTokens := 0
+	for offset := 0; offset+meetingDateTokenSize <= len(title); offset++ {
+		if _, ok := parseMeetingDateToken(title[offset : offset+meetingDateTokenSize]); ok {
+			validDateTokens++
+		}
+	}
+	if validDateTokens != 1 {
+		return nil
+	}
+	return &meetingDate
+}
+
+func parseMeetingDateToken(token string) (time.Time, bool) {
+	if len(token) != meetingDateTokenSize || token[0] != '[' || token[len(token)-1] != ']' {
+		return time.Time{}, false
+	}
+	value := token[1 : len(token)-1]
+	parsed, err := time.Parse(time.DateOnly, value)
+	if err != nil || parsed.Year() < 1 || parsed.Format(time.DateOnly) != value {
+		return time.Time{}, false
+	}
+	return parsed.UTC(), true
 }
 
 func sanitizedGoogleError(ctx context.Context, operation string, err error) error {

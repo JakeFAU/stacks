@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -227,6 +228,58 @@ func TestPoCSettingsValidateAllowsDefaultAWSCredentialChainForSyncAndAnalyze(t *
 	}
 }
 
+func TestPoCSettingsValidateRejectsSupersededPromptContractsWithUpgradeGuidance(t *testing.T) {
+	tests := []struct {
+		name       string
+		command    Command
+		configure  func(*PoCSettings)
+		wantConfig string
+		wantValue  string
+	}{
+		{
+			name: "sync legacy extraction", command: CommandSync,
+			configure:  func(settings *PoCSettings) { settings.ExtractionPromptVersion = "extract-v1" },
+			wantConfig: ExtractionPromptVersionEnvironmentVariable, wantValue: "extract-v2",
+		},
+		{
+			name: "analyze legacy extraction", command: CommandAnalyze,
+			configure:  func(settings *PoCSettings) { settings.ExtractionPromptVersion = "extract-v1" },
+			wantConfig: ExtractionPromptVersionEnvironmentVariable, wantValue: "extract-v2",
+		},
+		{
+			name: "sync legacy analysis", command: CommandSync,
+			configure:  func(settings *PoCSettings) { settings.AnalysisPromptVersion = "analyze-v0" },
+			wantConfig: AnalysisPromptVersionEnvironmentVariable, wantValue: "analyze-v1",
+		},
+		{
+			name: "analyze legacy analysis", command: CommandAnalyze,
+			configure:  func(settings *PoCSettings) { settings.AnalysisPromptVersion = "analyze-v0" },
+			wantConfig: AnalysisPromptVersionEnvironmentVariable, wantValue: "analyze-v1",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := validPoCSettings()
+			settings.ExtractionPromptVersion = "extract-v2"
+			testCase.configure(&settings)
+
+			err := settings.Validate(testCase.command)
+			if err == nil {
+				t.Fatal("Validate() error = nil, want superseded prompt rejection")
+			}
+			if !strings.Contains(err.Error(), testCase.wantConfig) ||
+				!strings.Contains(err.Error(), testCase.wantValue) ||
+				!strings.Contains(err.Error(), "sync") {
+				t.Fatalf("Validate() error = %q, want bounded config name, current version, and resync guidance", err)
+			}
+			if strings.Contains(err.Error(), "extract-v1") || strings.Contains(err.Error(), "analyze-v0") {
+				t.Fatalf("Validate() error echoed unsupported user-controlled version: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsInvalidOrUnboundedIngestionLeaseDuration(t *testing.T) {
 	for _, value := range []string{"0s", "not-a-duration", "2h"} {
 		t.Run(value, func(t *testing.T) {
@@ -374,7 +427,7 @@ func validPoCSettings() PoCSettings {
 		BedrockMaxAttempts:      5,
 		IngestionLeaseDuration:  defaultIngestionLeaseDuration,
 		IngestionAttemptTimeout: defaultIngestionAttemptTimeout,
-		ExtractionPromptVersion: "extract-v1",
+		ExtractionPromptVersion: "extract-v2",
 		AnalysisPromptVersion:   "analyze-v1",
 		EmployeeEntityID:        "employee-id",
 		ManagerEntityID:         "manager-id",

@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"stacks/internal/extract"
 )
 
 const (
 	defaultBedrockMaxAttempts      = 5
-	defaultExtractionPromptVersion = "extract-v2"
-	defaultAnalysisPromptVersion   = "analyze-v1"
+	defaultExtractionPromptVersion = extract.ExtractionPromptVersion
+	defaultAnalysisPromptVersion   = extract.AnalysisPromptVersion
 	defaultIngestionLeaseDuration  = 5 * time.Minute
 	defaultIngestionAttemptTimeout = 4 * time.Minute
 	maximumIngestionLeaseDuration  = time.Hour
@@ -162,10 +164,21 @@ func (settings PoCSettings) validateModelSettings(command Command) error {
 	if settings.BedrockMaxAttempts <= 0 {
 		return fmt.Errorf("%s must be a positive integer", BedrockMaxAttemptsEnvironmentVariable)
 	}
-	return settings.validateRequired(command,
+	if err := settings.validateRequired(command,
 		ExtractionPromptVersionEnvironmentVariable,
 		AnalysisPromptVersionEnvironmentVariable,
-	)
+	); err != nil {
+		return err
+	}
+	if settings.ExtractionPromptVersion != extract.ExtractionPromptVersion {
+		return fmt.Errorf("%s must be %q; update it and run stacks sync to create current derivations",
+			ExtractionPromptVersionEnvironmentVariable, extract.ExtractionPromptVersion)
+	}
+	if settings.AnalysisPromptVersion != extract.AnalysisPromptVersion {
+		return fmt.Errorf("%s must be %q; update it and run stacks sync before analysis",
+			AnalysisPromptVersionEnvironmentVariable, extract.AnalysisPromptVersion)
+	}
+	return nil
 }
 
 func (settings PoCSettings) validateRequired(command Command, names ...string) error {

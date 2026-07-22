@@ -63,6 +63,74 @@ func TestListQueriesDirectGoogleDocsInExactFolder(t *testing.T) {
 	}
 }
 
+func TestMeetingTimeFromTitleRequiresOneStrictLeadingISODate(t *testing.T) {
+	want := time.Date(2026, time.July, 20, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		title string
+		want  *time.Time
+	}{
+		{name: "strict prefix", title: "[2026-07-20] Synthetic weekly meeting", want: &want},
+		{name: "date elsewhere", title: "Synthetic weekly meeting 2026-07-20"},
+		{name: "deadline-like title", title: "Synthetic deadline [2026-07-20]"},
+		{name: "invalid calendar date", title: "[2026-02-30] Synthetic weekly meeting"},
+		{name: "ambiguous prefixes", title: "[2026-07-20] [2026-07-21] Synthetic weekly meeting"},
+		{name: "missing description", title: "[2026-07-20]"},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := meetingTimeFromTitle(testCase.title)
+			if testCase.want == nil {
+				if got != nil {
+					t.Fatalf("meetingTimeFromTitle() = %v, want unknown", got)
+				}
+				return
+			}
+			if got == nil || !got.Equal(*testCase.want) {
+				t.Fatalf("meetingTimeFromTitle() = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestListDerivesMeetingTimeFromStrictTitleMetadataNotModificationTime(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return jsonResponse(request, `{
+			"files":[{
+				"id":"dated-document",
+				"name":"[2026-07-20] Synthetic weekly meeting",
+				"modifiedTime":"2026-07-22T14:30:00Z",
+				"version":"42"
+			},{
+				"id":"undated-document",
+				"name":"Synthetic weekly meeting 2026-07-21",
+				"modifiedTime":"2026-07-23T14:30:00Z",
+				"version":"43"
+			}]
+		}`), nil
+	})}
+	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+
+	documents, err := client.List(context.Background(), "folder-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(documents) != 2 {
+		t.Fatalf("List() returned %d documents, want 2", len(documents))
+	}
+	wantMeetingTime := time.Date(2026, time.July, 20, 0, 0, 0, 0, time.UTC)
+	if documents[0].MeetingTime == nil || !documents[0].MeetingTime.Equal(wantMeetingTime) {
+		t.Fatalf("dated MeetingTime = %v, want %v", documents[0].MeetingTime, wantMeetingTime)
+	}
+	if documents[0].MeetingTime.Equal(documents[0].ModifiedAt) {
+		t.Fatal("meeting time must not be derived from Drive modification time")
+	}
+	if documents[1].MeetingTime != nil {
+		t.Fatalf("undated MeetingTime = %v, want unknown for non-contract title", documents[1].MeetingTime)
+	}
+}
+
 func TestListFollowsDrivePagination(t *testing.T) {
 	requests := 0
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
