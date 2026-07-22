@@ -116,6 +116,18 @@ func TestServiceRecordsInsufficientEvidenceDecisionWithoutModel(t *testing.T) {
 	}
 }
 
+func TestServicePreservesRetryableStaleInputResult(t *testing.T) {
+	snapshot := acceptedPairSnapshot()
+	snapshot.Signals = snapshot.Signals[:1]
+	repository := &fakeRepository{snapshot: snapshot, completeErr: ErrStaleAnalysisInput}
+	service := testService(repository, &fakeModel{})
+
+	_, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if !errors.Is(err, ErrStaleAnalysisInput) {
+		t.Fatalf("Analyze() error = %v, want retryable stale-input result", err)
+	}
+}
+
 func TestServiceUsesExactOrderedInputDigestAndCachesIdenticalRun(t *testing.T) {
 	repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
 	model := &fakeModel{output: analysisOutput(StatusMixedOrConflicting, []string{"signal-earlier"}, nil)}
@@ -351,6 +363,102 @@ func TestServicePreservesSourceCounterevidenceWhenModelOmitsIt(t *testing.T) {
 	}
 }
 
+func TestServiceUsesModelDesignatedSourceBackedCounterSignalForAdmittedMixedReport(t *testing.T) {
+	snapshot := acceptedPairSnapshot()
+	snapshot.Signals[0].Citations = append(snapshot.Signals[0].Citations, Citation{
+		ID: "signal-earlier-notes", Role: CitationSupporting, Quote: "Synthetic notes evidence.", Transcript: false,
+	})
+	repository := &fakeRepository{snapshot: snapshot}
+	model := &fakeModel{output: analysisOutput(
+		StatusMixedOrConflicting,
+		[]string{"signal-later"},
+		[]string{"signal-earlier"},
+	)}
+	service := testService(repository, model)
+
+	report, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if report.Status != StatusMixedOrConflicting {
+		t.Fatalf("report status = %q, want admitted mixed report", report.Status)
+	}
+	if got := signalIDs(report.Counterevidence); !slices.Equal(got, []string{"signal-earlier"}) {
+		t.Fatalf("counterevidence IDs = %#v, want model-designated transcript-backed counter-signal", got)
+	}
+	if len(report.Counterevidence[0].Citations) != 1 || report.Counterevidence[0].Citations[0].Role != CitationSupporting ||
+		!report.Counterevidence[0].Citations[0].Transcript {
+		t.Fatalf("counter-signal citations = %#v, want its supporting transcript citation", report.Counterevidence[0].Citations)
+	}
+}
+
+func TestServiceUsesModelDesignatedSourceBackedCounterSignalForAdmittedDecline(t *testing.T) {
+	snapshot := acceptedPairSnapshot()
+	counterDate := testMeetingDate(2026, time.June, 20)
+	counter := testSignal("signal-counter", &counterDate, DirectionStrengthening)
+	snapshot.Signals = append(snapshot.Signals, counter)
+	snapshot.Inputs = append(snapshot.Inputs, counter.Inputs...)
+	repository := &fakeRepository{snapshot: snapshot}
+	model := &fakeModel{output: analysisOutput(
+		StatusPossibleDecline,
+		[]string{"signal-earlier", "signal-later"},
+		[]string{"signal-counter"},
+	)}
+	service := testService(repository, model)
+
+	report, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if report.Status != StatusPossibleDecline {
+		t.Fatalf("report status = %q, want admitted decline", report.Status)
+	}
+	if got := signalIDs(report.Counterevidence); !slices.Equal(got, []string{"signal-counter"}) {
+		t.Fatalf("counterevidence IDs = %#v, want admitted strengthening counter-signal", got)
+	}
+}
+
+func TestServiceDeduplicatesModelDesignatedAndExplicitCounterevidence(t *testing.T) {
+	snapshot := acceptedPairSnapshot()
+	explicit := Citation{
+		ID: "signal-earlier-explicit-counter", Role: CitationContradicting, Quote: "Synthetic explicit counterevidence.",
+	}
+	snapshot.Signals[0].Citations = append(snapshot.Signals[0].Citations, explicit, explicit)
+	repository := &fakeRepository{snapshot: snapshot}
+	model := &fakeModel{output: analysisOutput(
+		StatusMixedOrConflicting,
+		[]string{"signal-later"},
+		[]string{"signal-earlier"},
+	)}
+	service := testService(repository, model)
+
+	report, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if got := signalIDs(report.Counterevidence); !slices.Equal(got, []string{"signal-earlier"}) {
+		t.Fatalf("counterevidence IDs = %#v, want one deduplicated signal", got)
+	}
+	if got := len(report.Counterevidence[0].Citations); got != 2 {
+		t.Fatalf("counterevidence citation count = %d, want supporting plus explicit contradicting citation", got)
+	}
+}
+
+func TestServiceRejectsUnknownModelContradictingSignalID(t *testing.T) {
+	repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
+	model := &fakeModel{output: analysisOutput(
+		StatusMixedOrConflicting,
+		[]string{"signal-later"},
+		[]string{"signal-unknown"},
+	)}
+	service := testService(repository, model)
+
+	_, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if !errors.Is(err, ErrInvalidModelOutput) {
+		t.Fatalf("Analyze() error = %v, want ErrInvalidModelOutput", err)
+	}
+}
+
 func TestServiceRejectsAnalysisOutputMissingRequiredArrays(t *testing.T) {
 	repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
 	model := &fakeModel{output: json.RawMessage(`{"conclusion":"mixed or conflicting signals","rationale":"Synthetic rationale."}`)}
@@ -443,6 +551,12 @@ func TestComputeInputDigestAllowsPairIdentityWithoutSignalInputs(t *testing.T) {
 	}
 }
 
+func TestAnalysisPolicyVersionChangesForCounterevidenceSemantics(t *testing.T) {
+	if AnalysisPolicyVersion != "manager-confidence-policy-v3" {
+		t.Fatalf("AnalysisPolicyVersion = %q, want cache-invalidating counterevidence policy version", AnalysisPolicyVersion)
+	}
+}
+
 const (
 	testEmployeeID           = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	testManagerID            = "11111111-2222-3333-4444-555555555555"
@@ -493,7 +607,7 @@ func testSignal(id string, validTime *time.Time, direction Direction) Signal {
 		Citations: []Citation{{
 			ID: id + "-citation", ProviderDocumentID: id + "-document-provider",
 			ProviderTabID: id + "-tab-provider", StartOffset: 4, EndOffset: 13,
-			Quote: "Synthetic", Role: CitationSupporting,
+			Quote: "Synthetic", Role: CitationSupporting, Transcript: true,
 		}},
 	}
 }
@@ -535,6 +649,7 @@ type fakeRepository struct {
 	completed     Completion
 	history       []Completion
 	completeCalls int
+	completeErr   error
 }
 
 func (repository *fakeRepository) LoadPairInputs(context.Context, string, string) (PairSnapshot, error) {
@@ -550,6 +665,9 @@ func (repository *fakeRepository) FindCompleted(_ context.Context, digest [sha25
 
 func (repository *fakeRepository) CompleteAnalysis(_ context.Context, completion Completion) (Report, error) {
 	repository.completeCalls++
+	if repository.completeErr != nil {
+		return Report{}, repository.completeErr
+	}
 	completion.Report.ID = "run-" + completion.Identity.InputDigestString()
 	completion.Report.InputDigest = completion.Identity.InputDigest
 	repository.completed = completion

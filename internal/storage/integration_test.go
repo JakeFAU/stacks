@@ -422,7 +422,7 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	if acceptedIdentity.InputDigest == emptyIdentity.InputDigest {
 		t.Fatal("later accepted signals reused the accepted-empty pair identity")
 	}
-	acceptedReport, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
+	acceptedCompletion := analysisdomain.Completion{
 		Identity: acceptedIdentity,
 		Report: analysisdomain.Report{
 			Status: analysisdomain.StatusMixedOrConflicting, Rationale: "Synthetic bounded report.",
@@ -430,13 +430,16 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 			ModelID: "synthetic-model", Region: "us-east-1", MaxTokens: 256,
 			PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
 		},
-	})
+	}
+	acceptedReport, err := repository.CompleteAnalysis(ctx, acceptedCompletion)
 	if err != nil {
 		t.Fatalf("complete accepted pair analysis: %v", err)
 	}
-
 	if _, err := entities.CorrectDecision(ctx, firstManagerDecision.ID, ResolutionDecisionInput{Outcome: ResolutionOutcomeAccepted, EntityID: replacement.ID}); err != nil {
-		t.Fatalf("correct first manager identity: %v", err)
+		t.Fatalf("correct first manager mention between load and completion: %v", err)
+	}
+	if _, err := repository.CompleteAnalysis(ctx, acceptedCompletion); !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) {
+		t.Fatalf("complete stale pair analysis error = %v, want retryable stale-input error", err)
 	}
 	corrected, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
 	if err != nil {
@@ -482,9 +485,10 @@ func acceptSyntheticIdentity(t *testing.T, pool *pgxpool.Pool, entityID string) 
 	if err != nil {
 		t.Fatalf("create synthetic identity proposal: %v", err)
 	}
-	if _, err := repository.RecordDecision(context.Background(), ResolutionDecisionInput{
+	_, err = repository.RecordDecision(context.Background(), ResolutionDecisionInput{
 		ProposalID: proposal.ID, Outcome: ResolutionOutcomeAccepted, EntityID: entityID,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("accept synthetic identity: %v", err)
 	}
 }

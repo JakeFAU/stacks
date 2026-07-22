@@ -26,7 +26,7 @@ import (
 const (
 	// AnalysisPolicyVersion changes whenever deterministic admission semantics
 	// change, ensuring old completed runs remain distinguishable.
-	AnalysisPolicyVersion = "manager-confidence-policy-v2"
+	AnalysisPolicyVersion = "manager-confidence-policy-v3"
 	analysisSpanName      = "stacks.analysis.pair"
 	analysisDecisionName  = "pair_analysis"
 	temporalDigestScope   = "stacks.temporal-pair-analysis.v1"
@@ -38,6 +38,10 @@ var (
 	// ErrInvalidModelOutput is deliberately bounded because raw model output can
 	// contain private source-derived material.
 	ErrInvalidModelOutput = errors.New("analysis model output is invalid")
+	// ErrStaleAnalysisInput indicates that an accepted identity decision changed
+	// after analysis inputs were loaded. Callers may safely retry from a fresh
+	// pair snapshot.
+	ErrStaleAnalysisInput = errors.New("analysis inputs are stale; retry with a fresh snapshot")
 )
 
 // InputKind is a durable provenance class included in completed-run identity.
@@ -199,7 +203,11 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 		SupportingSignalIDs: proposal.SupportingSignalIDs,
 	})
 	applyAdmittedProposal(&report, proposal)
-	report.Counterevidence = collectSourceCounterevidence(eligible)
+	if report.Status == proposal.Conclusion {
+		report.Counterevidence = collectAdmittedCounterevidence(eligible, proposal.ContradictingSignalIDs)
+	} else {
+		report.Counterevidence = collectSourceCounterevidence(eligible)
+	}
 	report.ModelID = response.ModelID
 	report.RecordedAt = service.now()
 	service.recordDecision(ctx, report.Status, len(chronology.Dated), len(proposal.SupportingSignalIDs), service.now().Sub(started))
@@ -347,39 +355,62 @@ func eligibleSignals(signals []Signal) []Signal {
 	return eligible
 }
 
-func signalsByID(signals []Signal, ids []string) []Signal {
-	byID := make(map[string]Signal, len(signals))
-	for _, signal := range signals {
-		byID[signal.ID] = signal
-	}
-	selected := make([]Signal, 0, len(ids))
-	for _, id := range ids {
-		selected = append(selected, byID[id])
-	}
-	return selected
+func collectSourceCounterevidence(signals []Signal) []Signal {
+	return collectCounterevidence(signals, nil)
 }
 
-func collectSourceCounterevidence(signals []Signal) []Signal {
-	selected := make(map[string]struct{}, len(signals))
-	for _, signal := range signals {
-		if hasContradictingCitation(signal) {
-			selected[signal.ID] = struct{}{}
-		}
+func collectAdmittedCounterevidence(signals []Signal, modelIDs []string) []Signal {
+	selectedByModel := make(map[string]struct{}, len(modelIDs))
+	for _, id := range modelIDs {
+		selectedByModel[id] = struct{}{}
 	}
-	ids := make([]string, 0, len(selected))
+	return collectCounterevidence(signals, selectedByModel)
+}
+
+func collectCounterevidence(signals []Signal, selectedByModel map[string]struct{}) []Signal {
 	chronology := OrderSignals(signals)
-	for _, signal := range chronology.Dated {
-		if _, exists := selected[signal.ID]; exists {
-			ids = append(ids, signal.ID)
-			delete(selected, signal.ID)
+	ordered := append(append([]Signal(nil), chronology.Dated...), chronology.UnknownTime...)
+	result := make([]Signal, 0, len(ordered))
+	for _, signal := range ordered {
+		_, modelSelected := selectedByModel[signal.ID]
+		modelSelected = modelSelected && hasSupportingCitation(signal)
+		hasExplicit := hasContradictingCitation(signal)
+		if !modelSelected && !hasExplicit {
+			continue
+		}
+		filtered := signal
+		filtered.Citations = relevantCounterevidenceCitations(signal.Citations, modelSelected)
+		if len(filtered.Citations) != 0 {
+			result = append(result, filtered)
 		}
 	}
-	for _, signal := range chronology.UnknownTime {
-		if _, exists := selected[signal.ID]; exists {
-			ids = append(ids, signal.ID)
+	return result
+}
+
+func relevantCounterevidenceCitations(citations []Citation, includeSupporting bool) []Citation {
+	result := make([]Citation, 0, len(citations))
+	seen := make(map[string]struct{}, len(citations))
+	for _, citation := range citations {
+		if citation.Role != CitationContradicting && (!includeSupporting || citation.Role != CitationSupporting || !citation.Transcript) {
+			continue
+		}
+		key := citation.ID + "\x00" + string(citation.Role)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, citation)
+	}
+	return result
+}
+
+func hasSupportingCitation(signal Signal) bool {
+	for _, citation := range signal.Citations {
+		if citation.Role == CitationSupporting && citation.Transcript {
+			return true
 		}
 	}
-	return signalsByID(signals, ids)
+	return false
 }
 
 func hasContradictingCitation(signal Signal) bool {

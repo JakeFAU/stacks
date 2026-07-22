@@ -74,6 +74,7 @@ type Citation struct {
 	Quote              string
 	Locator            string
 	Role               CitationRole
+	Transcript         bool
 }
 
 // Chronology keeps genuinely unknown source time out of the dated sequence.

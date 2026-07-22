@@ -62,7 +62,8 @@ type AnalysisRun struct {
 // AnalysisRepository owns transactions that complete an analysis run and its
 // input identity together.
 type AnalysisRepository struct {
-	pool *pgxpool.Pool
+	pool          *pgxpool.Pool
+	beginSnapshot func(context.Context, pgx.TxOptions) (analysisSnapshot, error)
 }
 
 type effectivePairDecision struct {
@@ -70,18 +71,39 @@ type effectivePairDecision struct {
 	Input    analysisdomain.InputReference
 }
 
+type analysisSnapshot interface {
+	LoadPairIdentity(context.Context, string, string) (analysisdomain.PairSnapshot, error)
+	LoadPairSignals(context.Context, string, string, analysisdomain.PairSnapshot) (analysisdomain.PairSnapshot, error)
+	Commit(context.Context) error
+	Rollback(context.Context) error
+}
+
+type postgresAnalysisSnapshot struct {
+	transaction pgx.Tx
+}
+
 var _ analysisdomain.Repository = (*AnalysisRepository)(nil)
 
 // NewAnalysisRepository creates an analysis repository backed by pool.
 func NewAnalysisRepository(pool *pgxpool.Pool) *AnalysisRepository {
-	return &AnalysisRepository{pool: pool}
+	repository := &AnalysisRepository{pool: pool}
+	if pool != nil {
+		repository.beginSnapshot = func(ctx context.Context, options pgx.TxOptions) (analysisSnapshot, error) {
+			transaction, err := pool.BeginTx(ctx, options)
+			if err != nil {
+				return nil, err
+			}
+			return &postgresAnalysisSnapshot{transaction: transaction}, nil
+		}
+	}
+	return repository
 }
 
 // LoadPairInputs resolves observation mention links through only the current
 // effective accepted decisions. Pending guesses never become eligible, and a
 // correction changes eligibility without rewriting the immutable observation.
 func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employeeID, managerID string) (analysisdomain.PairSnapshot, error) {
-	if repository == nil || repository.pool == nil {
+	if repository == nil || repository.beginSnapshot == nil {
 		return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: repository is not configured")
 	}
 	employeeID, err := canonicalUUID(employeeID)
@@ -92,7 +114,31 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 	if err != nil || employeeID == managerID {
 		return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: manager entity ID is invalid")
 	}
-	decisionRows, err := repository.pool.Query(ctx, `
+	transaction, err := repository.beginSnapshot(ctx, pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return analysisdomain.PairSnapshot{}, boundedAnalysisError("start pair analysis snapshot", err)
+	}
+	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
+	snapshot, err := transaction.LoadPairIdentity(ctx, employeeID, managerID)
+	if err != nil {
+		return analysisdomain.PairSnapshot{}, boundedAnalysisError("load pair identity snapshot", err)
+	}
+	if snapshot.Accepted {
+		snapshot, err = transaction.LoadPairSignals(ctx, employeeID, managerID, snapshot)
+		if err != nil {
+			return analysisdomain.PairSnapshot{}, boundedAnalysisError("load pair analysis signals", err)
+		}
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		return analysisdomain.PairSnapshot{}, boundedAnalysisError("commit pair analysis snapshot", err)
+	}
+	return snapshot, nil
+}
+
+func (snapshot *postgresAnalysisSnapshot) LoadPairIdentity(ctx context.Context, employeeID, managerID string) (analysisdomain.PairSnapshot, error) {
+	decisionRows, err := snapshot.transaction.Query(ctx, `
 		SELECT decision.entity_id::text, decision.id::text, decision.digest
 		FROM stacks.resolution_decisions AS decision
 		JOIN stacks.entities AS entity ON entity.id = decision.entity_id
@@ -125,15 +171,15 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 		return analysisdomain.PairSnapshot{}, fmt.Errorf("iterate configured pair identity decisions: %w", err)
 	}
 	decisionRows.Close()
-	snapshot, err := pairIdentitySnapshot(employeeID, managerID, decisions)
+	pair, err := pairIdentitySnapshot(employeeID, managerID, decisions)
 	if err != nil {
 		return analysisdomain.PairSnapshot{}, err
 	}
-	if !snapshot.Accepted {
-		return snapshot, nil
-	}
+	return pair, nil
+}
 
-	rows, err := repository.pool.Query(ctx, `
+func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, employeeID, managerID string, pair analysisdomain.PairSnapshot) (analysisdomain.PairSnapshot, error) {
+	rows, err := snapshot.transaction.Query(ctx, `
 		WITH effective_decisions AS (
 			SELECT proposal.mention_id, decision.id, decision.entity_id, decision.digest
 			FROM stacks.resolution_proposals AS proposal
@@ -149,9 +195,9 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 			       signal.confidence,
 			       observation.id AS observation_id,
 			       observation.digest AS observation_digest,
-				       observation.valid_start,
-				       observation.recorded_at,
-				       (
+			       observation.valid_start,
+			       observation.recorded_at,
+			       (
 					SELECT supporting_version.source_document_id
 					FROM stacks.signal_evidence AS supporting
 					JOIN stacks.evidence_spans AS supporting_span ON supporting_span.id = supporting.evidence_span_id
@@ -162,7 +208,7 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 					  AND supporting_tab.role = 'transcript'
 					ORDER BY supporting_version.source_document_id
 					LIMIT 1
-				       ) AS meeting_id,
+			       ) AS meeting_id,
 			       subject_decision.id AS subject_decision_id,
 			       subject_decision.digest AS subject_decision_digest,
 			       object_decision.id AS object_decision_id,
@@ -170,10 +216,10 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 			FROM stacks.interaction_signals AS signal
 			JOIN stacks.observations AS observation ON observation.id = signal.observation_id
 			JOIN effective_decisions AS subject_decision ON subject_decision.mention_id = observation.subject_mention_id
-				JOIN effective_decisions AS object_decision ON object_decision.mention_id = observation.object_mention_id
-				WHERE subject_decision.entity_id = $2::uuid
-				  AND object_decision.entity_id = $1::uuid
-				  AND EXISTS (
+			JOIN effective_decisions AS object_decision ON object_decision.mention_id = observation.object_mention_id
+			WHERE subject_decision.entity_id = $2::uuid
+			  AND object_decision.entity_id = $1::uuid
+			  AND EXISTS (
 					SELECT 1
 					FROM stacks.signal_evidence AS supporting
 					JOIN stacks.evidence_spans AS supporting_span ON supporting_span.id = supporting.evidence_span_id
@@ -181,8 +227,8 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 					WHERE supporting.signal_id = signal.id
 					  AND supporting.role = 'supporting'
 					  AND supporting_tab.role = 'transcript'
-				  )
-				  AND 1 = (
+			  )
+			  AND 1 = (
 					SELECT count(DISTINCT supporting_version.source_document_id)
 					FROM stacks.signal_evidence AS supporting
 					JOIN stacks.evidence_spans AS supporting_span ON supporting_span.id = supporting.evidence_span_id
@@ -191,7 +237,7 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 					WHERE supporting.signal_id = signal.id
 					  AND supporting.role = 'supporting'
 					  AND supporting_tab.role = 'transcript'
-				  )
+			  )
 			)
 		SELECT eligible.signal_id::text,
 		       eligible.signal_digest,
@@ -202,8 +248,8 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 		       eligible.observation_id::text,
 		       eligible.observation_digest,
 		       eligible.valid_start,
-			       eligible.recorded_at,
-			       eligible.meeting_id::text,
+		       eligible.recorded_at,
+		       eligible.meeting_id::text,
 		       eligible.subject_decision_id::text,
 		       eligible.subject_decision_digest,
 		       eligible.object_decision_id::text,
@@ -215,6 +261,7 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 		       document.provider,
 		       document.provider_document_id,
 		       tab.provider_tab_id,
+		       tab.role,
 		       evidence.id::text,
 		       evidence.start_offset,
 		       evidence.end_offset,
@@ -236,7 +283,7 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 	defer rows.Close()
 
 	inputSeen := make(map[string]struct{})
-	for _, input := range snapshot.Inputs {
+	for _, input := range pair.Inputs {
 		inputSeen[string(input.Kind)+"\x00"+input.ID] = struct{}{}
 	}
 	var current *analysisdomain.Signal
@@ -246,6 +293,7 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 			subjectDecisionID, objectDecisionID                     string
 			documentVersionID, documentTabID                        string
 			meetingID, provider, providerDocumentID, providerTabID  string
+			tabRole                                                 string
 			evidenceID, quote, evidenceRole                         string
 			signalDigest, observationDigest                         []byte
 			subjectDecisionDigest, objectDecisionDigest             []byte
@@ -261,7 +309,7 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 			&meetingID,
 			&subjectDecisionID, &subjectDecisionDigest, &objectDecisionID, &objectDecisionDigest,
 			&documentVersionID, &documentDigest, &documentTabID, &tabDigest,
-			&provider, &providerDocumentID, &providerTabID, &evidenceID,
+			&provider, &providerDocumentID, &providerTabID, &tabRole, &evidenceID,
 			&startOffset, &endOffset, &quote, &evidenceRole,
 		); err != nil {
 			return analysisdomain.PairSnapshot{}, fmt.Errorf("scan pair analysis signal: %w", err)
@@ -281,33 +329,54 @@ func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employ
 			if err != nil {
 				return analysisdomain.PairSnapshot{}, err
 			}
-			snapshot.Signals = append(snapshot.Signals, analysisdomain.Signal{
+			pair.Signals = append(pair.Signals, analysisdomain.Signal{
 				ID: signalID, MeetingID: meetingInput.ID, ObservationID: observationID,
 				Category: analysisdomain.Category(category), Direction: analysisdomain.Direction(direction),
 				ValidTime: validTime, RecordedAt: recordedAt.UTC(), Rationale: rationale,
 				Confidence: confidence, Validated: true, TranscriptBacked: true,
 				Inputs: signalInputRefs,
 			})
-			current = &snapshot.Signals[len(snapshot.Signals)-1]
+			current = &pair.Signals[len(pair.Signals)-1]
 			for _, input := range signalInputRefs {
-				appendAnalysisInput(&snapshot.Inputs, inputSeen, input)
+				appendAnalysisInput(&pair.Inputs, inputSeen, input)
 			}
 		}
 		documentInput := analysisdomain.InputReference{Kind: analysisdomain.InputDocumentVersion, ID: documentVersionID, Digest: digestArray(documentDigest)}
 		tabInput := analysisdomain.InputReference{Kind: analysisdomain.InputDocumentTab, ID: documentTabID, Digest: digestArray(tabDigest)}
 		current.Inputs = appendUniqueInput(current.Inputs, documentInput, tabInput)
-		appendAnalysisInput(&snapshot.Inputs, inputSeen, documentInput)
-		appendAnalysisInput(&snapshot.Inputs, inputSeen, tabInput)
+		appendAnalysisInput(&pair.Inputs, inputSeen, documentInput)
+		appendAnalysisInput(&pair.Inputs, inputSeen, tabInput)
 		current.Citations = append(current.Citations, analysisdomain.Citation{
 			ID: evidenceID, ProviderDocumentID: providerDocumentID, ProviderTabID: providerTabID,
 			StartOffset: startOffset, EndOffset: endOffset, Quote: quote,
-			Role: analysisdomain.CitationRole(evidenceRole), Locator: driveTabLocator(provider, providerDocumentID, providerTabID),
+			Role: analysisdomain.CitationRole(evidenceRole), Transcript: tabRole == "transcript",
+			Locator: driveTabLocator(provider, providerDocumentID, providerTabID),
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return analysisdomain.PairSnapshot{}, fmt.Errorf("iterate pair analysis signals: %w", err)
 	}
-	return snapshot, nil
+	return pair, nil
+}
+
+func (snapshot *postgresAnalysisSnapshot) Commit(ctx context.Context) error {
+	return snapshot.transaction.Commit(ctx)
+}
+
+func (snapshot *postgresAnalysisSnapshot) Rollback(ctx context.Context) error {
+	return snapshot.transaction.Rollback(ctx)
+}
+
+type boundedAnalysisOperationError struct {
+	operation string
+	cause     error
+}
+
+func (err boundedAnalysisOperationError) Error() string { return err.operation }
+func (err boundedAnalysisOperationError) Unwrap() error { return err.cause }
+
+func boundedAnalysisError(operation string, cause error) error {
+	return boundedAnalysisOperationError{operation: operation, cause: cause}
 }
 
 func pairIdentitySnapshot(employeeID, managerID string, decisions []effectivePairDecision) (analysisdomain.PairSnapshot, error) {
@@ -367,7 +436,13 @@ func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, comp
 		return analysisdomain.Report{}, fmt.Errorf("start pair analysis transaction: %w", err)
 	}
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
+	if err := validateEffectivePairDecisions(ctx, transaction, completion.Identity); err != nil {
+		return analysisdomain.Report{}, err
+	}
 	for position, input := range completion.Identity.Inputs {
+		if input.Kind == analysisdomain.InputResolutionDecision {
+			continue
+		}
 		if err := validatePersistedDomainAnalysisInput(ctx, transaction, input); err != nil {
 			return analysisdomain.Report{}, fmt.Errorf("validate analysis input %d: %w", position, err)
 		}
@@ -645,6 +720,47 @@ func meetingInputReference(sourceDocumentID string) (analysisdomain.InputReferen
 
 type completedAnalysisQueryer interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalysisQueryer, identity analysisdomain.AnalysisIdentity) error {
+	employeeID, err := canonicalUUID(identity.EmployeeEntityID)
+	if err != nil {
+		return fmt.Errorf("validate current resolution decisions: configured pair is invalid")
+	}
+	managerID, err := canonicalUUID(identity.ManagerEntityID)
+	if err != nil || employeeID == managerID {
+		return fmt.Errorf("validate current resolution decisions: configured pair is invalid")
+	}
+	var employeeAccepted, managerAccepted bool
+	for _, input := range identity.Inputs {
+		if input.Kind != analysisdomain.InputResolutionDecision {
+			continue
+		}
+		var storedDigest []byte
+		var entityID string
+		err := queryer.QueryRow(ctx, `
+			SELECT digest, entity_id::text
+			FROM stacks.resolution_decisions
+			WHERE id = $1
+			  AND superseded_by_id IS NULL
+			  AND outcome IN ('accepted', 'created')
+			FOR SHARE`, input.ID).Scan(&storedDigest, &entityID)
+		if err == pgx.ErrNoRows {
+			return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)
+		}
+		if err != nil {
+			return boundedAnalysisError("validate current resolution decisions", err)
+		}
+		if string(storedDigest) != string(input.Digest[:]) || (entityID != employeeID && entityID != managerID) {
+			return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)
+		}
+		employeeAccepted = employeeAccepted || entityID == employeeID
+		managerAccepted = managerAccepted || entityID == managerID
+	}
+	if !employeeAccepted || !managerAccepted {
+		return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)
+	}
+	return nil
 }
 
 func findCompletedAnalysis(ctx context.Context, queryer completedAnalysisQueryer, digest [sha256.Size]byte) (analysisdomain.Report, bool, error) {
