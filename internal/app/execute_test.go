@@ -63,3 +63,27 @@ func TestExecuteRoutesEntityAndReviewCommandsWithRemainingArguments(t *testing.T
 		})
 	}
 }
+
+func TestExecuteRoutesGoogleAuthWithRemainingArguments(t *testing.T) {
+	settings := config.Settings{PoC: config.PoCSettings{
+		GoogleOAuthClientFile: "/synthetic/client.json",
+		GoogleOAuthTokenFile:  "/synthetic/token.json",
+	}}
+	var gotArgs []string
+	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+		return map[string]cli.Command{"auth": cli.CommandFunc(func(_ context.Context, args []string) error {
+			gotArgs = append([]string(nil), args...)
+			return nil
+		})}, nil
+	})
+
+	err := Execute(context.Background(), []string{"auth", "google"}, settings,
+		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
+		provider, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !reflect.DeepEqual(gotArgs, []string{"google"}) {
+		t.Fatalf("auth command args = %#v, want %#v", gotArgs, []string{"google"})
+	}
+}

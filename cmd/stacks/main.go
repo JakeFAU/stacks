@@ -14,6 +14,7 @@ import (
 	"stacks/internal/cli"
 	"stacks/internal/config"
 	"stacks/internal/observability"
+	"stacks/internal/source/drive"
 	"stacks/internal/storage"
 )
 
@@ -48,7 +49,7 @@ func main() {
 		app.RuntimeFunc(func(ctx context.Context, settings config.Settings) error {
 			return app.Run(ctx, settings, logger, runtime.TracerProvider(), runtime.MeterProvider())
 		}),
-		app.CommandProviderFunc(reviewCommandProvider),
+		app.CommandProviderFunc(pocCommandProvider),
 		os.Stdout,
 		os.Stderr,
 	)
@@ -66,8 +67,13 @@ func main() {
 	}
 }
 
-func reviewCommandProvider(_ context.Context, settings config.Settings, stdout, _ io.Writer) (map[string]cli.Command, error) {
+func pocCommandProvider(_ context.Context, settings config.Settings, stdout, _ io.Writer) (map[string]cli.Command, error) {
 	return map[string]cli.Command{
+		string(config.CommandAuth): cli.AuthCommand{Google: drive.NewAuthorizer(
+			settings.PoC.GoogleOAuthClientFile,
+			settings.PoC.GoogleOAuthTokenFile,
+			stdout,
+		)},
 		string(config.CommandEntities): cli.CommandFunc(func(ctx context.Context, args []string) error {
 			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
 			if err != nil {
