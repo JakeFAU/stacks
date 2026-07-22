@@ -37,6 +37,7 @@ type Settings struct {
 	ReadHeaderTimeout time.Duration
 	LogLevel          string
 	Telemetry         TelemetrySettings
+	PoC               PoCSettings
 }
 
 // TelemetrySettings controls OTLP export. Telemetry remains optional so the
@@ -96,6 +97,38 @@ func Load() (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
+	bedrockMaxTokens, err := optionalPositiveIntegerEnvironment(BedrockMaxTokensEnvironmentVariable)
+	if err != nil {
+		return Settings{}, err
+	}
+	bedrockMaxAttempts, err := positiveIntegerEnvironment(
+		BedrockMaxAttemptsEnvironmentVariable,
+		defaultBedrockMaxAttempts,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+	ingestionLeaseDuration, err := durationEnvironment(
+		IngestionLeaseDurationEnvironmentVariable,
+		defaultIngestionLeaseDuration,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+	if ingestionLeaseDuration > maximumIngestionLeaseDuration {
+		return Settings{}, fmt.Errorf("%s must be no greater than %s", IngestionLeaseDurationEnvironmentVariable, maximumIngestionLeaseDuration)
+	}
+	ingestionAttemptTimeout, err := durationEnvironment(
+		IngestionAttemptTimeoutEnvironmentVariable,
+		defaultIngestionAttemptTimeout,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+	if ingestionAttemptTimeout > ingestionLeaseDuration-minimumLeaseCleanupMargin {
+		return Settings{}, fmt.Errorf("%s must leave at least %s before %s expires",
+			IngestionAttemptTimeoutEnvironmentVariable, minimumLeaseCleanupMargin, IngestionLeaseDurationEnvironmentVariable)
+	}
 
 	return Settings{
 		HTTPAddress:       net.JoinHostPort(host, strconv.Itoa(port)),
@@ -108,6 +141,25 @@ func Load() (Settings, error) {
 			MetricExportInterval: metricExportInterval,
 			ServiceName:          environmentOrDefault(OTelServiceNameEnvironmentVariable, defaultOTelServiceName),
 			TraceSampleRatio:     traceSampleRatio,
+		},
+		PoC: PoCSettings{
+			DatabaseURL:             os.Getenv(DatabaseURLEnvironmentVariable),
+			GoogleFolderID:          os.Getenv(GoogleFolderIDEnvironmentVariable),
+			GoogleOAuthClientFile:   os.Getenv(GoogleOAuthClientFileEnvironmentVariable),
+			GoogleOAuthTokenFile:    os.Getenv(GoogleOAuthTokenFileEnvironmentVariable),
+			TranscriptTitles:        titleSetEnvironment(TranscriptTitlesEnvironmentVariable),
+			NotesTitles:             titleSetEnvironment(NotesTitlesEnvironmentVariable),
+			AWSProfile:              os.Getenv(AWSProfileEnvironmentVariable),
+			AWSRegion:               os.Getenv(AWSRegionEnvironmentVariable),
+			BedrockModelID:          os.Getenv(BedrockModelIDEnvironmentVariable),
+			BedrockMaxTokens:        bedrockMaxTokens,
+			BedrockMaxAttempts:      bedrockMaxAttempts,
+			IngestionLeaseDuration:  ingestionLeaseDuration,
+			IngestionAttemptTimeout: ingestionAttemptTimeout,
+			ExtractionPromptVersion: environmentOrDefault(ExtractionPromptVersionEnvironmentVariable, defaultExtractionPromptVersion),
+			AnalysisPromptVersion:   environmentOrDefault(AnalysisPromptVersionEnvironmentVariable, defaultAnalysisPromptVersion),
+			EmployeeEntityID:        os.Getenv(EmployeeEntityIDEnvironmentVariable),
+			ManagerEntityID:         os.Getenv(ManagerEntityIDEnvironmentVariable),
 		},
 	}, nil
 }
@@ -130,6 +182,29 @@ func positiveIntegerEnvironment(name string, fallback int) (int, error) {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return parsed, nil
+}
+
+func optionalPositiveIntegerEnvironment(name string) (int, error) {
+	if os.Getenv(name) == "" {
+		return 0, nil
+	}
+	return positiveIntegerEnvironment(name, 0)
+}
+
+func titleSetEnvironment(name string) []string {
+	value := os.Getenv(name)
+	if value == "" {
+		return nil
+	}
+
+	parts := strings.Split(value, ",")
+	titles := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if title := strings.TrimSpace(part); title != "" {
+			titles = append(titles, title)
+		}
+	}
+	return titles
 }
 
 func booleanEnvironment(name string, fallback bool) (bool, error) {

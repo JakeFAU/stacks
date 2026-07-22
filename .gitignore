@@ -27,5 +27,7 @@ go.work.sum
 .idea/
 .vscode/
 
-# Worktree
-./worktrees/
+# Local linked worktrees and agent workflow state
+/.worktrees/
+/worktrees/
+/.superpowers/
