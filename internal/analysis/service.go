@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"stacks/internal/extract"
+	"stacks/internal/modelpolicy"
 	"stacks/internal/observability"
 )
 
@@ -30,6 +31,7 @@ const (
 	analysisSpanName      = "stacks.analysis.pair"
 	analysisDecisionName  = "pair_analysis"
 	temporalDigestScope   = "stacks.temporal-pair-analysis.v1"
+	providerDigestScope   = "stacks.pair-analysis-input.v2.provider"
 )
 
 var (
@@ -76,6 +78,7 @@ type AnalysisIdentity struct {
 	ManagerEntityID  string
 	PromptVersion    string
 	PolicyVersion    string
+	Provider         modelpolicy.Provider
 	Region           string
 	ModelID          string
 	MaxTokens        int
@@ -112,6 +115,7 @@ type Report struct {
 type Completion struct {
 	Identity AnalysisIdentity
 	Report   Report
+	DataMode modelpolicy.DataMode
 }
 
 // Repository retrieves eligible pair inputs, validates cache identities, and
@@ -132,6 +136,8 @@ type Service struct {
 	Repository    Repository
 	Model         extract.Model
 	PromptVersion string
+	Provider      modelpolicy.Provider
+	DataMode      modelpolicy.DataMode
 	Region        string
 	ModelID       string
 	MaxTokens     int
@@ -175,6 +181,7 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 		ManagerEntityID:  strings.TrimSpace(managerID),
 		PromptVersion:    service.PromptVersion,
 		PolicyVersion:    AnalysisPolicyVersion,
+		Provider:         service.Provider,
 		Region:           service.Region,
 		ModelID:          service.ModelID,
 		MaxTokens:        service.MaxTokens,
@@ -197,7 +204,7 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 		report.Rationale = "At least two distinct dated meetings are required before a directional comparison can be synthesized."
 		report.Gaps = append(report.Gaps, "Fewer than two distinct meetings have known source-valid dates.")
 		service.recordDecision(ctx, report.Status, len(chronology.Dated), 0, service.now().Sub(started))
-		return service.complete(ctx, identity, report, service.now())
+		return service.complete(ctx, identity, report, service.now(), "")
 	}
 
 	proposal, response, err := service.synthesize(ctx, chronology.Dated)
@@ -217,7 +224,7 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 	report.ModelID = response.ModelID
 	report.RecordedAt = service.now()
 	service.recordDecision(ctx, report.Status, len(chronology.Dated), len(proposal.SupportingSignalIDs), service.now().Sub(started))
-	return service.complete(ctx, identity, report, report.RecordedAt)
+	return service.complete(ctx, identity, report, report.RecordedAt, service.DataMode)
 }
 
 func (service *Service) baseReport(chronology Chronology) Report {
@@ -456,8 +463,15 @@ func validDirection(direction Direction) bool {
 func ComputeInputDigest(identity AnalysisIdentity) ([sha256.Size]byte, error) {
 	if strings.TrimSpace(identity.EmployeeEntityID) == "" || strings.TrimSpace(identity.ManagerEntityID) == "" ||
 		strings.TrimSpace(identity.PromptVersion) == "" || strings.TrimSpace(identity.PolicyVersion) == "" ||
-		strings.TrimSpace(identity.Region) == "" || strings.TrimSpace(identity.ModelID) == "" || identity.MaxTokens <= 0 {
+		strings.TrimSpace(identity.ModelID) == "" || identity.MaxTokens <= 0 {
 		return [sha256.Size]byte{}, fmt.Errorf("analysis identity fields are required")
+	}
+	if err := (modelpolicy.Invocation{
+		Provider: identity.Provider,
+		DataMode: modelpolicy.DataModePersonal,
+		Region:   identity.Region,
+	}).Validate(); err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("analysis identity provider policy is invalid")
 	}
 	employeeID, err := uuid.Parse(strings.TrimSpace(identity.EmployeeEntityID))
 	if err != nil {
@@ -468,12 +482,19 @@ func ComputeInputDigest(identity AnalysisIdentity) ([sha256.Size]byte, error) {
 		return [sha256.Size]byte{}, fmt.Errorf("analysis manager entity ID is invalid")
 	}
 	hasher := sha256.New()
-	writeDigestString(hasher, temporalDigestScope)
+	digestScope := providerDigestScope
+	if identity.Provider == modelpolicy.ProviderBedrock {
+		digestScope = temporalDigestScope
+	}
+	writeDigestString(hasher, digestScope)
 	writeDigestString(hasher, employeeID.String())
 	writeDigestString(hasher, managerID.String())
 	writeDigestString(hasher, strings.TrimSpace(identity.PromptVersion))
 	writeDigestString(hasher, strings.TrimSpace(identity.PolicyVersion))
 	writeDigestString(hasher, strings.TrimSpace(identity.Region))
+	if identity.Provider != modelpolicy.ProviderBedrock {
+		writeDigestString(hasher, string(identity.Provider))
+	}
 	writeDigestString(hasher, strings.TrimSpace(identity.ModelID))
 	writeDigestLength(hasher, uint64(identity.MaxTokens))
 	writeDigestLength(hasher, uint64(len(identity.Inputs)))
@@ -522,10 +543,16 @@ func writeDigestLength(hasher hash.Hash, length uint64) {
 	_, _ = hasher.Write(encoded[:])
 }
 
-func (service *Service) complete(ctx context.Context, identity AnalysisIdentity, report Report, recordedAt time.Time) (Report, error) {
+func (service *Service) complete(
+	ctx context.Context,
+	identity AnalysisIdentity,
+	report Report,
+	recordedAt time.Time,
+	dataMode modelpolicy.DataMode,
+) (Report, error) {
 	report.InputDigest = identity.InputDigest
 	report.RecordedAt = recordedAt.UTC()
-	completed, err := service.Repository.CompleteAnalysis(ctx, Completion{Identity: identity, Report: report})
+	completed, err := service.Repository.CompleteAnalysis(ctx, Completion{Identity: identity, Report: report, DataMode: dataMode})
 	if err != nil {
 		return Report{}, fmt.Errorf("complete pair analysis: %w", err)
 	}
@@ -539,8 +566,15 @@ func (service *Service) validate(employeeID, managerID string) error {
 	if strings.TrimSpace(employeeID) == "" || strings.TrimSpace(managerID) == "" || employeeID == managerID {
 		return fmt.Errorf("analysis employee and manager IDs must be distinct")
 	}
-	if strings.TrimSpace(service.PromptVersion) == "" || strings.TrimSpace(service.Region) == "" || strings.TrimSpace(service.ModelID) == "" || service.MaxTokens <= 0 {
+	if strings.TrimSpace(service.PromptVersion) == "" || strings.TrimSpace(service.ModelID) == "" || service.MaxTokens <= 0 {
 		return fmt.Errorf("analysis model configuration is required")
+	}
+	if err := (modelpolicy.Invocation{
+		Provider: service.Provider,
+		DataMode: service.DataMode,
+		Region:   service.Region,
+	}).Validate(); err != nil {
+		return fmt.Errorf("analysis model policy: %w", err)
 	}
 	return nil
 }

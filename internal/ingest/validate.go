@@ -25,6 +25,9 @@ var ErrPersistenceReference = errors.New("extraction output has an invalid durab
 // PostgreSQL identities after model-local IDs are translated into durable
 // evidence, mention/proposal, observation, or signal records.
 func ValidateForPersistence(completion Completion) error {
+	if !completion.DataMode.ValidForNewRun() {
+		return ErrPersistenceReference
+	}
 	evidenceIdentities, err := validateEvidenceIdentities(completion.Evidence)
 	if err != nil {
 		return err

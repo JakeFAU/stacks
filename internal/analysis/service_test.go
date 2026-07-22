@@ -3,6 +3,7 @@ package analysis
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -15,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"stacks/internal/extract"
+	"stacks/internal/modelpolicy"
 	"stacks/internal/observability"
 )
 
@@ -48,6 +50,9 @@ func TestServiceReturnsInsufficientWithoutModelForFewerThanTwoDatedMeetings(t *t
 	}
 	if repository.completeCalls != 1 {
 		t.Fatalf("complete calls = %d, want 1 durable deterministic report", repository.completeCalls)
+	}
+	if repository.completed.DataMode != "" {
+		t.Fatalf("deterministic completion data mode = %q, want no invocation provenance", repository.completed.DataMode)
 	}
 }
 
@@ -171,6 +176,7 @@ func TestServiceUsesExactOrderedInputDigestAndCachesIdenticalRun(t *testing.T) {
 		ManagerEntityID:  testManagerID,
 		PromptVersion:    extract.AnalysisPromptVersion,
 		PolicyVersion:    AnalysisPolicyVersion,
+		Provider:         modelpolicy.ProviderBedrock,
 		Region:           service.Region,
 		ModelID:          service.ModelID,
 		MaxTokens:        service.MaxTokens,
@@ -181,6 +187,9 @@ func TestServiceUsesExactOrderedInputDigestAndCachesIdenticalRun(t *testing.T) {
 	}
 	if repository.completed.Identity.InputDigest != wantDigest {
 		t.Fatalf("persisted input digest = %x, want %x", repository.completed.Identity.InputDigest, wantDigest)
+	}
+	if repository.completed.DataMode != modelpolicy.DataModePersonal {
+		t.Fatalf("model completion data mode = %q, want %q", repository.completed.DataMode, modelpolicy.DataModePersonal)
 	}
 	if got := referenceIDs(repository.completed.Identity.Inputs); !slices.Equal(got, referenceIDs(repository.snapshot.Inputs)) {
 		t.Fatalf("persisted ordered inputs = %#v, want %#v", got, referenceIDs(repository.snapshot.Inputs))
@@ -193,6 +202,67 @@ func TestServiceUsesExactOrderedInputDigestAndCachesIdenticalRun(t *testing.T) {
 	}
 	if second.ID != first.ID || model.calls != 1 || repository.completeCalls != 1 {
 		t.Fatalf("cached run = %#v, model/complete calls = %d/%d", second, model.calls, repository.completeCalls)
+	}
+}
+
+func TestServiceReusesBedrockAnalysisAcrossDataModesWithoutNewInvocation(t *testing.T) {
+	repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
+	model := &fakeModel{output: analysisOutput(StatusMixedOrConflicting, []string{"signal-earlier"}, nil)}
+	service := testService(repository, model)
+
+	first, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("first Analyze() error = %v", err)
+	}
+	if repository.completed.DataMode != modelpolicy.DataModePersonal {
+		t.Fatalf("completion data mode = %q, want %q", repository.completed.DataMode, modelpolicy.DataModePersonal)
+	}
+	firstDigest := repository.completed.Identity.InputDigest
+	repository.cached = first
+	service.DataMode = modelpolicy.DataModeRestricted
+
+	second, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
+	if err != nil {
+		t.Fatalf("second Analyze() error = %v", err)
+	}
+	if second.ID != first.ID || repository.findIdentity.InputDigest != firstDigest || model.calls != 1 || repository.completeCalls != 1 {
+		t.Fatalf("cached report/digest/model/completion = %q/%x/%d/%d, want same digest and no new disclosure", second.ID, repository.findIdentity.InputDigest, model.calls, repository.completeCalls)
+	}
+}
+
+func TestServiceRejectsProviderRegionPolicyBeforeRepositoryAccess(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Service)
+	}{
+		{"missing provider", func(service *Service) { service.Provider = "" }},
+		{"bedrock missing region", func(service *Service) { service.Region = "" }},
+		{"bedrock padded region", func(service *Service) { service.Region = " us-east-1 " }},
+		{"openai region", func(service *Service) {
+			service.Provider = modelpolicy.ProviderOpenAI
+			service.Region = "us-east-1"
+		}},
+		{"restricted direct provider", func(service *Service) {
+			service.Provider = modelpolicy.ProviderAnthropic
+			service.DataMode = modelpolicy.DataModeRestricted
+			service.Region = ""
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
+			model := &fakeModel{}
+			service := testService(repository, model)
+			test.mutate(service)
+
+			if _, err := service.Analyze(context.Background(), testEmployeeID, testManagerID); err == nil {
+				t.Fatal("Analyze() error = nil, want provider policy rejection")
+			}
+			if repository.loadCalls != 0 || model.calls != 0 || repository.findIdentity.InputDigest != ([sha256.Size]byte{}) {
+				t.Fatalf("load/model/find identity = %d/%d/%#v, want validation before boundaries", repository.loadCalls, model.calls, repository.findIdentity)
+			}
+		})
 	}
 }
 
@@ -575,7 +645,8 @@ func TestComputeInputDigestCanonicalizesPairAndInputUUIDs(t *testing.T) {
 	canonical := AnalysisIdentity{
 		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
 		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 		Inputs: []InputReference{{Kind: InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd", Digest: digest}},
 	}
 	variant := canonical
@@ -602,7 +673,8 @@ func TestComputeInputDigestRejectsRepeatedInputIdentity(t *testing.T) {
 	_, err := ComputeInputDigest(AnalysisIdentity{
 		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
 		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 		Inputs: []InputReference{input, input},
 	})
 	if err == nil {
@@ -614,7 +686,8 @@ func TestComputeInputDigestAllowsPairIdentityWithoutSignalInputs(t *testing.T) {
 	first, err := ComputeInputDigest(AnalysisIdentity{
 		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
 		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 	})
 	if err != nil {
 		t.Fatalf("ComputeInputDigest() error = %v", err)
@@ -622,7 +695,8 @@ func TestComputeInputDigestAllowsPairIdentityWithoutSignalInputs(t *testing.T) {
 	second, err := ComputeInputDigest(AnalysisIdentity{
 		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
 		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 	})
 	if err != nil {
 		t.Fatalf("repeated ComputeInputDigest() error = %v", err)
@@ -636,7 +710,8 @@ func TestComputeInputDigestChangesWithMaterialModelConfiguration(t *testing.T) {
 	base := AnalysisIdentity{
 		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
 		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Region: "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
 	}
 	first, err := ComputeInputDigest(base)
 	if err != nil {
@@ -659,6 +734,56 @@ func TestComputeInputDigestChangesWithMaterialModelConfiguration(t *testing.T) {
 				t.Fatal("material model configuration reused analysis identity")
 			}
 		})
+	}
+}
+
+func TestComputeInputDigestPreservesBedrockV1Bytes(t *testing.T) {
+	got, err := ComputeInputDigest(AnalysisIdentity{
+		EmployeeEntityID: testEmployeeID,
+		ManagerEntityID:  testManagerID,
+		PromptVersion:    "analyze-v1",
+		PolicyVersion:    AnalysisPolicyVersion,
+		Provider:         modelpolicy.ProviderBedrock,
+		Region:           "us-east-1",
+		ModelID:          "synthetic-model",
+		MaxTokens:        256,
+		Inputs: []InputReference{{
+			Kind: InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd",
+			Digest: sha256.Sum256([]byte("signal-input")),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(got[:]) != "0e0dabec4a207d0c8803b506d6b7bdee726120ff84f620f7b793d9fa483ff4a7" {
+		t.Fatalf("digest = %x", got)
+	}
+}
+
+func TestComputeInputDigestSeparatesProviders(t *testing.T) {
+	base := AnalysisIdentity{
+		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
+		PromptVersion: "analyze-v1", PolicyVersion: AnalysisPolicyVersion,
+		ModelID: "synthetic-model", MaxTokens: 256,
+		Inputs: []InputReference{{Kind: InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd", Digest: sha256.Sum256([]byte("signal-input"))}},
+	}
+	digests := make(map[modelpolicy.Provider][sha256.Size]byte)
+	for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderBedrock, modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
+		identity := base
+		identity.Provider = provider
+		if provider == modelpolicy.ProviderBedrock {
+			identity.Region = "us-east-1"
+		}
+		digest, err := ComputeInputDigest(identity)
+		if err != nil {
+			t.Fatalf("ComputeInputDigest(%q) error = %v", provider, err)
+		}
+		digests[provider] = digest
+	}
+	if digests[modelpolicy.ProviderBedrock] == digests[modelpolicy.ProviderOpenAI] ||
+		digests[modelpolicy.ProviderBedrock] == digests[modelpolicy.ProviderAnthropic] ||
+		digests[modelpolicy.ProviderOpenAI] == digests[modelpolicy.ProviderAnthropic] {
+		t.Fatalf("provider digests collided: %#v", digests)
 	}
 }
 
@@ -753,6 +878,8 @@ func testService(repository *fakeRepository, model *fakeModel) *Service {
 		Repository:    repository,
 		Model:         model,
 		PromptVersion: extract.AnalysisPromptVersion,
+		Provider:      modelpolicy.ProviderBedrock,
+		DataMode:      modelpolicy.DataModePersonal,
 		Region:        "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 		Now: func() time.Time { return time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC) },
 	}
@@ -760,6 +887,7 @@ func testService(repository *fakeRepository, model *fakeModel) *Service {
 
 type fakeRepository struct {
 	snapshot      PairSnapshot
+	loadCalls     int
 	cached        Report
 	findIdentity  AnalysisIdentity
 	findErr       error
@@ -770,6 +898,7 @@ type fakeRepository struct {
 }
 
 func (repository *fakeRepository) LoadPairInputs(context.Context, string, string) (PairSnapshot, error) {
+	repository.loadCalls++
 	return clonePairSnapshot(repository.snapshot), nil
 }
 

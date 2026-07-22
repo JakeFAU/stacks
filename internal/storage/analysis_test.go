@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	analysisdomain "stacks/internal/analysis"
+	"stacks/internal/modelpolicy"
 )
 
 func TestComputeAnalysisDigestIncludesPairVersionsAndOrderedInputs(t *testing.T) {
@@ -143,6 +144,7 @@ func TestLegacyAndTemporalAnalysisDigestsUseSeparateNamespaces(t *testing.T) {
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
 		PromptVersion:    "analyze-v1",
 		PolicyVersion:    "policy-v1",
+		Provider:         modelpolicy.ProviderBedrock,
 		Region:           "us-east-1",
 		ModelID:          "synthetic-model",
 		MaxTokens:        256,
@@ -538,6 +540,7 @@ func testCurrentAnalysisIdentity(t *testing.T) analysisdomain.AnalysisIdentity {
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
 		PromptVersion:    "analyze-test-v1",
 		PolicyVersion:    "policy-test-v1",
+		Provider:         modelpolicy.ProviderBedrock,
 		Region:           "us-east-1",
 		ModelID:          "synthetic-model",
 		MaxTokens:        256,

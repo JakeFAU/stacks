@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/knowledge"
+	"stacks/internal/modelpolicy"
 	"stacks/internal/observability"
 	"stacks/internal/source"
 )
@@ -199,6 +201,67 @@ func TestSyncSkipsExtractionForUnchangedVersion(t *testing.T) {
 	}
 	if len(summary.Results) != 1 || summary.Results[0].Outcome != OutcomeUnchanged {
 		t.Fatalf("summary results = %#v, want one unchanged result", summary.Results)
+	}
+}
+
+func TestSyncReusesBedrockDerivationAcrossDataModesWithoutNewInvocation(t *testing.T) {
+	document := syntheticDocument("document-data-mode-cache", "Leader assigns follow-up.")
+	repository := newMemoryRepository()
+	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
+	service := testService(document, repository, model)
+
+	first, err := service.Sync(context.Background())
+	if err != nil || first.Completed != 1 {
+		t.Fatalf("first Sync() = (%#v, %v), want one completed derivation", first, err)
+	}
+	if repository.lastCompletion.DataMode != modelpolicy.DataModePersonal {
+		t.Fatalf("completion data mode = %q, want %q", repository.lastCompletion.DataMode, modelpolicy.DataModePersonal)
+	}
+	firstDerivationID := first.Results[0].DerivationID
+	service.DataMode = modelpolicy.DataModeRestricted
+
+	second, err := service.Sync(context.Background())
+	if err != nil || second.Unchanged != 1 {
+		t.Fatalf("second Sync() = (%#v, %v), want cached unchanged derivation", second, err)
+	}
+	if second.Results[0].DerivationID != firstDerivationID || model.calls != 1 || repository.completionCalls != 1 {
+		t.Fatalf("derivation/model/completion = %q/%d/%d, want same derivation and no new disclosure", second.Results[0].DerivationID, model.calls, repository.completionCalls)
+	}
+}
+
+func TestSyncRejectsProviderRegionPolicyBeforeSourceAccess(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Service)
+	}{
+		{"missing provider", func(service *Service) { service.Provider = "" }},
+		{"bedrock missing region", func(service *Service) { service.Region = "" }},
+		{"bedrock padded region", func(service *Service) { service.Region = " us-east-1 " }},
+		{"openai region", func(service *Service) {
+			service.Provider = modelpolicy.ProviderOpenAI
+			service.Region = "us-east-1"
+		}},
+		{"restricted direct provider", func(service *Service) {
+			service.Provider = modelpolicy.ProviderAnthropic
+			service.DataMode = modelpolicy.DataModeRestricted
+			service.Region = ""
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			model := &recordingModel{}
+			service := testService(syntheticDocument("document-invalid-provider-policy", "Synthetic source."), newMemoryRepository(), model)
+			sourceBoundary := service.Source.(*memorySource)
+			test.mutate(service)
+
+			if _, err := service.Sync(context.Background()); err == nil {
+				t.Fatal("Sync() error = nil, want provider policy rejection")
+			}
+			if sourceBoundary.listCalls != 0 || model.calls != 0 {
+				t.Fatalf("source/model calls = %d/%d, want validation before boundaries", sourceBoundary.listCalls, model.calls)
+			}
+		})
 	}
 }
 
@@ -980,6 +1043,8 @@ func testServiceWithSource(sourceBoundary source.Source, repository *memoryRepos
 		Repository:     repository,
 		CollectionID:   "synthetic-folder",
 		PromptVersion:  extract.ExtractionPromptVersion,
+		Provider:       modelpolicy.ProviderBedrock,
+		DataMode:       modelpolicy.DataModePersonal,
 		Region:         "us-east-1",
 		ModelID:        "synthetic-model",
 		MaxTokens:      256,
@@ -1108,13 +1173,15 @@ func duplicateMentionResponse(t *testing.T) extract.Response {
 }
 
 type memorySource struct {
-	listed  []source.Document
-	fetched map[string]source.Document
-	listErr error
-	getErrs map[string]error
+	listed    []source.Document
+	fetched   map[string]source.Document
+	listErr   error
+	getErrs   map[string]error
+	listCalls int
 }
 
 func (sourceBoundary *memorySource) List(context.Context, string) ([]source.Document, error) {
+	sourceBoundary.listCalls++
 	if sourceBoundary.listErr != nil {
 		return nil, sourceBoundary.listErr
 	}
@@ -1303,7 +1370,8 @@ func derivationKey(version knowledge.DocumentVersion, identity DerivationIdentit
 func testDerivationIdentity(t *testing.T, version knowledge.DocumentVersion) DerivationIdentity {
 	t.Helper()
 	identity := DerivationIdentity{
-		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 		PromptVersion: extract.ExtractionPromptVersion,
 		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
 	}
@@ -1318,7 +1386,8 @@ func testDerivationIdentity(t *testing.T, version knowledge.DocumentVersion) Der
 func TestComputeDerivationDigestChangesWithMaterialExtractionConfiguration(t *testing.T) {
 	version := documentVersion(t, syntheticDocument("document-derivation-identity", "Synthetic Person delegated a task."))
 	base := DerivationIdentity{
-		Region: "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
 		PromptVersion: extract.ExtractionPromptVersion,
 		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
 	}
@@ -1348,6 +1417,58 @@ func TestComputeDerivationDigestChangesWithMaterialExtractionConfiguration(t *te
 	}
 }
 
+func TestComputeDerivationDigestPreservesBedrockV5Bytes(t *testing.T) {
+	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider: "drive", ProviderDocumentID: "document-compat", Title: "Synthetic Meeting",
+		Locator: "https://example.invalid/document", ProviderVersion: "version-1", ProviderRevision: "revision-1",
+		ModifiedAt: time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
+		RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
+		Tabs:       []source.Tab{{ID: "transcript-tab", Title: "Transcript", Path: []string{"Transcript"}, Role: source.TabRoleTranscript, Text: "Synthetic transcript."}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ComputeDerivationDigest(version, DerivationIdentity{
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		PromptVersion: extract.ExtractionPromptVersion,
+		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(got[:]) != "b000ccd59675147eebe18c0698207b23ab154160413ec40800c09dbb32e266e1" {
+		t.Fatalf("digest = %x", got)
+	}
+}
+
+func TestComputeDerivationDigestSeparatesProviders(t *testing.T) {
+	version := documentVersion(t, syntheticDocument("document-provider-identity", "Synthetic Person delegated a task."))
+	base := DerivationIdentity{
+		ModelID: "synthetic-model", MaxTokens: 256,
+		PromptVersion: extract.ExtractionPromptVersion,
+		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
+	}
+	digests := make(map[modelpolicy.Provider][sha256.Size]byte)
+	for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderBedrock, modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
+		identity := base
+		identity.Provider = provider
+		if provider == modelpolicy.ProviderBedrock {
+			identity.Region = "us-east-1"
+		}
+		digest, err := ComputeDerivationDigest(version, identity)
+		if err != nil {
+			t.Fatalf("ComputeDerivationDigest(%q) error = %v", provider, err)
+		}
+		digests[provider] = digest
+	}
+	if digests[modelpolicy.ProviderBedrock] == digests[modelpolicy.ProviderOpenAI] ||
+		digests[modelpolicy.ProviderBedrock] == digests[modelpolicy.ProviderAnthropic] ||
+		digests[modelpolicy.ProviderOpenAI] == digests[modelpolicy.ProviderAnthropic] {
+		t.Fatalf("provider digests collided: %#v", digests)
+	}
+}
+
 func TestExtractionDerivationNamespaceAdvancesPastSupersededIdentitySemantics(t *testing.T) {
 	if extractionDerivationDigestVersion != "stacks.extraction-derivation.v5" {
 		t.Fatalf("extractionDerivationDigestVersion = %q, want snapshot-coherent v5", extractionDerivationDigestVersion)
@@ -1361,7 +1482,8 @@ func TestComputeDerivationDigestIncludesLogicalSourceIdentity(t *testing.T) {
 		t.Fatal("fixture document content digests differ; source identity regression is not isolated")
 	}
 	identity := DerivationIdentity{
-		Region: "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
 		PromptVersion: extract.ExtractionPromptVersion,
 		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
 	}

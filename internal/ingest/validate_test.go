@@ -7,7 +7,23 @@ import (
 
 	"stacks/internal/entity"
 	"stacks/internal/knowledge"
+	"stacks/internal/modelpolicy"
 )
+
+func TestValidateForPersistenceRequiresNewRunDataMode(t *testing.T) {
+	completion := Completion{VersionID: "version-1"}
+	if err := ValidateForPersistence(completion); err == nil {
+		t.Fatal("ValidateForPersistence() error = nil, want missing data mode rejection")
+	}
+	completion.DataMode = modelpolicy.DataModeLegacy
+	if err := ValidateForPersistence(completion); err == nil {
+		t.Fatal("ValidateForPersistence() error = nil, want legacy data mode rejection")
+	}
+	completion.DataMode = modelpolicy.DataModePersonal
+	if err := ValidateForPersistence(completion); err != nil {
+		t.Fatalf("ValidateForPersistence() error = %v, want valid new-run data mode", err)
+	}
+}
 
 func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentity(t *testing.T) {
 	evidence := persistenceEvidence(t)
@@ -29,7 +45,7 @@ func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentit
 	}{
 		{
 			name: "evidence spans",
-			completion: Completion{VersionID: "version-1", Evidence: []EvidenceRecord{
+			completion: Completion{VersionID: "version-1", DataMode: modelpolicy.DataModePersonal, Evidence: []EvidenceRecord{
 				{Key: "citation-1", Span: evidence},
 				{Key: "citation-2", Span: evidence},
 			}},
@@ -37,7 +53,7 @@ func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentit
 		{
 			name: "mention and proposal identities",
 			completion: Completion{
-				VersionID: "version-1", Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+				VersionID: "version-1", DataMode: modelpolicy.DataModePersonal, Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 				Mentions: []MentionRecord{
 					{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic", NormalizedName: "synthetic", Role: "speaker", Resolution: entity.Resolution{AutoResolved: true, EntityID: "entity-1"}},
 					{Key: "mention-2", EvidenceKey: "citation-1", Surface: "Synthetic", NormalizedName: "synthetic", Role: "speaker", Resolution: entity.Resolution{AutoResolved: true, EntityID: "entity-1"}},
@@ -47,7 +63,7 @@ func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentit
 		{
 			name: "observation semantic identities",
 			completion: Completion{
-				VersionID: "version-1", Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+				VersionID: "version-1", DataMode: modelpolicy.DataModePersonal, Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 				Observations: []ObservationRecord{
 					baseObservation,
 					{ID: "33333333-3333-3333-3333-333333333333", Predicate: interactionPredicate, EvidenceKeys: []string{"citation-1"}},
@@ -57,7 +73,7 @@ func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentit
 		{
 			name: "signal semantic identities and evidence sets",
 			completion: Completion{
-				VersionID: "version-1", Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+				VersionID: "version-1", DataMode: modelpolicy.DataModePersonal, Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 				Observations: []ObservationRecord{baseObservation},
 				Signals: []SignalRecord{
 					baseSignal,
@@ -83,8 +99,8 @@ func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentit
 func TestValidateForPersistenceAcceptsDistinctDurableIdentities(t *testing.T) {
 	evidence := persistenceEvidence(t)
 	completion := Completion{
-		VersionID: "version-1",
-		Evidence:  []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+		VersionID: "version-1", DataMode: modelpolicy.DataModePersonal,
+		Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 		Mentions: []MentionRecord{
 			{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic", Role: "speaker"},
 			{Key: "mention-2", EvidenceKey: "citation-1", Surface: "evidence", Role: "reference"},
@@ -111,9 +127,9 @@ func TestValidateForPersistenceRejectsIdentityNotGroundedInSelectedEvidence(t *t
 	}
 	for _, mention := range tests {
 		completion := Completion{
-			VersionID: "version-1",
-			Evidence:  []EvidenceRecord{{Key: "citation-1", Span: evidence}},
-			Mentions:  []MentionRecord{mention},
+			VersionID: "version-1", DataMode: modelpolicy.DataModePersonal,
+			Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+			Mentions: []MentionRecord{mention},
 		}
 		if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
 			t.Fatalf("ValidateForPersistence() error = %v, want selected identity-evidence rejection", err)
@@ -124,8 +140,8 @@ func TestValidateForPersistenceRejectsIdentityNotGroundedInSelectedEvidence(t *t
 func TestValidateForPersistenceRejectsUnknownObservationMentionReferences(t *testing.T) {
 	evidence := persistenceEvidence(t)
 	completion := Completion{
-		VersionID: "version-1",
-		Evidence:  []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+		VersionID: "version-1", DataMode: modelpolicy.DataModePersonal,
+		Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 		Mentions: []MentionRecord{
 			{Key: "mention-manager", EvidenceKey: "citation-1", Surface: "Synthetic Manager", Role: "speaker"},
 			{Key: "mention-employee", EvidenceKey: "citation-1", Surface: "Synthetic Employee", Role: "reference"},
@@ -151,6 +167,7 @@ func TestValidateForPersistenceRejectsWhitespacePaddedLocalIdentifiersAndReferen
 		}
 		return Completion{
 			VersionID:    "version-1",
+			DataMode:     modelpolicy.DataModePersonal,
 			Evidence:     []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 			Mentions:     []MentionRecord{{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic Person", Role: "speaker"}},
 			Observations: []ObservationRecord{observation},

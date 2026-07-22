@@ -15,6 +15,7 @@ import (
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
 	"stacks/internal/knowledge"
+	"stacks/internal/modelpolicy"
 )
 
 type chronologyDocument struct {
@@ -76,6 +77,7 @@ func TestDriveMeetingTitleDatesFlowThroughSyncIntoAnalysisChronology(t *testing.
 	service := &ingest.Service{
 		Source: sourceBoundary, Model: model, Resolver: entity.Resolver{}, Repository: repository,
 		CollectionID: "synthetic-folder", PromptVersion: extract.ExtractionPromptVersion,
+		Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModePersonal,
 		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 		LeaseDuration: 5 * time.Minute, AttemptTimeout: 4 * time.Minute,
 		Now: func() time.Time { return time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC) },

@@ -22,6 +22,7 @@ import (
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/knowledge"
+	"stacks/internal/modelpolicy"
 	"stacks/internal/observability"
 	"stacks/internal/source"
 )
@@ -39,6 +40,7 @@ const (
 	ingestionDecisionName             = "ingest_document"
 	interactionPredicate              = "interaction_signal"
 	extractionDerivationDigestVersion = "stacks.extraction-derivation.v5"
+	providerDerivationDigestVersion   = "stacks.extraction-derivation.v6.provider"
 )
 
 // Outcome is the bounded per-document result exposed by sync.
@@ -92,6 +94,7 @@ type VersionState struct {
 // DerivationIdentity names one extraction attempt configuration independently
 // of the immutable source version. Digest is computed from both boundaries.
 type DerivationIdentity struct {
+	Provider      modelpolicy.Provider
 	Region        string
 	ModelID       string
 	MaxTokens     int
@@ -160,6 +163,7 @@ type Completion struct {
 	VersionID    string
 	DerivationID string
 	LeaseOwner   string
+	DataMode     modelpolicy.DataMode
 	Evidence     []EvidenceRecord
 	Mentions     []MentionRecord
 	Observations []ObservationRecord
@@ -194,6 +198,8 @@ type Service struct {
 	Repository     Repository
 	CollectionID   string
 	PromptVersion  string
+	Provider       modelpolicy.Provider
+	DataMode       modelpolicy.DataMode
 	Region         string
 	ModelID        string
 	MaxTokens      int
@@ -310,7 +316,8 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
 	}
 	derivation := DerivationIdentity{
-		Region: strings.TrimSpace(service.Region), ModelID: strings.TrimSpace(service.ModelID), MaxTokens: service.MaxTokens,
+		Provider: service.Provider,
+		Region:   service.Region, ModelID: strings.TrimSpace(service.ModelID), MaxTokens: service.MaxTokens,
 		PromptVersion: contract.Version, SchemaDigest: sha256.Sum256(contract.JSONSchema),
 	}
 	derivation.Digest, err = ComputeDerivationDigest(version, derivation)
@@ -410,7 +417,10 @@ func (service *Service) completion(
 	output extract.ExtractionOutput,
 	snapshots []entity.EntitySnapshot,
 ) (Completion, error) {
-	completion := Completion{VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner}
+	completion := Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: service.DataMode,
+	}
 	for _, citation := range output.Citations {
 		span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 			Document: version, TabID: citation.TabID, StartOffset: citation.StartOffset,
@@ -612,18 +622,32 @@ func stableDerivationID(derivationDigest [sha256.Size]byte, kind, sourceID strin
 // ComputeDerivationDigest identifies one immutable source version processed by
 // one exact extraction configuration. It excludes attempt/lease state.
 func ComputeDerivationDigest(version knowledge.DocumentVersion, identity DerivationIdentity) ([sha256.Size]byte, error) {
-	if strings.TrimSpace(identity.Region) == "" || strings.TrimSpace(identity.ModelID) == "" ||
+	if err := (modelpolicy.Invocation{
+		Provider: identity.Provider,
+		DataMode: modelpolicy.DataModePersonal,
+		Region:   identity.Region,
+	}).Validate(); err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("extraction derivation identity is invalid")
+	}
+	if strings.TrimSpace(identity.ModelID) == "" ||
 		strings.TrimSpace(identity.PromptVersion) == "" || identity.MaxTokens <= 0 ||
 		identity.SchemaDigest == ([sha256.Size]byte{}) {
 		return [sha256.Size]byte{}, fmt.Errorf("extraction derivation identity is invalid")
 	}
 	hasher := sha256.New()
-	writeDerivationString(hasher, extractionDerivationDigestVersion)
+	digestVersion := providerDerivationDigestVersion
+	if identity.Provider == modelpolicy.ProviderBedrock {
+		digestVersion = extractionDerivationDigestVersion
+	}
+	writeDerivationString(hasher, digestVersion)
 	writeDerivationString(hasher, version.Provider())
 	writeDerivationString(hasher, version.ProviderDocumentID())
 	documentDigest := version.Digest()
 	writeDerivationBytes(hasher, documentDigest[:])
 	writeDerivationString(hasher, strings.TrimSpace(identity.Region))
+	if identity.Provider != modelpolicy.ProviderBedrock {
+		writeDerivationString(hasher, string(identity.Provider))
+	}
 	writeDerivationString(hasher, strings.TrimSpace(identity.ModelID))
 	writeDerivationLength(hasher, uint64(identity.MaxTokens))
 	writeDerivationString(hasher, strings.TrimSpace(identity.PromptVersion))
@@ -711,9 +735,16 @@ func (service *Service) validate() error {
 		return fmt.Errorf("sync service dependencies are required")
 	}
 	if strings.TrimSpace(service.CollectionID) == "" || strings.TrimSpace(service.PromptVersion) == "" ||
-		strings.TrimSpace(service.Region) == "" || strings.TrimSpace(service.ModelID) == "" || service.MaxTokens <= 0 ||
+		strings.TrimSpace(service.ModelID) == "" || service.MaxTokens <= 0 ||
 		service.LeaseDuration <= 0 || service.AttemptTimeout <= 0 || service.AttemptTimeout >= service.LeaseDuration {
 		return fmt.Errorf("sync collection and model configuration are required")
+	}
+	if err := (modelpolicy.Invocation{
+		Provider: service.Provider,
+		DataMode: service.DataMode,
+		Region:   service.Region,
+	}).Validate(); err != nil {
+		return fmt.Errorf("sync model policy: %w", err)
 	}
 	return nil
 }

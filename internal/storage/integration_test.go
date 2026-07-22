@@ -20,6 +20,7 @@ import (
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
 	"stacks/internal/knowledge"
+	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 )
 
@@ -52,7 +53,10 @@ func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	if second.ID != first.ID || second.Status != ingest.VersionStatusPending || second.RetryCount != 1 || second.FailureCode != "" {
 		t.Fatalf("retry state = %#v, want same pending version with retry_count=1", second)
 	}
-	if err := repository.CompleteVersion(ctx, ingest.Completion{VersionID: second.ID, DerivationID: second.DerivationID, LeaseOwner: second.LeaseOwner}); err != nil {
+	if err := repository.CompleteVersion(ctx, ingest.Completion{
+		VersionID: second.ID, DerivationID: second.DerivationID, LeaseOwner: second.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}); err != nil {
 		t.Fatalf("complete retry: %v", err)
 	}
 	complete, err := repository.PrepareVersion(ctx, version, derivation, 5*time.Minute)
@@ -110,6 +114,7 @@ func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(
 	}
 	if err := repository.CompleteVersion(ctx, ingest.Completion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
 		Evidence: []ingest.EvidenceRecord{
 			{Key: "citation-alex", Span: alexSpan},
 			{Key: "citation-bob", Span: bobSpan},
@@ -220,11 +225,13 @@ func TestExtractionCompletionAndFailureRejectNonOwner(t *testing.T) {
 	}
 	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: uuid.NewString(),
+		DataMode: modelpolicy.DataModePersonal,
 	}); err == nil {
 		t.Fatal("non-owner completion error = nil")
 	}
 	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
 	}); err != nil {
 		t.Fatalf("owner completion: %v", err)
 	}
@@ -740,6 +747,7 @@ func TestSnapshotCoherenceAdmissionMigrationQuarantinesHybridRowsAndSafeResyncUs
 		Source: &snapshotCoherenceSource{listed: listed, fetched: fetched},
 		Model:  model, Resolver: entity.Resolver{}, Repository: repository,
 		CollectionID: "synthetic-folder", PromptVersion: extract.ExtractionPromptVersion,
+		Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModePersonal,
 		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 		LeaseDuration: 5 * time.Minute, AttemptTimeout: 4 * time.Minute,
 		Now: func() time.Time { return time.Date(2026, time.July, 22, 2, 0, 0, 0, time.UTC) },
@@ -1611,7 +1619,8 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	emptyIdentity := analysisdomain.AnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
 		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
-		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: acceptedEmpty.Inputs,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: acceptedEmpty.Inputs,
 	}
 	emptyIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(emptyIdentity)
 	if err != nil {
@@ -1656,7 +1665,8 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	acceptedIdentity := analysisdomain.AnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
 		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
-		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: accepted.Inputs,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: accepted.Inputs,
 	}
 	acceptedIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(acceptedIdentity)
 	if err != nil {
@@ -1667,6 +1677,7 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	}
 	acceptedCompletion := analysisdomain.Completion{
 		Identity: acceptedIdentity,
+		DataMode: modelpolicy.DataModePersonal,
 		Report: analysisdomain.Report{
 			Status: analysisdomain.StatusMixedOrConflicting, Rationale: "Synthetic bounded report.",
 			Chronology: accepted.Signals, RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
@@ -1697,7 +1708,8 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	correctedIdentity := analysisdomain.AnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
 		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
-		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: corrected.Inputs,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: corrected.Inputs,
 	}
 	correctedIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(correctedIdentity)
 	if err != nil {
@@ -2055,7 +2067,8 @@ func testDocumentVersion(t *testing.T, providerDocumentID string) knowledge.Docu
 func testExtractionDerivation(t *testing.T, version knowledge.DocumentVersion) ingest.DerivationIdentity {
 	t.Helper()
 	identity := ingest.DerivationIdentity{
-		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		Provider: modelpolicy.ProviderBedrock,
+		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 		PromptVersion: extract.ExtractionPromptVersion,
 		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
 	}
