@@ -60,7 +60,7 @@ func Execute(
 			return runtime.Serve(ctx, settings)
 		}),
 	}}
-	if command == config.CommandAuth || command == config.CommandSync || command == config.CommandEntities || command == config.CommandReview {
+	if command == config.CommandAuth || command == config.CommandSync || command == config.CommandEntities || command == config.CommandReview || command == config.CommandAnalyze {
 		if commandProvider == nil {
 			return fmt.Errorf("%s command is not configured", command)
 		}

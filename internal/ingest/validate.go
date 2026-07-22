@@ -26,10 +26,11 @@ func ValidateForPersistence(completion Completion) error {
 	if err != nil {
 		return err
 	}
-	if err := validateMentionIdentities(completion.Mentions, evidenceIdentities); err != nil {
+	mentionKeys, err := validateMentionIdentities(completion.Mentions, evidenceIdentities)
+	if err != nil {
 		return err
 	}
-	observationIdentities, err := validateObservationIdentities(completion.Observations, evidenceIdentities)
+	observationIdentities, err := validateObservationIdentities(completion.Observations, evidenceIdentities, mentionKeys)
 	if err != nil {
 		return err
 	}
@@ -67,16 +68,16 @@ func validateEvidenceIdentities(records []EvidenceRecord) (map[string][sha256.Si
 	return byKey, nil
 }
 
-func validateMentionIdentities(records []MentionRecord, evidence map[string][sha256.Size]byte) error {
+func validateMentionIdentities(records []MentionRecord, evidence map[string][sha256.Size]byte) (map[string]struct{}, error) {
 	seenKeys := make(map[string]struct{}, len(records))
 	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
 	for _, record := range records {
 		evidenceIdentity, exists := evidence[record.EvidenceKey]
 		if !canonicalLocalIdentifier(record.Key) || !canonicalLocalIdentifier(record.EvidenceKey) || !exists {
-			return ErrPersistenceReference
+			return nil, ErrPersistenceReference
 		}
 		if _, exists := seenKeys[record.Key]; exists {
-			return ErrPersistenceCollision
+			return nil, ErrPersistenceCollision
 		}
 		seenKeys[record.Key] = struct{}{}
 		identity := digestIdentity(struct {
@@ -85,14 +86,14 @@ func validateMentionIdentities(records []MentionRecord, evidence map[string][sha
 			Role     string
 		}{Evidence: evidenceIdentity, Surface: record.Surface, Role: record.Role})
 		if _, exists := seenDurable[identity]; exists {
-			return ErrPersistenceCollision
+			return nil, ErrPersistenceCollision
 		}
 		seenDurable[identity] = struct{}{}
 	}
-	return nil
+	return seenKeys, nil
 }
 
-func validateObservationIdentities(records []ObservationRecord, evidence map[string][sha256.Size]byte) (map[string][sha256.Size]byte, error) {
+func validateObservationIdentities(records []ObservationRecord, evidence map[string][sha256.Size]byte, mentions map[string]struct{}) (map[string][sha256.Size]byte, error) {
 	byID := make(map[string][sha256.Size]byte, len(records))
 	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
 	for _, record := range records {
@@ -102,21 +103,31 @@ func validateObservationIdentities(records []ObservationRecord, evidence map[str
 		if _, exists := byID[record.ID]; exists {
 			return nil, ErrPersistenceCollision
 		}
+		if record.SubjectMentionKey != "" || record.ObjectMentionKey != "" {
+			_, subjectExists := mentions[record.SubjectMentionKey]
+			_, objectExists := mentions[record.ObjectMentionKey]
+			if !canonicalLocalIdentifier(record.SubjectMentionKey) || !canonicalLocalIdentifier(record.ObjectMentionKey) || !subjectExists || !objectExists {
+				return nil, ErrPersistenceReference
+			}
+		}
 		evidenceSet, err := canonicalEvidenceSet(record.EvidenceKeys, evidence)
 		if err != nil {
 			return nil, err
 		}
 		identity := digestIdentity(struct {
-			Subject    string
-			Object     string
-			Predicate  string
-			ValidStart string
-			Confidence string
-			Evidence   [][sha256.Size]byte
-			Derivation string
-			Epistemic  string
+			Subject        string
+			Object         string
+			SubjectMention string
+			ObjectMention  string
+			Predicate      string
+			ValidStart     string
+			Confidence     string
+			Evidence       [][sha256.Size]byte
+			Derivation     string
+			Epistemic      string
 		}{
 			Subject: record.SubjectEntityID, Object: record.ObjectEntityID,
+			SubjectMention: record.SubjectMentionKey, ObjectMention: record.ObjectMentionKey,
 			Predicate: record.Predicate, ValidStart: optionalTime(record.ValidStart),
 			Confidence: optionalConfidence(record.Confidence), Evidence: evidenceSet,
 			Derivation: "model_extraction", Epistemic: "inferred",

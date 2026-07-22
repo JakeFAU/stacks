@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"stacks/internal/analysis"
 	"stacks/internal/app"
 	"stacks/internal/bedrock"
 	"stacks/internal/cli"
@@ -152,6 +153,39 @@ func pocCommandProvider(
 			defer pool.Close()
 			store := cli.NewStorageReviewStore(storage.NewEntityRepository(pool))
 			return (cli.ReviewCommand{Service: &cli.ReviewService{Store: store}, Output: stdout}).Run(ctx, args)
+		}),
+		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			awsConfiguration, err := awsconfig.LoadDefaultConfig(
+				ctx,
+				awsconfig.WithRegion(settings.PoC.AWSRegion),
+				awsconfig.WithSharedConfigProfile(settings.PoC.AWSProfile),
+			)
+			if err != nil {
+				return err
+			}
+			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
+				ModelID: settings.PoC.BedrockModelID, MaxTokens: settings.PoC.BedrockMaxTokens,
+				MaxAttempts: settings.PoC.BedrockMaxAttempts,
+			})
+			if err != nil {
+				return err
+			}
+			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			service := &analysis.Service{
+				Repository: storage.NewAnalysisRepository(pool), Model: model,
+				PromptVersion: settings.PoC.AnalysisPromptVersion,
+				Region:        settings.PoC.AWSRegion, ModelID: settings.PoC.BedrockModelID,
+				MaxTokens: settings.PoC.BedrockMaxTokens, Tracer: tracer,
+				Decisions: decisions, Now: time.Now,
+			}
+			return (cli.AnalyzeCommand{
+				Service: service, EmployeeID: settings.PoC.EmployeeEntityID,
+				ManagerID: settings.PoC.ManagerEntityID, Output: stdout,
+			}).Run(ctx, args)
 		}),
 	}, nil
 }

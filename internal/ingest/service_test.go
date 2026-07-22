@@ -337,6 +337,26 @@ func TestSyncPreservesUnknownMeetingTime(t *testing.T) {
 	}
 }
 
+func TestSyncPreservesSignalSubjectAndObjectMentionKeys(t *testing.T) {
+	repository := newMemoryRepository()
+	service := testService(
+		syntheticDocument("document-mention-links", "Leader assigns follow-up."),
+		repository,
+		&recordingModel{responses: []extract.Response{validSignalResponse(t, "2026-07-20")}},
+	)
+
+	if _, err := service.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if len(repository.lastCompletion.Observations) != 1 {
+		t.Fatalf("observations = %d, want 1", len(repository.lastCompletion.Observations))
+	}
+	observation := repository.lastCompletion.Observations[0]
+	if observation.SubjectMentionKey != "mention-leader" || observation.ObjectMentionKey != "mention-report" {
+		t.Fatalf("observation mention keys = %q/%q, want mention-leader/mention-report", observation.SubjectMentionKey, observation.ObjectMentionKey)
+	}
+}
+
 func TestSyncClassifiesPersistenceIdentityCollisionAsInvalidOutput(t *testing.T) {
 	cases := []struct {
 		name       string

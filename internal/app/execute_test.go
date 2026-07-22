@@ -127,3 +127,34 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 		t.Fatalf("provider/sync calls = %d/%d, want 1/1", providerCalls, syncCalls)
 	}
 }
+
+func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
+	settings := config.Settings{PoC: config.PoCSettings{
+		DatabaseURL: "postgres://synthetic", AWSProfile: "synthetic-profile", AWSRegion: "us-east-1",
+		BedrockModelID: "synthetic-model", BedrockMaxTokens: 256, BedrockMaxAttempts: 1,
+		ExtractionPromptVersion: "extract-v1", AnalysisPromptVersion: "analyze-v1",
+		EmployeeEntityID: "employee-id", ManagerEntityID: "manager-id",
+	}}
+	providerCalls := 0
+	analyzeCalls := 0
+	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+		providerCalls++
+		return map[string]cli.Command{"analyze": cli.CommandFunc(func(_ context.Context, args []string) error {
+			analyzeCalls++
+			if len(args) != 0 {
+				return fmt.Errorf("analyze received unexpected arguments")
+			}
+			return nil
+		})}, nil
+	})
+
+	err := Execute(context.Background(), []string{"analyze"}, settings,
+		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
+		provider, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if providerCalls != 1 || analyzeCalls != 1 {
+		t.Fatalf("provider/analyze calls = %d/%d, want 1/1", providerCalls, analyzeCalls)
+	}
+}

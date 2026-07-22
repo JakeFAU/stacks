@@ -54,6 +54,30 @@ func TestIngestionMigrationAddsOnlyBoundedForwardProcessingState(t *testing.T) {
 	}
 }
 
+func TestAnalysisMigrationAddsAuditedMentionLinksAndBoundedRunMetadata(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "migrations", "00004_temporal_pair_analysis.sql")
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", path, err)
+	}
+	migration := string(contents)
+	for _, required := range []string{
+		"subject_mention_id uuid REFERENCES stacks.mentions(id)",
+		"object_mention_id uuid REFERENCES stacks.mentions(id)",
+		"bedrock_region text",
+		"model_id text",
+		"max_output_tokens integer",
+		"report_json jsonb",
+	} {
+		if !strings.Contains(migration, required) {
+			t.Fatalf("analysis migration is missing %q", required)
+		}
+	}
+	if strings.Contains(migration, "-- +goose Down") {
+		t.Fatal("analysis migration is not forward-only")
+	}
+}
+
 func readManagerConfidenceMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00002_manager_confidence_poc.sql")

@@ -16,15 +16,17 @@ import (
 // ObservationInput is a retry-stable observation record. ID is supplied by the
 // caller so retries cannot create a second logical observation.
 type ObservationInput struct {
-	ID              string
-	SubjectEntityID string
-	ObjectEntityID  string
-	Predicate       string
-	ValidStart      *time.Time
-	ValidEnd        *time.Time
-	Derivation      string
-	EpistemicStatus string
-	Confidence      *float64
+	ID               string
+	SubjectEntityID  string
+	ObjectEntityID   string
+	SubjectMentionID string
+	ObjectMentionID  string
+	Predicate        string
+	ValidStart       *time.Time
+	ValidEnd         *time.Time
+	Derivation       string
+	EpistemicStatus  string
+	Confidence       *float64
 }
 
 // Observation identifies a durable temporal observation.
@@ -177,11 +179,12 @@ func putObservation(ctx context.Context, transaction pgx.Tx, input ObservationIn
 	var observation Observation
 	err := transaction.QueryRow(ctx, `
 		INSERT INTO stacks.observations
-			(id, subject_entity_id, object_entity_id, predicate, valid_start, valid_end, recorded_at, derivation, epistemic_status, confidence, digest)
-		VALUES ($1::uuid, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, $4, $5, $6, $7, $8, $9, $10, $11)
+			(id, subject_entity_id, object_entity_id, subject_mention_id, object_mention_id, predicate, valid_start, valid_end, recorded_at, derivation, epistemic_status, confidence, digest)
+		VALUES ($1::uuid, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, NULLIF($4, '')::uuid, NULLIF($5, '')::uuid, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (id) DO NOTHING
 		RETURNING id`,
-		input.ID, input.SubjectEntityID, input.ObjectEntityID, input.Predicate, input.ValidStart, input.ValidEnd, time.Now().UTC(), input.Derivation, input.EpistemicStatus, input.Confidence, digest).Scan(&observation.ID)
+		input.ID, input.SubjectEntityID, input.ObjectEntityID, input.SubjectMentionID, input.ObjectMentionID,
+		input.Predicate, input.ValidStart, input.ValidEnd, time.Now().UTC(), input.Derivation, input.EpistemicStatus, input.Confidence, digest).Scan(&observation.ID)
 	if err == pgx.ErrNoRows {
 		var storedDigest []byte
 		err = transaction.QueryRow(ctx, `SELECT id, digest FROM stacks.observations WHERE id = $1`, input.ID).Scan(&observation.ID, &storedDigest)
@@ -294,7 +297,7 @@ func ComputeObservationDigest(input ObservationInput, evidenceSpanIDs []string) 
 		return [sha256.Size]byte{}, err
 	}
 	input = canonicalInput
-	fields := []string{input.SubjectEntityID, input.ObjectEntityID, input.Predicate, input.Derivation, input.EpistemicStatus}
+	fields := []string{input.SubjectEntityID, input.ObjectEntityID, input.SubjectMentionID, input.ObjectMentionID, input.Predicate, input.Derivation, input.EpistemicStatus}
 	if input.ValidStart != nil {
 		fields = append(fields, input.ValidStart.UTC().Format(time.RFC3339Nano))
 	} else {
@@ -336,8 +339,10 @@ func canonicalizeObservationIdentity(input ObservationInput, evidenceSpanIDs []s
 	}
 	input.ID = canonicalID
 	for field, value := range map[string]*string{
-		"subject entity ID": &input.SubjectEntityID,
-		"object entity ID":  &input.ObjectEntityID,
+		"subject entity ID":  &input.SubjectEntityID,
+		"object entity ID":   &input.ObjectEntityID,
+		"subject mention ID": &input.SubjectMentionID,
+		"object mention ID":  &input.ObjectMentionID,
 	} {
 		if *value == "" {
 			continue

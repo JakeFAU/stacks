@@ -95,6 +95,27 @@ func TestValidateForPersistenceAcceptsDistinctDurableIdentities(t *testing.T) {
 	}
 }
 
+func TestValidateForPersistenceRejectsUnknownObservationMentionReferences(t *testing.T) {
+	evidence := persistenceEvidence(t)
+	completion := Completion{
+		VersionID: "version-1",
+		Evidence:  []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+		Mentions: []MentionRecord{
+			{Key: "mention-manager", EvidenceKey: "citation-1", Surface: "Synthetic Manager", Role: "speaker"},
+			{Key: "mention-employee", EvidenceKey: "citation-1", Surface: "Synthetic Employee", Role: "reference"},
+		},
+		Observations: []ObservationRecord{{
+			ID: "11111111-1111-1111-1111-111111111111", Predicate: interactionPredicate,
+			SubjectMentionKey: "mention-unknown", ObjectMentionKey: "mention-employee",
+			EvidenceKeys: []string{"citation-1"},
+		}},
+	}
+
+	if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
+		t.Fatalf("ValidateForPersistence() error = %v, want unknown mention reference rejection", err)
+	}
+}
+
 func TestValidateForPersistenceRejectsWhitespacePaddedLocalIdentifiersAndReferences(t *testing.T) {
 	newCompletion := func() Completion {
 		evidence := persistenceEvidence(t)

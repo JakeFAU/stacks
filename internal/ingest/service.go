@@ -96,13 +96,15 @@ type MentionRecord struct {
 // ObservationRecord is one inferred interaction observation. Empty entity IDs
 // preserve unresolved identity rather than promoting a guess to graph truth.
 type ObservationRecord struct {
-	ID              string
-	SubjectEntityID string
-	ObjectEntityID  string
-	Predicate       string
-	ValidStart      *time.Time
-	EvidenceKeys    []string
-	Confidence      *float64
+	ID                string
+	SubjectEntityID   string
+	ObjectEntityID    string
+	SubjectMentionKey string
+	ObjectMentionKey  string
+	Predicate         string
+	ValidStart        *time.Time
+	EvidenceKeys      []string
+	Confidence        *float64
 }
 
 // SignalEvidenceRecord associates one citation with its bounded signal role.
@@ -352,6 +354,7 @@ func (service *Service) completion(
 		confidence := signal.Confidence
 		completion.Observations = append(completion.Observations, ObservationRecord{
 			ID: observationID, SubjectEntityID: subject, ObjectEntityID: object,
+			SubjectMentionKey: signal.SubjectMentionID, ObjectMentionKey: signal.ObjectMentionID,
 			Predicate: interactionPredicate, ValidStart: validStart,
 			EvidenceKeys: evidenceKeys, Confidence: &confidence,
 		})

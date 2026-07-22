@@ -304,10 +304,11 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if err != nil {
 		return err
 	}
-	if err := persistIngestionMentions(ctx, transaction, completion.VersionID, completion.Mentions, evidenceIDs); err != nil {
+	mentionIDs, err := persistIngestionMentions(ctx, transaction, completion.VersionID, completion.Mentions, evidenceIDs)
+	if err != nil {
 		return err
 	}
-	if err := persistIngestionGraph(ctx, transaction, completion.Observations, completion.Signals, evidenceIDs); err != nil {
+	if err := persistIngestionGraph(ctx, transaction, completion.Observations, completion.Signals, evidenceIDs, mentionIDs); err != nil {
 		return err
 	}
 	result, err := transaction.Exec(ctx, `
@@ -346,11 +347,12 @@ func persistIngestionEvidence(ctx context.Context, transaction pgx.Tx, records [
 	return identifiers, nil
 }
 
-func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID string, records []ingest.MentionRecord, evidenceIDs map[string]string) error {
+func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID string, records []ingest.MentionRecord, evidenceIDs map[string]string) (map[string]string, error) {
+	mentionIDs := make(map[string]string, len(records))
 	for _, record := range records {
 		evidenceID, exists := evidenceIDs[record.EvidenceKey]
 		if !exists || strings.TrimSpace(record.Key) == "" || strings.TrimSpace(record.Surface) == "" {
-			return fmt.Errorf("persist ingestion mention: input is invalid")
+			return nil, fmt.Errorf("persist ingestion mention: input is invalid")
 		}
 		var mentionID string
 		err := transaction.QueryRow(ctx, `
@@ -359,8 +361,9 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID
 			ON CONFLICT (evidence_span_id, surface, role) DO UPDATE SET role = EXCLUDED.role
 			RETURNING id`, evidenceID, record.Surface, record.Role, time.Now().UTC()).Scan(&mentionID)
 		if err != nil {
-			return fmt.Errorf("persist ingestion mention: %w", err)
+			return nil, fmt.Errorf("persist ingestion mention: %w", err)
 		}
+		mentionIDs[record.Key] = mentionID
 		var proposalID string
 		err = transaction.QueryRow(ctx, `
 			INSERT INTO stacks.resolution_proposals (mention_id, derivation, recorded_at)
@@ -368,7 +371,7 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID
 			ON CONFLICT (mention_id) DO UPDATE SET mention_id = EXCLUDED.mention_id
 			RETURNING id`, mentionID, "extract", time.Now().UTC()).Scan(&proposalID)
 		if err != nil {
-			return fmt.Errorf("persist ingestion resolution proposal: %w", err)
+			return nil, fmt.Errorf("persist ingestion resolution proposal: %w", err)
 		}
 		for rank, candidate := range record.Resolution.Candidates {
 			confidence := candidate.Confidence
@@ -376,7 +379,7 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID
 				INSERT INTO stacks.resolution_candidates (proposal_id, entity_id, rank, confidence, reason)
 				VALUES ($1, $2, $3, $4, $5)
 				ON CONFLICT (proposal_id, entity_id) DO NOTHING`, proposalID, candidate.EntityID, rank, &confidence, candidate.Reason); err != nil {
-				return fmt.Errorf("persist ingestion resolution candidate: %w", err)
+				return nil, fmt.Errorf("persist ingestion resolution candidate: %w", err)
 			}
 		}
 		if record.Resolution.AutoResolved {
@@ -389,17 +392,17 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID
 					(id, proposal_id, outcome, entity_id, digest, recorded_at)
 				VALUES ($1, $2, 'accepted', $3, $4, $5)
 				ON CONFLICT (id) DO NOTHING`, decisionID, proposalID, record.Resolution.EntityID, digest[:], time.Now().UTC()); err != nil {
-				return fmt.Errorf("persist ingestion resolution decision: %w", err)
+				return nil, fmt.Errorf("persist ingestion resolution decision: %w", err)
 			}
 			if err := updateProposalStatus(ctx, transaction, proposalID, ResolutionOutcomeAccepted); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
-	return nil
+	return mentionIDs, nil
 }
 
-func persistIngestionGraph(ctx context.Context, transaction pgx.Tx, observations []ingest.ObservationRecord, signals []ingest.SignalRecord, evidenceIDs map[string]string) error {
+func persistIngestionGraph(ctx context.Context, transaction pgx.Tx, observations []ingest.ObservationRecord, signals []ingest.SignalRecord, evidenceIDs, mentionIDs map[string]string) error {
 	for _, record := range observations {
 		resolvedEvidence, err := resolveEvidenceKeys(record.EvidenceKeys, evidenceIDs)
 		if err != nil {
@@ -407,6 +410,7 @@ func persistIngestionGraph(ctx context.Context, transaction pgx.Tx, observations
 		}
 		input := ObservationInput{
 			ID: record.ID, SubjectEntityID: record.SubjectEntityID, ObjectEntityID: record.ObjectEntityID,
+			SubjectMentionID: mentionIDs[record.SubjectMentionKey], ObjectMentionID: mentionIDs[record.ObjectMentionKey],
 			Predicate: record.Predicate, ValidStart: record.ValidStart,
 			Derivation: "model_extraction", EpistemicStatus: "inferred", Confidence: record.Confidence,
 		}

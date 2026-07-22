@@ -12,7 +12,7 @@ import (
 	"stacks/internal/observability"
 )
 
-func TestPoCCommandProviderRegistersSyncWithoutConstructingLiveDependencies(t *testing.T) {
+func TestPoCCommandProviderRegistersSyncAndAnalyzeWithoutConstructingLiveDependencies(t *testing.T) {
 	recorder, err := observability.NewDecisionRecorder(noop.NewMeterProvider().Meter("synthetic"))
 	if err != nil {
 		t.Fatalf("create decision recorder: %v", err)
@@ -26,5 +26,8 @@ func TestPoCCommandProviderRegistersSyncWithoutConstructingLiveDependencies(t *t
 	}
 	if commands[string(config.CommandSync)] == nil {
 		t.Fatal("sync command is not registered")
+	}
+	if commands[string(config.CommandAnalyze)] == nil {
+		t.Fatal("analyze command is not registered")
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	analysisdomain "stacks/internal/analysis"
 	"stacks/internal/ingest"
 	"stacks/internal/knowledge"
 	"stacks/internal/source"
@@ -328,6 +329,176 @@ func TestCompleteAnalysisDeduplicatesStableInput(t *testing.T) {
 	if _, _, err := analysis.Complete(ctx, typeConfusedInput); err == nil {
 		t.Fatal("analysis accepted a document version ID as a signal input")
 	}
+}
+
+func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	entities := NewEntityRepository(pool)
+	repository := NewAnalysisRepository(pool)
+
+	employee, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Pair Employee"})
+	if err != nil {
+		t.Fatalf("create employee: %v", err)
+	}
+	manager, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Pair Manager"})
+	if err != nil {
+		t.Fatalf("create manager: %v", err)
+	}
+	replacement, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Replacement Manager"})
+	if err != nil {
+		t.Fatalf("create replacement manager: %v", err)
+	}
+
+	firstSubject, firstObject := createPendingPairSignal(t, pool, time.Date(2026, time.June, 3, 0, 0, 0, 0, time.UTC), "strengthening")
+	secondSubject, secondObject := createPendingPairSignal(t, pool, time.Date(2026, time.July, 8, 0, 0, 0, 0, time.UTC), "weakening")
+	pending, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	if err != nil {
+		t.Fatalf("load pending pair inputs: %v", err)
+	}
+	if !pending.Accepted || len(pending.Signals) != 0 {
+		t.Fatalf("pending pair snapshot = %#v, want accepted entities with no eligible guessed signals", pending)
+	}
+
+	firstManagerDecision, err := entities.RecordDecision(ctx, ResolutionDecisionInput{ProposalID: firstSubject, Outcome: ResolutionOutcomeAccepted, EntityID: manager.ID})
+	if err != nil {
+		t.Fatalf("accept first manager mention: %v", err)
+	}
+	for _, decision := range []ResolutionDecisionInput{
+		{ProposalID: firstObject, Outcome: ResolutionOutcomeAccepted, EntityID: employee.ID},
+		{ProposalID: secondSubject, Outcome: ResolutionOutcomeAccepted, EntityID: manager.ID},
+		{ProposalID: secondObject, Outcome: ResolutionOutcomeAccepted, EntityID: employee.ID},
+	} {
+		if _, err := entities.RecordDecision(ctx, decision); err != nil {
+			t.Fatalf("accept pair mention: %v", err)
+		}
+	}
+	accepted, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	if err != nil {
+		t.Fatalf("load accepted pair inputs: %v", err)
+	}
+	if len(accepted.Signals) != 2 || countInputKind(accepted.Inputs, analysisdomain.InputResolutionDecision) != 4 {
+		t.Fatalf("accepted pair signals/decision inputs = %d/%d, want 2/4", len(accepted.Signals), countInputKind(accepted.Inputs, analysisdomain.InputResolutionDecision))
+	}
+	acceptedIdentity := analysisdomain.AnalysisIdentity{
+		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
+		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1", Inputs: accepted.Inputs,
+	}
+	acceptedIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(acceptedIdentity)
+	if err != nil {
+		t.Fatalf("compute accepted analysis identity: %v", err)
+	}
+	acceptedReport, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
+		Identity: acceptedIdentity,
+		Report: analysisdomain.Report{
+			Status: analysisdomain.StatusMixedOrConflicting, Rationale: "Synthetic bounded report.",
+			Chronology: accepted.Signals, RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
+			ModelID: "synthetic-model", Region: "us-east-1", MaxTokens: 256,
+			PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("complete accepted pair analysis: %v", err)
+	}
+
+	if _, err := entities.CorrectDecision(ctx, firstManagerDecision.ID, ResolutionDecisionInput{Outcome: ResolutionOutcomeAccepted, EntityID: replacement.ID}); err != nil {
+		t.Fatalf("correct first manager identity: %v", err)
+	}
+	corrected, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	if err != nil {
+		t.Fatalf("load corrected pair inputs: %v", err)
+	}
+	if len(corrected.Signals) != 1 || len(corrected.Inputs) >= len(accepted.Inputs) {
+		t.Fatalf("corrected pair signals/inputs = %d/%d, want one signal and reduced current provenance", len(corrected.Signals), len(corrected.Inputs))
+	}
+	correctedIdentity := analysisdomain.AnalysisIdentity{
+		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
+		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1", Inputs: corrected.Inputs,
+	}
+	correctedIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(correctedIdentity)
+	if err != nil {
+		t.Fatalf("compute corrected analysis identity: %v", err)
+	}
+	if correctedIdentity.InputDigest == acceptedIdentity.InputDigest {
+		t.Fatal("identity correction did not change completed analysis digest")
+	}
+	if _, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
+		Identity: correctedIdentity,
+		Report: analysisdomain.Report{
+			Status: analysisdomain.StatusInsufficientEvidence, Rationale: "Synthetic insufficient report.",
+			Chronology: corrected.Signals, RecordedAt: time.Date(2026, time.July, 21, 13, 0, 0, 0, time.UTC),
+			ModelID: "synthetic-model", Region: "us-east-1", MaxTokens: 256,
+			PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
+		},
+	}); err != nil {
+		t.Fatalf("complete corrected pair analysis: %v", err)
+	}
+	prior, found, err := repository.FindCompleted(ctx, acceptedIdentity.InputDigest)
+	if err != nil || !found || prior.ID != acceptedReport.ID || len(prior.Chronology) != 2 {
+		t.Fatalf("prior completed report after correction = (%#v, %t, %v)", prior, found, err)
+	}
+}
+
+func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Time, direction string) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	documents := NewDocumentRepository(pool)
+	version := testDocumentVersion(t, testIdentifier("document-pair-analysis"))
+	if _, _, err := documents.PutDocumentVersion(ctx, version); err != nil {
+		t.Fatalf("put pair-analysis document: %v", err)
+	}
+	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, TabID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+	})
+	if err != nil {
+		t.Fatalf("new pair-analysis evidence span: %v", err)
+	}
+	storedSpan, err := documents.PutEvidenceSpan(ctx, span)
+	if err != nil {
+		t.Fatalf("put pair-analysis evidence span: %v", err)
+	}
+	entities := NewEntityRepository(pool)
+	managerMention, err := entities.CreateMention(ctx, MentionInput{EvidenceSpanID: storedSpan.ID, Surface: testIdentifier("Synthetic Manager Mention"), Role: "speaker"})
+	if err != nil {
+		t.Fatalf("create manager mention: %v", err)
+	}
+	employeeMention, err := entities.CreateMention(ctx, MentionInput{EvidenceSpanID: storedSpan.ID, Surface: testIdentifier("Synthetic Employee Mention"), Role: "reference"})
+	if err != nil {
+		t.Fatalf("create employee mention: %v", err)
+	}
+	managerProposal, err := entities.CreateResolutionProposal(ctx, ResolutionProposalInput{MentionID: managerMention.ID})
+	if err != nil {
+		t.Fatalf("create manager proposal: %v", err)
+	}
+	employeeProposal, err := entities.CreateResolutionProposal(ctx, ResolutionProposalInput{MentionID: employeeMention.ID})
+	if err != nil {
+		t.Fatalf("create employee proposal: %v", err)
+	}
+	graph := NewGraphRepository(pool)
+	observation, err := graph.CompleteObservation(ctx, ObservationInput{
+		ID: uuid.NewString(), SubjectMentionID: managerMention.ID, ObjectMentionID: employeeMention.ID,
+		Predicate: "interaction_signal", ValidStart: &validTime, Derivation: "model_extraction", EpistemicStatus: "inferred",
+	}, []string{storedSpan.ID})
+	if err != nil {
+		t.Fatalf("complete pair observation: %v", err)
+	}
+	if _, err := graph.CompleteSignal(ctx, SignalInput{
+		ID: uuid.NewString(), ObservationID: observation.ID, Category: "delegation_autonomy", Direction: direction,
+		ExtractionModelID: "synthetic-model", PromptVersion: "extract-v1", Rationale: "Synthetic observable pair rationale.", Confidence: 0.5,
+	}, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}}); err != nil {
+		t.Fatalf("complete pair signal: %v", err)
+	}
+	return managerProposal.ID, employeeProposal.ID
+}
+
+func countInputKind(inputs []analysisdomain.InputReference, kind analysisdomain.InputKind) int {
+	count := 0
+	for _, input := range inputs {
+		if input.Kind == kind {
+			count++
+		}
+	}
+	return count
 }
 
 func TestStorageRetriesDoNotDuplicateGraphRecords(t *testing.T) {
