@@ -152,7 +152,23 @@ func (service Service) Check(ctx context.Context) Report {
 		}
 	}
 
-	if service.Google == nil {
+	invocation, model, disclosure := service.modelChecks()
+	disclosureState := InvocationLoggingUnknown
+	var disclosureErr error
+	sourceAccessAllowed := invocation.DataMode == modelpolicy.DataModePersonal
+	if invocation.DataMode == modelpolicy.DataModeRestricted && invocation.Provider == modelpolicy.ProviderBedrock && disclosure != nil {
+		disclosureState, disclosureErr = disclosure.InvocationLogging(ctx)
+		if stop(&report, ctx, CheckModelDisclosure, disclosureErr) {
+			return report
+		}
+		if disclosureErr == nil && disclosureState == InvocationLoggingDisabled {
+			sourceAccessAllowed = true
+		}
+	}
+
+	if !sourceAccessAllowed {
+		report.Checks = appendGoogleDisclosureBlocked(report.Checks)
+	} else if service.Google == nil {
 		report.Checks = appendGoogleUnavailable(report.Checks, "Google check is not configured")
 	} else {
 		err := service.Google.CheckAuthorization(ctx)
@@ -197,7 +213,6 @@ func (service Service) Check(ctx context.Context) Report {
 		}
 	}
 
-	invocation, model, disclosure := service.modelChecks()
 	if model == nil {
 		report.Checks = appendModelUnavailable(report.Checks, invocation.Provider, fmt.Sprintf("%s model check is not configured", providerName(invocation.Provider)))
 	} else {
@@ -225,15 +240,7 @@ func (service Service) Check(ctx context.Context) Report {
 		report.Checks = append(report.Checks, ok(CheckModelDisclosure, "personal data mode selected; provider logging inspection is not required"))
 		return report
 	}
-	state := InvocationLoggingUnknown
-	var disclosureErr error
-	if disclosure != nil {
-		state, disclosureErr = disclosure.InvocationLogging(ctx)
-		if stop(&report, ctx, CheckModelDisclosure, disclosureErr) {
-			return report
-		}
-	}
-	report.Checks = append(report.Checks, restrictedDisclosureCheck(state, disclosureErr))
+	report.Checks = append(report.Checks, restrictedDisclosureCheck(disclosureState, disclosureErr))
 	return report
 }
 
@@ -286,6 +293,16 @@ func appendGoogleUnavailable(checks []Check, authorizationMessage string) []Chec
 		failed(CheckGoogleAuthorization, authorizationMessage, "run `stacks auth google`"),
 		failed(CheckGoogleFolder, "not checked because Google authorization is unavailable", "run `stacks auth google`"),
 		failed(CheckGoogleTabs, "not checked because Google authorization is unavailable", "run `stacks auth google`"),
+	)
+}
+
+func appendGoogleDisclosureBlocked(checks []Check) []Check {
+	const message = "not checked because restricted model disclosure safety is not confirmed"
+	const remediation = "confirm Bedrock invocation logging is disabled before source access"
+	return append(checks,
+		failed(CheckGoogleAuthorization, message, remediation),
+		failed(CheckGoogleFolder, message, remediation),
+		failed(CheckGoogleTabs, message, remediation),
 	)
 }
 

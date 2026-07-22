@@ -29,6 +29,124 @@ func TestDoctorReportsProviderNeutralModelChecksWithoutRuntimeInvocation(t *test
 	}
 }
 
+func TestDoctorRestrictedDisclosurePrecedesGoogleAndDisabledPermitsReads(t *testing.T) {
+	calls := []string{}
+	disclosure := &fakeDisclosureProbe{logging: func(context.Context) (InvocationLoggingState, error) {
+		calls = append(calls, "disclosure")
+		return InvocationLoggingDisabled, nil
+	}}
+	google := healthyGoogle()
+	google.authorization = func(context.Context) error {
+		calls = append(calls, "google.authorization")
+		return nil
+	}
+	model := &fakeModelProbe{}
+
+	report := (Service{
+		Database:   &fakeDatabase{migrationsCurrent: true},
+		Google:     google,
+		Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
+		Model:      model,
+		Disclosure: disclosure,
+	}).Check(context.Background())
+
+	if len(calls) != 2 || calls[0] != "disclosure" || calls[1] != "google.authorization" {
+		t.Fatalf("boundary calls = %v, want disclosure before Google authorization", calls)
+	}
+	if disclosure.calls != 1 || google.authorizationCalls != 1 || google.folderCalls != 1 || google.representativeCalls != 1 || google.getCalls != 1 {
+		t.Fatalf("calls = disclosure:%d authorization:%d folder:%d representative:%d get:%d, want 1/1/1/1/1", disclosure.calls, google.authorizationCalls, google.folderCalls, google.representativeCalls, google.getCalls)
+	}
+	if model.credentialsCalls != 1 || model.modelCalls != 1 || model.invokeCalls != 0 {
+		t.Fatalf("model calls = credentials:%d metadata:%d runtime:%d, want 1/1/0", model.credentialsCalls, model.modelCalls, model.invokeCalls)
+	}
+	assertCheck(t, report, CheckModelDisclosure, StatusOK, "restricted data mode selected; Bedrock invocation logging is disabled")
+}
+
+func TestDoctorRestrictedDisclosureFailureSkipsAllGoogleReads(t *testing.T) {
+	privateError := errors.New("AccessDeniedException private-request-id")
+	tests := []struct {
+		name  string
+		probe DisclosureProbe
+	}{
+		{name: "enabled", probe: &fakeDisclosureProbe{state: InvocationLoggingEnabled}},
+		{name: "unknown", probe: &fakeDisclosureProbe{state: InvocationLoggingUnknown}},
+		{name: "access denied", probe: &fakeDisclosureProbe{err: privateError}},
+		{name: "missing probe"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			google := healthyGoogle()
+			model := &fakeModelProbe{}
+			report := (Service{
+				Database:   &fakeDatabase{migrationsCurrent: true},
+				Google:     google,
+				Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
+				Model:      model,
+				Disclosure: testCase.probe,
+			}).Check(context.Background())
+
+			if google.authorizationCalls != 0 || google.folderCalls != 0 || google.representativeCalls != 0 || google.getCalls != 0 {
+				t.Fatalf("Google calls = authorization:%d folder:%d representative:%d get:%d, want all zero", google.authorizationCalls, google.folderCalls, google.representativeCalls, google.getCalls)
+			}
+			for _, name := range []CheckName{CheckGoogleAuthorization, CheckGoogleFolder, CheckGoogleTabs} {
+				check := assertCheck(t, report, name, StatusFailed, "not checked because restricted model disclosure safety is not confirmed")
+				if strings.Contains(check.Message, "private") || len(check.Message) > 160 || len(check.Remediation) > 160 {
+					t.Fatalf("Google skipped check leaked or is unbounded: %#v", check)
+				}
+			}
+			assertCheck(t, report, CheckModelDisclosure, StatusFailed, "restricted data mode selected; model disclosure safety is not confirmed")
+			if model.credentialsCalls != 1 || model.modelCalls != 1 || model.invokeCalls != 0 {
+				t.Fatalf("model calls = credentials:%d metadata:%d runtime:%d, want 1/1/0", model.credentialsCalls, model.modelCalls, model.invokeCalls)
+			}
+		})
+	}
+}
+
+func TestDoctorRestrictedDisclosureCancellationStopsBeforeGoogleAndModel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	disclosure := &fakeDisclosureProbe{logging: func(context.Context) (InvocationLoggingState, error) {
+		cancel()
+		return InvocationLoggingDisabled, nil
+	}}
+	google := healthyGoogle()
+	model := &fakeModelProbe{}
+
+	report := (Service{
+		Database:   &fakeDatabase{migrationsCurrent: true},
+		Google:     google,
+		Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
+		Model:      model,
+		Disclosure: disclosure,
+	}).Check(ctx)
+
+	if report.Err != context.Canceled || !errors.Is(report.Err, context.Canceled) {
+		t.Fatalf("Report.Err = %v, want canonical context.Canceled", report.Err)
+	}
+	assertCheck(t, report, CheckModelDisclosure, StatusFailed, "check canceled")
+	if google.authorizationCalls != 0 || google.folderCalls != 0 || google.representativeCalls != 0 || google.getCalls != 0 || model.credentialsCalls != 0 || model.modelCalls != 0 || model.invokeCalls != 0 {
+		t.Fatalf("calls after cancellation = Google:%d/%d/%d/%d model:%d/%d/%d, want all zero", google.authorizationCalls, google.folderCalls, google.representativeCalls, google.getCalls, model.credentialsCalls, model.modelCalls, model.invokeCalls)
+	}
+}
+
+func TestDoctorPersonalModeSkipsDisclosureAndPreservesGoogleAndModelFlow(t *testing.T) {
+	disclosure := &fakeDisclosureProbe{state: InvocationLoggingEnabled}
+	google := healthyGoogle()
+	model := &fakeModelProbe{}
+
+	report := (Service{
+		Database:   &fakeDatabase{migrationsCurrent: true},
+		Google:     google,
+		Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderAnthropic, DataMode: modelpolicy.DataModePersonal},
+		Model:      model,
+		Disclosure: disclosure,
+	}).Check(context.Background())
+
+	if disclosure.calls != 0 || google.authorizationCalls != 1 || google.folderCalls != 1 || google.representativeCalls != 1 || google.getCalls != 1 || model.credentialsCalls != 1 || model.modelCalls != 1 || model.invokeCalls != 0 {
+		t.Fatalf("calls = disclosure:%d Google:%d/%d/%d/%d model:%d/%d/%d", disclosure.calls, google.authorizationCalls, google.folderCalls, google.representativeCalls, google.getCalls, model.credentialsCalls, model.modelCalls, model.invokeCalls)
+	}
+	assertCheck(t, report, CheckModelDisclosure, StatusOK, "personal data mode selected; provider logging inspection is not required")
+}
+
 func TestDoctorRestrictedDisclosureFailsUnlessDisabledIsConfirmed(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -326,8 +444,8 @@ func TestDoctorStopsAfterSuccessfulCallThatCancelsContext(t *testing.T) {
 			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
 				aws := &fakeAWS{credentials: func(context.Context) error { cancel(); return nil }}
 				return healthyService(aws), func(t *testing.T) {
-					if aws.modelCalls != 0 || aws.loggingCalls != 0 {
-						t.Fatalf("downstream calls = model:%d logging:%d, want zero", aws.modelCalls, aws.loggingCalls)
+					if aws.modelCalls != 0 || aws.loggingCalls != 1 {
+						t.Fatalf("calls = model:%d logging:%d, want 0/1 with disclosure checked first", aws.modelCalls, aws.loggingCalls)
 					}
 				}
 			},
@@ -337,8 +455,8 @@ func TestDoctorStopsAfterSuccessfulCallThatCancelsContext(t *testing.T) {
 			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
 				aws := &fakeAWS{model: func(context.Context) error { cancel(); return nil }}
 				return healthyService(aws), func(t *testing.T) {
-					if aws.loggingCalls != 0 {
-						t.Fatalf("logging calls = %d, want zero", aws.loggingCalls)
+					if aws.loggingCalls != 1 {
+						t.Fatalf("logging calls = %d, want one before model metadata", aws.loggingCalls)
 					}
 				}
 			},
