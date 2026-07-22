@@ -2,29 +2,53 @@ package main
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
+	"go.uber.org/zap"
 
 	"stacks/internal/app"
 	"stacks/internal/config"
+	"stacks/internal/observability"
 )
 
+const observabilityShutdownTimeout = 10 * time.Second
+
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	bootstrapLogger, err := zap.NewProduction()
+	if err != nil {
+		panic(err)
+	}
 
 	settings, err := config.Load()
 	if err != nil {
-		logger.Error("load configuration", "error", err)
+		bootstrapLogger.Error("load configuration", zap.Error(err))
 		os.Exit(1)
 	}
+
+	runtime, err := observability.New(context.Background(), settings)
+	if err != nil {
+		bootstrapLogger.Error("initialize observability", zap.Error(err))
+		os.Exit(1)
+	}
+	logger := runtime.Logger()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := app.Run(ctx, settings, logger); err != nil {
-		logger.Error("run stacks", "error", err)
+	runErr := app.Run(ctx, settings, logger, runtime.TracerProvider(), runtime.MeterProvider())
+	if runErr != nil {
+		logger.Error("run stacks", zap.Error(runErr))
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), observabilityShutdownTimeout)
+	shutdownErr := runtime.Shutdown(shutdownCtx)
+	cancel()
+	if shutdownErr != nil {
+		bootstrapLogger.Error("shut down observability", zap.Error(shutdownErr))
+	}
+	if runErr != nil || shutdownErr != nil {
 		os.Exit(1)
 	}
 }

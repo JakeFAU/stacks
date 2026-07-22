@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"time"
+
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
 	"stacks/internal/config"
 	"stacks/internal/httpapi"
@@ -16,16 +19,22 @@ const shutdownTimeout = 10 * time.Second
 
 // Run owns the application lifecycle and blocks until the context is canceled
 // or the HTTP server fails.
-func Run(ctx context.Context, settings config.Settings, logger *slog.Logger) error {
+func Run(
+	ctx context.Context,
+	settings config.Settings,
+	logger *zap.Logger,
+	tracerProvider trace.TracerProvider,
+	meterProvider metric.MeterProvider,
+) error {
 	server := &http.Server{
 		Addr:              settings.HTTPAddress,
-		Handler:           httpapi.NewHandler(),
+		Handler:           httpapi.NewHandler(tracerProvider, meterProvider),
 		ReadHeaderTimeout: settings.ReadHeaderTimeout,
 	}
 
 	serverError := make(chan error, 1)
 	go func() {
-		logger.Info("HTTP server listening", "address", settings.HTTPAddress)
+		logger.Info("HTTP server listening", zap.String("address", settings.HTTPAddress))
 		serverError <- server.ListenAndServe()
 	}()
 

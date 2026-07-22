@@ -136,7 +136,16 @@ This is a private-data system. Failures must be diagnosable without logging priv
 
 Use structured logs. Include stable operational identifiers where useful, such as source ID, document ID, ingestion run ID, or content hash. Do not log raw documents, extracted passages, prompts containing private text, embeddings, credentials, or authorization headers.
 
-Add metrics or tracing only when they answer a concrete operational question.
+Logging uses Zap. Traces and metrics use OpenTelemetry. Successful spans must be
+explicitly marked `OK`; use `observability.FinishSpan` for manually owned spans.
+Create spans only for meaningful request, job, storage, or provider boundaries.
+Record decisions as attributes and events on the owning span instead of creating
+deep decision subtrees.
+
+Prefer distributional metrics for durations, input/output sizes, candidate
+counts, and confidence. Metric attributes must be low-cardinality. Never use
+document contents, prompts, user-controlled values, or unbounded identifiers as
+metric labels. `observability.DecisionRecorder` is the default decision boundary.
 
 ## Build and Development Commands
 
@@ -149,6 +158,9 @@ Add metrics or tracing only when they answer a concrete operational question.
 * `make db-migrate` applies pending forward migrations as `stacks_admin`.
 * `make db-status` reports applied and pending migrations.
 * `make db-down` stops PostgreSQL without deleting its named volume.
+* `make obs-up` starts the optional Collector, Prometheus, Tempo, Loki, and Grafana stack.
+* `make obs-down` stops that stack without deleting its named volumes.
+* `make obs-config` validates the observability Compose model.
 
 The default health endpoint is:
 
