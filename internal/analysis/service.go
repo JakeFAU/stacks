@@ -26,7 +26,7 @@ import (
 const (
 	// AnalysisPolicyVersion changes whenever deterministic admission semantics
 	// change, ensuring old completed runs remain distinguishable.
-	AnalysisPolicyVersion = "manager-confidence-policy-v3"
+	AnalysisPolicyVersion = "manager-confidence-policy-v4"
 	analysisSpanName      = "stacks.analysis.pair"
 	analysisDecisionName  = "pair_analysis"
 	temporalDigestScope   = "stacks.temporal-pair-analysis.v1"
@@ -76,6 +76,9 @@ type AnalysisIdentity struct {
 	ManagerEntityID  string
 	PromptVersion    string
 	PolicyVersion    string
+	Region           string
+	ModelID          string
+	MaxTokens        int
 	Inputs           []InputReference
 	InputDigest      [sha256.Size]byte
 }
@@ -172,6 +175,9 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 		ManagerEntityID:  strings.TrimSpace(managerID),
 		PromptVersion:    service.PromptVersion,
 		PolicyVersion:    AnalysisPolicyVersion,
+		Region:           service.Region,
+		ModelID:          service.ModelID,
+		MaxTokens:        service.MaxTokens,
 		Inputs:           append([]InputReference(nil), snapshot.Inputs...),
 	}
 	identity.InputDigest, err = ComputeInputDigest(identity)
@@ -202,12 +208,12 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 		PairAccepted: true, Proposed: proposal.Conclusion, Signals: chronology.Dated,
 		SupportingSignalIDs: proposal.SupportingSignalIDs,
 	})
-	applyAdmittedProposal(&report, proposal)
 	if report.Status == proposal.Conclusion {
 		report.Counterevidence = collectAdmittedCounterevidence(eligible, proposal.ContradictingSignalIDs)
 	} else {
 		report.Counterevidence = collectSourceCounterevidence(eligible)
 	}
+	applyAdmittedProposal(&report, proposal)
 	report.ModelID = response.ModelID
 	report.RecordedAt = service.now()
 	service.recordDecision(ctx, report.Status, len(chronology.Dated), len(proposal.SupportingSignalIDs), service.now().Sub(started))
@@ -230,21 +236,26 @@ func (service *Service) baseReport(chronology Chronology) Report {
 }
 
 func applyAdmittedProposal(report *Report, proposal analysisProposal) {
-	if report.Status == proposal.Conclusion {
-		report.Rationale = proposal.Rationale
-		report.Gaps = append(report.Gaps, proposal.Gaps...)
-		return
+	if report.Status != proposal.Conclusion {
+		report.Limitations = append(report.Limitations,
+			"The model-proposed status was replaced because its cited signal references did not satisfy deterministic admission policy.")
 	}
-	report.Limitations = append(report.Limitations,
-		"The model-proposed status and explanatory prose were replaced because the cited evidence did not satisfy deterministic admission policy.")
 	switch report.Status {
 	case StatusMixedOrConflicting:
-		report.Rationale = "Deterministic policy found conflicting dated observations and did not admit the model-proposed directional conclusion."
+		report.Rationale = "Deterministic admission policy found mixed or opposing observable directions across the dated, transcript-backed signals."
 	case StatusInsufficientEvidence:
-		report.Rationale = "Deterministic policy did not find the cited earlier/later meeting comparison required to admit the model-proposed conclusion."
-		report.Gaps = append(report.Gaps, "The cited signals do not establish an earlier/later weakening comparison across distinct meetings.")
-	default:
-		report.Rationale = "Deterministic policy replaced a model-proposed conclusion that was not supported by the admitted evidence."
+		report.Rationale = "Deterministic admission policy did not find the required dated, transcript-backed comparison for a stronger conclusion."
+		report.Gaps = append(report.Gaps, "The admitted signal references do not establish the required earlier/later comparison across distinct meetings.")
+	case StatusNoMaterialChange:
+		report.Rationale = "Deterministic admission policy found no material opposing directional pattern in the dated, transcript-backed signals."
+	case StatusPossibleDecline:
+		report.Rationale = "Deterministic admission policy found a cited earlier comparison and a later weakening observable signal in different dated meetings."
+	}
+	if len(report.UnknownTime) > 0 {
+		report.Gaps = append(report.Gaps, "One or more eligible signals lack source-valid time and are excluded from dated comparison.")
+	}
+	if len(report.Counterevidence) == 0 {
+		report.Gaps = append(report.Gaps, "No explicit contradicting transcript citation was identified in the admitted inputs.")
 	}
 }
 
@@ -444,7 +455,8 @@ func validDirection(direction Direction) bool {
 // ordered immutable inputs, and active prompt/policy versions.
 func ComputeInputDigest(identity AnalysisIdentity) ([sha256.Size]byte, error) {
 	if strings.TrimSpace(identity.EmployeeEntityID) == "" || strings.TrimSpace(identity.ManagerEntityID) == "" ||
-		strings.TrimSpace(identity.PromptVersion) == "" || strings.TrimSpace(identity.PolicyVersion) == "" {
+		strings.TrimSpace(identity.PromptVersion) == "" || strings.TrimSpace(identity.PolicyVersion) == "" ||
+		strings.TrimSpace(identity.Region) == "" || strings.TrimSpace(identity.ModelID) == "" || identity.MaxTokens <= 0 {
 		return [sha256.Size]byte{}, fmt.Errorf("analysis identity fields are required")
 	}
 	employeeID, err := uuid.Parse(strings.TrimSpace(identity.EmployeeEntityID))
@@ -461,6 +473,9 @@ func ComputeInputDigest(identity AnalysisIdentity) ([sha256.Size]byte, error) {
 	writeDigestString(hasher, managerID.String())
 	writeDigestString(hasher, strings.TrimSpace(identity.PromptVersion))
 	writeDigestString(hasher, strings.TrimSpace(identity.PolicyVersion))
+	writeDigestString(hasher, strings.TrimSpace(identity.Region))
+	writeDigestString(hasher, strings.TrimSpace(identity.ModelID))
+	writeDigestLength(hasher, uint64(identity.MaxTokens))
 	writeDigestLength(hasher, uint64(len(identity.Inputs)))
 	seenInputs := make(map[string]struct{}, len(identity.Inputs))
 	for index, input := range identity.Inputs {

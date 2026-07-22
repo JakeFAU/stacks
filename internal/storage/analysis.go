@@ -308,22 +308,22 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 	var current *analysisdomain.Signal
 	for rows.Next() {
 		var (
-			signalID, category, direction, rationale, observationID string
-			subjectDecisionID, objectDecisionID                     string
-			documentVersionID, documentTabID                        string
-			meetingID, provider, providerDocumentID, providerTabID  string
-			tabRole                                                 string
-			evidenceID, quote, evidenceRole                         string
-			signalDigest, observationDigest                         []byte
-			subjectDecisionDigest, objectDecisionDigest             []byte
-			documentDigest, tabDigest                               []byte
-			validTime                                               *time.Time
-			recordedAt                                              time.Time
-			confidence                                              float64
-			startOffset, endOffset                                  int
+			signalID, category, direction, storedRationale, observationID string
+			subjectDecisionID, objectDecisionID                           string
+			documentVersionID, documentTabID                              string
+			meetingID, provider, providerDocumentID, providerTabID        string
+			tabRole                                                       string
+			evidenceID, quote, evidenceRole                               string
+			signalDigest, observationDigest                               []byte
+			subjectDecisionDigest, objectDecisionDigest                   []byte
+			documentDigest, tabDigest                                     []byte
+			validTime                                                     *time.Time
+			recordedAt                                                    time.Time
+			confidence                                                    float64
+			startOffset, endOffset                                        int
 		)
 		if err := rows.Scan(
-			&signalID, &signalDigest, &category, &direction, &rationale, &confidence,
+			&signalID, &signalDigest, &category, &direction, &storedRationale, &confidence,
 			&observationID, &observationDigest, &validTime, &recordedAt,
 			&meetingID,
 			&subjectDecisionID, &subjectDecisionDigest, &objectDecisionID, &objectDecisionDigest,
@@ -351,7 +351,8 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 			pair.Signals = append(pair.Signals, analysisdomain.Signal{
 				ID: signalID, MeetingID: meetingInput.ID, ObservationID: observationID,
 				Category: analysisdomain.Category(category), Direction: analysisdomain.Direction(direction),
-				ValidTime: validTime, RecordedAt: recordedAt.UTC(), Rationale: rationale,
+				ValidTime: validTime, RecordedAt: recordedAt.UTC(),
+				Rationale:  analysisdomain.ExplainSignal(analysisdomain.Category(category), analysisdomain.Direction(direction)),
 				Confidence: confidence, Validated: true, TranscriptBacked: true,
 				Inputs: signalInputRefs,
 			})
@@ -478,8 +479,10 @@ func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, comp
 	if err := validateCompletedReport(completion.Report); err != nil {
 		return analysisdomain.Report{}, err
 	}
-	if completion.Report.PromptVersion != completion.Identity.PromptVersion || completion.Report.PolicyVersion != completion.Identity.PolicyVersion {
-		return analysisdomain.Report{}, fmt.Errorf("complete pair analysis: report versions conflict with input identity")
+	if completion.Report.PromptVersion != completion.Identity.PromptVersion || completion.Report.PolicyVersion != completion.Identity.PolicyVersion ||
+		completion.Report.Region != completion.Identity.Region || completion.Report.ModelID != completion.Identity.ModelID ||
+		completion.Report.MaxTokens != completion.Identity.MaxTokens {
+		return analysisdomain.Report{}, fmt.Errorf("complete pair analysis: report configuration conflicts with input identity")
 	}
 	completion.Report.InputDigest = wantDigest
 	completion.Report.ID = uuid.NewSHA1(uuid.NameSpaceOID, wantDigest[:]).String()
@@ -512,7 +515,7 @@ func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, comp
 		completion.Report.ID, completion.Identity.EmployeeEntityID, completion.Identity.ManagerEntityID,
 		wantDigest[:], completion.Identity.PromptVersion, completion.Identity.PolicyVersion,
 		completion.Report.RecordedAt, completion.Report.Rationale, string(completion.Report.Status),
-		completion.Report.Region, completion.Report.ModelID, completion.Report.MaxTokens, reportJSON)
+		completion.Identity.Region, completion.Identity.ModelID, completion.Identity.MaxTokens, reportJSON)
 	if err != nil {
 		return analysisdomain.Report{}, fmt.Errorf("persist pair analysis: %w", err)
 	}

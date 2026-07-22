@@ -16,9 +16,9 @@ counterevidence, uncertainty, gaps, and citations visible.
 - Docker with Compose
 - a Google installed-application OAuth client with read-only Drive and Docs
   access
-- AWS credentials, an explicit region, and a Bedrock model or inference
-  profile; doctor may use an optional shared profile or the default credential
-  chain
+- AWS credentials available through the default credential chain or an
+  optional shared profile, an explicit region, and a Bedrock model or inference
+  profile
 
 ## Configure the local environment
 
@@ -65,11 +65,12 @@ implemented.
 | `STACKS_GOOGLE_OAUTH_TOKEN_FILE` | no default | External owner-only OAuth token JSON path |
 | `STACKS_TRANSCRIPT_TITLES` | no default | Comma-separated exact transcript titles after case/whitespace normalization |
 | `STACKS_NOTES_TITLES` | no default | Comma-separated exact Gemini-notes titles after normalization |
-| `STACKS_AWS_PROFILE` | no default | Shared AWS profile required by `sync` and `analyze`; doctor uses the default credential chain when unset |
+| `STACKS_AWS_PROFILE` | no default | Optional shared AWS profile; all AWS commands use the default credential chain when unset |
 | `STACKS_AWS_REGION` | no default | Explicit Bedrock control-plane and runtime region |
 | `STACKS_BEDROCK_MODEL_ID` | no default | Foundation-model or inference-profile ID; no model is guessed |
 | `STACKS_BEDROCK_MAX_TOKENS` | no default | Required positive output-token limit for every invocation |
 | `STACKS_BEDROCK_MAX_ATTEMPTS` | `5` | Positive bound for retryable model failures |
+| `STACKS_INGEST_LEASE_DURATION` | `5m` | Positive extraction-claim duration, bounded to at most `1h` |
 | `STACKS_EXTRACTION_PROMPT_VERSION` | `extract-v1` | Versioned extraction prompt |
 | `STACKS_ANALYSIS_PROMPT_VERSION` | `analyze-v1` | Versioned pair-analysis prompt |
 | `STACKS_EMPLOYEE_ENTITY_ID` | no default | Accepted employee entity used by `analyze` |
@@ -111,23 +112,31 @@ make review ARGS="correct <effective-decision-id> <entity-id>"
 make analyze
 ```
 
-`stacks doctor` is read-only. It checks PostgreSQL connectivity and applied
-migrations; Google OAuth material, configured-folder access, and one
-representative all-tabs classification; AWS credentials; configured Bedrock
-model or inference-profile control-plane availability; and account-level model
-invocation logging when inspectable. It never runs OAuth, applies migrations,
-syncs or persists graph data, extracts content, invokes a model, changes
-configuration, or enables/disables logging. Missing or expired Google
-authorization directs the operator to `stacks auth google`.
+`stacks doctor` is read-only. It checks PostgreSQL connectivity and the complete
+required set of applied migrations; Google OAuth material, configured-folder
+access, and one representative all-tabs classification; AWS credentials;
+configured Bedrock model or inference-profile control-plane availability; and
+account-level model invocation logging when inspectable. It never runs OAuth,
+applies migrations, syncs or persists graph data, extracts content, invokes a
+model, changes configuration, or enables/disables logging. Missing or expired
+Google authorization directs the operator to `stacks auth google`.
 
 Doctor requires only the database, Google folder and OAuth paths, tab-title
-sets, AWS region, and model or inference-profile ID. An AWS profile is optional
-for doctor, and model invocation limits, retry settings, prompt versions, and
-pair IDs are not part of its read-only preflight contract.
+sets, AWS region, and model or inference-profile ID. An AWS profile is optional,
+and model invocation limits, retry settings, prompt versions, and pair IDs are
+not part of its read-only preflight contract.
 
 If AWS credential validation fails, refresh credentials in the active default
 credential chain or the explicitly configured shared profile. Doctor does not
 assume that a profile is configured.
+
+Sync claims each exact source-version and extraction-configuration derivation
+for `STACKS_INGEST_LEASE_DURATION`. A concurrent sync reports that document as
+incomplete/busy without invoking Bedrock. Failed attempts release their claim;
+an interrupted process can be retried after the finite lease expires. Changing
+the Bedrock region, model ID, token limit, prompt version, or extraction schema
+creates a new auditable extraction run while retaining the immutable source
+version and earlier derivations.
 
 The Bedrock availability check does not invoke the model and therefore cannot
 prove runtime quota, throughput, or successful inference. An account with zero
@@ -151,12 +160,15 @@ cannot rely on notes alone: its citations must map exactly to transcript text.
 
 ## Review, corrections, and bounded conclusions
 
-Ambiguous identity matches remain proposals. A ranked guess and confidence do
-not become graph truth until accepted. `review accept`, `review reject`, and
-`review create` append decisions. `review correct` appends a replacement that
-supersedes the prior effective decision without deleting it. A subsequent
-analysis uses the corrected identity while earlier decisions, analysis inputs,
-and provenance remain available for audit.
+Ambiguous identity matches remain proposals. `review list` prints the highest
+ranked guess, confidence, alternative count, bounded reason, and bounded cited
+transcript context for local inspection. A ranked guess and confidence do not
+become graph truth until accepted. `review accept`, `review reject`, and `review
+create` append decisions and decision-owned alias assertions. `review correct`
+appends a replacement that supersedes the prior effective decision without
+deleting it or its audit history; aliases owned by the old decision stop being
+authoritative. A subsequent analysis uses the corrected identity while earlier
+decisions, analysis inputs, and provenance remain available for audit.
 
 `analyze` can return only:
 
@@ -182,8 +194,10 @@ AccessDenied inspection result, must never be treated as safe.
 
 Operational logs, metrics, and traces exclude transcript and notes text,
 prompts, raw model output, names, emails, Drive titles and URLs, credentials,
-and OAuth tokens. The local review and analysis commands deliberately print
-private evidence to their explicit terminal output for operator inspection.
+and OAuth tokens. Bedrock telemetry records only bounded outcomes, configured
+model and prompt versions, attempts, token counts, and wall/provider latency.
+The local review and analysis commands deliberately print private evidence to
+their explicit terminal output for operator inspection.
 
 ## Service and observability
 

@@ -20,12 +20,27 @@ import (
 	"stacks/internal/source/drive"
 )
 
-const requiredMigrationVersion int64 = 4
+const (
+	enableVectorMigrationVersion             int64 = 1
+	managerConfidenceMigrationVersion        int64 = 2
+	ingestionProcessingStateMigrationVersion int64 = 3
+	temporalPairAnalysisMigrationVersion     int64 = 4
+	managerConfidenceFinalFixesVersion       int64 = 5
+)
 
-const migrationVersionQuery = `
-	SELECT COALESCE(MAX(version_id), 0)
-	FROM public.goose_db_version
-	WHERE is_applied`
+const migrationSetQuery = `
+	WITH latest_migration_state AS (
+		SELECT DISTINCT ON (version_id) version_id, is_applied
+		FROM public.goose_db_version
+		ORDER BY version_id, id DESC
+	)
+	SELECT NOT EXISTS (
+		SELECT 1
+		FROM unnest($1::bigint[]) AS required(version_id)
+		LEFT JOIN latest_migration_state AS applied
+			ON applied.version_id = required.version_id AND applied.is_applied
+		WHERE applied.version_id IS NULL
+	)`
 
 type postgresRow interface {
 	Scan(...any) error
@@ -73,18 +88,28 @@ func (probe *PostgresProbe) Ping(ctx context.Context) error {
 	return nil
 }
 
-// MigrationsCurrent inspects Goose's applied migration version without
-// applying or modifying any migration.
+// MigrationsCurrent verifies every required Goose migration's latest state
+// without applying or modifying any migration.
 func (probe *PostgresProbe) MigrationsCurrent(ctx context.Context) (bool, error) {
 	connection, err := probe.connect(ctx)
 	if err != nil {
 		return false, fmt.Errorf("open PostgreSQL doctor connection: %w", err)
 	}
-	var version int64
-	if err := connection.QueryRow(ctx, migrationVersionQuery).Scan(&version); err != nil {
+	var current bool
+	if err := connection.QueryRow(ctx, migrationSetQuery, requiredMigrationVersions()).Scan(&current); err != nil {
 		return false, fmt.Errorf("inspect PostgreSQL migrations: %w", err)
 	}
-	return version >= requiredMigrationVersion, nil
+	return current, nil
+}
+
+func requiredMigrationVersions() []int64 {
+	return []int64{
+		enableVectorMigrationVersion,
+		managerConfidenceMigrationVersion,
+		ingestionProcessingStateMigrationVersion,
+		temporalPairAnalysisMigrationVersion,
+		managerConfidenceFinalFixesVersion,
+	}
 }
 
 // Close releases the probe connection when one was opened.

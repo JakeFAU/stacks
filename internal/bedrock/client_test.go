@@ -3,6 +3,7 @@ package bedrock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -15,6 +16,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"stacks/internal/extract"
 )
 
@@ -61,8 +65,51 @@ func TestGenerateBuildsStructuredConverseRequestAndCapturesUsage(t *testing.T) {
 		t.Fatalf("telemetry observations = %d, want 1", len(recorder.observations))
 	}
 	observation := recorder.observations[0]
-	if observation.ModelID != testModelID || observation.PromptVersion != testPromptVersion || observation.Outcome != OutcomeSuccess || observation.InputTokens != 11 || observation.OutputTokens != 7 || observation.Latency != 47*time.Millisecond || observation.Attempts != 1 {
+	if observation.ModelID != testModelID || observation.PromptVersion != testPromptVersion || observation.Outcome != OutcomeSuccess || observation.InputTokens != 11 || observation.OutputTokens != 7 || observation.TotalTokens != 18 || observation.ProviderLatency != 47*time.Millisecond || observation.Attempts != 1 {
 		t.Errorf("telemetry observation = %+v", observation)
+	}
+}
+
+func TestGenerateRecordsWallAndProviderLatencyAndExplicitSuccessSpan(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	recorder := &recordingInvocationRecorder{}
+	client := newTestClient(t, &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{successfulOutput(`{}`)}}, recorder, 1)
+	client.tracer = provider.Tracer("stacks")
+	started := time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC)
+	times := []time.Time{started, started.Add(75 * time.Millisecond)}
+	client.now = func() time.Time {
+		value := times[0]
+		times = times[1:]
+		return value
+	}
+
+	if _, err := client.Generate(context.Background(), validRequest()); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if got := recorder.observations[0]; got.WallLatency != 75*time.Millisecond || got.ProviderLatency != 47*time.Millisecond {
+		t.Fatalf("invocation latency = %#v, want wall=75ms provider=47ms", got)
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != invocationSpanName || spans[0].Status.Code != codes.Ok {
+		t.Fatalf("invocation spans = %#v, want one explicit OK span", spans)
+	}
+}
+
+func TestGenerateRecordsRealBoundedWallLatencyForProviderFailure(t *testing.T) {
+	recorder := &recordingInvocationRecorder{}
+	client := newTestClient(t, &fakeConverseAPI{errors: []error{&smithy.GenericAPIError{Code: "AccessDeniedException", Message: testPrivateInput}}}, recorder, 1)
+	started := time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC)
+	times := []time.Time{started, started.Add(25 * time.Millisecond)}
+	client.now = func() time.Time {
+		value := times[0]
+		times = times[1:]
+		return value
+	}
+
+	_, _ = client.Generate(context.Background(), validRequest())
+	if got := recorder.observations[0]; got.WallLatency != 25*time.Millisecond || got.ProviderLatency != 0 || got.Outcome != OutcomeAccessDenied {
+		t.Fatalf("failure telemetry = %#v, want bounded non-zero wall latency", got)
 	}
 }
 
@@ -200,10 +247,47 @@ func TestGenerateDoesNotRetryAccessDenied(t *testing.T) {
 	}
 }
 
+func TestGenerateReturnsBoundedTypedAuthenticationAndAuthorizationFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		want error
+	}{
+		{name: "expired credentials", code: "ExpiredTokenException", want: extract.ErrAuthentication},
+		{name: "unrecognized credentials", code: "UnrecognizedClientException", want: extract.ErrAuthentication},
+		{name: "access denied", code: "AccessDeniedException", want: extract.ErrAuthorization},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := newTestClient(t, &fakeConverseAPI{errors: []error{&smithy.GenericAPIError{Code: test.code, Message: testPrivateInput}}}, &recordingInvocationRecorder{}, 1)
+			_, err := client.Generate(context.Background(), validRequest())
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Generate() error = %v, want typed auth failure", err)
+			}
+			if strings.Contains(err.Error(), testPrivateInput) {
+				t.Fatalf("typed auth error leaked provider text: %v", err)
+			}
+		})
+	}
+}
+
+func TestGeneratePreservesBoundedCredentialProviderAuthenticationFailure(t *testing.T) {
+	providerErr := fmt.Errorf("synthetic signing boundary: %w", extract.ErrAuthentication)
+	recorder := &recordingInvocationRecorder{}
+	client := newTestClient(t, &fakeConverseAPI{errors: []error{providerErr}}, recorder, 5)
+
+	_, err := client.Generate(context.Background(), validRequest())
+	if !errors.Is(err, extract.ErrAuthentication) {
+		t.Fatalf("Generate() error = %v, want typed authentication failure", err)
+	}
+	if len(recorder.observations) != 1 || recorder.observations[0].Outcome != OutcomeAuthentication {
+		t.Fatalf("telemetry = %+v, want one authentication outcome", recorder.observations)
+	}
+}
+
 func TestGenerateDoesNotRetryErrorsOutsideExactAllowlist(t *testing.T) {
 	tests := map[string]error{
 		"connection failure": &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET},
-		"request timeout":    &smithy.GenericAPIError{Code: "RequestTimeout", Message: testPrivateInput},
 		"other throttling": &smithy.GenericAPIError{
 			Code: "ProvisionedThroughputExceededException", Message: testPrivateInput,
 		},
@@ -211,7 +295,6 @@ func TestGenerateDoesNotRetryErrorsOutsideExactAllowlist(t *testing.T) {
 			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusInternalServerError}},
 			Err:      errors.New("synthetic transport failure"),
 		},
-		"network timeout": syntheticTimeoutError{},
 	}
 	for name, providerErr := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -229,6 +312,46 @@ func TestGenerateDoesNotRetryErrorsOutsideExactAllowlist(t *testing.T) {
 				t.Fatalf("Converse calls = %d, want exact-policy single attempt", len(api.inputs))
 			}
 		})
+	}
+}
+
+func TestGenerateRetriesLiveContextTransportAndRequestTimeouts(t *testing.T) {
+	tests := map[string]error{
+		"deadline returned by request": context.DeadlineExceeded,
+		"request timeout service code": &smithy.GenericAPIError{Code: "RequestTimeout", Message: testPrivateInput},
+		"network timeout":              syntheticTimeoutError{},
+	}
+	for name, timeoutErr := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeConverseAPI{
+				errors:  []error{timeoutErr, nil},
+				outputs: []*bedrockruntime.ConverseOutput{nil, successfulOutput(`{}`)},
+			}
+			client := newTestClient(t, api, &recordingInvocationRecorder{}, 2)
+			if _, err := client.Generate(context.Background(), validRequest()); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+			if len(api.inputs) != 2 {
+				t.Fatalf("Converse calls = %d, want one bounded timeout retry", len(api.inputs))
+			}
+		})
+	}
+}
+
+func TestGenerateNeverRetriesExpiredCallerDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	api := &fakeConverseAPI{call: func() error {
+		cancel()
+		return context.DeadlineExceeded
+	}}
+	client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
+
+	_, err := client.Generate(ctx, validRequest())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Generate() error = %v, want caller cancellation", err)
+	}
+	if len(api.inputs) != 1 {
+		t.Fatalf("Converse calls = %d, want no caller-cancellation retry", len(api.inputs))
 	}
 }
 
@@ -291,7 +414,7 @@ func TestGenerateRejectsUnsupportedStopReasonWithoutLeakingOutput(t *testing.T) 
 	if strings.Contains(err.Error(), testPrivateOutput) {
 		t.Fatalf("error leaks private model output: %v", err)
 	}
-	if got := recorder.observations[0]; got.InputTokens != 11 || got.OutputTokens != 7 || got.Latency != 47*time.Millisecond || got.Outcome != OutcomeInvalidOutput {
+	if got := recorder.observations[0]; got.InputTokens != 11 || got.OutputTokens != 7 || got.ProviderLatency != 47*time.Millisecond || got.Outcome != OutcomeInvalidOutput {
 		t.Fatalf("invalid-output telemetry = %+v, want provider usage without private output", got)
 	}
 }

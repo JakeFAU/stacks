@@ -16,7 +16,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/smithy-go"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
+
 	"stacks/internal/extract"
+	"stacks/internal/observability"
 )
 
 const (
@@ -29,6 +33,7 @@ const (
 	OutcomeTimeout        = "timeout"
 	OutcomeUnavailable    = "unavailable"
 	OutcomeInternal       = "internal_error"
+	OutcomeAuthentication = "authentication_error"
 	OutcomeAccessDenied   = "access_denied"
 	OutcomeNotFound       = "not_found"
 	OutcomeInvalidRequest = "invalid_request"
@@ -44,10 +49,13 @@ var (
 )
 
 const (
-	modelTimeoutErrorCode             = "ModelTimeoutException"
-	serviceUnavailableErrorCode       = "ServiceUnavailableException"
-	internalServerErrorCode           = "InternalServerException"
-	maxLatencyMilliseconds      int64 = (1<<63 - 1) / int64(time.Millisecond)
+	modelTimeoutErrorCode                  = "ModelTimeoutException"
+	requestTimeoutErrorCode                = "RequestTimeout"
+	requestTimeoutExceptionErrorCode       = "RequestTimeoutException"
+	serviceUnavailableErrorCode            = "ServiceUnavailableException"
+	internalServerErrorCode                = "InternalServerException"
+	maxLatencyMilliseconds           int64 = (1<<63 - 1) / int64(time.Millisecond)
+	invocationSpanName                     = "stacks.bedrock.converse"
 )
 
 type converseAPI interface {
@@ -57,13 +65,15 @@ type converseAPI interface {
 // InvocationObservation is the bounded telemetry emitted for one completed
 // Generate call. It deliberately excludes request and response text.
 type InvocationObservation struct {
-	ModelID       string
-	PromptVersion string
-	Outcome       string
-	InputTokens   int64
-	OutputTokens  int64
-	Latency       time.Duration
-	Attempts      int
+	ModelID         string
+	PromptVersion   string
+	Outcome         string
+	InputTokens     int64
+	OutputTokens    int64
+	TotalTokens     int64
+	WallLatency     time.Duration
+	ProviderLatency time.Duration
+	Attempts        int
 }
 
 // InvocationRecorder receives privacy-safe invocation telemetry.
@@ -77,6 +87,7 @@ type Options struct {
 	MaxTokens   int
 	MaxAttempts int
 	Recorder    InvocationRecorder
+	Tracer      trace.Tracer
 }
 
 // Client implements extract.Model with Bedrock Runtime Converse structured
@@ -88,6 +99,8 @@ type Client struct {
 	maxTokens int32
 	retryer   aws.Retryer
 	recorder  InvocationRecorder
+	tracer    trace.Tracer
+	now       func() time.Time
 }
 
 var _ extract.Model = (*Client)(nil)
@@ -126,19 +139,27 @@ func newClient(api converseAPI, options Options, retryer aws.Retryer) (*Client, 
 	if options.MaxAttempts <= 0 || options.MaxAttempts > MaxAttemptsLimit || retryer.MaxAttempts() != options.MaxAttempts {
 		return nil, fmt.Errorf("create Bedrock client: maximum attempts are invalid")
 	}
+	tracer := options.Tracer
+	if tracer == nil {
+		tracer = tracenoop.NewTracerProvider().Tracer("stacks")
+	}
 	return &Client{
 		api: api, modelID: modelID, maxTokens: int32(options.MaxTokens),
-		retryer: retryer, recorder: options.Recorder,
+		retryer: retryer, recorder: options.Recorder, tracer: tracer, now: time.Now,
 	}, nil
 }
 
 // Generate invokes Converse and returns untrusted structured JSON plus bounded
 // metadata. It never includes private request or response data in errors or
 // telemetry.
-func (client *Client) Generate(ctx context.Context, request extract.Request) (extract.Response, error) {
+func (client *Client) Generate(ctx context.Context, request extract.Request) (response extract.Response, resultErr error) {
+	ctx, span := client.tracer.Start(ctx, invocationSpanName)
+	started := client.now()
+	defer func() { observability.FinishSpan(span, resultErr) }()
+
 	input, err := client.converseInput(request)
 	if err != nil {
-		client.record(ctx, "", OutcomeInvalidRequest, extract.Usage{}, 0, 0)
+		client.record(ctx, started, "", OutcomeInvalidRequest, extract.Usage{}, 0, 0)
 		return extract.Response{}, err
 	}
 
@@ -148,7 +169,7 @@ func (client *Client) Generate(ctx context.Context, request extract.Request) (ex
 			if retryToken != nil {
 				_ = retryToken(err)
 			}
-			client.record(ctx, request.PromptVersion, OutcomeCanceled, extract.Usage{}, 0, attempt-1)
+			client.record(ctx, started, request.PromptVersion, OutcomeCanceled, extract.Usage{}, 0, attempt-1)
 			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, err)
 		}
 
@@ -157,7 +178,7 @@ func (client *Client) Generate(ctx context.Context, request extract.Request) (ex
 			if retryToken != nil {
 				_ = retryToken(tokenErr)
 			}
-			client.record(ctx, request.PromptVersion, outcomeForError(tokenErr), extract.Usage{}, 0, attempt-1)
+			client.record(ctx, started, request.PromptVersion, outcomeForError(tokenErr), extract.Usage{}, 0, attempt-1)
 			return extract.Response{}, fmt.Errorf("%w: retry policy", ErrInvocation)
 		}
 		output, invokeErr := client.api.Converse(ctx, input)
@@ -171,39 +192,39 @@ func (client *Client) Generate(ctx context.Context, request extract.Request) (ex
 			response, outputErr := client.response(request.PromptVersion, output)
 			if outputErr != nil {
 				usage, latency := boundedMetadata(output)
-				client.record(ctx, request.PromptVersion, OutcomeInvalidOutput, usage, latency, attempt)
+				client.record(ctx, started, request.PromptVersion, OutcomeInvalidOutput, usage, latency, attempt)
 				return extract.Response{}, outputErr
 			}
-			client.record(ctx, request.PromptVersion, OutcomeSuccess, response.Usage, response.Latency, attempt)
+			client.record(ctx, started, request.PromptVersion, OutcomeSuccess, response.Usage, response.Latency, attempt)
 			return response, nil
 		}
 
 		if ctx.Err() != nil {
-			client.record(ctx, request.PromptVersion, OutcomeCanceled, extract.Usage{}, 0, attempt)
+			client.record(ctx, started, request.PromptVersion, OutcomeCanceled, extract.Usage{}, 0, attempt)
 			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, ctx.Err())
 		}
 		if attempt == client.retryer.MaxAttempts() || !client.retryer.IsErrorRetryable(invokeErr) {
 			outcome := outcomeForError(invokeErr)
-			client.record(ctx, request.PromptVersion, outcome, extract.Usage{}, 0, attempt)
-			return extract.Response{}, fmt.Errorf("%w: %s", ErrInvocation, outcome)
+			client.record(ctx, started, request.PromptVersion, outcome, extract.Usage{}, 0, attempt)
+			return extract.Response{}, boundedInvocationError(invokeErr, outcome)
 		}
 
 		retryToken, tokenErr = client.retryer.GetRetryToken(ctx, invokeErr)
 		if tokenErr != nil {
-			client.record(ctx, request.PromptVersion, outcomeForError(invokeErr), extract.Usage{}, 0, attempt)
+			client.record(ctx, started, request.PromptVersion, outcomeForError(invokeErr), extract.Usage{}, 0, attempt)
 			return extract.Response{}, fmt.Errorf("%w: retry policy", ErrInvocation)
 		}
 		delay, delayErr := client.retryer.RetryDelay(attempt, invokeErr)
 		if delayErr != nil {
 			_ = retryToken(delayErr)
 			retryToken = nil
-			client.record(ctx, request.PromptVersion, outcomeForError(invokeErr), extract.Usage{}, 0, attempt)
+			client.record(ctx, started, request.PromptVersion, outcomeForError(invokeErr), extract.Usage{}, 0, attempt)
 			return extract.Response{}, fmt.Errorf("%w: retry policy", ErrInvocation)
 		}
 		if err := wait(ctx, delay); err != nil {
 			_ = retryToken(err)
 			retryToken = nil
-			client.record(ctx, request.PromptVersion, OutcomeCanceled, extract.Usage{}, 0, attempt)
+			client.record(ctx, started, request.PromptVersion, OutcomeCanceled, extract.Usage{}, 0, attempt)
 			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, err)
 		}
 	}
@@ -298,14 +319,18 @@ func (client *Client) response(promptVersion string, output *bedrockruntime.Conv
 	}, nil
 }
 
-func (client *Client) record(ctx context.Context, promptVersion, outcome string, usage extract.Usage, latency time.Duration, attempts int) {
+func (client *Client) record(ctx context.Context, started time.Time, promptVersion, outcome string, usage extract.Usage, providerLatency time.Duration, attempts int) {
 	if client.recorder == nil {
 		return
 	}
+	wallLatency := client.now().Sub(started)
+	if wallLatency < 0 {
+		wallLatency = 0
+	}
 	client.recorder.Record(ctx, InvocationObservation{
 		ModelID: client.modelID, PromptVersion: promptVersion, Outcome: outcome,
-		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
-		Latency: latency, Attempts: attempts,
+		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens,
+		WallLatency: wallLatency, ProviderLatency: providerLatency, Attempts: attempts,
 	})
 }
 
@@ -331,19 +356,24 @@ func wait(ctx context.Context, delay time.Duration) error {
 }
 
 func isAllowlistedRetry(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
 		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	var apiError smithy.APIError
 	if errors.As(err, &apiError) {
 		switch apiError.ErrorCode() {
-		case "ThrottlingException", modelTimeoutErrorCode, serviceUnavailableErrorCode, internalServerErrorCode:
+		case "ThrottlingException", modelTimeoutErrorCode, requestTimeoutErrorCode,
+			requestTimeoutExceptionErrorCode, serviceUnavailableErrorCode, internalServerErrorCode:
 			return true
 		default:
 			return false
 		}
 	}
-	return false
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
 }
 
 type exactAdaptiveRetryer struct {
@@ -355,21 +385,32 @@ func (retryer *exactAdaptiveRetryer) IsErrorRetryable(err error) bool {
 }
 
 func outcomeForError(err error) string {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
 		return OutcomeCanceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return OutcomeTimeout
+	}
+	if errors.Is(err, extract.ErrAuthentication) {
+		return OutcomeAuthentication
+	}
+	if errors.Is(err, extract.ErrAuthorization) {
+		return OutcomeAccessDenied
 	}
 	var apiError smithy.APIError
 	if errors.As(err, &apiError) {
 		switch apiError.ErrorCode() {
 		case "ThrottlingException":
 			return OutcomeThrottled
-		case modelTimeoutErrorCode:
+		case modelTimeoutErrorCode, requestTimeoutErrorCode, requestTimeoutExceptionErrorCode:
 			return OutcomeTimeout
 		case serviceUnavailableErrorCode:
 			return OutcomeUnavailable
 		case internalServerErrorCode:
 			return OutcomeInternal
-		case "AccessDeniedException", "UnrecognizedClientException":
+		case "ExpiredTokenException", "InvalidClientTokenId", "UnrecognizedClientException":
+			return OutcomeAuthentication
+		case "AccessDeniedException":
 			return OutcomeAccessDenied
 		case "ResourceNotFoundException":
 			return OutcomeNotFound
@@ -382,4 +423,23 @@ func outcomeForError(err error) string {
 		return OutcomeTimeout
 	}
 	return OutcomeProviderError
+}
+
+func boundedInvocationError(err error, outcome string) error {
+	if errors.Is(err, extract.ErrAuthentication) {
+		return fmt.Errorf("%w: %w", ErrInvocation, extract.ErrAuthentication)
+	}
+	if errors.Is(err, extract.ErrAuthorization) {
+		return fmt.Errorf("%w: %w", ErrInvocation, extract.ErrAuthorization)
+	}
+	var apiError smithy.APIError
+	if errors.As(err, &apiError) {
+		switch apiError.ErrorCode() {
+		case "ExpiredTokenException", "InvalidClientTokenId", "UnrecognizedClientException":
+			return fmt.Errorf("%w: %w", ErrInvocation, extract.ErrAuthentication)
+		case "AccessDeniedException":
+			return fmt.Errorf("%w: %w", ErrInvocation, extract.ErrAuthorization)
+		}
+	}
+	return fmt.Errorf("%w: %s", ErrInvocation, outcome)
 }

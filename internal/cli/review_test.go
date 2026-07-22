@@ -50,6 +50,52 @@ func TestReviewCommandWritesPrivateProposalContextOnlyToStdout(t *testing.T) {
 	}
 }
 
+func TestReviewCommandListRendersCompactHighestRankedGuessAndContext(t *testing.T) {
+	confidence := 0.8125
+	store := &fakeReviewStore{proposal: ReviewProposal{
+		ID:      "proposal-1",
+		Context: "Synthetic transcript context",
+		Candidates: []ReviewCandidate{
+			{EntityID: "person-primary", Confidence: &confidence, Reason: "exact accepted alias similarity"},
+			{EntityID: "person-alternative", Reason: "weaker name similarity"},
+		},
+	}}
+	var stdout strings.Builder
+	command := ReviewCommand{Service: &ReviewService{Store: store}, Output: &stdout}
+
+	if err := command.Run(context.Background(), []string{"list"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	want := "proposal-1 | guess=person-primary | confidence=0.812 | alternatives=1 | reason=\"exact accepted alias similarity\" | context=\"Synthetic transcript context\"\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+func TestReviewCommandListBoundsPrivateTextToOneLine(t *testing.T) {
+	store := &fakeReviewStore{proposal: ReviewProposal{
+		ID:      "proposal-1",
+		Context: "first line\n" + strings.Repeat("private context ", 30) + "unbounded-context-suffix",
+		Candidates: []ReviewCandidate{{
+			EntityID: "person-primary",
+			Reason:   strings.Repeat("bounded reason ", 30) + "unbounded-reason-suffix",
+		}},
+	}}
+	var stdout strings.Builder
+	command := ReviewCommand{Service: &ReviewService{Store: store}, Output: &stdout}
+
+	if err := command.Run(context.Background(), []string{"list"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	line := stdout.String()
+	if strings.Count(line, "\n") != 1 || strings.Contains(line, "unbounded-context-suffix") || strings.Contains(line, "unbounded-reason-suffix") {
+		t.Fatalf("stdout = %q, want one bounded line without private suffixes", line)
+	}
+	if !strings.Contains(line, `confidence=unknown | alternatives=0`) || !strings.Contains(line, `..."`) {
+		t.Fatalf("stdout = %q, want explicit unknown confidence, alternative count, and truncation marker", line)
+	}
+}
+
 func TestReviewServicePropagatesStaleEffectiveDecisionFailure(t *testing.T) {
 	store := &fakeReviewStore{correctErr: errors.New("decision is not effective")}
 	service := ReviewService{Store: store}

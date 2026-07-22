@@ -5,7 +5,16 @@ package source
 
 import (
 	"context"
+	"errors"
 	"time"
+)
+
+var (
+	// ErrAuthentication is a bounded global source-credential failure. Callers
+	// may stop a batch without exposing provider text.
+	ErrAuthentication = errors.New("source authentication failed; refresh the configured credentials")
+	// ErrAuthorization is a bounded global source-permission failure.
+	ErrAuthorization = errors.New("source authorization failed; grant read access to the configured collection")
 )
 
 // Source discovers documents in a collection and retrieves one document with
@@ -27,13 +36,15 @@ type RepresentativeSource interface {
 // Document is a provider-neutral source document. Tabs are ordered in the
 // provider's user-visible order and retain their hierarchy independently.
 type Document struct {
-	Provider   string
-	ID         string
-	Title      string
-	Locator    string
-	Version    string
-	ModifiedAt time.Time
-	Tabs       []Tab
+	Provider    string
+	ID          string
+	Title       string
+	Locator     string
+	Version     string
+	Revision    string
+	ModifiedAt  time.Time
+	MeetingTime *time.Time
+	Tabs        []Tab
 }
 
 // TabRole identifies the evidentiary role assigned from a configured tab

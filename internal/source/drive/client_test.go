@@ -147,11 +147,40 @@ func TestCheckCollectionBoundsMissingAndDeniedErrors(t *testing.T) {
 				t.Fatal("CheckCollection() error = nil, want provider error")
 			}
 			want := "inspect Google Drive folder: Google API returned HTTP " + strconv.Itoa(status)
+			if status == http.StatusForbidden {
+				want = "inspect Google Drive folder: " + source.ErrAuthorization.Error()
+			}
 			if err.Error() != want {
 				t.Fatalf("CheckCollection() error = %q, want %q", err, want)
 			}
 			if strings.Contains(err.Error(), secretFolderID) || strings.Contains(err.Error(), secretDetail) {
 				t.Fatalf("CheckCollection() error disclosed private values: %v", err)
+			}
+		})
+	}
+}
+
+func TestGoogleAPIErrorsPreserveBoundedAuthenticationAndAuthorizationTypes(t *testing.T) {
+	tests := []struct {
+		status int
+		want   error
+	}{
+		{status: http.StatusUnauthorized, want: source.ErrAuthentication},
+		{status: http.StatusForbidden, want: source.ErrAuthorization},
+	}
+	for _, test := range tests {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			const privateDetail = "private provider authentication detail"
+			httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return jsonStatusResponse(request, test.status, `{"error":{"code":`+strconv.Itoa(test.status)+`,"message":"`+privateDetail+`"}}`), nil
+			})}
+			client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+			_, err := client.List(context.Background(), "private-folder")
+			if !errors.Is(err, test.want) {
+				t.Fatalf("List() error = %v, want typed auth failure", err)
+			}
+			if strings.Contains(err.Error(), privateDetail) || strings.Contains(err.Error(), "private-folder") {
+				t.Fatalf("typed auth error leaked private provider text: %v", err)
 			}
 		})
 	}
@@ -295,8 +324,8 @@ func TestGetRequestsAllTabsAndConvertsDocument(t *testing.T) {
 	if document.Provider != "drive" || document.ID != "document-1" || document.Title != "Synthetic weekly meeting" {
 		t.Errorf("Get() identity = %#v, want converted Drive document", document)
 	}
-	if document.Version != "revision-7" {
-		t.Errorf("Get() version = %q, want %q", document.Version, "revision-7")
+	if document.Revision != "revision-7" {
+		t.Errorf("Get() revision = %q, want %q", document.Revision, "revision-7")
 	}
 	if document.Locator != "https://docs.google.com/document/d/document-1/edit" {
 		t.Errorf("Get() locator = %q, want tab-capable Docs locator", document.Locator)

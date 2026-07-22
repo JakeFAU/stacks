@@ -8,7 +8,10 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 type TabRole string
@@ -44,7 +47,8 @@ type SubmittedTab struct {
 // SubmittedText contains the exact, separately classified text supplied to a
 // model. Notes are never promoted to primary signal evidence.
 type SubmittedText struct {
-	Tabs []SubmittedTab
+	Tabs              []SubmittedTab
+	SourceMeetingTime *time.Time
 }
 
 type Citation struct {
@@ -115,6 +119,7 @@ func DecodeAndValidateExtraction(submitted SubmittedText, raw []byte) (Extractio
 	if err := ValidateExtraction(submitted, output); err != nil {
 		return ExtractionOutput{}, err
 	}
+	output.MeetingDate = groundedMeetingDate(submitted, output)
 	return output, nil
 }
 
@@ -254,6 +259,9 @@ func ValidateExtraction(submitted SubmittedText, output ExtractionOutput) error 
 		if err := validateReferences("person mention", index, person.CitationIDs, citations); err != nil {
 			return err
 		}
+		if err := validateGroundedPerson(index, person, citations); err != nil {
+			return err
+		}
 		people[person.ID] = person.Role
 	}
 
@@ -385,6 +393,25 @@ func validateDate(field, value string) error {
 	return nil
 }
 
+func groundedMeetingDate(submitted SubmittedText, output ExtractionOutput) string {
+	if submitted.SourceMeetingTime != nil && !submitted.SourceMeetingTime.IsZero() {
+		return submitted.SourceMeetingTime.Format(time.DateOnly)
+	}
+	if output.MeetingDate == "" {
+		return ""
+	}
+	for _, citation := range output.Citations {
+		if containsExactDate(citation.Quote, output.MeetingDate) {
+			return output.MeetingDate
+		}
+	}
+	return ""
+}
+
+func containsExactDate(text, date string) bool {
+	return containsBoundedIdentity(text, date, isDateTokenRune)
+}
+
 func validateReferences(kind string, index int, references []string, known map[string]Citation) error {
 	if len(references) == 0 {
 		return fmt.Errorf("%s %d citation references are required", kind, index)
@@ -404,6 +431,133 @@ func validateOptionalReferences(kind string, index int, references []string, kno
 		seen[reference] = struct{}{}
 	}
 	return nil
+}
+
+func validateGroundedPerson(index int, person PersonMention, citations map[string]Citation) error {
+	normalizedSurface := normalizeIdentityName(person.Surface)
+	surfaceGrounded := false
+	for _, citationID := range person.CitationIDs {
+		if containsBoundedIdentity(normalizeIdentityName(citations[citationID].Quote), normalizedSurface, isNameIdentityRune) {
+			surfaceGrounded = true
+			break
+		}
+	}
+	if !surfaceGrounded {
+		return fmt.Errorf("person mention %d surface is not grounded in cited evidence", index)
+	}
+
+	normalizedEmail := normalizeIdentityEmail(person.Email)
+	if normalizedEmail == "" {
+		return nil
+	}
+	for _, citationID := range person.CitationIDs {
+		quote := strings.ToLower(norm.NFKC.String(citations[citationID].Quote))
+		if containsBoundedEmailIdentity(quote, normalizedEmail) {
+			return nil
+		}
+	}
+	return fmt.Errorf("person mention %d email is not grounded in cited evidence", index)
+}
+
+func normalizeIdentityName(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(norm.NFKC.String(value)), " "))
+}
+
+func normalizeIdentityEmail(value string) string {
+	return strings.ToLower(strings.TrimSpace(norm.NFKC.String(value)))
+}
+
+func containsBoundedIdentity(text, value string, runeChecks ...func(rune) bool) bool {
+	if value == "" {
+		return false
+	}
+	for offset := 0; offset <= len(text)-len(value); {
+		index := strings.Index(text[offset:], value)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeMatches := false
+		if index > 0 {
+			before, _ := utf8.DecodeLastRuneInString(text[:index])
+			beforeMatches = matchesAnyRuneCheck(before, runeChecks)
+		}
+		afterOffset := index + len(value)
+		afterMatches := false
+		if afterOffset < len(text) {
+			after, _ := utf8.DecodeRuneInString(text[afterOffset:])
+			afterMatches = matchesAnyRuneCheck(after, runeChecks)
+		}
+		if !beforeMatches && !afterMatches {
+			return true
+		}
+		offset = afterOffset
+	}
+	return false
+}
+
+func containsBoundedEmailIdentity(text, value string) bool {
+	if value == "" {
+		return false
+	}
+	for offset := 0; offset <= len(text)-len(value); {
+		index := strings.Index(text[offset:], value)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeMatches := false
+		if index > 0 {
+			before, _ := utf8.DecodeLastRuneInString(text[:index])
+			beforeMatches = isEmailRune(before)
+		}
+		afterOffset := index + len(value)
+		if !beforeMatches && !emailIdentityContinues(text[afterOffset:]) {
+			return true
+		}
+		offset = afterOffset
+	}
+	return false
+}
+
+func emailIdentityContinues(suffix string) bool {
+	if suffix == "" {
+		return false
+	}
+	next, width := utf8.DecodeRuneInString(suffix)
+	if !isEmailRune(next) {
+		return false
+	}
+	if next != '.' {
+		return true
+	}
+	if width == len(suffix) {
+		return false
+	}
+	afterPeriod, _ := utf8.DecodeRuneInString(suffix[width:])
+	return unicode.IsLetter(afterPeriod) || unicode.IsDigit(afterPeriod)
+}
+
+func matchesAnyRuneCheck(value rune, checks []func(rune) bool) bool {
+	for _, check := range checks {
+		if check(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func isEmailRune(value rune) bool {
+	return unicode.IsLetter(value) || unicode.IsDigit(value) || strings.ContainsRune(".!#$%&'*+-/=?^_`{|}~@", value)
+}
+
+func isNameIdentityRune(value rune) bool {
+	return unicode.IsLetter(value) || unicode.IsDigit(value) || unicode.IsMark(value) ||
+		unicode.Is(unicode.Pd, value) || unicode.Is(unicode.Pc, value) || value == '\'' || value == '’'
+}
+
+func isDateTokenRune(value rune) bool {
+	return unicode.IsLetter(value) || unicode.IsDigit(value) || unicode.IsMark(value) || unicode.Is(unicode.Pc, value)
 }
 
 func hasTranscriptCitation(references []string, citations map[string]Citation, tabs map[string]SubmittedTab) bool {

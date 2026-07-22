@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"stacks/internal/entity"
 	"stacks/internal/ingest"
 	"stacks/internal/knowledge"
 	"stacks/internal/source"
@@ -88,11 +89,15 @@ func (repository *DocumentRepository) PutDocumentVersion(ctx context.Context, ve
 func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, version knowledge.DocumentVersion) (StoredDocumentVersion, bool, error) {
 	var sourceDocumentID string
 	err := repository.query.QueryRow(ctx, `
-		INSERT INTO stacks.source_documents (provider, provider_document_id, recorded_at)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (provider, provider_document_id) DO UPDATE
-		SET provider = EXCLUDED.provider
-		RETURNING id`, version.Provider(), version.ProviderDocumentID(), version.RecordedAt()).Scan(&sourceDocumentID)
+		INSERT INTO stacks.source_documents (provider, provider_document_id, title, locator, recorded_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (provider, provider_document_id) DO NOTHING
+		RETURNING id`, version.Provider(), version.ProviderDocumentID(), version.Title(), version.Locator(), version.RecordedAt()).Scan(&sourceDocumentID)
+	if err == pgx.ErrNoRows {
+		err = repository.query.QueryRow(ctx, `
+			SELECT id FROM stacks.source_documents
+			WHERE provider = $1 AND provider_document_id = $2`, version.Provider(), version.ProviderDocumentID()).Scan(&sourceDocumentID)
+	}
 	if err != nil {
 		return StoredDocumentVersion{}, false, fmt.Errorf("persist source document %q: %w", version.ProviderDocumentID(), err)
 	}
@@ -100,10 +105,13 @@ func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, ve
 	var stored StoredDocumentVersion
 	digest := version.Digest()
 	err = repository.query.QueryRow(ctx, `
-		INSERT INTO stacks.document_versions (source_document_id, digest, recorded_at)
-		VALUES ($1, $2, $3)
+		INSERT INTO stacks.document_versions
+			(source_document_id, digest, title, locator, provider_version, provider_revision,
+			 provider_modified_at, source_meeting_time, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (source_document_id, digest) DO NOTHING
-		RETURNING id`, sourceDocumentID, digest[:], version.RecordedAt()).Scan(&stored.ID)
+		RETURNING id`, sourceDocumentID, digest[:], version.Title(), version.Locator(),
+		version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt(), version.SourceMeetingTime(), version.RecordedAt()).Scan(&stored.ID)
 	if err == pgx.ErrNoRows {
 		err = repository.query.QueryRow(ctx, `
 			SELECT id FROM stacks.document_versions
@@ -198,12 +206,20 @@ func NewIngestionRepository(pool *pgxpool.Pool) *IngestionRepository {
 	return &IngestionRepository{pool: pool}
 }
 
-// PrepareVersion creates a pending immutable version or resumes a prior
-// incomplete/failed attempt. A completed version is returned unchanged.
-func (repository *IngestionRepository) PrepareVersion(ctx context.Context, version knowledge.DocumentVersion) (ingest.VersionState, error) {
+// PrepareVersion stores the immutable source version and independently creates
+// or resumes the exact configured extraction derivation.
+func (repository *IngestionRepository) PrepareVersion(ctx context.Context, version knowledge.DocumentVersion, derivation ingest.DerivationIdentity, leaseDuration time.Duration) (ingest.VersionState, error) {
 	if repository == nil || repository.pool == nil {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: repository is not configured")
 	}
+	wantDigest, err := ingest.ComputeDerivationDigest(version, derivation)
+	if err != nil || wantDigest != derivation.Digest {
+		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: derivation identity is invalid")
+	}
+	if leaseDuration <= 0 {
+		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: lease duration is invalid")
+	}
+	claimOwner := uuid.NewString()
 	transaction, err := repository.pool.Begin(ctx)
 	if err != nil {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: %w", err)
@@ -211,36 +227,72 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 
 	documents := &DocumentRepository{query: transaction}
-	stored, created, err := documents.PutDocumentVersion(ctx, version)
+	stored, _, err := documents.PutDocumentVersion(ctx, version)
 	if err != nil {
 		return ingest.VersionState{}, err
 	}
-	state := ingest.VersionState{ID: stored.ID}
-	if created {
+	claimedAt := time.Now().UTC()
+	leaseExpiresAt := claimedAt.Add(leaseDuration)
+	state := ingest.VersionState{ID: stored.ID, DerivationDigest: derivation.Digest}
+	err = transaction.QueryRow(ctx, `
+		INSERT INTO stacks.extraction_runs
+			(document_version_id, derivation_digest, model_id, bedrock_region,
+			 max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (document_version_id, derivation_digest) DO NOTHING
+		RETURNING id`, stored.ID, derivation.Digest[:], derivation.ModelID, derivation.Region,
+		derivation.MaxTokens, derivation.PromptVersion, derivation.SchemaDigest[:], claimOwner, leaseExpiresAt, claimedAt).Scan(&state.DerivationID)
+	if err == nil {
 		state.Status = ingest.VersionStatusPending
-	} else {
+		state.LeaseOwner = claimOwner
+	} else if err == pgx.ErrNoRows {
 		var status string
 		var failureCode *string
+		var activeOwner *string
+		var activeUntil *time.Time
+		var storedModelID, storedRegion, storedPromptVersion string
+		var storedMaxTokens int
+		var storedSchemaDigest []byte
 		if err := transaction.QueryRow(ctx, `
-			SELECT processing_status, retry_count, failure_code
-			FROM stacks.document_versions WHERE id = $1 FOR UPDATE`, stored.ID).Scan(&status, &state.RetryCount, &failureCode); err != nil {
-			return ingest.VersionState{}, fmt.Errorf("load ingestion version %q state: %w", stored.ID, err)
+			SELECT id, processing_status, retry_count, failure_code, lease_owner, lease_expires_at,
+			       model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest
+			FROM stacks.extraction_runs
+			WHERE document_version_id = $1 AND derivation_digest = $2
+			FOR UPDATE`, stored.ID, derivation.Digest[:]).Scan(
+			&state.DerivationID, &status, &state.RetryCount, &failureCode, &activeOwner, &activeUntil,
+			&storedModelID, &storedRegion, &storedMaxTokens, &storedPromptVersion, &storedSchemaDigest,
+		); err != nil {
+			return ingest.VersionState{}, fmt.Errorf("load ingestion derivation state: %w", err)
+		}
+		if storedModelID != derivation.ModelID || storedRegion != derivation.Region ||
+			storedMaxTokens != derivation.MaxTokens || storedPromptVersion != derivation.PromptVersion ||
+			string(storedSchemaDigest) != string(derivation.SchemaDigest[:]) {
+			return ingest.VersionState{}, fmt.Errorf("load ingestion derivation state: immutable configuration conflicts")
 		}
 		state.Status = ingest.VersionStatus(status)
 		if failureCode != nil {
 			state.FailureCode = ingest.FailureCode(*failureCode)
 		}
-		if state.Status != ingest.VersionStatusComplete {
+		observedAt := time.Now().UTC()
+		if state.Status != ingest.VersionStatusComplete && activeOwner != nil && activeUntil != nil && activeUntil.After(observedAt) {
+			state.Status = ingest.VersionStatusBusy
+			state.FailureCode = ingest.FailureBusy
+		} else if state.Status != ingest.VersionStatusComplete {
+			leaseExpiresAt = observedAt.Add(leaseDuration)
 			if err := transaction.QueryRow(ctx, `
-				UPDATE stacks.document_versions
-				SET processing_status = 'pending', failure_code = NULL, retry_count = retry_count + 1
+				UPDATE stacks.extraction_runs
+				SET processing_status = 'pending', failure_code = NULL, retry_count = retry_count + 1,
+				    lease_owner = $2, lease_expires_at = $3
 				WHERE id = $1
-				RETURNING retry_count`, stored.ID).Scan(&state.RetryCount); err != nil {
-				return ingest.VersionState{}, fmt.Errorf("resume ingestion version %q: %w", stored.ID, err)
+				RETURNING retry_count`, state.DerivationID, claimOwner, leaseExpiresAt).Scan(&state.RetryCount); err != nil {
+				return ingest.VersionState{}, fmt.Errorf("resume ingestion derivation: %w", err)
 			}
 			state.Status = ingest.VersionStatusPending
 			state.FailureCode = ""
+			state.LeaseOwner = claimOwner
 		}
+	} else {
+		return ingest.VersionState{}, fmt.Errorf("prepare ingestion derivation: %w", err)
 	}
 	if err := transaction.Commit(ctx); err != nil {
 		return ingest.VersionState{}, fmt.Errorf("commit ingestion version preparation: %w", err)
@@ -250,7 +302,7 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 
 // RecordFailure stores only finite processing state and a bounded diagnostic
 // code. It never stores an error string or private model/source text.
-func (repository *IngestionRepository) RecordFailure(ctx context.Context, versionID string, status ingest.VersionStatus, code ingest.FailureCode) error {
+func (repository *IngestionRepository) RecordFailure(ctx context.Context, derivationID, leaseOwner string, status ingest.VersionStatus, code ingest.FailureCode) error {
 	if repository == nil || repository.pool == nil {
 		return fmt.Errorf("record ingestion failure: repository is not configured")
 	}
@@ -260,15 +312,22 @@ func (repository *IngestionRepository) RecordFailure(ctx context.Context, versio
 	if !validIngestionFailureCode(code) {
 		return fmt.Errorf("record ingestion failure: code is invalid")
 	}
+	if _, err := uuid.Parse(derivationID); err != nil {
+		return fmt.Errorf("record ingestion failure: derivation ID is invalid")
+	}
+	if _, err := uuid.Parse(leaseOwner); err != nil {
+		return fmt.Errorf("record ingestion failure: lease owner is invalid")
+	}
 	result, err := repository.pool.Exec(ctx, `
-		UPDATE stacks.document_versions
-		SET processing_status = $1, failure_code = $2
-		WHERE id = $3 AND processing_status <> 'complete'`, string(status), string(code), versionID)
+		UPDATE stacks.extraction_runs
+		SET processing_status = $1, failure_code = $2, lease_owner = NULL, lease_expires_at = NULL
+		WHERE id = $3 AND lease_owner = $4 AND lease_expires_at > $5
+		  AND processing_status <> 'complete'`, string(status), string(code), derivationID, leaseOwner, time.Now().UTC())
 	if err != nil {
-		return fmt.Errorf("record ingestion version %q failure: %w", versionID, err)
+		return fmt.Errorf("record ingestion derivation failure: %w", err)
 	}
 	if result.RowsAffected() != 1 {
-		return fmt.Errorf("record ingestion version %q failure: version is missing or complete", versionID)
+		return fmt.Errorf("record ingestion derivation failure: active lease is not owned")
 	}
 	return nil
 }
@@ -285,41 +344,63 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if _, err := uuid.Parse(completion.VersionID); err != nil {
 		return fmt.Errorf("complete ingestion version: version ID is invalid")
 	}
+	if _, err := uuid.Parse(completion.DerivationID); err != nil {
+		return fmt.Errorf("complete ingestion version: derivation ID is invalid")
+	}
+	if _, err := uuid.Parse(completion.LeaseOwner); err != nil {
+		return fmt.Errorf("complete ingestion version: lease owner is invalid")
+	}
 	transaction, err := repository.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("start ingestion completion: %w", err)
 	}
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 
-	var status string
+	var storedVersionID, status string
+	var activeOwner, completedByOwner *string
+	var activeUntil *time.Time
 	if err := transaction.QueryRow(ctx, `
-		SELECT processing_status FROM stacks.document_versions WHERE id = $1 FOR UPDATE`, completion.VersionID).Scan(&status); err != nil {
-		return fmt.Errorf("lock ingestion version %q: %w", completion.VersionID, err)
+		SELECT document_version_id, processing_status, lease_owner, lease_expires_at, completed_by_owner
+		FROM stacks.extraction_runs WHERE id = $1 FOR UPDATE`, completion.DerivationID).Scan(
+		&storedVersionID, &status, &activeOwner, &activeUntil, &completedByOwner,
+	); err != nil {
+		return fmt.Errorf("lock ingestion derivation: %w", err)
+	}
+	if storedVersionID != completion.VersionID {
+		return fmt.Errorf("complete ingestion version: derivation source version conflicts")
 	}
 	if status == string(ingest.VersionStatusComplete) {
+		if completedByOwner == nil || *completedByOwner != completion.LeaseOwner {
+			return fmt.Errorf("complete ingestion version: completion lease is not owned")
+		}
 		return transaction.Commit(ctx)
+	}
+	if activeOwner == nil || activeUntil == nil || *activeOwner != completion.LeaseOwner || !activeUntil.After(time.Now().UTC()) {
+		return fmt.Errorf("complete ingestion version: active lease is not owned")
 	}
 
 	evidenceIDs, err := persistIngestionEvidence(ctx, transaction, completion.Evidence)
 	if err != nil {
 		return err
 	}
-	mentionIDs, err := persistIngestionMentions(ctx, transaction, completion.VersionID, completion.Mentions, evidenceIDs)
+	mentionIDs, err := persistIngestionMentions(ctx, transaction, completion.DerivationID, completion.Mentions, evidenceIDs)
 	if err != nil {
 		return err
 	}
-	if err := persistIngestionGraph(ctx, transaction, completion.Observations, completion.Signals, evidenceIDs, mentionIDs); err != nil {
+	if err := persistIngestionGraph(ctx, transaction, completion.DerivationID, completion.Observations, completion.Signals, evidenceIDs, mentionIDs); err != nil {
 		return err
 	}
 	result, err := transaction.Exec(ctx, `
-		UPDATE stacks.document_versions
-		SET processing_status = 'complete', failure_code = NULL
-		WHERE id = $1`, completion.VersionID)
+		UPDATE stacks.extraction_runs
+		SET processing_status = 'complete', failure_code = NULL, completed_at = $2,
+		    completed_by_owner = $3, lease_owner = NULL, lease_expires_at = NULL
+		WHERE id = $1 AND lease_owner = $3 AND lease_expires_at > $2`,
+		completion.DerivationID, time.Now().UTC(), completion.LeaseOwner)
 	if err != nil {
-		return fmt.Errorf("mark ingestion version %q complete: %w", completion.VersionID, err)
+		return fmt.Errorf("mark ingestion derivation complete: %w", err)
 	}
 	if result.RowsAffected() != 1 {
-		return fmt.Errorf("mark ingestion version %q complete: version does not exist", completion.VersionID)
+		return fmt.Errorf("mark ingestion derivation complete: active lease is not owned")
 	}
 	if err := transaction.Commit(ctx); err != nil {
 		return fmt.Errorf("commit ingestion version %q: %w", completion.VersionID, err)
@@ -347,7 +428,7 @@ func persistIngestionEvidence(ctx context.Context, transaction pgx.Tx, records [
 	return identifiers, nil
 }
 
-func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID string, records []ingest.MentionRecord, evidenceIDs map[string]string) (map[string]string, error) {
+func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, derivationID string, records []ingest.MentionRecord, evidenceIDs map[string]string) (map[string]string, error) {
 	mentionIDs := make(map[string]string, len(records))
 	for _, record := range records {
 		evidenceID, exists := evidenceIDs[record.EvidenceKey]
@@ -355,11 +436,23 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID
 			return nil, fmt.Errorf("persist ingestion mention: input is invalid")
 		}
 		var mentionID string
+		normalizedName := record.NormalizedName
+		if normalizedName == "" {
+			normalizedName = entity.NormalizeName(record.Surface)
+		}
+		if normalizedName != entity.NormalizeName(record.Surface) || record.NormalizedEmail != entity.NormalizeEmail(record.NormalizedEmail) {
+			return nil, fmt.Errorf("persist ingestion mention: normalized identity is invalid")
+		}
 		err := transaction.QueryRow(ctx, `
-			INSERT INTO stacks.mentions (evidence_span_id, surface, role, recorded_at)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (evidence_span_id, surface, role) DO UPDATE SET role = EXCLUDED.role
-			RETURNING id`, evidenceID, record.Surface, record.Role, time.Now().UTC()).Scan(&mentionID)
+			INSERT INTO stacks.mentions
+				(extraction_run_id, evidence_span_id, surface, normalized_name, normalized_email, role, recorded_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (extraction_run_id, evidence_span_id, surface, role)
+				WHERE extraction_run_id IS NOT NULL
+			DO UPDATE
+			SET normalized_name = EXCLUDED.normalized_name,
+				normalized_email = EXCLUDED.normalized_email
+			RETURNING id`, derivationID, evidenceID, record.Surface, normalizedName, record.NormalizedEmail, record.Role, time.Now().UTC()).Scan(&mentionID)
 		if err != nil {
 			return nil, fmt.Errorf("persist ingestion mention: %w", err)
 		}
@@ -383,7 +476,7 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID
 			}
 		}
 		if record.Resolution.AutoResolved {
-			decisionID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(versionID+"\x00decision\x00"+record.Key)).String()
+			decisionID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(derivationID+"\x00decision\x00"+record.Key)).String()
 			digest := resolutionDecisionDigest(ResolutionDecisionInput{
 				ProposalID: proposalID, Outcome: ResolutionOutcomeAccepted, EntityID: record.Resolution.EntityID,
 			}, "")
@@ -394,6 +487,13 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID
 				ON CONFLICT (id) DO NOTHING`, decisionID, proposalID, record.Resolution.EntityID, digest[:], time.Now().UTC()); err != nil {
 				return nil, fmt.Errorf("persist ingestion resolution decision: %w", err)
 			}
+			decision := ResolutionDecision{
+				ID: decisionID, ProposalID: proposalID, Outcome: ResolutionOutcomeAccepted,
+				EntityID: record.Resolution.EntityID,
+			}
+			if err := insertMentionAliasAssertions(ctx, transaction, decision); err != nil {
+				return nil, err
+			}
 			if err := updateProposalStatus(ctx, transaction, proposalID, ResolutionOutcomeAccepted); err != nil {
 				return nil, err
 			}
@@ -402,7 +502,7 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, versionID
 	return mentionIDs, nil
 }
 
-func persistIngestionGraph(ctx context.Context, transaction pgx.Tx, observations []ingest.ObservationRecord, signals []ingest.SignalRecord, evidenceIDs, mentionIDs map[string]string) error {
+func persistIngestionGraph(ctx context.Context, transaction pgx.Tx, derivationID string, observations []ingest.ObservationRecord, signals []ingest.SignalRecord, evidenceIDs, mentionIDs map[string]string) error {
 	for _, record := range observations {
 		resolvedEvidence, err := resolveEvidenceKeys(record.EvidenceKeys, evidenceIDs)
 		if err != nil {
@@ -410,6 +510,7 @@ func persistIngestionGraph(ctx context.Context, transaction pgx.Tx, observations
 		}
 		input := ObservationInput{
 			ID: record.ID, SubjectEntityID: record.SubjectEntityID, ObjectEntityID: record.ObjectEntityID,
+			ExtractionRunID:  derivationID,
 			SubjectMentionID: mentionIDs[record.SubjectMentionKey], ObjectMentionID: mentionIDs[record.ObjectMentionKey],
 			Predicate: record.Predicate, ValidStart: record.ValidStart,
 			Derivation: "model_extraction", EpistemicStatus: "inferred", Confidence: record.Confidence,

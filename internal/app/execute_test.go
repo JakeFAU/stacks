@@ -6,6 +6,7 @@ import (
 	"io"
 	"reflect"
 	"testing"
+	"time"
 
 	"stacks/internal/cli"
 	"stacks/internal/config"
@@ -101,6 +102,7 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 		BedrockModelID:          "synthetic-model",
 		BedrockMaxTokens:        256,
 		BedrockMaxAttempts:      1,
+		IngestionLeaseDuration:  5 * time.Minute,
 		ExtractionPromptVersion: "extract-v1",
 		AnalysisPromptVersion:   "analyze-v1",
 	}}

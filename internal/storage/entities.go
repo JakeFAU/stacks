@@ -55,6 +55,7 @@ type EntityAlias struct {
 type MentionInput struct {
 	EvidenceSpanID string
 	Surface        string
+	Email          string
 	Role           string
 }
 
@@ -178,9 +179,13 @@ func (repository *IngestionRepository) EntitySnapshots(ctx context.Context) ([]e
 	}
 	for index := range snapshots {
 		aliases, err := repository.pool.Query(ctx, `
-			SELECT alias_type, normalized_value
-			FROM stacks.entity_aliases
-			WHERE entity_id = $1
+			SELECT DISTINCT assertion.alias_type, assertion.normalized_value
+			FROM stacks.entity_alias_assertions AS assertion
+			JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+			WHERE assertion.entity_id = $1
+			  AND decision.entity_id = assertion.entity_id
+			  AND decision.outcome IN ('accepted', 'created')
+			  AND decision.superseded_by_id IS NULL
 			ORDER BY alias_type, normalized_value`, snapshots[index].ID)
 		if err != nil {
 			return nil, fmt.Errorf("list ingestion entity aliases: %w", err)
@@ -277,12 +282,17 @@ func (repository *EntityRepository) CreateMention(ctx context.Context, input Men
 	if input.Role != "speaker" && input.Role != "reference" {
 		return Mention{}, fmt.Errorf("create mention: role is invalid")
 	}
+	normalizedName := entity.NormalizeName(input.Surface)
+	normalizedEmail := entity.NormalizeEmail(input.Email)
 	var mention Mention
 	err := repository.pool.QueryRow(ctx, `
-		INSERT INTO stacks.mentions (evidence_span_id, surface, role, recorded_at)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (evidence_span_id, surface, role) DO NOTHING
-		RETURNING id`, input.EvidenceSpanID, input.Surface, input.Role, time.Now().UTC()).Scan(&mention.ID)
+		INSERT INTO stacks.mentions
+			(evidence_span_id, surface, normalized_name, normalized_email, role, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (evidence_span_id, surface, role) WHERE extraction_run_id IS NULL DO UPDATE
+		SET normalized_name = EXCLUDED.normalized_name,
+			normalized_email = EXCLUDED.normalized_email
+		RETURNING id`, input.EvidenceSpanID, input.Surface, normalizedName, normalizedEmail, input.Role, time.Now().UTC()).Scan(&mention.ID)
 	if err == pgx.ErrNoRows {
 		err = repository.pool.QueryRow(ctx, `
 			SELECT id FROM stacks.mentions
@@ -509,8 +519,14 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 		return EntityDetail{}, fmt.Errorf("show entity %q: %w", entityID, err)
 	}
 	aliases, err := repository.pool.Query(ctx, `
-		SELECT normalized_value FROM stacks.entity_aliases
-		WHERE entity_id = $1 ORDER BY alias_type, normalized_value`, entityID)
+		SELECT DISTINCT assertion.normalized_value
+		FROM stacks.entity_alias_assertions AS assertion
+		JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		WHERE assertion.entity_id = $1
+		  AND decision.entity_id = assertion.entity_id
+		  AND decision.outcome IN ('accepted', 'created')
+		  AND decision.superseded_by_id IS NULL
+		ORDER BY assertion.normalized_value`, entityID)
 	if err != nil {
 		return EntityDetail{}, fmt.Errorf("list aliases for entity %q: %w", entityID, err)
 	}
@@ -649,13 +665,8 @@ func (repository *EntityRepository) CreateReviewPerson(ctx context.Context, inpu
 			if alias.EntityID != "" && alias.EntityID != entity.ID {
 				return fmt.Errorf("create review person %q: alias entity ID does not match", entity.ID)
 			}
-			if strings.TrimSpace(alias.NormalizedValue) == "" || (alias.Type != "name" && alias.Type != "email") {
+			if err := validateAliasInput(alias); err != nil {
 				return fmt.Errorf("create review person %q: alias is invalid", entity.ID)
-			}
-			if _, err := transaction.Exec(ctx, `
-				INSERT INTO stacks.entity_aliases (entity_id, normalized_value, alias_type, recorded_at)
-				VALUES ($1::uuid, $2, $3, $4)`, entity.ID, alias.NormalizedValue, alias.Type, time.Now().UTC()); err != nil {
-				return fmt.Errorf("create alias for review entity %q: %w", entity.ID, err)
 			}
 		}
 		if _, err := loadEffectiveDecision(ctx, transaction, input.ProposalID); err == nil {
@@ -671,6 +682,11 @@ func (repository *EntityRepository) CreateReviewPerson(ctx context.Context, inpu
 		}, "")
 		if err != nil {
 			return err
+		}
+		for _, alias := range input.Aliases {
+			if err := insertAliasAssertion(ctx, transaction, decision.ID, entity.ID, alias); err != nil {
+				return fmt.Errorf("create alias for review entity %q: %w", entity.ID, err)
+			}
 		}
 		return updateProposalStatus(ctx, transaction, input.ProposalID, ResolutionOutcomeCreated)
 	})
@@ -739,7 +755,71 @@ func insertDecision(ctx context.Context, transaction pgx.Tx, id string, input Re
 	if err != nil {
 		return ResolutionDecision{}, fmt.Errorf("record resolution decision for proposal %q: %w", input.ProposalID, err)
 	}
+	if err := insertMentionAliasAssertions(ctx, transaction, decision); err != nil {
+		return ResolutionDecision{}, err
+	}
 	return decision, nil
+}
+
+func insertMentionAliasAssertions(ctx context.Context, transaction pgx.Tx, decision ResolutionDecision) error {
+	if decision.Outcome != ResolutionOutcomeAccepted && decision.Outcome != ResolutionOutcomeCreated {
+		return nil
+	}
+	var normalizedName, normalizedEmail string
+	if err := transaction.QueryRow(ctx, `
+		SELECT mention.normalized_name, mention.normalized_email
+		FROM stacks.resolution_proposals AS proposal
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		WHERE proposal.id = $1`, decision.ProposalID).Scan(&normalizedName, &normalizedEmail); err != nil {
+		return fmt.Errorf("load accepted aliases for resolution proposal %q: %w", decision.ProposalID, err)
+	}
+	for _, alias := range []AliasInput{
+		{EntityID: decision.EntityID, NormalizedValue: normalizedName, Type: "name"},
+		{EntityID: decision.EntityID, NormalizedValue: normalizedEmail, Type: "email"},
+	} {
+		if alias.NormalizedValue == "" {
+			continue
+		}
+		if err := insertAliasAssertion(ctx, transaction, decision.ID, decision.EntityID, alias); err != nil {
+			return fmt.Errorf("record accepted alias for resolution proposal %q: %w", decision.ProposalID, err)
+		}
+	}
+	return nil
+}
+
+func insertAliasAssertion(ctx context.Context, transaction pgx.Tx, decisionID, entityID string, alias AliasInput) error {
+	if alias.EntityID != "" && alias.EntityID != entityID {
+		return fmt.Errorf("alias entity ID does not match decision")
+	}
+	if err := validateAliasInput(alias); err != nil {
+		return err
+	}
+	_, err := transaction.Exec(ctx, `
+		INSERT INTO stacks.entity_alias_assertions
+			(decision_id, entity_id, normalized_value, alias_type, recorded_at)
+		VALUES ($1::uuid, $2::uuid, $3, $4, $5)
+		ON CONFLICT (decision_id, normalized_value, alias_type) DO NOTHING`,
+		decisionID, entityID, alias.NormalizedValue, alias.Type, time.Now().UTC())
+	return err
+}
+
+func validateAliasInput(alias AliasInput) error {
+	if strings.TrimSpace(alias.NormalizedValue) == "" {
+		return fmt.Errorf("normalized alias value is required")
+	}
+	switch alias.Type {
+	case "name":
+		if entity.NormalizeName(alias.NormalizedValue) != alias.NormalizedValue {
+			return fmt.Errorf("name alias is not normalized")
+		}
+	case "email":
+		if entity.NormalizeEmail(alias.NormalizedValue) != alias.NormalizedValue {
+			return fmt.Errorf("email alias is not normalized")
+		}
+	default:
+		return fmt.Errorf("alias type is invalid")
+	}
+	return nil
 }
 
 func resolutionDecisionDigest(input ResolutionDecisionInput, supersedesID string) [sha256.Size]byte {

@@ -4,9 +4,12 @@ package ingest
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"strings"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
+	"stacks/internal/analysis"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/knowledge"
@@ -31,9 +35,10 @@ var ErrSourceList = errors.New("sync source listing failed")
 var ErrFailurePersistence = errors.New("sync failure state persistence failed")
 
 const (
-	ingestionSpanName     = "stacks.ingest.sync"
-	ingestionDecisionName = "ingest_document"
-	interactionPredicate  = "interaction_signal"
+	ingestionSpanName                 = "stacks.ingest.sync"
+	ingestionDecisionName             = "ingest_document"
+	interactionPredicate              = "interaction_signal"
+	extractionDerivationDigestVersion = "stacks.extraction-derivation.v2"
 )
 
 // Outcome is the bounded per-document result exposed by sync.
@@ -54,6 +59,8 @@ const (
 	VersionStatusComplete   VersionStatus = "complete"
 	VersionStatusIncomplete VersionStatus = "incomplete"
 	VersionStatusFailed     VersionStatus = "failed"
+	// VersionStatusBusy is returned but never persisted when another live claim owns a derivation.
+	VersionStatusBusy VersionStatus = "busy"
 )
 
 // FailureCode is deliberately finite so persistence and telemetry never
@@ -66,15 +73,30 @@ const (
 	FailureModel         FailureCode = "model_error"
 	FailureInvalidOutput FailureCode = "invalid_output"
 	FailureStorage       FailureCode = "storage_error"
+	FailureBusy          FailureCode = "busy"
 )
 
 // VersionState identifies the durable processing state returned before model
 // work begins. RetryCount counts attempts after the initial attempt.
 type VersionState struct {
-	ID          string
-	Status      VersionStatus
-	RetryCount  int
-	FailureCode FailureCode
+	ID               string
+	DerivationID     string
+	DerivationDigest [sha256.Size]byte
+	LeaseOwner       string
+	Status           VersionStatus
+	RetryCount       int
+	FailureCode      FailureCode
+}
+
+// DerivationIdentity names one extraction attempt configuration independently
+// of the immutable source version. Digest is computed from both boundaries.
+type DerivationIdentity struct {
+	Region        string
+	ModelID       string
+	MaxTokens     int
+	PromptVersion string
+	SchemaDigest  [sha256.Size]byte
+	Digest        [sha256.Size]byte
 }
 
 // EvidenceRecord maps a model-local citation key to validated exact evidence.
@@ -86,11 +108,13 @@ type EvidenceRecord struct {
 // MentionRecord is one source-grounded person mention and its deterministic
 // identity-resolution result.
 type MentionRecord struct {
-	Key         string
-	EvidenceKey string
-	Surface     string
-	Role        string
-	Resolution  entity.Resolution
+	Key             string
+	EvidenceKey     string
+	Surface         string
+	NormalizedName  string
+	NormalizedEmail string
+	Role            string
+	Resolution      entity.Resolution
 }
 
 // ObservationRecord is one inferred interaction observation. Empty entity IDs
@@ -129,6 +153,8 @@ type SignalRecord struct {
 // Completion is the complete atomic write-set for one document version.
 type Completion struct {
 	VersionID    string
+	DerivationID string
+	LeaseOwner   string
 	Evidence     []EvidenceRecord
 	Mentions     []MentionRecord
 	Observations []ObservationRecord
@@ -137,9 +163,9 @@ type Completion struct {
 
 // Repository owns durable processing state and the atomic completion boundary.
 type Repository interface {
-	PrepareVersion(context.Context, knowledge.DocumentVersion) (VersionState, error)
+	PrepareVersion(context.Context, knowledge.DocumentVersion, DerivationIdentity, time.Duration) (VersionState, error)
 	CompleteVersion(context.Context, Completion) error
-	RecordFailure(context.Context, string, VersionStatus, FailureCode) error
+	RecordFailure(context.Context, string, string, VersionStatus, FailureCode) error
 	EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error)
 }
 
@@ -163,6 +189,10 @@ type Service struct {
 	Repository    Repository
 	CollectionID  string
 	PromptVersion string
+	Region        string
+	ModelID       string
+	MaxTokens     int
+	LeaseDuration time.Duration
 	Tracer        trace.Tracer
 	Decisions     DecisionRecorder
 	Now           func() time.Time
@@ -170,11 +200,13 @@ type Service struct {
 
 // Result is one privacy-safe per-document outcome.
 type Result struct {
-	DocumentID  string
-	VersionID   string
-	Outcome     Outcome
-	RetryCount  int
-	FailureCode FailureCode
+	DocumentID   string
+	VersionID    string
+	DerivationID string
+	Outcome      Outcome
+	RetryCount   int
+	FailureCode  FailureCode
+	leaseOwner   string
 }
 
 // Summary reports bounded totals and ordered per-document results.
@@ -187,7 +219,8 @@ type Summary struct {
 }
 
 // Sync lists direct documents and processes each as an independent failure
-// boundary. Only cancellation or failure to list the collection aborts the run.
+// boundary. Cancellation and bounded global authentication or authorization
+// failures abort the run immediately.
 func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr error) {
 	if err := service.validate(); err != nil {
 		return Summary{}, err
@@ -212,6 +245,9 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
 		return Summary{}, cancellationErr
 	}
+	if authErr := boundedGlobalAuthentication(err); authErr != nil {
+		return Summary{}, authErr
+	}
 	if err != nil {
 		return Summary{}, ErrSourceList
 	}
@@ -225,6 +261,9 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 		result, documentErr := service.processDocument(ctx, listed)
 		if cancellationErr := boundedCancellation(ctx, documentErr); cancellationErr != nil {
 			return summary, errors.Join(aggregateErr, cancellationErr)
+		}
+		if authErr := boundedGlobalAuthentication(documentErr); authErr != nil {
+			return summary, errors.Join(aggregateErr, authErr)
 		}
 		summary.add(result)
 		service.recordDecision(ctx, result.Outcome, service.now().Sub(started))
@@ -241,30 +280,62 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
 		return Result{}, cancellationErr
 	}
+	if authErr := boundedGlobalAuthentication(err); authErr != nil {
+		return Result{}, authErr
+	}
 	if err != nil {
 		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureSource}, nil
 	}
+	document, err = mergeSourceDocument(listed, document)
+	if err != nil {
+		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
+	}
 	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
-		Provider: document.Provider, ProviderDocumentID: document.ID,
+		Provider: document.Provider, ProviderDocumentID: document.ID, Title: document.Title,
+		Locator: document.Locator, ProviderVersion: document.Version, ProviderRevision: document.Revision,
+		ModifiedAt: document.ModifiedAt, SourceMeetingTime: document.MeetingTime,
 		RecordedAt: service.now(), Tabs: document.Tabs,
 	})
 	if err != nil {
 		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
 	}
-	state, err := service.Repository.PrepareVersion(ctx, version)
+	contract, err := extract.PromptContract(service.PromptVersion)
+	if err != nil {
+		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
+	}
+	derivation := DerivationIdentity{
+		Region: strings.TrimSpace(service.Region), ModelID: strings.TrimSpace(service.ModelID), MaxTokens: service.MaxTokens,
+		PromptVersion: contract.Version, SchemaDigest: sha256.Sum256(contract.JSONSchema),
+	}
+	derivation.Digest, err = ComputeDerivationDigest(version, derivation)
+	if err != nil {
+		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
+	}
+	state, err := service.Repository.PrepareVersion(ctx, version, derivation, service.LeaseDuration)
 	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
 		return Result{}, cancellationErr
+	}
+	if authErr := boundedGlobalAuthentication(err); authErr != nil {
+		return Result{}, authErr
 	}
 	if err != nil {
 		return Result{DocumentID: documentID, Outcome: OutcomeIncomplete, FailureCode: FailureStorage}, nil
 	}
-	result := Result{DocumentID: documentID, VersionID: state.ID, RetryCount: state.RetryCount}
+	result := Result{
+		DocumentID: documentID, VersionID: state.ID, DerivationID: state.DerivationID,
+		RetryCount: state.RetryCount, leaseOwner: state.LeaseOwner,
+	}
 	if state.Status == VersionStatusComplete {
 		result.Outcome = OutcomeUnchanged
 		return result, nil
 	}
+	if state.Status == VersionStatusBusy {
+		result.Outcome = OutcomeIncomplete
+		result.FailureCode = FailureBusy
+		return result, nil
+	}
 
-	submitted, request, err := extractionRequest(document.Tabs, service.PromptVersion)
+	submitted, request, err := extractionRequest(document.Tabs, document.MeetingTime, service.PromptVersion)
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidSource)
 	}
@@ -272,10 +343,16 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
 		return Result{}, cancellationErr
 	}
+	if authErr := boundedGlobalAuthentication(err); authErr != nil {
+		if _, failureErr := service.fail(ctx, result, VersionStatusIncomplete, FailureModel); failureErr != nil {
+			return Result{}, errors.Join(authErr, failureErr)
+		}
+		return Result{}, authErr
+	}
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureModel)
 	}
-	if response.ModelID == "" || response.PromptVersion != service.PromptVersion {
+	if response.ModelID != derivation.ModelID || response.PromptVersion != derivation.PromptVersion {
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidOutput)
 	}
 	output, err := extract.DecodeAndValidateExtraction(submitted, response.Output)
@@ -289,7 +366,7 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
 	}
-	completion, err := service.completion(version, state.ID, response, output, snapshots)
+	completion, err := service.completion(version, state, response, output, snapshots)
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidOutput)
 	}
@@ -308,12 +385,12 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 
 func (service *Service) completion(
 	version knowledge.DocumentVersion,
-	versionID string,
+	state VersionState,
 	response extract.Response,
 	output extract.ExtractionOutput,
 	snapshots []entity.EntitySnapshot,
 ) (Completion, error) {
-	completion := Completion{VersionID: versionID}
+	completion := Completion{VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner}
 	for _, citation := range output.Citations {
 		span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 			Document: version, TabID: citation.TabID, StartOffset: citation.StartOffset,
@@ -334,6 +411,7 @@ func (service *Service) completion(
 		resolutions[person.ID] = resolution
 		completion.Mentions = append(completion.Mentions, MentionRecord{
 			Key: person.ID, EvidenceKey: person.CitationIDs[0], Surface: person.Surface,
+			NormalizedName: entity.NormalizeName(person.Surface), NormalizedEmail: entity.NormalizeEmail(person.Email),
 			Role: person.Role, Resolution: resolution,
 		})
 	}
@@ -347,7 +425,7 @@ func (service *Service) completion(
 		statements[statement.ID] = statement
 	}
 	for _, signal := range output.Signals {
-		observationID := stableID(version, "observation", signal.ID)
+		observationID := stableDerivationID(state.DerivationDigest, "observation", signal.ID)
 		subject := resolvedEntityID(resolutions[signal.SubjectMentionID])
 		object := resolvedEntityID(resolutions[signal.ObjectMentionID])
 		evidenceKeys := signalEvidenceKeys(signal, statements)
@@ -366,21 +444,22 @@ func (service *Service) completion(
 			signalEvidence = append(signalEvidence, SignalEvidenceRecord{EvidenceKey: key, Role: "contradicting"})
 		}
 		completion.Signals = append(completion.Signals, SignalRecord{
-			ID: stableID(version, "signal", signal.ID), ObservationID: observationID,
+			ID: stableDerivationID(state.DerivationDigest, "signal", signal.ID), ObservationID: observationID,
 			Category: signal.Category, Direction: signal.Direction,
 			ExtractionModelID: response.ModelID, PromptVersion: response.PromptVersion,
-			Rationale: signal.Rationale, Confidence: signal.Confidence, Evidence: signalEvidence,
+			Rationale:  analysis.ExplainSignal(analysis.Category(signal.Category), analysis.Direction(signal.Direction)),
+			Confidence: signal.Confidence, Evidence: signalEvidence,
 		})
 	}
 	return completion, nil
 }
 
-func extractionRequest(tabs []source.Tab, promptVersion string) (extract.SubmittedText, extract.Request, error) {
+func extractionRequest(tabs []source.Tab, sourceMeetingTime *time.Time, promptVersion string) (extract.SubmittedText, extract.Request, error) {
 	contract, err := extract.PromptContract(promptVersion)
 	if err != nil {
 		return extract.SubmittedText{}, extract.Request{}, err
 	}
-	submitted := extract.SubmittedText{}
+	submitted := extract.SubmittedText{SourceMeetingTime: sourceMeetingTime}
 	transcriptCount := 0
 	for _, tab := range tabs {
 		var role extract.TabRole
@@ -412,6 +491,34 @@ func extractionRequest(tabs []source.Tab, promptVersion string) (extract.Submitt
 		PromptVersion: contract.Version, SystemPrompt: contract.SystemPrompt,
 		Input: string(input), SchemaName: contract.SchemaName, JSONSchema: contract.JSONSchema,
 	}, nil
+}
+
+func mergeSourceDocument(listed, fetched source.Document) (source.Document, error) {
+	if strings.TrimSpace(listed.ID) == "" || strings.TrimSpace(fetched.ID) == "" || listed.ID != fetched.ID {
+		return source.Document{}, fmt.Errorf("source document identity is inconsistent")
+	}
+	if fetched.Provider == "" {
+		fetched.Provider = listed.Provider
+	}
+	if listed.Provider != "" && fetched.Provider != listed.Provider {
+		return source.Document{}, fmt.Errorf("source document provider is inconsistent")
+	}
+	if fetched.Title == "" {
+		fetched.Title = listed.Title
+	}
+	if fetched.Locator == "" {
+		fetched.Locator = listed.Locator
+	}
+	if listed.Version != "" {
+		fetched.Version = listed.Version
+	}
+	if !listed.ModifiedAt.IsZero() {
+		fetched.ModifiedAt = listed.ModifiedAt
+	}
+	if fetched.MeetingTime == nil {
+		fetched.MeetingTime = listed.MeetingTime
+	}
+	return fetched, nil
 }
 
 func modelTabs(tabs []extract.SubmittedTab) []struct {
@@ -475,17 +582,56 @@ func parseOptionalDate(value string) (*time.Time, error) {
 	return &parsed, nil
 }
 
-func stableID(version knowledge.DocumentVersion, kind, sourceID string) string {
-	seed := strings.Join([]string{version.Provider(), version.ProviderDocumentID(), version.Digest().String(), kind, sourceID}, "\x00")
+func stableDerivationID(derivationDigest [sha256.Size]byte, kind, sourceID string) string {
+	seed := strings.Join([]string{fmt.Sprintf("%x", derivationDigest), kind, sourceID}, "\x00")
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(seed)).String()
+}
+
+// ComputeDerivationDigest identifies one immutable source version processed by
+// one exact extraction configuration. It excludes attempt/lease state.
+func ComputeDerivationDigest(version knowledge.DocumentVersion, identity DerivationIdentity) ([sha256.Size]byte, error) {
+	if strings.TrimSpace(identity.Region) == "" || strings.TrimSpace(identity.ModelID) == "" ||
+		strings.TrimSpace(identity.PromptVersion) == "" || identity.MaxTokens <= 0 ||
+		identity.SchemaDigest == ([sha256.Size]byte{}) {
+		return [sha256.Size]byte{}, fmt.Errorf("extraction derivation identity is invalid")
+	}
+	hasher := sha256.New()
+	writeDerivationString(hasher, extractionDerivationDigestVersion)
+	writeDerivationString(hasher, version.Provider())
+	writeDerivationString(hasher, version.ProviderDocumentID())
+	documentDigest := version.Digest()
+	writeDerivationBytes(hasher, documentDigest[:])
+	writeDerivationString(hasher, strings.TrimSpace(identity.Region))
+	writeDerivationString(hasher, strings.TrimSpace(identity.ModelID))
+	writeDerivationLength(hasher, uint64(identity.MaxTokens))
+	writeDerivationString(hasher, strings.TrimSpace(identity.PromptVersion))
+	writeDerivationBytes(hasher, identity.SchemaDigest[:])
+	var digest [sha256.Size]byte
+	copy(digest[:], hasher.Sum(nil))
+	return digest, nil
+}
+
+func writeDerivationString(hasher hash.Hash, value string) {
+	writeDerivationBytes(hasher, []byte(value))
+}
+
+func writeDerivationBytes(hasher hash.Hash, value []byte) {
+	writeDerivationLength(hasher, uint64(len(value)))
+	_, _ = hasher.Write(value)
+}
+
+func writeDerivationLength(hasher hash.Hash, value uint64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
+	_, _ = hasher.Write(encoded[:])
 }
 
 func (service *Service) fail(ctx context.Context, result Result, status VersionStatus, code FailureCode) (Result, error) {
 	if cancellationErr := boundedCancellation(ctx, nil); cancellationErr != nil {
 		return Result{}, cancellationErr
 	}
-	if result.VersionID != "" {
-		if err := service.Repository.RecordFailure(ctx, result.VersionID, status, code); err != nil {
+	if result.DerivationID != "" {
+		if err := service.Repository.RecordFailure(ctx, result.DerivationID, result.leaseOwner, status, code); err != nil {
 			if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
 				return Result{}, cancellationErr
 			}
@@ -516,12 +662,28 @@ func boundedCancellation(ctx context.Context, err error) error {
 	return nil
 }
 
+func boundedGlobalAuthentication(err error) error {
+	switch {
+	case errors.Is(err, source.ErrAuthentication):
+		return source.ErrAuthentication
+	case errors.Is(err, source.ErrAuthorization):
+		return source.ErrAuthorization
+	case errors.Is(err, extract.ErrAuthentication):
+		return extract.ErrAuthentication
+	case errors.Is(err, extract.ErrAuthorization):
+		return extract.ErrAuthorization
+	default:
+		return nil
+	}
+}
+
 func (service *Service) validate() error {
 	if service == nil || service.Source == nil || service.Model == nil || service.Resolver == nil || service.Repository == nil || service.Now == nil {
 		return fmt.Errorf("sync service dependencies are required")
 	}
-	if strings.TrimSpace(service.CollectionID) == "" || strings.TrimSpace(service.PromptVersion) == "" {
-		return fmt.Errorf("sync collection and prompt version are required")
+	if strings.TrimSpace(service.CollectionID) == "" || strings.TrimSpace(service.PromptVersion) == "" ||
+		strings.TrimSpace(service.Region) == "" || strings.TrimSpace(service.ModelID) == "" || service.MaxTokens <= 0 || service.LeaseDuration <= 0 {
+		return fmt.Errorf("sync collection and model configuration are required")
 	}
 	return nil
 }

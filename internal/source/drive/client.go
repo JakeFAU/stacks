@@ -159,7 +159,7 @@ func (client *Client) Get(ctx context.Context, documentID string) (source.Docume
 		ID:       document.DocumentId,
 		Title:    document.Title,
 		Locator:  fmt.Sprintf(docsLocatorFormat, url.PathEscape(document.DocumentId)),
-		Version:  document.RevisionId,
+		Revision: document.RevisionId,
 		Tabs:     tabs,
 	}, nil
 }
@@ -170,6 +170,12 @@ func sanitizedGoogleError(ctx context.Context, operation string, err error) erro
 	}
 	var apiError *googleapi.Error
 	if errors.As(err, &apiError) {
+		switch apiError.Code {
+		case http.StatusUnauthorized:
+			return fmt.Errorf("%s: %w", operation, source.ErrAuthentication)
+		case http.StatusForbidden:
+			return fmt.Errorf("%s: %w", operation, source.ErrAuthorization)
+		}
 		return fmt.Errorf("%s: Google API returned HTTP %d", operation, apiError.Code)
 	}
 	return fmt.Errorf("%s: request failed", operation)

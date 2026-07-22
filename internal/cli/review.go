@@ -8,6 +8,12 @@ import (
 	"strings"
 )
 
+const (
+	maximumReviewListReasonRunes  = 96
+	maximumReviewListContextRunes = 160
+	reviewListTruncationMarker    = "..."
+)
+
 // ReviewCandidate is one ranked, non-authoritative identity suggestion.
 type ReviewCandidate struct {
 	EntityID   string
@@ -54,7 +60,7 @@ type ReviewService struct {
 	Store ReviewStore
 }
 
-// List returns pending and resolved proposals for local review.
+// List returns pending proposals for local review.
 func (service ReviewService) List(ctx context.Context) ([]ReviewProposal, error) {
 	if service.Store == nil {
 		return nil, fmt.Errorf("list review proposals: store is not configured")
@@ -138,7 +144,7 @@ func (command ReviewCommand) Run(ctx context.Context, args []string) error {
 			return err
 		}
 		for _, proposal := range proposals {
-			fmt.Fprintf(output, "%s\n", proposal.ID)
+			renderReviewListProposal(output, proposal)
 		}
 		return nil
 	}
@@ -180,6 +186,40 @@ func (command ReviewCommand) Run(ctx context.Context, args []string) error {
 		return err
 	}
 	return fmt.Errorf("review command usage: review list | review show <proposal-id> | review accept <proposal-id> <entity-id> | review reject <proposal-id> | review create <proposal-id> --name <name> [--email <email>] | review correct <effective-decision-id> <entity-id>")
+}
+
+func renderReviewListProposal(output io.Writer, proposal ReviewProposal) {
+	guess := "none"
+	confidence := "unknown"
+	reason := ""
+	alternatives := 0
+	if len(proposal.Candidates) > 0 {
+		highestRanked := proposal.Candidates[0]
+		guess = highestRanked.EntityID
+		reason = highestRanked.Reason
+		alternatives = len(proposal.Candidates) - 1
+		if highestRanked.Confidence != nil {
+			confidence = fmt.Sprintf("%.3f", *highestRanked.Confidence)
+		}
+	}
+	fmt.Fprintf(output, "%s | guess=%s | confidence=%s | alternatives=%d | reason=%q | context=%q\n",
+		proposal.ID,
+		guess,
+		confidence,
+		alternatives,
+		boundedReviewListText(reason, maximumReviewListReasonRunes),
+		boundedReviewListText(proposal.Context, maximumReviewListContextRunes),
+	)
+}
+
+func boundedReviewListText(value string, maximumRunes int) string {
+	normalized := strings.Join(strings.Fields(value), " ")
+	runes := []rune(normalized)
+	if len(runes) <= maximumRunes {
+		return normalized
+	}
+	marker := []rune(reviewListTruncationMarker)
+	return string(runes[:maximumRunes-len(marker)]) + reviewListTruncationMarker
 }
 
 func parseCreatePerson(args []string) (CreatePersonInput, error) {

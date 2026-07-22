@@ -68,6 +68,53 @@ func TestDocumentVersionCopiesMutableSourceTabs(t *testing.T) {
 	}
 }
 
+func TestDocumentVersionRetainsImmutableSourceProvenance(t *testing.T) {
+	modifiedAt := time.Date(2026, time.July, 20, 15, 30, 0, 0, time.UTC)
+	meetingTime := time.Date(2026, time.July, 20, 9, 0, 0, 0, time.FixedZone("synthetic", -4*60*60))
+	input := documentVersionInput([]source.Tab{sourceTab("t.transcript", "Transcript", "Alex: synthetic words")})
+	input.Title = "Synthetic weekly meeting"
+	input.Locator = "https://docs.example.invalid/document/doc-1"
+	input.ProviderVersion = "drive-version-42"
+	input.ProviderRevision = "docs-revision-7"
+	input.ModifiedAt = modifiedAt
+	input.SourceMeetingTime = &meetingTime
+
+	version, err := NewDocumentVersion(input)
+	if err != nil {
+		t.Fatalf("NewDocumentVersion() error = %v", err)
+	}
+	meetingTime = meetingTime.Add(24 * time.Hour)
+
+	if version.Title() != input.Title || version.Locator() != input.Locator ||
+		version.ProviderVersion() != input.ProviderVersion || version.ProviderRevision() != input.ProviderRevision ||
+		!version.ModifiedAt().Equal(modifiedAt) {
+		t.Fatalf("source provenance was not retained: title=%q locator=%q version=%q revision=%q modified=%s",
+			version.Title(), version.Locator(), version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt())
+	}
+	if got := version.SourceMeetingTime(); got == nil || !got.Equal(time.Date(2026, time.July, 20, 9, 0, 0, 0, time.FixedZone("synthetic", -4*60*60))) {
+		t.Fatalf("SourceMeetingTime() = %v, want immutable source value", got)
+	}
+}
+
+func TestDocumentVersionDigestChangesWhenProviderRevisionChanges(t *testing.T) {
+	firstInput := documentVersionInput([]source.Tab{sourceTab("t.transcript", "Transcript", "Alex: synthetic words")})
+	firstInput.ProviderRevision = "revision-1"
+	secondInput := firstInput
+	secondInput.ProviderRevision = "revision-2"
+
+	first, err := NewDocumentVersion(firstInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewDocumentVersion(secondInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Digest() == second.Digest() {
+		t.Fatal("document digests are equal after provider revision changed")
+	}
+}
+
 func TestEvidenceSpanRejectsInvalidUTF8ByteOffsets(t *testing.T) {
 	version, err := NewDocumentVersion(documentVersionInput([]source.Tab{
 		sourceTab("t.transcript", "Transcript", "AéB"),
@@ -142,6 +189,11 @@ func documentVersionInput(tabs []source.Tab) DocumentVersionInput {
 	return DocumentVersionInput{
 		Provider:           "drive",
 		ProviderDocumentID: "doc-1",
+		Title:              "Synthetic meeting",
+		Locator:            "https://docs.example.invalid/document/doc-1",
+		ProviderVersion:    "drive-version-1",
+		ProviderRevision:   "docs-revision-1",
+		ModifiedAt:         time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
 		RecordedAt:         time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
 		Tabs:               tabs,
 	}

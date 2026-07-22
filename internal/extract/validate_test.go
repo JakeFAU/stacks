@@ -1,12 +1,102 @@
 package extract
 
 import (
+	"encoding/json"
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 const submittedTranscript = "speaker-a assigned the follow-up."
+
+func TestDecodeExtractionLeavesAbsentMeetingDateUnknown(t *testing.T) {
+	output := validExtraction()
+	output.MeetingDate = ""
+
+	got := decodeExtractionForTest(t, validSubmittedText(), output)
+	if got.MeetingDate != "" {
+		t.Fatalf("MeetingDate = %q, want unknown", got.MeetingDate)
+	}
+}
+
+func TestDecodeExtractionDoesNotTrustInventedMeetingDate(t *testing.T) {
+	output := validExtraction()
+	output.MeetingDate = "2026-07-21"
+
+	got := decodeExtractionForTest(t, validSubmittedText(), output)
+	if got.MeetingDate != "" {
+		t.Fatalf("MeetingDate = %q, want unknown because no exact source citation contains the date", got.MeetingDate)
+	}
+}
+
+func TestDecodeExtractionAcceptsExactDateBearingCitation(t *testing.T) {
+	const citedText = "2026-07-21 speaker-a assigned"
+	submitted := SubmittedText{Tabs: []SubmittedTab{{
+		ID: "transcript-tab", Role: TabRoleTranscript,
+		Text: citedText + " the follow-up.",
+	}}}
+	output := validExtraction()
+	output.Citations[0] = Citation{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+		EndOffset: len(citedText), Quote: citedText,
+	}
+
+	got := decodeExtractionForTest(t, submitted, output)
+	if got.MeetingDate != "2026-07-21" {
+		t.Fatalf("MeetingDate = %q, want exact cited date", got.MeetingDate)
+	}
+}
+
+func TestDecodeExtractionDoesNotTreatEmbeddedDateAsExactToken(t *testing.T) {
+	const citedText = "speaker-a codeA2026-07-21B assigned"
+	submitted := SubmittedText{Tabs: []SubmittedTab{{
+		ID: "transcript-tab", Role: TabRoleTranscript,
+		Text: citedText + " the follow-up.",
+	}}}
+	output := validExtraction()
+	output.MeetingDate = "2026-07-21"
+	output.Citations[0] = Citation{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+		EndOffset: len(citedText), Quote: citedText,
+	}
+
+	got := decodeExtractionForTest(t, submitted, output)
+	if got.MeetingDate != "" {
+		t.Fatalf("MeetingDate = %q, want unknown for a date embedded in a larger token", got.MeetingDate)
+	}
+}
+
+func TestDecodeExtractionDerivesMeetingDateFromPersistedSourceMetadata(t *testing.T) {
+	sourceMeetingTime := time.Date(2026, time.July, 21, 14, 30, 0, 0, time.FixedZone("synthetic", -4*60*60))
+	submitted := validSubmittedText()
+	submitted.SourceMeetingTime = &sourceMeetingTime
+	output := validExtraction()
+	output.MeetingDate = "2026-07-22"
+
+	got := decodeExtractionForTest(t, submitted, output)
+	if got.MeetingDate != "2026-07-21" {
+		t.Fatalf("MeetingDate = %q, want source metadata date", got.MeetingDate)
+	}
+}
+
+func decodeExtractionForTest(t *testing.T, submitted SubmittedText, output ExtractionOutput) ExtractionOutput {
+	t.Helper()
+	for index := range output.Signals {
+		if output.Signals[index].ContradictingCitationIDs == nil {
+			output.Signals[index].ContradictingCitationIDs = []string{}
+		}
+	}
+	raw, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("marshal extraction: %v", err)
+	}
+	decoded, err := DecodeAndValidateExtraction(submitted, raw)
+	if err != nil {
+		t.Fatalf("DecodeAndValidateExtraction() error = %v", err)
+	}
+	return decoded
+}
 
 func TestValidateExtractionAcceptsExactUTF8ByteCitations(t *testing.T) {
 	text := SubmittedText{Tabs: []SubmittedTab{
@@ -18,6 +108,7 @@ func TestValidateExtractionAcceptsExactUTF8ByteCitations(t *testing.T) {
 		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
 		EndOffset: len("é assigned"), Quote: "é assigned",
 	}
+	output.People[0].Surface = "é"
 
 	if err := ValidateExtraction(text, output); err != nil {
 		t.Fatalf("ValidateExtraction() error = %v", err)
@@ -31,6 +122,79 @@ func TestValidateExtractionRejectsInventedCitation(t *testing.T) {
 	err := ValidateExtraction(validSubmittedText(), output)
 	if err == nil || !strings.Contains(err.Error(), "does not exactly match") {
 		t.Fatalf("ValidateExtraction() error = %v, want exact citation mismatch", err)
+	}
+}
+
+func TestValidateExtractionRejectsPersonSurfaceAbsentFromCitedEvidence(t *testing.T) {
+	output := validExtraction()
+	output.People[0].Surface = "invented-person"
+
+	err := ValidateExtraction(validSubmittedText(), output)
+	if err == nil || !strings.Contains(err.Error(), "grounded") {
+		t.Fatalf("ValidateExtraction() error = %v, want ungrounded identity rejection", err)
+	}
+}
+
+func TestValidateExtractionRejectsNamePrefixInsideHyphenatedIdentity(t *testing.T) {
+	const citedText = "Ann-Marie assigned the follow-up."
+	submitted := SubmittedText{Tabs: []SubmittedTab{{
+		ID: "transcript-tab", Role: TabRoleTranscript, Text: citedText,
+	}}}
+	output := validExtraction()
+	output.People[0].Surface = "Ann"
+	output.Citations[0] = Citation{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+		EndOffset: len(citedText), Quote: citedText,
+	}
+
+	err := ValidateExtraction(submitted, output)
+	if err == nil || !strings.Contains(err.Error(), "grounded") {
+		t.Fatalf("ValidateExtraction() error = %v, want partial hyphenated identity rejection", err)
+	}
+}
+
+func TestValidateExtractionRejectsPersonEmailAbsentFromCitedEvidence(t *testing.T) {
+	output := validExtraction()
+	output.People[0].Email = "invented@example.test"
+
+	err := ValidateExtraction(validSubmittedText(), output)
+	if err == nil || !strings.Contains(err.Error(), "email") {
+		t.Fatalf("ValidateExtraction() error = %v, want ungrounded email rejection", err)
+	}
+}
+
+func TestValidateExtractionAcceptsNormalizedEmailExactlyPresentInCitedEvidence(t *testing.T) {
+	const citedText = "speaker-a <speaker@example.test> assigned"
+	submitted := SubmittedText{Tabs: []SubmittedTab{{
+		ID: "transcript-tab", Role: TabRoleTranscript,
+		Text: citedText + " the follow-up.",
+	}}}
+	output := validExtraction()
+	output.People[0].Email = "SPEAKER@EXAMPLE.TEST"
+	output.Citations[0] = Citation{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+		EndOffset: len(citedText), Quote: citedText,
+	}
+
+	if err := ValidateExtraction(submitted, output); err != nil {
+		t.Fatalf("ValidateExtraction() error = %v", err)
+	}
+}
+
+func TestValidateExtractionAcceptsExactEmailBeforeSentencePeriod(t *testing.T) {
+	const citedText = "speaker-a emailed speaker@example.test."
+	submitted := SubmittedText{Tabs: []SubmittedTab{{
+		ID: "transcript-tab", Role: TabRoleTranscript, Text: citedText,
+	}}}
+	output := validExtraction()
+	output.People[0].Email = "speaker@example.test"
+	output.Citations[0] = Citation{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+		EndOffset: len(citedText), Quote: citedText,
+	}
+
+	if err := ValidateExtraction(submitted, output); err != nil {
+		t.Fatalf("ValidateExtraction() error = %v, want exact email token before punctuation", err)
 	}
 }
 
@@ -56,6 +220,7 @@ func TestValidateExtractionRejectsNotesOnlySignal(t *testing.T) {
 		ID: "citation-1", TabID: "notes-tab", StartOffset: 0,
 		EndOffset: len("secondary"), Quote: "secondary",
 	}
+	output.People[0].Surface = "secondary"
 
 	err := ValidateExtraction(validSubmittedText(), output)
 	if err == nil || !strings.Contains(err.Error(), "transcript") {

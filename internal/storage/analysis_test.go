@@ -143,6 +143,9 @@ func TestLegacyAndTemporalAnalysisDigestsUseSeparateNamespaces(t *testing.T) {
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
 		PromptVersion:    "analyze-v1",
 		PolicyVersion:    "policy-v1",
+		Region:           "us-east-1",
+		ModelID:          "synthetic-model",
+		MaxTokens:        256,
 		Inputs: []analysisdomain.InputReference{{
 			Kind: analysisdomain.InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd", Digest: inputDigest,
 		}},
@@ -532,6 +535,9 @@ func testCurrentAnalysisIdentity(t *testing.T) analysisdomain.AnalysisIdentity {
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
 		PromptVersion:    "analyze-test-v1",
 		PolicyVersion:    "policy-test-v1",
+		Region:           "us-east-1",
+		ModelID:          "synthetic-model",
+		MaxTokens:        256,
 		Inputs: []analysisdomain.InputReference{
 			{Kind: analysisdomain.InputResolutionDecision, ID: "00000000-0000-0000-0000-000000000001", Digest: employeeDigest},
 			{Kind: analysisdomain.InputResolutionDecision, ID: "00000000-0000-0000-0000-000000000002", Digest: managerDigest},

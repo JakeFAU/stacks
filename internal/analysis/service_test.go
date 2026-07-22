@@ -171,6 +171,9 @@ func TestServiceUsesExactOrderedInputDigestAndCachesIdenticalRun(t *testing.T) {
 		ManagerEntityID:  testManagerID,
 		PromptVersion:    extract.AnalysisPromptVersion,
 		PolicyVersion:    AnalysisPolicyVersion,
+		Region:           service.Region,
+		ModelID:          service.ModelID,
+		MaxTokens:        service.MaxTokens,
 		Inputs:           repository.snapshot.Inputs,
 	})
 	if err != nil {
@@ -345,6 +348,51 @@ func TestServiceDowngradesUnsupportedModelDeclineAndRecordsBoundedDecision(t *te
 	observation := decisions.observations[0]
 	if observation.Name != analysisDecisionName || observation.Outcome != string(StatusMixedOrConflicting) || observation.InputSize != 2 || observation.OutputSize != 1 {
 		t.Fatalf("decision observation = %#v", observation)
+	}
+}
+
+func TestServiceNeverPersistsModelNarrativeForAnyAdmittedStatus(t *testing.T) {
+	const unsafeNarrative = "The manager secretly distrusts the employee and intends to remove them."
+	tests := []struct {
+		name       string
+		status     ReportStatus
+		mutate     func(*PairSnapshot)
+		supporting []string
+		contrary   []string
+	}{
+		{name: "insufficient", status: StatusInsufficientEvidence},
+		{name: "no material change", status: StatusNoMaterialChange, mutate: func(snapshot *PairSnapshot) {
+			snapshot.Signals[1].Direction = DirectionStrengthening
+		}},
+		{name: "mixed", status: StatusMixedOrConflicting, supporting: []string{"signal-earlier"}, contrary: []string{"signal-later"}},
+		{name: "possible decline", status: StatusPossibleDecline, supporting: []string{"signal-earlier", "signal-later"}},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			snapshot := acceptedPairSnapshot()
+			if testCase.mutate != nil {
+				testCase.mutate(&snapshot)
+			}
+			repository := &fakeRepository{snapshot: snapshot}
+			model := &fakeModel{output: analysisOutputWithNarrative(
+				testCase.status, unsafeNarrative, testCase.supporting, testCase.contrary,
+				[]string{unsafeNarrative},
+			)}
+
+			report, err := testService(repository, model).Analyze(context.Background(), testEmployeeID, testManagerID)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if report.Status != testCase.status {
+				t.Fatalf("report status = %q, want admitted %q", report.Status, testCase.status)
+			}
+			persisted := repository.completed.Report
+			prose := strings.Join(append(append([]string{persisted.Rationale}, persisted.Limitations...), persisted.Gaps...), " ")
+			if strings.Contains(prose, unsafeNarrative) || strings.TrimSpace(persisted.Rationale) == "" {
+				t.Fatalf("persisted admitted report prose = %q, want nonempty deterministic explanation without model narrative", prose)
+			}
+		})
 	}
 }
 
@@ -527,6 +575,7 @@ func TestComputeInputDigestCanonicalizesPairAndInputUUIDs(t *testing.T) {
 	canonical := AnalysisIdentity{
 		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
 		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 		Inputs: []InputReference{{Kind: InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd", Digest: digest}},
 	}
 	variant := canonical
@@ -553,6 +602,7 @@ func TestComputeInputDigestRejectsRepeatedInputIdentity(t *testing.T) {
 	_, err := ComputeInputDigest(AnalysisIdentity{
 		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
 		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 		Inputs: []InputReference{input, input},
 	})
 	if err == nil {
@@ -564,6 +614,7 @@ func TestComputeInputDigestAllowsPairIdentityWithoutSignalInputs(t *testing.T) {
 	first, err := ComputeInputDigest(AnalysisIdentity{
 		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
 		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 	})
 	if err != nil {
 		t.Fatalf("ComputeInputDigest() error = %v", err)
@@ -571,6 +622,7 @@ func TestComputeInputDigestAllowsPairIdentityWithoutSignalInputs(t *testing.T) {
 	second, err := ComputeInputDigest(AnalysisIdentity{
 		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
 		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
 	})
 	if err != nil {
 		t.Fatalf("repeated ComputeInputDigest() error = %v", err)
@@ -580,9 +632,39 @@ func TestComputeInputDigestAllowsPairIdentityWithoutSignalInputs(t *testing.T) {
 	}
 }
 
-func TestAnalysisPolicyVersionChangesForCounterevidenceSemantics(t *testing.T) {
-	if AnalysisPolicyVersion != "manager-confidence-policy-v3" {
-		t.Fatalf("AnalysisPolicyVersion = %q, want cache-invalidating counterevidence policy version", AnalysisPolicyVersion)
+func TestComputeInputDigestChangesWithMaterialModelConfiguration(t *testing.T) {
+	base := AnalysisIdentity{
+		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
+		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
+		Region: "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
+	}
+	first, err := ComputeInputDigest(base)
+	if err != nil {
+		t.Fatalf("ComputeInputDigest() error = %v", err)
+	}
+	tests := map[string]func(*AnalysisIdentity){
+		"region":     func(identity *AnalysisIdentity) { identity.Region = "us-west-2" },
+		"model ID":   func(identity *AnalysisIdentity) { identity.ModelID = "synthetic-model-v2" },
+		"max tokens": func(identity *AnalysisIdentity) { identity.MaxTokens++ },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			digest, err := ComputeInputDigest(changed)
+			if err != nil {
+				t.Fatalf("ComputeInputDigest() error = %v", err)
+			}
+			if digest == first {
+				t.Fatal("material model configuration reused analysis identity")
+			}
+		})
+	}
+}
+
+func TestAnalysisPolicyVersionChangesForSafeExplanationSemantics(t *testing.T) {
+	if AnalysisPolicyVersion != "manager-confidence-policy-v4" {
+		t.Fatalf("AnalysisPolicyVersion = %q, want cache-invalidating safe-explanation policy version", AnalysisPolicyVersion)
 	}
 }
 
@@ -646,6 +728,10 @@ func analysisOutput(status ReportStatus, supporting, contradicting []string) jso
 }
 
 func analysisOutputWithRationale(status ReportStatus, rationale string, supporting, contradicting []string) json.RawMessage {
+	return analysisOutputWithNarrative(status, rationale, supporting, contradicting, []string{"No direct observation outside scheduled meetings."})
+}
+
+func analysisOutputWithNarrative(status ReportStatus, rationale string, supporting, contradicting, gaps []string) json.RawMessage {
 	if supporting == nil {
 		supporting = []string{}
 	}
@@ -657,7 +743,7 @@ func analysisOutputWithRationale(status ReportStatus, rationale string, supporti
 		"rationale":                rationale,
 		"supporting_signal_ids":    supporting,
 		"contradicting_signal_ids": contradicting,
-		"gaps":                     []string{"No direct observation outside scheduled meetings."},
+		"gaps":                     gaps,
 	})
 	return output
 }

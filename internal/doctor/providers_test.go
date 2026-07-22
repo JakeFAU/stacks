@@ -3,6 +3,7 @@ package doctor
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	awsbedrock "github.com/aws/aws-sdk-go-v2/service/bedrock"
@@ -13,7 +14,9 @@ import (
 )
 
 func TestPostgresProbeChecksRequiredMigrationWithoutApplyingIt(t *testing.T) {
-	connection := &fakePostgresConnection{migrationVersion: requiredMigrationVersion}
+	connection := &fakePostgresConnection{
+		appliedMigrationVersions: []int64{1, 2, 3, 4, 5},
+	}
 	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
 		return connection, nil
 	})
@@ -31,6 +34,28 @@ func TestPostgresProbeChecksRequiredMigrationWithoutApplyingIt(t *testing.T) {
 	}
 	if connection.pingCalls != 1 || connection.queryCalls != 1 || connection.mutationCalls != 0 {
 		t.Fatalf("calls = ping:%d query:%d mutation:%d, want 1/1/0", connection.pingCalls, connection.queryCalls, connection.mutationCalls)
+	}
+	normalizedQuery := strings.ToLower(connection.lastQuery)
+	if strings.Contains(normalizedQuery, "max(") || !strings.Contains(normalizedQuery, "unnest") || !strings.Contains(normalizedQuery, "distinct on") {
+		t.Fatalf("migration query = %q, want required-set comparison against each version's latest state", connection.lastQuery)
+	}
+}
+
+func TestPostgresProbeRejectsAppliedMigrationSetWithInteriorGap(t *testing.T) {
+	connection := &fakePostgresConnection{
+		appliedMigrationVersions: []int64{1, 2, 4, 5},
+	}
+	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
+		return connection, nil
+	})
+	defer probe.Close()
+
+	current, err := probe.MigrationsCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("MigrationsCurrent() error = %v", err)
+	}
+	if current {
+		t.Fatal("MigrationsCurrent() = true, want false for missing applied migration 3")
 	}
 }
 
@@ -222,10 +247,11 @@ func TestAWSProbeTreatsAnyLoggingConfigurationAsEnabled(t *testing.T) {
 }
 
 type fakePostgresConnection struct {
-	migrationVersion int64
-	pingCalls        int
-	queryCalls       int
-	mutationCalls    int
+	appliedMigrationVersions []int64
+	pingCalls                int
+	queryCalls               int
+	mutationCalls            int
+	lastQuery                string
 }
 
 func (fake *fakePostgresConnection) Ping(context.Context) error {
@@ -233,9 +259,18 @@ func (fake *fakePostgresConnection) Ping(context.Context) error {
 	return nil
 }
 
-func (fake *fakePostgresConnection) QueryRow(context.Context, string, ...any) postgresRow {
+func (fake *fakePostgresConnection) QueryRow(_ context.Context, query string, arguments ...any) postgresRow {
 	fake.queryCalls++
-	return fakePostgresRow{version: fake.migrationVersion}
+	fake.lastQuery = query
+	if len(arguments) == 1 {
+		requiredVersions, ok := arguments[0].([]int64)
+		if !ok {
+			return fakePostgresRow{err: errors.New("unexpected migration query argument")}
+		}
+		current := containsEveryMigration(requiredVersions, fake.appliedMigrationVersions)
+		return fakePostgresRow{current: &current}
+	}
+	return fakePostgresRow{err: errors.New("required migration versions were not supplied")}
 }
 
 func (fake *fakePostgresConnection) Close() {}
@@ -246,19 +281,40 @@ func (fake *fakePostgresConnection) ApplyMigrations(context.Context) error {
 }
 
 type fakePostgresRow struct {
-	version int64
+	current *bool
+	err     error
 }
 
 func (row fakePostgresRow) Scan(destinations ...any) error {
+	if row.err != nil {
+		return row.err
+	}
 	if len(destinations) != 1 {
 		return errors.New("unexpected scan destinations")
 	}
-	value, ok := destinations[0].(*int64)
-	if !ok {
+	switch value := destinations[0].(type) {
+	case *bool:
+		if row.current == nil {
+			return errors.New("unexpected boolean scan destination")
+		}
+		*value = *row.current
+	default:
 		return errors.New("unexpected scan destination")
 	}
-	*value = row.version
 	return nil
+}
+
+func containsEveryMigration(required, applied []int64) bool {
+	appliedSet := make(map[int64]struct{}, len(applied))
+	for _, version := range applied {
+		appliedSet[version] = struct{}{}
+	}
+	for _, version := range required {
+		if _, ok := appliedSet[version]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 type fakeSource struct {

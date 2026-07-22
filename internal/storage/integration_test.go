@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	analysisdomain "stacks/internal/analysis"
+	"stacks/internal/entity"
+	"stacks/internal/extract"
 	"stacks/internal/ingest"
 	"stacks/internal/knowledge"
 	"stacks/internal/source"
@@ -23,33 +27,124 @@ func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	repository := NewIngestionRepository(pool)
 	ctx := context.Background()
 	version := testDocumentVersion(t, testIdentifier("document-ingestion-state"))
+	derivation := testExtractionDerivation(t, version)
 
-	first, err := repository.PrepareVersion(ctx, version)
+	first, err := repository.PrepareVersion(ctx, version, derivation, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare first ingestion attempt: %v", err)
 	}
 	if first.Status != ingest.VersionStatusPending || first.RetryCount != 0 {
 		t.Fatalf("first state = %#v, want pending retry_count=0", first)
 	}
-	if err := repository.RecordFailure(ctx, first.ID, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
+	if err := repository.RecordFailure(ctx, first.DerivationID, first.LeaseOwner, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
 		t.Fatalf("record incomplete attempt: %v", err)
 	}
-	second, err := repository.PrepareVersion(ctx, version)
+	second, err := repository.PrepareVersion(ctx, version, derivation, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare retry: %v", err)
 	}
 	if second.ID != first.ID || second.Status != ingest.VersionStatusPending || second.RetryCount != 1 || second.FailureCode != "" {
 		t.Fatalf("retry state = %#v, want same pending version with retry_count=1", second)
 	}
-	if err := repository.CompleteVersion(ctx, ingest.Completion{VersionID: second.ID}); err != nil {
+	if err := repository.CompleteVersion(ctx, ingest.Completion{VersionID: second.ID, DerivationID: second.DerivationID, LeaseOwner: second.LeaseOwner}); err != nil {
 		t.Fatalf("complete retry: %v", err)
 	}
-	complete, err := repository.PrepareVersion(ctx, version)
+	complete, err := repository.PrepareVersion(ctx, version, derivation, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare completed version: %v", err)
 	}
 	if complete.Status != ingest.VersionStatusComplete || complete.RetryCount != 1 {
 		t.Fatalf("completed state = %#v, want complete retry_count=1", complete)
+	}
+}
+
+func TestConcurrentExtractionClaimAllowsOneActiveOwner(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	version := testDocumentVersion(t, testIdentifier("document-concurrent-claim"))
+	derivation := testExtractionDerivation(t, version)
+	start := make(chan struct{})
+	type claimResult struct {
+		state ingest.VersionState
+		err   error
+	}
+	results := make(chan claimResult, 2)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			state, err := NewIngestionRepository(pool).PrepareVersion(context.Background(), version, derivation, 5*time.Minute)
+			results <- claimResult{state: state, err: err}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	counts := map[ingest.VersionStatus]int{}
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("claim extraction derivation: %v", result.err)
+		}
+		counts[result.state.Status]++
+		if result.state.Status == ingest.VersionStatusPending && result.state.LeaseOwner == "" {
+			t.Fatal("winning extraction claim has no owner")
+		}
+		if result.state.Status == ingest.VersionStatusBusy && result.state.LeaseOwner != "" {
+			t.Fatal("busy extraction claim disclosed another worker owner")
+		}
+	}
+	if counts[ingest.VersionStatusPending] != 1 || counts[ingest.VersionStatusBusy] != 1 {
+		t.Fatalf("claim statuses = %#v, want one pending owner and one busy worker", counts)
+	}
+}
+
+func TestExtractionCompletionAndFailureRejectNonOwner(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewIngestionRepository(pool)
+	version := testDocumentVersion(t, testIdentifier("document-lease-owner"))
+	state, err := repository.PrepareVersion(context.Background(), version, testExtractionDerivation(t, version), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("claim extraction derivation: %v", err)
+	}
+	if err := repository.RecordFailure(context.Background(), state.DerivationID, uuid.NewString(), ingest.VersionStatusIncomplete, ingest.FailureStorage); err == nil {
+		t.Fatal("non-owner failure update error = nil")
+	}
+	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: uuid.NewString(),
+	}); err == nil {
+		t.Fatal("non-owner completion error = nil")
+	}
+	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+	}); err != nil {
+		t.Fatalf("owner completion: %v", err)
+	}
+}
+
+func TestExpiredExtractionClaimCanBeRecoveredByNewOwner(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewIngestionRepository(pool)
+	version := testDocumentVersion(t, testIdentifier("document-expired-claim"))
+	derivation := testExtractionDerivation(t, version)
+	first, err := repository.PrepareVersion(context.Background(), version, derivation, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("claim extraction derivation: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE stacks.extraction_runs
+		SET lease_expires_at = clock_timestamp() - interval '1 second'
+		WHERE id = $1`, first.DerivationID); err != nil {
+		t.Fatalf("expire synthetic extraction claim: %v", err)
+	}
+
+	recovered, err := repository.PrepareVersion(context.Background(), version, derivation, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("recover expired extraction claim: %v", err)
+	}
+	if recovered.Status != ingest.VersionStatusPending || recovered.RetryCount != 1 ||
+		recovered.LeaseOwner == "" || recovered.LeaseOwner == first.LeaseOwner {
+		t.Fatalf("recovered state = %#v, want retry with a new active owner", recovered)
 	}
 }
 
@@ -259,6 +354,72 @@ func TestInteractiveReviewActionsAppendHistoryAndRejectStaleState(t *testing.T) 
 	}
 }
 
+func TestAcceptedAliasFollowsEffectiveDecisionLifecycle(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	entities := NewEntityRepository(pool)
+	ingestion := NewIngestionRepository(pool)
+	ctx := context.Background()
+	first, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Alias Owner A"})
+	if err != nil {
+		t.Fatalf("create first alias owner: %v", err)
+	}
+	second, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Alias Owner B"})
+	if err != nil {
+		t.Fatalf("create second alias owner: %v", err)
+	}
+	proposal, err := entities.CreateResolutionProposal(ctx, ResolutionProposalInput{MentionID: createSyntheticMention(t, pool)})
+	if err != nil {
+		t.Fatalf("create alias proposal: %v", err)
+	}
+	accepted, err := entities.RecordReviewDecision(ctx, ResolutionDecisionInput{
+		ProposalID: proposal.ID, Outcome: ResolutionOutcomeAccepted, EntityID: first.ID,
+	})
+	if err != nil {
+		t.Fatalf("accept alias proposal: %v", err)
+	}
+	assertSnapshotAlias(t, snapshotsForTest(t, ingestion), first.ID, "synthetic", true)
+
+	if _, err := entities.CorrectReviewDecision(ctx, accepted.ID, ResolutionDecisionInput{
+		Outcome: ResolutionOutcomeAccepted, EntityID: second.ID,
+	}); err != nil {
+		t.Fatalf("correct alias decision: %v", err)
+	}
+	snapshots := snapshotsForTest(t, ingestion)
+	assertSnapshotAlias(t, snapshots, first.ID, "synthetic", false)
+	assertSnapshotAlias(t, snapshots, second.ID, "synthetic", true)
+}
+
+func snapshotsForTest(t *testing.T, repository *IngestionRepository) []entity.EntitySnapshot {
+	t.Helper()
+	snapshots, err := repository.EntitySnapshots(context.Background())
+	if err != nil {
+		t.Fatalf("list entity snapshots: %v", err)
+	}
+	return snapshots
+}
+
+func assertSnapshotAlias(t *testing.T, snapshots []entity.EntitySnapshot, entityID, value string, want bool) {
+	t.Helper()
+	for _, snapshot := range snapshots {
+		if snapshot.ID != entityID {
+			continue
+		}
+		for _, alias := range snapshot.Aliases {
+			if alias.Value == value {
+				if !want {
+					t.Fatalf("entity %q retained superseded alias %q", entityID, value)
+				}
+				return
+			}
+		}
+		if want {
+			t.Fatalf("entity %q is missing effective alias %q", entityID, value)
+		}
+		return
+	}
+	t.Fatalf("entity snapshot %q was not found", entityID)
+}
+
 func TestCompleteAnalysisDeduplicatesStableInput(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	entities := NewEntityRepository(pool)
@@ -369,7 +530,8 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	}
 	emptyIdentity := analysisdomain.AnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
-		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1", Inputs: acceptedEmpty.Inputs,
+		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: acceptedEmpty.Inputs,
 	}
 	emptyIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(emptyIdentity)
 	if err != nil {
@@ -413,7 +575,8 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	}
 	acceptedIdentity := analysisdomain.AnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
-		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1", Inputs: accepted.Inputs,
+		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: accepted.Inputs,
 	}
 	acceptedIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(acceptedIdentity)
 	if err != nil {
@@ -453,7 +616,8 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	}
 	correctedIdentity := analysisdomain.AnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
-		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1", Inputs: corrected.Inputs,
+		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: corrected.Inputs,
 	}
 	correctedIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(correctedIdentity)
 	if err != nil {
@@ -800,11 +964,31 @@ func testDocumentVersion(t *testing.T, providerDocumentID string) knowledge.Docu
 	return testDocumentVersionWithRole(t, providerDocumentID, source.TabRoleTranscript)
 }
 
+func testExtractionDerivation(t *testing.T, version knowledge.DocumentVersion) ingest.DerivationIdentity {
+	t.Helper()
+	identity := ingest.DerivationIdentity{
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		PromptVersion: extract.ExtractionPromptVersion,
+		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
+	}
+	var err error
+	identity.Digest, err = ingest.ComputeDerivationDigest(version, identity)
+	if err != nil {
+		t.Fatalf("compute extraction derivation: %v", err)
+	}
+	return identity
+}
+
 func testDocumentVersionWithRole(t *testing.T, providerDocumentID string, role source.TabRole) knowledge.DocumentVersion {
 	t.Helper()
 	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
 		Provider:           "synthetic-drive",
 		ProviderDocumentID: providerDocumentID,
+		Title:              "Synthetic meeting",
+		Locator:            "https://docs.example.invalid/document/" + providerDocumentID,
+		ProviderVersion:    "synthetic-version-1",
+		ProviderRevision:   "synthetic-revision-1",
+		ModifiedAt:         time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
 		RecordedAt:         time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
 		Tabs: []source.Tab{{
 			ID:    "tab-synthetic",

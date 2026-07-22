@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"fmt"
 	"sort"
 	"time"
 )
@@ -200,4 +201,27 @@ func validReportStatus(status ReportStatus) bool {
 	default:
 		return false
 	}
+}
+
+// ExplainSignal returns bounded user-facing prose derived only from the typed
+// observable category and direction. Model-authored extraction narrative is
+// never part of the explanation.
+func ExplainSignal(category Category, direction Direction) string {
+	categoryLabel := map[Category]string{
+		CategoryDelegationAutonomy:   "delegation or autonomy",
+		CategoryScrutinyCorrection:   "scrutiny or correction",
+		CategoryEndorsementTrust:     "explicit endorsement or trust language",
+		CategorySupportAdvocacy:      "support or advocacy",
+		CategoryFutureResponsibility: "future responsibility",
+	}[category]
+	directionLabel := map[Direction]string{
+		DirectionStrengthening: "strengthening",
+		DirectionWeakening:     "weakening",
+		DirectionMixed:         "mixed",
+		DirectionUnclear:       "unclear",
+	}[direction]
+	if categoryLabel == "" || directionLabel == "" {
+		return "Validated transcript evidence contains an observable interaction signal."
+	}
+	return fmt.Sprintf("Validated transcript evidence classifies %s as %s.", categoryLabel, directionLabel)
 }

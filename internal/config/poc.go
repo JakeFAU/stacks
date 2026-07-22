@@ -3,12 +3,15 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 const (
 	defaultBedrockMaxAttempts      = 5
 	defaultExtractionPromptVersion = "extract-v1"
 	defaultAnalysisPromptVersion   = "analyze-v1"
+	defaultIngestionLeaseDuration  = 5 * time.Minute
+	maximumIngestionLeaseDuration  = time.Hour
 
 	DatabaseURLEnvironmentVariable             = "STACKS_DATABASE_URL"
 	GoogleFolderIDEnvironmentVariable          = "STACKS_GOOGLE_FOLDER_ID"
@@ -21,6 +24,7 @@ const (
 	BedrockModelIDEnvironmentVariable          = "STACKS_BEDROCK_MODEL_ID"
 	BedrockMaxTokensEnvironmentVariable        = "STACKS_BEDROCK_MAX_TOKENS"
 	BedrockMaxAttemptsEnvironmentVariable      = "STACKS_BEDROCK_MAX_ATTEMPTS"
+	IngestionLeaseDurationEnvironmentVariable  = "STACKS_INGEST_LEASE_DURATION"
 	ExtractionPromptVersionEnvironmentVariable = "STACKS_EXTRACTION_PROMPT_VERSION"
 	AnalysisPromptVersionEnvironmentVariable   = "STACKS_ANALYSIS_PROMPT_VERSION"
 	EmployeeEntityIDEnvironmentVariable        = "STACKS_EMPLOYEE_ENTITY_ID"
@@ -55,6 +59,7 @@ type PoCSettings struct {
 	BedrockModelID          string
 	BedrockMaxTokens        int
 	BedrockMaxAttempts      int
+	IngestionLeaseDuration  time.Duration
 	ExtractionPromptVersion string
 	AnalysisPromptVersion   string
 	EmployeeEntityID        string
@@ -81,7 +86,6 @@ func (settings PoCSettings) Validate(command Command) error {
 	case CommandAnalyze:
 		if err := settings.validateRequired(command,
 			DatabaseURLEnvironmentVariable,
-			AWSProfileEnvironmentVariable,
 			AWSRegionEnvironmentVariable,
 			BedrockModelIDEnvironmentVariable,
 			EmployeeEntityIDEnvironmentVariable,
@@ -115,7 +119,6 @@ func (settings PoCSettings) validateCorpusAndModel(command Command) error {
 		GoogleFolderIDEnvironmentVariable,
 		GoogleOAuthClientFileEnvironmentVariable,
 		GoogleOAuthTokenFileEnvironmentVariable,
-		AWSProfileEnvironmentVariable,
 		AWSRegionEnvironmentVariable,
 		BedrockModelIDEnvironmentVariable,
 	); err != nil {
@@ -123,6 +126,9 @@ func (settings PoCSettings) validateCorpusAndModel(command Command) error {
 	}
 	if err := settings.validateCorpusTitles(); err != nil {
 		return err
+	}
+	if settings.IngestionLeaseDuration <= 0 || settings.IngestionLeaseDuration > maximumIngestionLeaseDuration {
+		return fmt.Errorf("%s must be a positive duration no greater than %s", IngestionLeaseDurationEnvironmentVariable, maximumIngestionLeaseDuration)
 	}
 	return settings.validateModelSettings(command)
 }

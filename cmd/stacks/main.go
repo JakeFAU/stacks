@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/smithy-go"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
@@ -19,13 +23,18 @@ import (
 	"stacks/internal/config"
 	"stacks/internal/doctor"
 	"stacks/internal/entity"
+	"stacks/internal/extract"
 	"stacks/internal/ingest"
 	"stacks/internal/observability"
 	"stacks/internal/source/drive"
 	"stacks/internal/storage"
 )
 
-const observabilityShutdownTimeout = 10 * time.Second
+const (
+	observabilityShutdownTimeout      = 10 * time.Second
+	awsAccessDeniedErrorCode          = "AccessDenied"
+	awsAccessDeniedExceptionErrorCode = "AccessDeniedException"
+)
 
 func main() {
 	bootstrapLogger, err := zap.NewProduction()
@@ -61,7 +70,11 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			return pocCommandProvider(ctx, settings, stdout, stderr, runtime.TracerProvider().Tracer("stacks"), decisions)
+			invocations, err := bedrock.NewMetricsInvocationRecorder(runtime.MeterProvider().Meter("stacks"))
+			if err != nil {
+				return nil, err
+			}
+			return pocCommandProvider(ctx, settings, stdout, stderr, runtime.TracerProvider().Tracer("stacks"), decisions, invocations)
 		}),
 		os.Stdout,
 		os.Stderr,
@@ -86,6 +99,7 @@ func pocCommandProvider(
 	stdout, _ io.Writer,
 	tracer trace.Tracer,
 	decisions *observability.DecisionRecorder,
+	invocations bedrock.InvocationRecorder,
 ) (map[string]cli.Command, error) {
 	return map[string]cli.Command{
 		string(config.CommandAuth): cli.AuthCommand{Google: drive.NewAuthorizer(
@@ -124,17 +138,13 @@ func pocCommandProvider(
 			if err != nil {
 				return err
 			}
-			awsConfiguration, err := awsconfig.LoadDefaultConfig(
-				ctx,
-				awsconfig.WithRegion(settings.PoC.AWSRegion),
-				awsconfig.WithSharedConfigProfile(settings.PoC.AWSProfile),
-			)
+			awsConfiguration, err := loadAWSConfiguration(ctx, settings.PoC.AWSProfile, settings.PoC.AWSRegion)
 			if err != nil {
 				return err
 			}
 			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
 				ModelID: settings.PoC.BedrockModelID, MaxTokens: settings.PoC.BedrockMaxTokens,
-				MaxAttempts: settings.PoC.BedrockMaxAttempts,
+				MaxAttempts: settings.PoC.BedrockMaxAttempts, Recorder: invocations, Tracer: tracer,
 			})
 			if err != nil {
 				return err
@@ -148,7 +158,10 @@ func pocCommandProvider(
 				Source: sourceBoundary, Model: model, Resolver: entity.Resolver{},
 				Repository:   storage.NewIngestionRepository(pool),
 				CollectionID: settings.PoC.GoogleFolderID, PromptVersion: settings.PoC.ExtractionPromptVersion,
-				Tracer: tracer, Decisions: decisions, Now: time.Now,
+				Region: strings.TrimSpace(settings.PoC.AWSRegion), ModelID: strings.TrimSpace(settings.PoC.BedrockModelID),
+				MaxTokens:     settings.PoC.BedrockMaxTokens,
+				LeaseDuration: settings.PoC.IngestionLeaseDuration,
+				Tracer:        tracer, Decisions: decisions, Now: time.Now,
 			}
 			return (cli.SyncCommand{Service: service, Output: stdout}).Run(ctx, args)
 		}),
@@ -171,17 +184,13 @@ func pocCommandProvider(
 			return (cli.ReviewCommand{Service: &cli.ReviewService{Store: store}, Output: stdout}).Run(ctx, args)
 		}),
 		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			awsConfiguration, err := awsconfig.LoadDefaultConfig(
-				ctx,
-				awsconfig.WithRegion(settings.PoC.AWSRegion),
-				awsconfig.WithSharedConfigProfile(settings.PoC.AWSProfile),
-			)
+			awsConfiguration, err := loadAWSConfiguration(ctx, settings.PoC.AWSProfile, settings.PoC.AWSRegion)
 			if err != nil {
 				return err
 			}
 			model, err := bedrock.NewFromConfig(awsConfiguration, bedrock.Options{
 				ModelID: settings.PoC.BedrockModelID, MaxTokens: settings.PoC.BedrockMaxTokens,
-				MaxAttempts: settings.PoC.BedrockMaxAttempts,
+				MaxAttempts: settings.PoC.BedrockMaxAttempts, Recorder: invocations, Tracer: tracer,
 			})
 			if err != nil {
 				return err
@@ -194,7 +203,7 @@ func pocCommandProvider(
 			service := &analysis.Service{
 				Repository: storage.NewAnalysisRepository(pool), Model: model,
 				PromptVersion: settings.PoC.AnalysisPromptVersion,
-				Region:        settings.PoC.AWSRegion, ModelID: settings.PoC.BedrockModelID,
+				Region:        strings.TrimSpace(settings.PoC.AWSRegion), ModelID: strings.TrimSpace(settings.PoC.BedrockModelID),
 				MaxTokens: settings.PoC.BedrockMaxTokens, Tracer: tracer,
 				Decisions: decisions, Now: time.Now,
 			}
@@ -204,4 +213,63 @@ func pocCommandProvider(
 			}).Run(ctx, args)
 		}),
 	}, nil
+}
+
+func awsLoadOptions(profile, region string) []func(*awsconfig.LoadOptions) error {
+	options := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(strings.TrimSpace(region))}
+	if profile = strings.TrimSpace(profile); profile != "" {
+		options = append(options, awsconfig.WithSharedConfigProfile(profile))
+	}
+	return options
+}
+
+func loadAWSConfiguration(ctx context.Context, profile, region string) (aws.Config, error) {
+	configuration, err := awsconfig.LoadDefaultConfig(ctx, awsLoadOptions(profile, region)...)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return aws.Config{}, ctxErr
+		}
+		return aws.Config{}, extract.ErrAuthentication
+	}
+	if err := validateAWSConfigurationCredentials(ctx, configuration); err != nil {
+		return aws.Config{}, err
+	}
+	configuration.Credentials = boundedAWSCredentialsProvider{provider: configuration.Credentials}
+	return configuration, nil
+}
+
+func validateAWSConfigurationCredentials(ctx context.Context, configuration aws.Config) error {
+	if configuration.Credentials == nil {
+		return extract.ErrAuthentication
+	}
+	_, err := (boundedAWSCredentialsProvider{provider: configuration.Credentials}).Retrieve(ctx)
+	return err
+}
+
+type boundedAWSCredentialsProvider struct {
+	provider aws.CredentialsProvider
+}
+
+func (provider boundedAWSCredentialsProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return aws.Credentials{}, ctxErr
+	}
+	if provider.provider == nil {
+		return aws.Credentials{}, extract.ErrAuthentication
+	}
+	credentials, err := provider.provider.Retrieve(ctx)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return aws.Credentials{}, ctxErr
+		}
+		var apiError smithy.APIError
+		if errors.As(err, &apiError) && (apiError.ErrorCode() == awsAccessDeniedErrorCode || apiError.ErrorCode() == awsAccessDeniedExceptionErrorCode) {
+			return aws.Credentials{}, extract.ErrAuthorization
+		}
+		return aws.Credentials{}, extract.ErrAuthentication
+	}
+	if !credentials.HasKeys() || credentials.Expired() {
+		return aws.Credentials{}, extract.ErrAuthentication
+	}
+	return credentials, nil
 }

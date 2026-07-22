@@ -108,6 +108,16 @@ func Load() (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
+	ingestionLeaseDuration, err := durationEnvironment(
+		IngestionLeaseDurationEnvironmentVariable,
+		defaultIngestionLeaseDuration,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+	if ingestionLeaseDuration > maximumIngestionLeaseDuration {
+		return Settings{}, fmt.Errorf("%s must be no greater than %s", IngestionLeaseDurationEnvironmentVariable, maximumIngestionLeaseDuration)
+	}
 
 	return Settings{
 		HTTPAddress:       net.JoinHostPort(host, strconv.Itoa(port)),
@@ -133,6 +143,7 @@ func Load() (Settings, error) {
 			BedrockModelID:          os.Getenv(BedrockModelIDEnvironmentVariable),
 			BedrockMaxTokens:        bedrockMaxTokens,
 			BedrockMaxAttempts:      bedrockMaxAttempts,
+			IngestionLeaseDuration:  ingestionLeaseDuration,
 			ExtractionPromptVersion: environmentOrDefault(ExtractionPromptVersionEnvironmentVariable, defaultExtractionPromptVersion),
 			AnalysisPromptVersion:   environmentOrDefault(AnalysisPromptVersionEnvironmentVariable, defaultAnalysisPromptVersion),
 			EmployeeEntityID:        os.Getenv(EmployeeEntityIDEnvironmentVariable),

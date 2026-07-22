@@ -17,15 +17,28 @@ import (
 type DocumentVersionInput struct {
 	Provider           string
 	ProviderDocumentID string
+	Title              string
+	Locator            string
+	ProviderVersion    string
+	ProviderRevision   string
+	ModifiedAt         time.Time
+	SourceMeetingTime  *time.Time
 	RecordedAt         time.Time
 	Tabs               []source.Tab
 }
 
 // DocumentVersion is an immutable, tab-aware source document version. Its
-// digest is derived from the ordered tab structure and tab content digests.
+// digest covers immutable source provenance, ordered tab structure, and tab
+// content digests while excluding the local recorded time.
 type DocumentVersion struct {
 	provider           string
 	providerDocumentID string
+	title              string
+	locator            string
+	providerVersion    string
+	providerRevision   string
+	modifiedAt         time.Time
+	sourceMeetingTime  *time.Time
 	recordedAt         time.Time
 	digest             ContentDigest
 	tabs               []source.Tab
@@ -45,6 +58,13 @@ func NewDocumentVersion(input DocumentVersionInput) (DocumentVersion, error) {
 	if input.RecordedAt.IsZero() {
 		return DocumentVersion{}, fmt.Errorf("document recorded time is required")
 	}
+	title := strings.TrimSpace(input.Title)
+	locator := strings.TrimSpace(input.Locator)
+	providerVersion := strings.TrimSpace(input.ProviderVersion)
+	providerRevision := strings.TrimSpace(input.ProviderRevision)
+	if title == "" || locator == "" || providerVersion == "" || providerRevision == "" || input.ModifiedAt.IsZero() {
+		return DocumentVersion{}, fmt.Errorf("document source provenance is required")
+	}
 	if len(input.Tabs) == 0 {
 		return DocumentVersion{}, fmt.Errorf("document tabs are required")
 	}
@@ -63,13 +83,28 @@ func NewDocumentVersion(input DocumentVersionInput) (DocumentVersion, error) {
 		tabs[index] = copied
 	}
 
-	return DocumentVersion{
+	var sourceMeetingTime *time.Time
+	if input.SourceMeetingTime != nil {
+		if input.SourceMeetingTime.IsZero() {
+			return DocumentVersion{}, fmt.Errorf("document source meeting time must not be zero")
+		}
+		value := input.SourceMeetingTime.UTC()
+		sourceMeetingTime = &value
+	}
+	version := DocumentVersion{
 		provider:           provider,
 		providerDocumentID: providerDocumentID,
+		title:              title,
+		locator:            locator,
+		providerVersion:    providerVersion,
+		providerRevision:   providerRevision,
+		modifiedAt:         input.ModifiedAt.UTC(),
+		sourceMeetingTime:  sourceMeetingTime,
 		recordedAt:         input.RecordedAt.UTC(),
-		digest:             digestTabs(tabs),
 		tabs:               tabs,
-	}, nil
+	}
+	version.digest = digestDocumentVersion(version)
+	return version, nil
 }
 
 // Provider returns the source provider that owns the document.
@@ -80,6 +115,30 @@ func (version DocumentVersion) Provider() string {
 // ProviderDocumentID returns the provider's immutable document identifier.
 func (version DocumentVersion) ProviderDocumentID() string {
 	return version.providerDocumentID
+}
+
+// Title returns the source title captured for this immutable version.
+func (version DocumentVersion) Title() string { return version.title }
+
+// Locator returns the source locator captured for this immutable version.
+func (version DocumentVersion) Locator() string { return version.locator }
+
+// ProviderVersion returns the provider's file-version marker.
+func (version DocumentVersion) ProviderVersion() string { return version.providerVersion }
+
+// ProviderRevision returns the provider's document-revision marker.
+func (version DocumentVersion) ProviderRevision() string { return version.providerRevision }
+
+// ModifiedAt returns the provider modification timestamp.
+func (version DocumentVersion) ModifiedAt() time.Time { return version.modifiedAt }
+
+// SourceMeetingTime returns a copy of the optional explicit source meeting time.
+func (version DocumentVersion) SourceMeetingTime() *time.Time {
+	if version.sourceMeetingTime == nil {
+		return nil
+	}
+	value := *version.sourceMeetingTime
+	return &value
 }
 
 // RecordedAt returns when Stacks recorded this immutable document version.
@@ -154,8 +213,19 @@ func validTabRole(role source.TabRole) bool {
 	}
 }
 
-func digestTabs(tabs []source.Tab) ContentDigest {
+func digestDocumentVersion(version DocumentVersion) ContentDigest {
 	hasher := sha256.New()
+	writeString(hasher, version.title)
+	writeString(hasher, version.locator)
+	writeString(hasher, version.providerVersion)
+	writeString(hasher, version.providerRevision)
+	writeString(hasher, version.modifiedAt.UTC().Format(time.RFC3339Nano))
+	if version.sourceMeetingTime == nil {
+		writeString(hasher, "")
+	} else {
+		writeString(hasher, version.sourceMeetingTime.UTC().Format(time.RFC3339Nano))
+	}
+	tabs := version.tabs
 	writeLength(hasher, uint64(len(tabs)))
 	for _, tab := range tabs {
 		writeString(hasher, tab.ID)

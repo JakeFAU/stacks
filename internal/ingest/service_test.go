@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -181,7 +182,11 @@ func TestSyncSkipsExtractionForUnchangedVersion(t *testing.T) {
 	document := syntheticDocument("document-unchanged", "Leader assigns follow-up.")
 	repository := newMemoryRepository()
 	version := documentVersion(t, document)
-	repository.versions[versionKey(version)] = VersionState{ID: "version-unchanged", Status: VersionStatusComplete}
+	derivation := testDerivationIdentity(t, version)
+	repository.versions[derivationKey(version, derivation)] = VersionState{
+		ID: "version-unchanged", DerivationID: "derivation-unchanged",
+		DerivationDigest: derivation.Digest, Status: VersionStatusComplete,
+	}
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
 	service := testService(document, repository, model)
 
@@ -194,6 +199,27 @@ func TestSyncSkipsExtractionForUnchangedVersion(t *testing.T) {
 	}
 	if len(summary.Results) != 1 || summary.Results[0].Outcome != OutcomeUnchanged {
 		t.Fatalf("summary results = %#v, want one unchanged result", summary.Results)
+	}
+}
+
+func TestSyncReturnsBusyWithoutInvokingModelForActiveDerivationLease(t *testing.T) {
+	document := syntheticDocument("document-busy", "Leader assigns follow-up.")
+	repository := newMemoryRepository()
+	version := documentVersion(t, document)
+	derivation := testDerivationIdentity(t, version)
+	repository.versions[derivationKey(version, derivation)] = VersionState{
+		ID: "version-busy", DerivationID: "derivation-busy", DerivationDigest: derivation.Digest,
+		Status: VersionStatusPending, LeaseOwner: "other-worker",
+	}
+	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
+	service := testService(document, repository, model)
+
+	summary, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if model.calls != 0 || len(summary.Results) != 1 || summary.Results[0].Outcome != OutcomeIncomplete || summary.Results[0].FailureCode != FailureBusy {
+		t.Fatalf("model/results = %d/%#v, want bounded busy without model invocation", model.calls, summary.Results)
 	}
 }
 
@@ -223,6 +249,32 @@ func TestSyncCreatesNewVersionWhenOneTabChanges(t *testing.T) {
 	}
 }
 
+func TestSyncCreatesNewDerivationWithoutDuplicatingSourceVersionWhenConfigurationChanges(t *testing.T) {
+	document := syntheticDocument("document-config-change", "Leader assigns follow-up.")
+	repository := newMemoryRepository()
+	model := &recordingModel{responses: []extract.Response{
+		validEmptyResponse(t),
+		{Output: validEmptyResponse(t).Output, ModelID: "synthetic-model-v2", PromptVersion: extract.ExtractionPromptVersion},
+	}}
+	service := testService(document, repository, model)
+	first, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("first Sync() error = %v", err)
+	}
+	service.ModelID = "synthetic-model-v2"
+	second, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("configured Sync() error = %v", err)
+	}
+	if model.calls != 2 || len(repository.versions) != 2 {
+		t.Fatalf("model calls/derivations = %d/%d, want 2/2", model.calls, len(repository.versions))
+	}
+	if first.Results[0].VersionID != second.Results[0].VersionID ||
+		first.Results[0].DerivationID == second.Results[0].DerivationID {
+		t.Fatalf("source/derivation identities = %#v / %#v, want shared source and distinct derivations", first.Results[0], second.Results[0])
+	}
+}
+
 func TestSyncContinuesAfterOneDocumentFails(t *testing.T) {
 	malformed := extract.Response{Output: json.RawMessage(`{"unexpected":true}`), ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion}
 	model := &recordingModel{responses: []extract.Response{malformed, validEmptyResponse(t)}}
@@ -247,6 +299,51 @@ func TestSyncContinuesAfterOneDocumentFails(t *testing.T) {
 	}
 	if repository.completionCalls != 1 {
 		t.Fatalf("completion transactions = %d, want 1", repository.completionCalls)
+	}
+}
+
+func TestSyncAbortsImmediatelyOnGlobalModelAuthenticationFailure(t *testing.T) {
+	first := syntheticDocument("document-auth-first", "Leader assigns follow-up.")
+	second := syntheticDocument("document-auth-second", "Leader assigns another follow-up.")
+	listedFirst, listedSecond := first, second
+	listedFirst.Tabs, listedSecond.Tabs = nil, nil
+	listedFirst.Revision, listedSecond.Revision = "", ""
+	model := &recordingModel{errs: []error{fmt.Errorf("private provider detail: %w", extract.ErrAuthentication)}}
+	repository := newMemoryRepository()
+	service := testServiceWithSource(&memorySource{
+		listed:  []source.Document{listedFirst, listedSecond},
+		fetched: map[string]source.Document{first.ID: first, second.ID: second},
+	}, repository, model)
+
+	summary, err := service.Sync(context.Background())
+	if !errors.Is(err, extract.ErrAuthentication) || err.Error() != extract.ErrAuthentication.Error() {
+		t.Fatalf("Sync() error = %v, want bounded global authentication sentinel", err)
+	}
+	if model.calls != 1 || len(summary.Results) != 0 {
+		t.Fatalf("model calls/results = %d/%d, want immediate abort before per-document result", model.calls, len(summary.Results))
+	}
+	for _, state := range repository.versions {
+		if state.Status != VersionStatusIncomplete || state.FailureCode != FailureModel || state.LeaseOwner != "" {
+			t.Fatalf("authentication-failed derivation state = %#v, want released incomplete model failure", state)
+		}
+	}
+}
+
+func TestSyncRejectsResponseFromDifferentModelWithoutCompletingConfiguredDerivation(t *testing.T) {
+	document := syntheticDocument("document-model-mismatch", "Leader assigns follow-up.")
+	response := validEmptyResponse(t)
+	response.ModelID = "different-model"
+	repository := newMemoryRepository()
+	model := &recordingModel{responses: []extract.Response{response}}
+	service := testService(document, repository, model)
+
+	summary, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if repository.completionCalls != 0 || len(summary.Results) != 1 ||
+		summary.Results[0].Outcome != OutcomeFailed || summary.Results[0].FailureCode != FailureInvalidOutput {
+		t.Fatalf("completion/results = %d/%#v, want mismatched model rejected before persistence", repository.completionCalls, summary.Results)
 	}
 }
 
@@ -433,8 +530,8 @@ func duplicateSignalResponse(t *testing.T) extract.Response {
 	output, err := json.Marshal(extract.ExtractionOutput{
 		Citations: []extract.Citation{{ID: "citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript}},
 		People: []extract.PersonMention{
-			{ID: "mention-1", Surface: "Synthetic Leader", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
-			{ID: "mention-2", Surface: "Synthetic Report", Role: extract.MentionRoleReference, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-1", Surface: "Synthetic", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-2", Surface: "signal", Role: extract.MentionRoleReference, CitationIDs: []string{"citation-1"}},
 		},
 		Statements: []extract.AttributedStatement{{
 			ID: "statement-1", SpeakerMentionID: "mention-1", SubjectMentionID: "mention-2",
@@ -523,9 +620,53 @@ func TestSyncRecordsOneSuccessfulBoundedIngestionSpanAndDecision(t *testing.T) {
 	}
 }
 
+func TestCompletionReplacesRawSignalRationaleWithDeterministicExplanation(t *testing.T) {
+	const unsafeRationale = "The manager secretly distrusts the employee."
+	const transcript = "Leader assigns follow-up."
+	version := documentVersion(t, syntheticDocument("document-safe-explanation", transcript))
+	output := extract.ExtractionOutput{
+		Citations: []extract.Citation{{
+			ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+			EndOffset: len(transcript), Quote: transcript,
+		}},
+		People: []extract.PersonMention{{
+			ID: "mention-leader", Surface: "Leader", Role: extract.MentionRoleSpeaker,
+			CitationIDs: []string{"citation-1"},
+		}},
+		Statements: []extract.AttributedStatement{{
+			ID: "statement-1", SpeakerMentionID: "mention-leader", SubjectMentionID: "mention-leader",
+			Predicate: "assigned", ObjectText: "follow-up", CitationIDs: []string{"citation-1"},
+		}},
+		Signals: []extract.InteractionSignal{{
+			ID: "signal-1", SubjectMentionID: "mention-leader", ObjectMentionID: "mention-leader",
+			StatementIDs: []string{"statement-1"}, Category: extract.SignalCategoryFutureResponsibility,
+			Direction: extract.SignalDirectionStrengthening, Rationale: unsafeRationale,
+			Confidence: 0.8, SupportingCitationIDs: []string{"citation-1"},
+		}},
+	}
+	service := &Service{Resolver: entity.Resolver{}}
+
+	completion, err := service.completion(version, VersionState{
+		ID: "version-id", DerivationID: "derivation-id",
+		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")),
+	}, extract.Response{
+		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+	}, output, nil)
+	if err != nil {
+		t.Fatalf("completion() error = %v", err)
+	}
+	if len(completion.Signals) != 1 || completion.Signals[0].Rationale == unsafeRationale ||
+		!strings.Contains(completion.Signals[0].Rationale, "future responsibility") {
+		t.Fatalf("stored signal rationale = %#v, want deterministic category/direction explanation", completion.Signals)
+	}
+}
+
 func testService(document source.Document, repository *memoryRepository, model *recordingModel) *Service {
+	listed := document
+	listed.Tabs = nil
+	listed.Revision = ""
 	return testServiceWithSource(&memorySource{
-		listed:  []source.Document{{Provider: document.Provider, ID: document.ID}},
+		listed:  []source.Document{listed},
 		fetched: map[string]source.Document{document.ID: document},
 	}, repository, model)
 }
@@ -538,13 +679,18 @@ func testServiceWithSource(sourceBoundary source.Source, repository *memoryRepos
 		Repository:    repository,
 		CollectionID:  "synthetic-folder",
 		PromptVersion: extract.ExtractionPromptVersion,
+		Region:        "us-east-1",
+		ModelID:       "synthetic-model",
+		MaxTokens:     256,
+		LeaseDuration: 5 * time.Minute,
 		Now:           func() time.Time { return recordedAt },
 	}
 }
 
 func syntheticDocument(id, transcript string) source.Document {
 	return source.Document{
-		Provider: "drive", ID: id, Title: "Synthetic Meeting", Locator: "https://example.invalid/document", Version: "revision-1",
+		Provider: "drive", ID: id, Title: "Synthetic Meeting", Locator: "https://example.invalid/document",
+		Version: "version-1", Revision: "revision-1", ModifiedAt: time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
 		Tabs: []source.Tab{{ID: "transcript-tab", Title: "Transcript", Path: []string{"Transcript"}, Order: 0, Role: source.TabRoleTranscript, Text: transcript}},
 	}
 }
@@ -552,7 +698,10 @@ func syntheticDocument(id, transcript string) source.Document {
 func documentVersion(t *testing.T, document source.Document) knowledge.DocumentVersion {
 	t.Helper()
 	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
-		Provider: document.Provider, ProviderDocumentID: document.ID, RecordedAt: recordedAt, Tabs: document.Tabs,
+		Provider: document.Provider, ProviderDocumentID: document.ID, Title: document.Title,
+		Locator: document.Locator, ProviderVersion: document.Version, ProviderRevision: document.Revision,
+		ModifiedAt: document.ModifiedAt, SourceMeetingTime: document.MeetingTime,
+		RecordedAt: recordedAt, Tabs: document.Tabs,
 	})
 	if err != nil {
 		t.Fatalf("NewDocumentVersion() error = %v", err)
@@ -581,8 +730,8 @@ func validSignalResponse(t *testing.T, meetingDate string) extract.Response {
 		MeetingDate: meetingDate,
 		Citations:   []extract.Citation{{ID: "citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript}},
 		People: []extract.PersonMention{
-			{ID: "mention-leader", Surface: "Synthetic Leader", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
-			{ID: "mention-report", Surface: "Synthetic Report", Role: extract.MentionRoleReference, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-leader", Surface: "Leader", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-report", Surface: "follow-up", Role: extract.MentionRoleReference, CitationIDs: []string{"citation-1"}},
 		},
 		Statements: []extract.AttributedStatement{{
 			ID: "statement-1", SpeakerMentionID: "mention-leader", SubjectMentionID: "mention-report",
@@ -611,8 +760,8 @@ func duplicateMentionResponse(t *testing.T) extract.Response {
 	output, err := json.Marshal(extract.ExtractionOutput{
 		Citations: []extract.Citation{{ID: "citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript}},
 		People: []extract.PersonMention{
-			{ID: "mention-1", Surface: "Synthetic Person", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
-			{ID: "mention-2", Surface: "Synthetic Person", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-1", Surface: "Synthetic", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-2", Surface: "Synthetic", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
 		},
 		Statements: []extract.AttributedStatement{},
 		Signals:    []extract.InteractionSignal{},
@@ -696,24 +845,42 @@ type memoryRepository struct {
 	persistedMentions     int
 	persistedObservations int
 	persistedSignals      int
+	prepareClaims         int
 }
 
 func newMemoryRepository() *memoryRepository {
 	return &memoryRepository{versions: make(map[string]VersionState), completions: make(map[string]Completion)}
 }
 
-func (repository *memoryRepository) PrepareVersion(_ context.Context, version knowledge.DocumentVersion) (VersionState, error) {
+func (repository *memoryRepository) PrepareVersion(_ context.Context, version knowledge.DocumentVersion, derivation DerivationIdentity, leaseDuration time.Duration) (VersionState, error) {
 	if repository.prepareErr != nil {
 		return VersionState{}, repository.prepareErr
 	}
-	key := versionKey(version)
+	if leaseDuration <= 0 {
+		return VersionState{}, errors.New("synthetic invalid lease duration")
+	}
+	key := derivationKey(version, derivation)
 	state, exists := repository.versions[key]
 	if !exists {
-		state = VersionState{ID: "version-" + version.Digest().String()[:12], Status: VersionStatusPending}
+		repository.prepareClaims++
+		state = VersionState{
+			ID:               "version-" + version.Digest().String()[:12],
+			DerivationID:     "derivation-" + fmt.Sprintf("%x", derivation.Digest[:6]),
+			DerivationDigest: derivation.Digest, Status: VersionStatusPending,
+			LeaseOwner: fmt.Sprintf("owner-%d", repository.prepareClaims),
+		}
+	} else if state.Status == VersionStatusPending && state.LeaseOwner != "" {
+		busy := state
+		busy.Status = VersionStatusBusy
+		busy.FailureCode = FailureBusy
+		busy.LeaseOwner = ""
+		return busy, nil
 	} else if state.Status != VersionStatusComplete {
+		repository.prepareClaims++
 		state.Status = VersionStatusPending
 		state.RetryCount++
 		state.FailureCode = ""
+		state.LeaseOwner = fmt.Sprintf("owner-%d", repository.prepareClaims)
 	}
 	repository.versions[key] = state
 	return state, nil
@@ -729,9 +896,13 @@ func (repository *memoryRepository) CompleteVersion(_ context.Context, completio
 		return errors.New("synthetic completion interruption")
 	}
 	for key, state := range repository.versions {
-		if state.ID == completion.VersionID {
+		if state.DerivationID == completion.DerivationID {
+			if state.LeaseOwner != completion.LeaseOwner {
+				return errors.New("synthetic completion lease is not owned")
+			}
 			state.Status = VersionStatusComplete
 			state.FailureCode = ""
+			state.LeaseOwner = ""
 			repository.versions[key] = state
 			break
 		}
@@ -745,14 +916,18 @@ func (repository *memoryRepository) CompleteVersion(_ context.Context, completio
 	return nil
 }
 
-func (repository *memoryRepository) RecordFailure(_ context.Context, versionID string, status VersionStatus, code FailureCode) error {
+func (repository *memoryRepository) RecordFailure(_ context.Context, derivationID, leaseOwner string, status VersionStatus, code FailureCode) error {
 	if repository.failureRecordErr != nil {
 		return repository.failureRecordErr
 	}
 	for key, state := range repository.versions {
-		if state.ID == versionID {
+		if state.DerivationID == derivationID {
+			if state.LeaseOwner != leaseOwner {
+				return errors.New("synthetic failure lease is not owned")
+			}
 			state.Status = status
 			state.FailureCode = code
+			state.LeaseOwner = ""
 			repository.versions[key] = state
 			return nil
 		}
@@ -766,6 +941,82 @@ func (repository *memoryRepository) EntitySnapshots(context.Context) ([]entity.E
 
 func versionKey(version knowledge.DocumentVersion) string {
 	return version.Provider() + "/" + version.ProviderDocumentID() + "/" + version.Digest().String()
+}
+
+func derivationKey(version knowledge.DocumentVersion, identity DerivationIdentity) string {
+	return versionKey(version) + "/" + fmt.Sprintf("%x", identity.Digest)
+}
+
+func testDerivationIdentity(t *testing.T, version knowledge.DocumentVersion) DerivationIdentity {
+	t.Helper()
+	identity := DerivationIdentity{
+		Region: "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		PromptVersion: extract.ExtractionPromptVersion,
+		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
+	}
+	var err error
+	identity.Digest, err = ComputeDerivationDigest(version, identity)
+	if err != nil {
+		t.Fatalf("ComputeDerivationDigest() error = %v", err)
+	}
+	return identity
+}
+
+func TestComputeDerivationDigestChangesWithMaterialExtractionConfiguration(t *testing.T) {
+	version := documentVersion(t, syntheticDocument("document-derivation-identity", "Synthetic Person delegated a task."))
+	base := DerivationIdentity{
+		Region: "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
+		PromptVersion: extract.ExtractionPromptVersion,
+		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
+	}
+	first, err := ComputeDerivationDigest(version, base)
+	if err != nil {
+		t.Fatalf("ComputeDerivationDigest() error = %v", err)
+	}
+	tests := map[string]func(*DerivationIdentity){
+		"region":         func(identity *DerivationIdentity) { identity.Region = "us-west-2" },
+		"model ID":       func(identity *DerivationIdentity) { identity.ModelID = "synthetic-model-v2" },
+		"max tokens":     func(identity *DerivationIdentity) { identity.MaxTokens++ },
+		"prompt version": func(identity *DerivationIdentity) { identity.PromptVersion = "extract-v2" },
+		"schema":         func(identity *DerivationIdentity) { identity.SchemaDigest = sha256.Sum256([]byte("changed schema")) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			digest, err := ComputeDerivationDigest(version, changed)
+			if err != nil {
+				t.Fatalf("ComputeDerivationDigest() error = %v", err)
+			}
+			if digest == first {
+				t.Fatal("material extraction configuration reused derivation identity")
+			}
+		})
+	}
+}
+
+func TestComputeDerivationDigestIncludesLogicalSourceIdentity(t *testing.T) {
+	firstVersion := documentVersion(t, syntheticDocument("source-document-a", "Synthetic Person delegated a task."))
+	secondVersion := documentVersion(t, syntheticDocument("source-document-b", "Synthetic Person delegated a task."))
+	if firstVersion.Digest() != secondVersion.Digest() {
+		t.Fatal("fixture document content digests differ; source identity regression is not isolated")
+	}
+	identity := DerivationIdentity{
+		Region: "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
+		PromptVersion: extract.ExtractionPromptVersion,
+		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
+	}
+	first, err := ComputeDerivationDigest(firstVersion, identity)
+	if err != nil {
+		t.Fatalf("ComputeDerivationDigest(first) error = %v", err)
+	}
+	second, err := ComputeDerivationDigest(secondVersion, identity)
+	if err != nil {
+		t.Fatalf("ComputeDerivationDigest(second) error = %v", err)
+	}
+	if first == second {
+		t.Fatal("distinct logical source documents reused one extraction derivation identity")
+	}
 }
 
 func renderRecordedSpan(span tracetest.SpanStub) string {

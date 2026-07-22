@@ -4,8 +4,16 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
+)
+
+var (
+	// ErrAuthentication is a provider-neutral bounded model credential failure.
+	ErrAuthentication = errors.New("model authentication failed; configure valid provider credentials")
+	// ErrAuthorization is a provider-neutral bounded model permission failure.
+	ErrAuthorization = errors.New("model authorization failed; grant invocation access to the configured model")
 )
 
 const (
