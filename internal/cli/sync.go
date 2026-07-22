@@ -27,10 +27,7 @@ func (command SyncCommand) Run(ctx context.Context, args []string) error {
 	if command.Service == nil {
 		return fmt.Errorf("sync command: service is not configured")
 	}
-	summary, err := command.Service.Sync(ctx)
-	if err != nil {
-		return err
-	}
+	summary, syncErr := command.Service.Sync(ctx)
 	output := command.Output
 	if output == nil {
 		output = io.Discard
@@ -50,7 +47,7 @@ func (command SyncCommand) Run(ctx context.Context, args []string) error {
 		summary.Unchanged, summary.Completed, summary.Incomplete, summary.Failed); err != nil {
 		return fmt.Errorf("write sync summary: %w", err)
 	}
-	return nil
+	return syncErr
 }
 
 func validSyncOutcome(outcome ingest.Outcome) bool {

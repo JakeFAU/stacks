@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"stacks/internal/entity"
 	"stacks/internal/extract"
@@ -20,6 +22,39 @@ import (
 )
 
 var recordedAt = time.Date(2026, 7, 21, 14, 0, 0, 0, time.UTC)
+
+func TestSyncBoundsSourceListFailureBeforeErrorTelemetryAndLogging(t *testing.T) {
+	const privateValue = "SECRET meeting title https://private.invalid/transcript"
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	service := testServiceWithSource(
+		&memorySource{listErr: errors.New(privateValue)},
+		newMemoryRepository(),
+		&recordingModel{},
+	)
+	service.Tracer = provider.Tracer("synthetic")
+
+	_, err := service.Sync(context.Background())
+	if !errors.Is(err, ErrSourceList) {
+		t.Fatalf("Sync() error = %v, want bounded source-list error", err)
+	}
+	if strings.Contains(err.Error(), privateValue) {
+		t.Fatalf("Sync() error disclosed private source text: %v", err)
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("span count = %d, want 1", len(spans))
+	}
+	if strings.Contains(renderRecordedSpan(spans[0]), privateValue) {
+		t.Fatal("recorded span disclosed private source text")
+	}
+	core, observed := observer.New(zap.ErrorLevel)
+	zap.New(core).Error("run stacks", zap.Error(err))
+	if strings.Contains(observed.All()[0].ContextMap()["error"].(string), privateValue) {
+		t.Fatal("logger path disclosed private source text")
+	}
+}
 
 func TestSyncSkipsExtractionForUnchangedVersion(t *testing.T) {
 	document := syntheticDocument("document-unchanged", "Leader assigns follow-up.")
@@ -94,6 +129,52 @@ func TestSyncContinuesAfterOneDocumentFails(t *testing.T) {
 	}
 }
 
+func TestSyncContinuesAndReturnsBoundedErrorWhenFailureStateCannotPersist(t *testing.T) {
+	const privateStorageError = "database rejected private transcript row"
+	malformed := extract.Response{Output: json.RawMessage(`{"unexpected":true}`), ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion}
+	model := &recordingModel{responses: []extract.Response{malformed, malformed, validEmptyResponse(t)}}
+	repository := newMemoryRepository()
+	repository.failureRecordErr = errors.New(privateStorageError)
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	service := testServiceWithSource(&memorySource{
+		listed: []source.Document{{Provider: "drive", ID: "document-unpersisted-1"}, {Provider: "drive", ID: "document-unpersisted-2"}, {Provider: "drive", ID: "document-later"}},
+		fetched: map[string]source.Document{
+			"document-unpersisted-1": syntheticDocument("document-unpersisted-1", "First synthetic source."),
+			"document-unpersisted-2": syntheticDocument("document-unpersisted-2", "Second synthetic source."),
+			"document-later":         syntheticDocument("document-later", "Later synthetic source."),
+		},
+	}, repository, model)
+	service.Tracer = provider.Tracer("synthetic")
+
+	summary, err := service.Sync(context.Background())
+	if !errors.Is(err, ErrFailurePersistence) {
+		t.Fatalf("Sync() error = %v, want bounded failure-persistence error", err)
+	}
+	if strings.Contains(err.Error(), privateStorageError) {
+		t.Fatalf("Sync() error disclosed storage text: %v", err)
+	}
+	if err.Error() != ErrFailurePersistence.Error() {
+		t.Fatalf("Sync() error = %q, want one bounded aggregate error", err.Error())
+	}
+	if len(summary.Results) != 3 || summary.Results[0].Outcome != OutcomeIncomplete || summary.Results[0].FailureCode != FailureStorage || summary.Results[1].Outcome != OutcomeIncomplete || summary.Results[2].Outcome != OutcomeCompleted {
+		t.Fatalf("summary results = %#v, want two bounded incomplete outcomes then completed", summary.Results)
+	}
+	if summary.Incomplete != 2 || summary.Completed != 1 || model.calls != 3 || repository.completionCalls != 1 {
+		t.Fatalf("summary/model/completion = %#v/%d/%d, want isolated later completion", summary, model.calls, repository.completionCalls)
+	}
+	for _, state := range repository.versions {
+		if state.ID == summary.Results[0].VersionID && state.Status != VersionStatusPending {
+			t.Fatalf("unpersisted failure state = %q, want prior pending state", state.Status)
+		}
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 || strings.Contains(renderRecordedSpan(spans[0]), privateStorageError) {
+		t.Fatalf("recorded spans leaked private persistence error: %#v", spans)
+	}
+}
+
 func TestSyncResumesPendingVersionWithoutDuplicates(t *testing.T) {
 	repository := newMemoryRepository()
 	repository.failCompletionOnce = true
@@ -133,6 +214,77 @@ func TestSyncPreservesUnknownMeetingTime(t *testing.T) {
 	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart != nil {
 		t.Fatalf("observation valid time = %#v, want unknown", repository.lastCompletion.Observations)
 	}
+}
+
+func TestSyncClassifiesPersistenceIdentityCollisionAsInvalidOutput(t *testing.T) {
+	cases := []struct {
+		name       string
+		transcript string
+		response   extract.Response
+	}{
+		{name: "mention proposal", transcript: "Synthetic duplicate mention.", response: duplicateMentionResponse(t)},
+		{name: "observation and signal", transcript: "Synthetic duplicate signal.", response: duplicateSignalResponse(t)},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			repository := newMemoryRepository()
+			model := &recordingModel{responses: []extract.Response{testCase.response}}
+			service := testService(syntheticDocument("document-duplicate-output", testCase.transcript), repository, model)
+
+			summary, err := service.Sync(context.Background())
+			if err != nil {
+				t.Fatalf("Sync() error = %v", err)
+			}
+			if len(summary.Results) != 1 || summary.Results[0].Outcome != OutcomeFailed || summary.Results[0].FailureCode != FailureInvalidOutput {
+				t.Fatalf("summary results = %#v, want failed invalid_output", summary.Results)
+			}
+			if repository.completionCalls != 0 {
+				t.Fatalf("completion calls = %d, want 0 for rejected output", repository.completionCalls)
+			}
+			for _, state := range repository.versions {
+				if state.Status != VersionStatusFailed || state.FailureCode != FailureInvalidOutput {
+					t.Fatalf("durable state = %#v, want bounded invalid-output failure", state)
+				}
+			}
+		})
+	}
+}
+
+func duplicateSignalResponse(t *testing.T) extract.Response {
+	t.Helper()
+	const transcript = "Synthetic duplicate signal."
+	output, err := json.Marshal(extract.ExtractionOutput{
+		Citations: []extract.Citation{{ID: "citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript}},
+		People: []extract.PersonMention{
+			{ID: "mention-1", Surface: "Synthetic Leader", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-2", Surface: "Synthetic Report", Role: extract.MentionRoleReference, CitationIDs: []string{"citation-1"}},
+		},
+		Statements: []extract.AttributedStatement{{
+			ID: "statement-1", SpeakerMentionID: "mention-1", SubjectMentionID: "mention-2",
+			Predicate: "assigned", ObjectText: "follow-up", CitationIDs: []string{"citation-1"},
+		}},
+		Signals: []extract.InteractionSignal{
+			{
+				ID: "signal-1", SubjectMentionID: "mention-1", ObjectMentionID: "mention-2", StatementIDs: []string{"statement-1"},
+				Category: extract.SignalCategoryFutureResponsibility, Direction: extract.SignalDirectionStrengthening,
+				Rationale: "Synthetic rationale one", Confidence: 0.8, SupportingCitationIDs: []string{"citation-1"}, ContradictingCitationIDs: []string{},
+			},
+			{
+				ID: "signal-2", SubjectMentionID: "mention-1", ObjectMentionID: "mention-2", StatementIDs: []string{"statement-1"},
+				Category: extract.SignalCategorySupportAdvocacy, Direction: extract.SignalDirectionStrengthening,
+				Rationale: "Synthetic rationale two", Confidence: 0.8, SupportingCitationIDs: []string{"citation-1"}, ContradictingCitationIDs: []string{},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal duplicate signal extraction: %v", err)
+	}
+	if _, err := extract.DecodeAndValidateExtraction(extract.SubmittedText{Tabs: []extract.SubmittedTab{{
+		ID: "transcript-tab", Role: extract.TabRoleTranscript, Text: transcript,
+	}}}, output); err != nil {
+		t.Fatalf("duplicate signal fixture must remain schema-valid: %v", err)
+	}
+	return extract.Response{Output: output, ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion, Outcome: "success"}
 }
 
 func TestSyncSubmitsTranscriptAndNotesAsSeparatelyLabeledTabs(t *testing.T) {
@@ -276,12 +428,39 @@ func validSignalResponse(t *testing.T, meetingDate string) extract.Response {
 	return extract.Response{Output: output, ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion, Outcome: "success"}
 }
 
+func duplicateMentionResponse(t *testing.T) extract.Response {
+	t.Helper()
+	const transcript = "Synthetic duplicate mention."
+	output, err := json.Marshal(extract.ExtractionOutput{
+		Citations: []extract.Citation{{ID: "citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript}},
+		People: []extract.PersonMention{
+			{ID: "mention-1", Surface: "Synthetic Person", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-2", Surface: "Synthetic Person", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+		},
+		Statements: []extract.AttributedStatement{},
+		Signals:    []extract.InteractionSignal{},
+	})
+	if err != nil {
+		t.Fatalf("marshal duplicate mention extraction: %v", err)
+	}
+	if _, err := extract.DecodeAndValidateExtraction(extract.SubmittedText{Tabs: []extract.SubmittedTab{{
+		ID: "transcript-tab", Role: extract.TabRoleTranscript, Text: transcript,
+	}}}, output); err != nil {
+		t.Fatalf("duplicate mention fixture must remain schema-valid: %v", err)
+	}
+	return extract.Response{Output: output, ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion, Outcome: "success"}
+}
+
 type memorySource struct {
 	listed  []source.Document
 	fetched map[string]source.Document
+	listErr error
 }
 
 func (sourceBoundary *memorySource) List(context.Context, string) ([]source.Document, error) {
+	if sourceBoundary.listErr != nil {
+		return nil, sourceBoundary.listErr
+	}
 	return append([]source.Document(nil), sourceBoundary.listed...), nil
 }
 
@@ -324,6 +503,7 @@ type memoryRepository struct {
 	lastCompletion        Completion
 	completionCalls       int
 	failCompletionOnce    bool
+	failureRecordErr      error
 	persistedEvidence     int
 	persistedMentions     int
 	persistedObservations int
@@ -372,6 +552,9 @@ func (repository *memoryRepository) CompleteVersion(_ context.Context, completio
 }
 
 func (repository *memoryRepository) RecordFailure(_ context.Context, versionID string, status VersionStatus, code FailureCode) error {
+	if repository.failureRecordErr != nil {
+		return repository.failureRecordErr
+	}
 	for key, state := range repository.versions {
 		if state.ID == versionID {
 			state.Status = status
@@ -389,4 +572,22 @@ func (repository *memoryRepository) EntitySnapshots(context.Context) ([]entity.E
 
 func versionKey(version knowledge.DocumentVersion) string {
 	return version.Provider() + "/" + version.ProviderDocumentID() + "/" + version.Digest().String()
+}
+
+func renderRecordedSpan(span tracetest.SpanStub) string {
+	var rendered strings.Builder
+	rendered.WriteString(span.Name)
+	rendered.WriteString(span.Status.Description)
+	for _, value := range span.Attributes {
+		rendered.WriteString(string(value.Key))
+		rendered.WriteString(value.Value.String())
+	}
+	for _, event := range span.Events {
+		rendered.WriteString(event.Name)
+		for _, value := range event.Attributes {
+			rendered.WriteString(string(value.Key))
+			rendered.WriteString(value.Value.String())
+		}
+	}
+	return rendered.String()
 }

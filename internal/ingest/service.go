@@ -5,6 +5,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -20,6 +21,14 @@ import (
 	"stacks/internal/observability"
 	"stacks/internal/source"
 )
+
+// ErrSourceList is returned without wrapping provider errors so private or
+// unbounded source text cannot reach command logging or span error events.
+var ErrSourceList = errors.New("sync source listing failed")
+
+// ErrFailurePersistence reports that a classified per-document state could
+// not be made durable. It never wraps the repository error.
+var ErrFailurePersistence = errors.New("sync failure state persistence failed")
 
 const (
 	ingestionSpanName     = "stacks.ingest.sync"
@@ -199,42 +208,46 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 
 	documents, err := service.Source.List(ctx, service.CollectionID)
 	if err != nil {
-		return Summary{}, fmt.Errorf("list source documents: %w", err)
+		return Summary{}, ErrSourceList
 	}
 	summary.Results = make([]Result, 0, len(documents))
+	var aggregateErr error
 	for _, listed := range documents {
 		if err := ctx.Err(); err != nil {
-			return summary, err
+			return summary, errors.Join(aggregateErr, err)
 		}
 		started := service.now()
-		result := service.processDocument(ctx, listed)
+		result, documentErr := service.processDocument(ctx, listed)
 		summary.add(result)
 		service.recordDecision(ctx, result.Outcome, service.now().Sub(started))
+		if documentErr != nil {
+			aggregateErr = ErrFailurePersistence
+		}
 	}
-	return summary, nil
+	return summary, aggregateErr
 }
 
-func (service *Service) processDocument(ctx context.Context, listed source.Document) Result {
+func (service *Service) processDocument(ctx context.Context, listed source.Document) (Result, error) {
 	documentID := strings.TrimSpace(listed.ID)
 	document, err := service.Source.Get(ctx, documentID)
 	if err != nil {
-		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureSource}
+		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureSource}, nil
 	}
 	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
 		Provider: document.Provider, ProviderDocumentID: document.ID,
 		RecordedAt: service.now(), Tabs: document.Tabs,
 	})
 	if err != nil {
-		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}
+		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
 	}
 	state, err := service.Repository.PrepareVersion(ctx, version)
 	if err != nil {
-		return Result{DocumentID: documentID, Outcome: OutcomeIncomplete, FailureCode: FailureStorage}
+		return Result{DocumentID: documentID, Outcome: OutcomeIncomplete, FailureCode: FailureStorage}, nil
 	}
 	result := Result{DocumentID: documentID, VersionID: state.ID, RetryCount: state.RetryCount}
 	if state.Status == VersionStatusComplete {
 		result.Outcome = OutcomeUnchanged
-		return result
+		return result, nil
 	}
 
 	submitted, request, err := extractionRequest(document.Tabs, service.PromptVersion)
@@ -260,11 +273,14 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidOutput)
 	}
+	if err := ValidateForPersistence(completion); err != nil {
+		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidOutput)
+	}
 	if err := service.Repository.CompleteVersion(ctx, completion); err != nil {
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
 	}
 	result.Outcome = OutcomeCompleted
-	return result
+	return result, nil
 }
 
 func (service *Service) completion(
@@ -440,9 +456,13 @@ func stableID(version knowledge.DocumentVersion, kind, sourceID string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(seed)).String()
 }
 
-func (service *Service) fail(ctx context.Context, result Result, status VersionStatus, code FailureCode) Result {
+func (service *Service) fail(ctx context.Context, result Result, status VersionStatus, code FailureCode) (Result, error) {
 	if result.VersionID != "" {
-		_ = service.Repository.RecordFailure(ctx, result.VersionID, status, code)
+		if err := service.Repository.RecordFailure(ctx, result.VersionID, status, code); err != nil {
+			result.FailureCode = FailureStorage
+			result.Outcome = OutcomeIncomplete
+			return result, ErrFailurePersistence
+		}
 	}
 	result.FailureCode = code
 	if status == VersionStatusFailed {
@@ -450,7 +470,7 @@ func (service *Service) fail(ctx context.Context, result Result, status VersionS
 	} else {
 		result.Outcome = OutcomeIncomplete
 	}
-	return result
+	return result, nil
 }
 
 func (service *Service) validate() error {

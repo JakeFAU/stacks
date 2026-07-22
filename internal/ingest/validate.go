@@ -1,0 +1,246 @@
+package ingest
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"sort"
+	"strconv"
+	"time"
+)
+
+// ErrPersistenceCollision reports that distinct model records would collapse
+// onto one durable identity. It deliberately contains no model/source value.
+var ErrPersistenceCollision = errors.New("extraction output has a duplicate durable identity")
+
+// ErrPersistenceReference reports a missing model-local reference without
+// including the untrusted identifier or private value.
+var ErrPersistenceReference = errors.New("extraction output has an invalid durable reference")
+
+// ValidateForPersistence rejects schema-valid output that would collide with
+// PostgreSQL identities after model-local IDs are translated into durable
+// evidence, mention/proposal, observation, or signal records.
+func ValidateForPersistence(completion Completion) error {
+	evidenceIdentities, err := validateEvidenceIdentities(completion.Evidence)
+	if err != nil {
+		return err
+	}
+	if err := validateMentionIdentities(completion.Mentions, evidenceIdentities); err != nil {
+		return err
+	}
+	observationIdentities, err := validateObservationIdentities(completion.Observations, evidenceIdentities)
+	if err != nil {
+		return err
+	}
+	return validateSignalIdentities(completion.Signals, observationIdentities, evidenceIdentities)
+}
+
+func validateEvidenceIdentities(records []EvidenceRecord) (map[string][sha256.Size]byte, error) {
+	byKey := make(map[string][sha256.Size]byte, len(records))
+	seenDurable := make(map[[sha256.Size]byte]string, len(records))
+	for _, record := range records {
+		if record.Key == "" {
+			return nil, ErrPersistenceReference
+		}
+		identity := digestIdentity(struct {
+			Provider       string
+			DocumentID     string
+			DocumentDigest string
+			TabID          string
+			StartOffset    int
+			EndOffset      int
+		}{
+			Provider: record.Span.Provider(), DocumentID: record.Span.ProviderDocumentID(),
+			DocumentDigest: record.Span.DocumentDigest().String(), TabID: record.Span.TabID(),
+			StartOffset: record.Span.StartOffset(), EndOffset: record.Span.EndOffset(),
+		})
+		if _, exists := byKey[record.Key]; exists {
+			return nil, ErrPersistenceCollision
+		}
+		if priorKey, exists := seenDurable[identity]; exists && priorKey != record.Key {
+			return nil, ErrPersistenceCollision
+		}
+		byKey[record.Key] = identity
+		seenDurable[identity] = record.Key
+	}
+	return byKey, nil
+}
+
+func validateMentionIdentities(records []MentionRecord, evidence map[string][sha256.Size]byte) error {
+	seenKeys := make(map[string]struct{}, len(records))
+	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
+	for _, record := range records {
+		evidenceIdentity, exists := evidence[record.EvidenceKey]
+		if record.Key == "" || !exists {
+			return ErrPersistenceReference
+		}
+		if _, exists := seenKeys[record.Key]; exists {
+			return ErrPersistenceCollision
+		}
+		seenKeys[record.Key] = struct{}{}
+		identity := digestIdentity(struct {
+			Evidence [sha256.Size]byte
+			Surface  string
+			Role     string
+		}{Evidence: evidenceIdentity, Surface: record.Surface, Role: record.Role})
+		if _, exists := seenDurable[identity]; exists {
+			return ErrPersistenceCollision
+		}
+		seenDurable[identity] = struct{}{}
+	}
+	return nil
+}
+
+func validateObservationIdentities(records []ObservationRecord, evidence map[string][sha256.Size]byte) (map[string][sha256.Size]byte, error) {
+	byID := make(map[string][sha256.Size]byte, len(records))
+	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
+	for _, record := range records {
+		if record.ID == "" {
+			return nil, ErrPersistenceReference
+		}
+		if _, exists := byID[record.ID]; exists {
+			return nil, ErrPersistenceCollision
+		}
+		evidenceSet, err := canonicalEvidenceSet(record.EvidenceKeys, evidence)
+		if err != nil {
+			return nil, err
+		}
+		identity := digestIdentity(struct {
+			Subject    string
+			Object     string
+			Predicate  string
+			ValidStart string
+			Confidence string
+			Evidence   [][sha256.Size]byte
+			Derivation string
+			Epistemic  string
+		}{
+			Subject: record.SubjectEntityID, Object: record.ObjectEntityID,
+			Predicate: record.Predicate, ValidStart: optionalTime(record.ValidStart),
+			Confidence: optionalConfidence(record.Confidence), Evidence: evidenceSet,
+			Derivation: "model_extraction", Epistemic: "inferred",
+		})
+		if _, exists := seenDurable[identity]; exists {
+			return nil, ErrPersistenceCollision
+		}
+		byID[record.ID] = identity
+		seenDurable[identity] = struct{}{}
+	}
+	return byID, nil
+}
+
+func validateSignalIdentities(records []SignalRecord, observations map[string][sha256.Size]byte, evidence map[string][sha256.Size]byte) error {
+	seenIDs := make(map[string]struct{}, len(records))
+	seenObservations := make(map[string]struct{}, len(records))
+	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
+	for _, record := range records {
+		observationIdentity, exists := observations[record.ObservationID]
+		if record.ID == "" || !exists {
+			return ErrPersistenceReference
+		}
+		if _, exists := seenIDs[record.ID]; exists {
+			return ErrPersistenceCollision
+		}
+		if _, exists := seenObservations[record.ObservationID]; exists {
+			return ErrPersistenceCollision
+		}
+		seenIDs[record.ID] = struct{}{}
+		seenObservations[record.ObservationID] = struct{}{}
+		evidenceSet, err := canonicalSignalEvidenceSet(record.Evidence, evidence)
+		if err != nil {
+			return err
+		}
+		identity := digestIdentity(struct {
+			Observation [sha256.Size]byte
+			Category    string
+			Direction   string
+			Model       string
+			Prompt      string
+			Rationale   string
+			Confidence  string
+			Evidence    []signalEvidenceIdentity
+		}{
+			Observation: observationIdentity, Category: record.Category,
+			Direction: record.Direction, Model: record.ExtractionModelID,
+			Prompt: record.PromptVersion, Rationale: record.Rationale,
+			Confidence: strconv.FormatFloat(record.Confidence, 'g', -1, 64), Evidence: evidenceSet,
+		})
+		if _, exists := seenDurable[identity]; exists {
+			return ErrPersistenceCollision
+		}
+		seenDurable[identity] = struct{}{}
+	}
+	return nil
+}
+
+type signalEvidenceIdentity struct {
+	Evidence [sha256.Size]byte
+	Role     string
+}
+
+func canonicalEvidenceSet(keys []string, evidence map[string][sha256.Size]byte) ([][sha256.Size]byte, error) {
+	set := make(map[[sha256.Size]byte]struct{}, len(keys))
+	for _, key := range keys {
+		identity, exists := evidence[key]
+		if !exists {
+			return nil, ErrPersistenceReference
+		}
+		set[identity] = struct{}{}
+	}
+	canonical := make([][sha256.Size]byte, 0, len(set))
+	for identity := range set {
+		canonical = append(canonical, identity)
+	}
+	sort.Slice(canonical, func(left, right int) bool {
+		return string(canonical[left][:]) < string(canonical[right][:])
+	})
+	return canonical, nil
+}
+
+func canonicalSignalEvidenceSet(records []SignalEvidenceRecord, evidence map[string][sha256.Size]byte) ([]signalEvidenceIdentity, error) {
+	set := make(map[signalEvidenceIdentity]struct{}, len(records))
+	for _, record := range records {
+		identity, exists := evidence[record.EvidenceKey]
+		if !exists {
+			return nil, ErrPersistenceReference
+		}
+		pair := signalEvidenceIdentity{Evidence: identity, Role: record.Role}
+		if _, exists := set[pair]; exists {
+			return nil, ErrPersistenceCollision
+		}
+		set[pair] = struct{}{}
+	}
+	canonical := make([]signalEvidenceIdentity, 0, len(set))
+	for identity := range set {
+		canonical = append(canonical, identity)
+	}
+	sort.Slice(canonical, func(left, right int) bool {
+		if canonical[left].Evidence == canonical[right].Evidence {
+			return canonical[left].Role < canonical[right].Role
+		}
+		return string(canonical[left].Evidence[:]) < string(canonical[right].Evidence[:])
+	})
+	return canonical, nil
+}
+
+func digestIdentity(value any) [sha256.Size]byte {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic("ingestion identity contains an unsupported value")
+	}
+	return sha256.Sum256(encoded)
+}
+
+func optionalTime(value *time.Time) string {
+	if value == nil {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func optionalConfidence(value *float64) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.FormatFloat(*value, 'g', -1, 64)
+}

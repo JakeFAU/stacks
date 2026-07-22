@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -44,6 +45,29 @@ func TestSyncCommandRejectsArguments(t *testing.T) {
 	err := (SyncCommand{Service: &fixedSyncer{}}).Run(context.Background(), []string{"unexpected"})
 	if err == nil || !strings.Contains(err.Error(), "sync command usage") {
 		t.Fatalf("Run() error = %v, want usage error", err)
+	}
+}
+
+func TestSyncCommandRendersCompletedDocumentOutcomesBeforeReturningAggregateError(t *testing.T) {
+	service := &fixedSyncer{
+		summary: ingest.Summary{
+			Results: []ingest.Result{
+				{DocumentID: "document-1", VersionID: "version-1", Outcome: ingest.OutcomeIncomplete},
+				{DocumentID: "document-2", VersionID: "version-2", Outcome: ingest.OutcomeCompleted},
+			},
+			Incomplete: 1,
+			Completed:  1,
+		},
+		err: ingest.ErrFailurePersistence,
+	}
+	var output bytes.Buffer
+	err := (SyncCommand{Service: service, Output: &output}).Run(context.Background(), nil)
+	if !errors.Is(err, ingest.ErrFailurePersistence) {
+		t.Fatalf("Run() error = %v, want aggregate persistence error", err)
+	}
+	if !strings.Contains(output.String(), "document_id=document-2 version_id=version-2 outcome=completed") ||
+		!strings.Contains(output.String(), "summary unchanged=0 completed=1 incomplete=1 failed=0") {
+		t.Fatalf("partial-success output = %q, want later completed outcome and summary", output.String())
 	}
 }
 
