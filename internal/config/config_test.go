@@ -257,6 +257,47 @@ func TestPoCSettingsValidateRejectsOverlappingNormalizedTabTitles(t *testing.T) 
 	}
 }
 
+func TestPoCSettingsValidateDoctorUsesOnlyReadOnlyPreflightSettings(t *testing.T) {
+	settings := validPoCSettings()
+	settings.AWSProfile = ""
+	settings.BedrockMaxTokens = 0
+	settings.BedrockMaxAttempts = 0
+	settings.ExtractionPromptVersion = ""
+	settings.AnalysisPromptVersion = ""
+	settings.EmployeeEntityID = ""
+	settings.ManagerEntityID = ""
+
+	if err := settings.Validate(CommandDoctor); err != nil {
+		t.Fatalf("Validate(doctor) error = %v, want optional profile and no invocation/analysis settings", err)
+	}
+}
+
+func TestPoCSettingsValidateDoctorRequiresEveryPreflightSetting(t *testing.T) {
+	tests := []struct {
+		name       string
+		invalidate func(*PoCSettings)
+	}{
+		{name: "database URL", invalidate: func(settings *PoCSettings) { settings.DatabaseURL = "" }},
+		{name: "Google folder", invalidate: func(settings *PoCSettings) { settings.GoogleFolderID = "" }},
+		{name: "Google client file", invalidate: func(settings *PoCSettings) { settings.GoogleOAuthClientFile = "" }},
+		{name: "Google token file", invalidate: func(settings *PoCSettings) { settings.GoogleOAuthTokenFile = "" }},
+		{name: "transcript titles", invalidate: func(settings *PoCSettings) { settings.TranscriptTitles = nil }},
+		{name: "notes titles", invalidate: func(settings *PoCSettings) { settings.NotesTitles = nil }},
+		{name: "AWS region", invalidate: func(settings *PoCSettings) { settings.AWSRegion = "" }},
+		{name: "Bedrock model", invalidate: func(settings *PoCSettings) { settings.BedrockModelID = "" }},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := validPoCSettings()
+			testCase.invalidate(&settings)
+			if err := settings.Validate(CommandDoctor); err == nil {
+				t.Fatal("Validate(doctor) error = nil, want missing preflight setting error")
+			}
+		})
+	}
+}
+
 func validPoCSettings() PoCSettings {
 	return PoCSettings{
 		DatabaseURL:             "postgres://stacks:test@localhost:5432/stacks",

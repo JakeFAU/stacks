@@ -85,6 +85,39 @@ func TestListFollowsDrivePagination(t *testing.T) {
 	}
 }
 
+func TestGetRepresentativeLimitsDirectGoogleDocLookupToOnePageAndOneID(t *testing.T) {
+	const folderID = "folder 'synthetic'"
+	requests := 0
+	var gotQuery url.Values
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		gotQuery = request.URL.Query()
+		return jsonResponse(request, `{"nextPageToken":"must-not-be-followed","files":[{"id":"document-1"}]}`), nil
+	})}
+	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+
+	document, found, err := client.GetRepresentative(context.Background(), folderID)
+	if err != nil {
+		t.Fatalf("GetRepresentative() error = %v", err)
+	}
+	if !found || document.ID != "document-1" {
+		t.Fatalf("GetRepresentative() = (%#v, %t), want document-1, true", document, found)
+	}
+	if requests != 1 {
+		t.Fatalf("GetRepresentative() requests = %d, want 1", requests)
+	}
+	wantQuery := "'folder \\'synthetic\\'' in parents and trashed = false and mimeType = 'application/vnd.google-apps.document'"
+	if got := gotQuery.Get("q"); got != wantQuery {
+		t.Errorf("Drive query = %q, want %q", got, wantQuery)
+	}
+	if got := gotQuery.Get("pageSize"); got != "1" {
+		t.Errorf("pageSize = %q, want 1", got)
+	}
+	if got := gotQuery.Get("fields"); got != "files(id)" {
+		t.Errorf("fields = %q, want minimal representative fields", got)
+	}
+}
+
 func TestListRedactsTransportErrors(t *testing.T) {
 	const secret = "secret-transport-detail"
 	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {

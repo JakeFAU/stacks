@@ -19,10 +19,12 @@ import (
 )
 
 const (
-	driveProvider       = "drive"
-	googleDocumentMIME  = "application/vnd.google-apps.document"
-	driveDocumentFields = "nextPageToken,files(id,name,modifiedTime,version,webViewLink)"
-	docsLocatorFormat   = "https://docs.google.com/document/d/%s/edit"
+	driveProvider        = "drive"
+	googleDocumentMIME   = "application/vnd.google-apps.document"
+	driveDocumentFields  = "nextPageToken,files(id,name,modifiedTime,version,webViewLink)"
+	representativeFields = "files(id)"
+	representativeLimit  = 1
+	docsLocatorFormat    = "https://docs.google.com/document/d/%s/edit"
 )
 
 // Client reads direct Google Doc children from Drive and retrieves complete
@@ -34,6 +36,7 @@ type Client struct {
 }
 
 var _ source.Source = (*Client)(nil)
+var _ source.RepresentativeSource = (*Client)(nil)
 
 // NewClient constructs a Google Drive and Docs source without exposing
 // provider SDK types at the package boundary.
@@ -94,6 +97,28 @@ func (client *Client) List(ctx context.Context, folderID string) ([]source.Docum
 		}
 	}
 	return documents, nil
+}
+
+// GetRepresentative returns at most one supported direct child without
+// following Drive pagination or retrieving provider-controlled metadata that
+// doctor does not need.
+func (client *Client) GetRepresentative(ctx context.Context, folderID string) (source.Document, bool, error) {
+	query := fmt.Sprintf("'%s' in parents and trashed = false and mimeType = '%s'", escapeDriveQueryValue(folderID), googleDocumentMIME)
+	files, err := client.drive.Files.List().
+		Q(query).
+		PageSize(representativeLimit).
+		Fields(googleapi.Field(representativeFields)).
+		Context(ctx).
+		Do()
+	if err != nil {
+		return source.Document{}, false, sanitizedGoogleError(ctx, "find representative Google Doc", err)
+	}
+	for _, file := range files.Files {
+		if file != nil && strings.TrimSpace(file.Id) != "" {
+			return source.Document{Provider: driveProvider, ID: file.Id}, true, nil
+		}
+	}
+	return source.Document{}, false, nil
 }
 
 // Get retrieves all document tabs and immediately converts them into source

@@ -103,6 +103,131 @@ func TestDoctorBoundsProviderErrorsAndPreservesCancellation(t *testing.T) {
 	}
 }
 
+func TestDoctorStopsAfterSuccessfulCallThatCancelsContext(t *testing.T) {
+	tests := []struct {
+		name    string
+		service func(context.CancelFunc) (Service, func(*testing.T))
+	}{
+		{
+			name: "database ping",
+			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
+				database := &fakeDatabase{ping: func(context.Context) error { cancel(); return nil }, migrationsCurrent: true}
+				google := &fakeGoogle{}
+				aws := &fakeAWS{}
+				return Service{Database: database, Google: google, AWS: aws}, func(t *testing.T) {
+					if database.migrationsCalls != 0 || google.authorizationCalls != 0 || aws.credentialsCalls != 0 {
+						t.Fatalf("downstream calls = migrations:%d google:%d aws:%d, want zero", database.migrationsCalls, google.authorizationCalls, aws.credentialsCalls)
+					}
+				}
+			},
+		},
+		{
+			name: "database migrations",
+			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
+				database := &fakeDatabase{migrations: func(context.Context) (bool, error) { cancel(); return true, nil }}
+				google := &fakeGoogle{}
+				aws := &fakeAWS{}
+				return Service{Database: database, Google: google, AWS: aws}, func(t *testing.T) {
+					if google.authorizationCalls != 0 || aws.credentialsCalls != 0 {
+						t.Fatalf("downstream calls = google:%d aws:%d, want zero", google.authorizationCalls, aws.credentialsCalls)
+					}
+				}
+			},
+		},
+		{
+			name: "Google authorization",
+			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
+				google := &fakeGoogle{authorization: func(context.Context) error { cancel(); return nil }}
+				aws := &fakeAWS{}
+				return Service{Database: &fakeDatabase{migrationsCurrent: true}, Google: google, AWS: aws}, func(t *testing.T) {
+					if google.listCalls != 0 || google.getCalls != 0 || aws.credentialsCalls != 0 {
+						t.Fatalf("downstream calls = folder:%d document:%d aws:%d, want zero", google.listCalls, google.getCalls, aws.credentialsCalls)
+					}
+				}
+			},
+		},
+		{
+			name: "Google folder",
+			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
+				google := &fakeGoogle{list: func(context.Context) ([]source.Document, error) {
+					cancel()
+					return []source.Document{{ID: "synthetic-document"}}, nil
+				}}
+				aws := &fakeAWS{}
+				return Service{Database: &fakeDatabase{migrationsCurrent: true}, Google: google, AWS: aws}, func(t *testing.T) {
+					if google.getCalls != 0 || aws.credentialsCalls != 0 {
+						t.Fatalf("downstream calls = document:%d aws:%d, want zero", google.getCalls, aws.credentialsCalls)
+					}
+				}
+			},
+		},
+		{
+			name: "Google document",
+			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
+				google := &fakeGoogle{
+					documents: []source.Document{{ID: "synthetic-document"}},
+					get: func(context.Context, string) (source.Document, error) {
+						cancel()
+						return source.Document{Tabs: []source.Tab{{Role: source.TabRoleTranscript}}}, nil
+					},
+				}
+				aws := &fakeAWS{}
+				return Service{Database: &fakeDatabase{migrationsCurrent: true}, Google: google, AWS: aws}, func(t *testing.T) {
+					if aws.credentialsCalls != 0 {
+						t.Fatalf("AWS credential calls = %d, want zero", aws.credentialsCalls)
+					}
+				}
+			},
+		},
+		{
+			name: "AWS credentials",
+			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
+				aws := &fakeAWS{credentials: func(context.Context) error { cancel(); return nil }}
+				return healthyService(aws), func(t *testing.T) {
+					if aws.modelCalls != 0 || aws.loggingCalls != 0 {
+						t.Fatalf("downstream calls = model:%d logging:%d, want zero", aws.modelCalls, aws.loggingCalls)
+					}
+				}
+			},
+		},
+		{
+			name: "Bedrock model",
+			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
+				aws := &fakeAWS{model: func(context.Context) error { cancel(); return nil }}
+				return healthyService(aws), func(t *testing.T) {
+					if aws.loggingCalls != 0 {
+						t.Fatalf("logging calls = %d, want zero", aws.loggingCalls)
+					}
+				}
+			},
+		},
+		{
+			name: "invocation logging",
+			service: func(cancel context.CancelFunc) (Service, func(*testing.T)) {
+				aws := &fakeAWS{logging: func(context.Context) (InvocationLoggingState, error) {
+					cancel()
+					return InvocationLoggingDisabled, nil
+				}}
+				return healthyService(aws), func(*testing.T) {}
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			service, assertNoDownstreamCalls := testCase.service(cancel)
+
+			report := service.Check(ctx)
+
+			if !errors.Is(report.Err, context.Canceled) || report.Err != context.Canceled {
+				t.Fatalf("Report.Err = %v, want canonical context.Canceled", report.Err)
+			}
+			assertNoDownstreamCalls(t)
+		})
+	}
+}
+
 func healthyService(aws AWS) Service {
 	return Service{
 		Database: &fakeDatabase{migrationsCurrent: true},
@@ -130,6 +255,7 @@ func assertCheck(t *testing.T, report Report, name CheckName, status Status, mes
 
 type fakeDatabase struct {
 	ping                 func(context.Context) error
+	migrations           func(context.Context) (bool, error)
 	pingErr              error
 	migrationsCurrent    bool
 	migrationsErr        error
@@ -146,8 +272,11 @@ func (fake *fakeDatabase) Ping(ctx context.Context) error {
 	return fake.pingErr
 }
 
-func (fake *fakeDatabase) MigrationsCurrent(context.Context) (bool, error) {
+func (fake *fakeDatabase) MigrationsCurrent(ctx context.Context) (bool, error) {
 	fake.migrationsCalls++
+	if fake.migrations != nil {
+		return fake.migrations(ctx)
+	}
 	return fake.migrationsCurrent, fake.migrationsErr
 }
 
@@ -157,6 +286,9 @@ func (fake *fakeDatabase) ApplyMigrations(context.Context) error {
 }
 
 type fakeGoogle struct {
+	authorization      func(context.Context) error
+	list               func(context.Context) ([]source.Document, error)
+	get                func(context.Context, string) (source.Document, error)
 	authorizationErr   error
 	listErr            error
 	getErr             error
@@ -169,18 +301,27 @@ type fakeGoogle struct {
 	syncCalls          int
 }
 
-func (fake *fakeGoogle) CheckAuthorization(context.Context) error {
+func (fake *fakeGoogle) CheckAuthorization(ctx context.Context) error {
 	fake.authorizationCalls++
+	if fake.authorization != nil {
+		return fake.authorization(ctx)
+	}
 	return fake.authorizationErr
 }
 
-func (fake *fakeGoogle) ListFolder(context.Context) ([]source.Document, error) {
+func (fake *fakeGoogle) ListFolder(ctx context.Context) ([]source.Document, error) {
 	fake.listCalls++
+	if fake.list != nil {
+		return fake.list(ctx)
+	}
 	return fake.documents, fake.listErr
 }
 
-func (fake *fakeGoogle) GetDocument(context.Context, string) (source.Document, error) {
+func (fake *fakeGoogle) GetDocument(ctx context.Context, documentID string) (source.Document, error) {
 	fake.getCalls++
+	if fake.get != nil {
+		return fake.get(ctx, documentID)
+	}
 	return fake.document, fake.getErr
 }
 
@@ -195,6 +336,9 @@ func (fake *fakeGoogle) Sync(context.Context) error {
 }
 
 type fakeAWS struct {
+	credentials           func(context.Context) error
+	model                 func(context.Context) error
+	logging               func(context.Context) (InvocationLoggingState, error)
 	credentialsErr        error
 	modelErr              error
 	loggingState          InvocationLoggingState
@@ -206,18 +350,27 @@ type fakeAWS struct {
 	configureLoggingCalls int
 }
 
-func (fake *fakeAWS) CheckCredentials(context.Context) error {
+func (fake *fakeAWS) CheckCredentials(ctx context.Context) error {
 	fake.credentialsCalls++
+	if fake.credentials != nil {
+		return fake.credentials(ctx)
+	}
 	return fake.credentialsErr
 }
 
-func (fake *fakeAWS) CheckModel(context.Context) error {
+func (fake *fakeAWS) CheckModel(ctx context.Context) error {
 	fake.modelCalls++
+	if fake.model != nil {
+		return fake.model(ctx)
+	}
 	return fake.modelErr
 }
 
-func (fake *fakeAWS) InvocationLogging(context.Context) (InvocationLoggingState, error) {
+func (fake *fakeAWS) InvocationLogging(ctx context.Context) (InvocationLoggingState, error) {
 	fake.loggingCalls++
+	if fake.logging != nil {
+		return fake.logging(ctx)
+	}
 	return fake.loggingState, fake.loggingErr
 }
 

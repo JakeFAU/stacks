@@ -72,7 +72,9 @@ func (settings PoCSettings) Validate(command Command) error {
 			GoogleOAuthClientFileEnvironmentVariable,
 			GoogleOAuthTokenFileEnvironmentVariable,
 		)
-	case CommandDoctor, CommandSync:
+	case CommandDoctor:
+		return settings.validateDoctor(command)
+	case CommandSync:
 		return settings.validateCorpusAndModel(command)
 	case CommandEntities, CommandReview:
 		return settings.validateRequired(command, DatabaseURLEnvironmentVariable)
@@ -93,6 +95,20 @@ func (settings PoCSettings) Validate(command Command) error {
 	}
 }
 
+func (settings PoCSettings) validateDoctor(command Command) error {
+	if err := settings.validateRequired(command,
+		DatabaseURLEnvironmentVariable,
+		GoogleFolderIDEnvironmentVariable,
+		GoogleOAuthClientFileEnvironmentVariable,
+		GoogleOAuthTokenFileEnvironmentVariable,
+		AWSRegionEnvironmentVariable,
+		BedrockModelIDEnvironmentVariable,
+	); err != nil {
+		return err
+	}
+	return settings.validateCorpusTitles()
+}
+
 func (settings PoCSettings) validateCorpusAndModel(command Command) error {
 	if err := settings.validateRequired(command,
 		DatabaseURLEnvironmentVariable,
@@ -105,6 +121,13 @@ func (settings PoCSettings) validateCorpusAndModel(command Command) error {
 	); err != nil {
 		return err
 	}
+	if err := settings.validateCorpusTitles(); err != nil {
+		return err
+	}
+	return settings.validateModelSettings(command)
+}
+
+func (settings PoCSettings) validateCorpusTitles() error {
 	if len(normalizedTitleSet(settings.TranscriptTitles)) == 0 {
 		return fmt.Errorf("%s must include at least one title", TranscriptTitlesEnvironmentVariable)
 	}
@@ -114,7 +137,7 @@ func (settings PoCSettings) validateCorpusAndModel(command Command) error {
 	if err := validateDistinctTabTitles(settings.TranscriptTitles, settings.NotesTitles); err != nil {
 		return err
 	}
-	return settings.validateModelSettings(command)
+	return nil
 }
 
 func (settings PoCSettings) validateModelSettings(command Command) error {

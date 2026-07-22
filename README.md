@@ -16,8 +16,9 @@ counterevidence, uncertainty, gaps, and citations visible.
 - Docker with Compose
 - a Google installed-application OAuth client with read-only Drive and Docs
   access
-- an AWS profile, region, and Bedrock model or inference profile configured by
-  the operator
+- AWS credentials, an explicit region, and a Bedrock model or inference
+  profile; doctor may use an optional shared profile or the default credential
+  chain
 
 ## Configure the local environment
 
@@ -64,7 +65,7 @@ implemented.
 | `STACKS_GOOGLE_OAUTH_TOKEN_FILE` | no default | External owner-only OAuth token JSON path |
 | `STACKS_TRANSCRIPT_TITLES` | no default | Comma-separated exact transcript titles after case/whitespace normalization |
 | `STACKS_NOTES_TITLES` | no default | Comma-separated exact Gemini-notes titles after normalization |
-| `STACKS_AWS_PROFILE` | no default | Shared AWS profile used by implemented PoC commands |
+| `STACKS_AWS_PROFILE` | no default | Shared AWS profile required by `sync` and `analyze`; doctor uses the default credential chain when unset |
 | `STACKS_AWS_REGION` | no default | Explicit Bedrock control-plane and runtime region |
 | `STACKS_BEDROCK_MODEL_ID` | no default | Foundation-model or inference-profile ID; no model is guessed |
 | `STACKS_BEDROCK_MAX_TOKENS` | no default | Required positive output-token limit for every invocation |
@@ -118,6 +119,11 @@ invocation logging when inspectable. It never runs OAuth, applies migrations,
 syncs or persists graph data, extracts content, invokes a model, changes
 configuration, or enables/disables logging. Missing or expired Google
 authorization directs the operator to `stacks auth google`.
+
+Doctor requires only the database, Google folder and OAuth paths, tab-title
+sets, AWS region, and model or inference-profile ID. An AWS profile is optional
+for doctor, and model invocation limits, retry settings, prompt versions, and
+pair IDs are not part of its read-only preflight contract.
 
 The Bedrock availability check does not invoke the model and therefore cannot
 prove runtime quota, throughput, or successful inference. An account with zero

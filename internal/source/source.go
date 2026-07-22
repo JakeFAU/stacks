@@ -15,6 +15,14 @@ type Source interface {
 	Get(ctx context.Context, documentID string) (Document, error)
 }
 
+// RepresentativeSource finds at most one supported document in a collection.
+// It exists for bounded read-only preflight checks that must not enumerate an
+// entire provider collection.
+type RepresentativeSource interface {
+	GetRepresentative(ctx context.Context, collectionID string) (Document, bool, error)
+	Get(ctx context.Context, documentID string) (Document, error)
+}
+
 // Document is a provider-neutral source document. Tabs are ordered in the
 // provider's user-visible order and retain their hierarchy independently.
 type Document struct {

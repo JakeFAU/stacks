@@ -130,19 +130,14 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 
 func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
 	settings := config.Settings{PoC: config.PoCSettings{
-		DatabaseURL:             "postgres://synthetic",
-		GoogleFolderID:          "synthetic-folder",
-		GoogleOAuthClientFile:   "/synthetic/client.json",
-		GoogleOAuthTokenFile:    "/synthetic/token.json",
-		TranscriptTitles:        []string{"Transcript"},
-		NotesTitles:             []string{"Notes"},
-		AWSProfile:              "synthetic-profile",
-		AWSRegion:               "us-east-1",
-		BedrockModelID:          "synthetic-model",
-		BedrockMaxTokens:        256,
-		BedrockMaxAttempts:      1,
-		ExtractionPromptVersion: "extract-v1",
-		AnalysisPromptVersion:   "analyze-v1",
+		DatabaseURL:           "postgres://synthetic",
+		GoogleFolderID:        "synthetic-folder",
+		GoogleOAuthClientFile: "/synthetic/client.json",
+		GoogleOAuthTokenFile:  "/synthetic/token.json",
+		TranscriptTitles:      []string{"Transcript"},
+		NotesTitles:           []string{"Notes"},
+		AWSRegion:             "us-east-1",
+		BedrockModelID:        "synthetic-model",
 	}}
 	providerCalls := 0
 	doctorCalls := 0

@@ -12,6 +12,7 @@ import (
 	awsbedrock "github.com/aws/aws-sdk-go-v2/service/bedrock"
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/oauth2"
 
@@ -122,20 +123,20 @@ func (connection pgxPoolConnection) Close() {
 	connection.pool.Close()
 }
 
-type googleSourceFactory func(context.Context) (source.Source, error)
+type googleSourceFactory func(context.Context) (source.RepresentativeSource, error)
 
 // GoogleProbe lazily validates the OAuth material and inspects one in-scope
 // document. It does not run the authorization flow or synchronize content.
 type GoogleProbe struct {
 	folderID string
 	open     googleSourceFactory
-	source   source.Source
+	source   source.RepresentativeSource
 }
 
 // NewGoogleProbe constructs a Google probe without reading credentials or
 // contacting Google.
 func NewGoogleProbe(clientFile, tokenFile, folderID string, classifier drive.TabClassifier) *GoogleProbe {
-	return newGoogleProbe(folderID, func(ctx context.Context) (source.Source, error) {
+	return newGoogleProbe(folderID, func(ctx context.Context) (source.RepresentativeSource, error) {
 		httpClient, err := drive.NewAuthorizedHTTPClient(ctx, clientFile, tokenFile)
 		if err != nil {
 			return nil, err
@@ -171,14 +172,14 @@ func (probe *GoogleProbe) ListFolder(ctx context.Context) ([]source.Document, er
 	if probe.source == nil {
 		return nil, errors.New("Google authorization has not been checked")
 	}
-	documents, err := probe.source.List(ctx, probe.folderID)
+	document, found, err := probe.source.GetRepresentative(ctx, probe.folderID)
 	if err != nil {
 		return nil, err
 	}
-	if len(documents) > 1 {
-		documents = documents[:1]
+	if !found {
+		return nil, nil
 	}
-	return documents, nil
+	return []source.Document{document}, nil
 }
 
 // GetDocument retrieves the representative document through the source's
@@ -268,31 +269,49 @@ func (probe *AWSProbe) CheckModel(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load AWS doctor clients: %w", err)
 	}
-	if isInferenceProfileID(probe.modelID) {
-		output, err := control.GetInferenceProfile(ctx, &awsbedrock.GetInferenceProfileInput{
-			InferenceProfileIdentifier: awssdk.String(probe.modelID),
-		})
-		if err != nil {
-			return fmt.Errorf("inspect Bedrock inference profile: %w", err)
-		}
+	output, profileErr := control.GetInferenceProfile(ctx, &awsbedrock.GetInferenceProfileInput{
+		InferenceProfileIdentifier: awssdk.String(probe.modelID),
+	})
+	if profileErr == nil {
 		if output == nil || output.Status != bedrocktypes.InferenceProfileStatusActive {
 			return errors.New("bedrock inference profile is not active")
 		}
 		return nil
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("inspect Bedrock inference profile: %w", ctxErr)
+	}
+	if isInferenceProfileID(probe.modelID) || !foundationFallbackAllowed(profileErr) {
+		return fmt.Errorf("inspect Bedrock inference profile: %w", profileErr)
+	}
 
-	output, err := control.GetFoundationModelAvailability(ctx, &awsbedrock.GetFoundationModelAvailabilityInput{
+	foundationOutput, err := control.GetFoundationModelAvailability(ctx, &awsbedrock.GetFoundationModelAvailabilityInput{
 		ModelId: awssdk.String(probe.modelID),
 	})
 	if err != nil {
 		return fmt.Errorf("inspect Bedrock foundation model availability: %w", err)
 	}
-	if output == nil || output.AuthorizationStatus != bedrocktypes.AuthorizationStatusAuthorized ||
-		output.EntitlementAvailability != bedrocktypes.EntitlementAvailabilityAvailable ||
-		output.RegionAvailability != bedrocktypes.RegionAvailabilityAvailable {
+	if foundationOutput == nil || foundationOutput.AgreementAvailability == nil ||
+		foundationOutput.AgreementAvailability.Status != bedrocktypes.AgreementStatusAvailable ||
+		foundationOutput.AuthorizationStatus != bedrocktypes.AuthorizationStatusAuthorized ||
+		foundationOutput.EntitlementAvailability != bedrocktypes.EntitlementAvailabilityAvailable ||
+		foundationOutput.RegionAvailability != bedrocktypes.RegionAvailabilityAvailable {
 		return errors.New("bedrock foundation model is not available")
 	}
 	return nil
+}
+
+func foundationFallbackAllowed(err error) bool {
+	var apiError smithy.APIError
+	if !errors.As(err, &apiError) {
+		return false
+	}
+	switch apiError.ErrorCode() {
+	case "ResourceNotFoundException", "ValidationException":
+		return true
+	default:
+		return false
+	}
 }
 
 // InvocationLogging inspects account-level configuration. Any non-nil

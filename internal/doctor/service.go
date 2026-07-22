@@ -109,60 +109,66 @@ func (service Service) Check(ctx context.Context) Report {
 			failed(CheckDatabaseConnectivity, "PostgreSQL check is not configured", "configure STACKS_DATABASE_URL"),
 			failed(CheckDatabaseMigrations, "not checked because PostgreSQL is unavailable", "restore PostgreSQL connectivity"),
 		)
-	} else if err := service.Database.Ping(ctx); err != nil {
+	} else {
+		err := service.Database.Ping(ctx)
 		if stop(&report, ctx, CheckDatabaseConnectivity, err) {
 			return report
 		}
-		report.Checks = append(report.Checks,
-			failed(CheckDatabaseConnectivity, "PostgreSQL is unavailable", "verify STACKS_DATABASE_URL and start PostgreSQL"),
-			failed(CheckDatabaseMigrations, "not checked because PostgreSQL is unavailable", "restore PostgreSQL connectivity"),
-		)
-	} else {
-		report.Checks = append(report.Checks, ok(CheckDatabaseConnectivity, "PostgreSQL is reachable"))
-		current, err := service.Database.MigrationsCurrent(ctx)
 		if err != nil {
+			report.Checks = append(report.Checks,
+				failed(CheckDatabaseConnectivity, "PostgreSQL is unavailable", "verify STACKS_DATABASE_URL and start PostgreSQL"),
+				failed(CheckDatabaseMigrations, "not checked because PostgreSQL is unavailable", "restore PostgreSQL connectivity"),
+			)
+		} else {
+			report.Checks = append(report.Checks, ok(CheckDatabaseConnectivity, "PostgreSQL is reachable"))
+			current, err := service.Database.MigrationsCurrent(ctx)
 			if stop(&report, ctx, CheckDatabaseMigrations, err) {
 				return report
 			}
-			report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migration state could not be inspected", "run `make db-migrate`"))
-		} else if !current {
-			report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migrations are pending", "run `make db-migrate`"))
-		} else {
-			report.Checks = append(report.Checks, ok(CheckDatabaseMigrations, "database migrations are current"))
+			if err != nil {
+				report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migration state could not be inspected", "run `make db-migrate`"))
+			} else if !current {
+				report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migrations are pending", "run `make db-migrate`"))
+			} else {
+				report.Checks = append(report.Checks, ok(CheckDatabaseMigrations, "database migrations are current"))
+			}
 		}
 	}
 
 	if service.Google == nil {
 		report.Checks = appendGoogleUnavailable(report.Checks, "Google check is not configured")
-	} else if err := service.Google.CheckAuthorization(ctx); err != nil {
+	} else {
+		err := service.Google.CheckAuthorization(ctx)
 		if stop(&report, ctx, CheckGoogleAuthorization, err) {
 			return report
 		}
-		report.Checks = appendGoogleUnavailable(report.Checks, "Google authorization is missing, expired, or invalid")
-	} else {
-		report.Checks = append(report.Checks, ok(CheckGoogleAuthorization, "Google OAuth configuration and token are readable"))
-		documents, err := service.Google.ListFolder(ctx)
 		if err != nil {
+			report.Checks = appendGoogleUnavailable(report.Checks, "Google authorization is missing, expired, or invalid")
+		} else {
+			report.Checks = append(report.Checks, ok(CheckGoogleAuthorization, "Google OAuth configuration and token are readable"))
+			documents, err := service.Google.ListFolder(ctx)
 			if stop(&report, ctx, CheckGoogleFolder, err) {
 				return report
 			}
-			report.Checks = append(report.Checks,
-				failed(CheckGoogleFolder, "configured Google Drive folder is unavailable", "verify folder access and STACKS_GOOGLE_FOLDER_ID"),
-				failed(CheckGoogleTabs, "not checked because the Google Drive folder is unavailable", "restore configured folder access"),
-			)
-		} else {
-			report.Checks = append(report.Checks, ok(CheckGoogleFolder, "configured Google Drive folder is readable"))
-			if len(documents) == 0 {
-				report.Checks = append(report.Checks, failed(CheckGoogleTabs, "no supported Google Docs are available for representative tab inspection", "add an in-scope Google Doc or verify folder configuration"))
+			if err != nil {
+				report.Checks = append(report.Checks,
+					failed(CheckGoogleFolder, "configured Google Drive folder is unavailable", "verify folder access and STACKS_GOOGLE_FOLDER_ID"),
+					failed(CheckGoogleTabs, "not checked because the Google Drive folder is unavailable", "restore configured folder access"),
+				)
 			} else {
-				document, err := service.Google.GetDocument(ctx, documents[0].ID)
-				if err != nil {
+				report.Checks = append(report.Checks, ok(CheckGoogleFolder, "configured Google Drive folder is readable"))
+				if len(documents) == 0 {
+					report.Checks = append(report.Checks, failed(CheckGoogleTabs, "no supported Google Docs are available for representative tab inspection", "add an in-scope Google Doc or verify folder configuration"))
+				} else {
+					document, err := service.Google.GetDocument(ctx, documents[0].ID)
 					if stop(&report, ctx, CheckGoogleTabs, err) {
 						return report
 					}
-					report.Checks = append(report.Checks, failed(CheckGoogleTabs, "representative all-tabs classification failed", "verify configured tab titles and document access"))
-				} else {
-					report.Checks = append(report.Checks, classifyTabs(document.Tabs))
+					if err != nil {
+						report.Checks = append(report.Checks, failed(CheckGoogleTabs, "representative all-tabs classification failed", "verify configured tab titles and document access"))
+					} else {
+						report.Checks = append(report.Checks, classifyTabs(document.Tabs))
+					}
 				}
 			}
 		}
@@ -170,29 +176,33 @@ func (service Service) Check(ctx context.Context) Report {
 
 	if service.AWS == nil {
 		report.Checks = appendAWSUnavailable(report.Checks, "AWS check is not configured")
-	} else if err := service.AWS.CheckCredentials(ctx); err != nil {
+	} else {
+		err := service.AWS.CheckCredentials(ctx)
 		if stop(&report, ctx, CheckAWSCredentials, err) {
 			return report
 		}
-		report.Checks = appendAWSUnavailable(report.Checks, "AWS credentials are unavailable or expired")
-	} else {
-		report.Checks = append(report.Checks, ok(CheckAWSCredentials, "AWS credentials are valid"))
-		if err := service.AWS.CheckModel(ctx); err != nil {
+		if err != nil {
+			report.Checks = appendAWSUnavailable(report.Checks, "AWS credentials are unavailable or expired")
+		} else {
+			report.Checks = append(report.Checks, ok(CheckAWSCredentials, "AWS credentials are valid"))
+			err := service.AWS.CheckModel(ctx)
 			if stop(&report, ctx, CheckBedrockModel, err) {
 				return report
 			}
-			report.Checks = append(report.Checks, failed(CheckBedrockModel, "configured Bedrock model or inference profile is unavailable", "verify STACKS_AWS_REGION, STACKS_BEDROCK_MODEL_ID, model access, and quota"))
-		} else {
-			report.Checks = append(report.Checks, ok(CheckBedrockModel, "configured Bedrock model or inference profile is available"))
-		}
-		state, err := service.AWS.InvocationLogging(ctx)
-		if err != nil {
+			if err != nil {
+				report.Checks = append(report.Checks, failed(CheckBedrockModel, "configured Bedrock model or inference profile is unavailable", "verify STACKS_AWS_REGION, STACKS_BEDROCK_MODEL_ID, model access, and quota"))
+			} else {
+				report.Checks = append(report.Checks, ok(CheckBedrockModel, "configured Bedrock model or inference profile is available"))
+			}
+			state, err := service.AWS.InvocationLogging(ctx)
 			if stop(&report, ctx, CheckInvocationLogging, err) {
 				return report
 			}
-			state = InvocationLoggingUnknown
+			if err != nil {
+				state = InvocationLoggingUnknown
+			}
+			report.Checks = append(report.Checks, loggingCheck(state))
 		}
-		report.Checks = append(report.Checks, loggingCheck(state))
 	}
 	return report
 }
