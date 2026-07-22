@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"stacks/internal/cli"
@@ -11,6 +12,20 @@ import (
 // Runtime owns the server command's runtime behavior.
 type Runtime interface {
 	Serve(ctx context.Context, settings config.Settings) error
+}
+
+// CommandProvider supplies already-wired non-server commands. It keeps process
+// dependencies such as PostgreSQL outside of the argument router.
+type CommandProvider interface {
+	Commands(ctx context.Context, settings config.Settings, stdout, stderr io.Writer) (map[string]cli.Command, error)
+}
+
+// CommandProviderFunc adapts a function into a CommandProvider.
+type CommandProviderFunc func(ctx context.Context, settings config.Settings, stdout, stderr io.Writer) (map[string]cli.Command, error)
+
+// Commands returns the command map constructed by fn.
+func (fn CommandProviderFunc) Commands(ctx context.Context, settings config.Settings, stdout, stderr io.Writer) (map[string]cli.Command, error) {
+	return fn(ctx, settings, stdout, stderr)
 }
 
 // RuntimeFunc adapts a function into a Runtime.
@@ -29,11 +44,9 @@ func Execute(
 	args []string,
 	settings config.Settings,
 	runtime Runtime,
+	commandProvider CommandProvider,
 	stdout, stderr io.Writer,
 ) error {
-	_ = stdout
-	_ = stderr
-
 	command := config.CommandServe
 	if len(args) > 0 {
 		command = config.Command(args[0])
@@ -47,5 +60,17 @@ func Execute(
 			return runtime.Serve(ctx, settings)
 		}),
 	}}
+	if command == config.CommandEntities || command == config.CommandReview {
+		if commandProvider == nil {
+			return fmt.Errorf("%s command is not configured", command)
+		}
+		commands, err := commandProvider.Commands(ctx, settings, stdout, stderr)
+		if err != nil {
+			return err
+		}
+		for name, registered := range commands {
+			runner.Commands[name] = registered
+		}
+	}
 	return runner.Run(ctx, args)
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,8 +11,10 @@ import (
 	"go.uber.org/zap"
 
 	"stacks/internal/app"
+	"stacks/internal/cli"
 	"stacks/internal/config"
 	"stacks/internal/observability"
+	"stacks/internal/storage"
 )
 
 const observabilityShutdownTimeout = 10 * time.Second
@@ -45,6 +48,7 @@ func main() {
 		app.RuntimeFunc(func(ctx context.Context, settings config.Settings) error {
 			return app.Run(ctx, settings, logger, runtime.TracerProvider(), runtime.MeterProvider())
 		}),
+		app.CommandProviderFunc(reviewCommandProvider),
 		os.Stdout,
 		os.Stderr,
 	)
@@ -60,4 +64,27 @@ func main() {
 	if runErr != nil || shutdownErr != nil {
 		os.Exit(1)
 	}
+}
+
+func reviewCommandProvider(_ context.Context, settings config.Settings, stdout, _ io.Writer) (map[string]cli.Command, error) {
+	return map[string]cli.Command{
+		string(config.CommandEntities): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			store := cli.NewStorageReviewStore(storage.NewEntityRepository(pool))
+			return (cli.EntitiesCommand{Service: &cli.EntityService{Store: store}, Output: stdout}).Run(ctx, args)
+		}),
+		string(config.CommandReview): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			store := cli.NewStorageReviewStore(storage.NewEntityRepository(pool))
+			return (cli.ReviewCommand{Service: &cli.ReviewService{Store: store}, Output: stdout}).Run(ctx, args)
+		}),
+	}, nil
 }

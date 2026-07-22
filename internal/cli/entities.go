@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // EntityView is the private review projection of one canonical entity.
 type EntityView struct {
 	ID           string
 	DisplayName  string
+	RecordedAt   time.Time
 	Aliases      []string
 	MentionCount int
 	Evidence     []string
@@ -68,7 +70,7 @@ func (command EntitiesCommand) Run(ctx context.Context, args []string) error {
 			return err
 		}
 		for _, entity := range entities {
-			fmt.Fprintf(output, "%s\t%s\tmentions=%d\n", entity.ID, entity.DisplayName, entity.MentionCount)
+			fmt.Fprintf(output, "%s\t%s\trecorded=%s\tmentions=%d\n", entity.ID, entity.DisplayName, entity.RecordedAt.UTC().Format(time.RFC3339), entity.MentionCount)
 		}
 		return nil
 	}
@@ -84,7 +86,7 @@ func (command EntitiesCommand) Run(ctx context.Context, args []string) error {
 }
 
 func renderEntity(output io.Writer, entity EntityView) {
-	fmt.Fprintf(output, "entity %s\nname: %s\nmentions: %d\n", entity.ID, entity.DisplayName, entity.MentionCount)
+	fmt.Fprintf(output, "entity %s\nname: %s\nrecorded: %s\nmentions: %d\n", entity.ID, entity.DisplayName, entity.RecordedAt.UTC().Format(time.RFC3339), entity.MentionCount)
 	for _, alias := range entity.Aliases {
 		fmt.Fprintf(output, "alias: %s\n", alias)
 	}

@@ -3,6 +3,7 @@ package entity
 
 import (
 	"strings"
+	"time"
 
 	"golang.org/x/text/unicode/norm"
 )
@@ -38,6 +39,7 @@ type EntitySnapshot struct {
 	ID          string
 	Kind        Kind
 	DisplayName string
+	RecordedAt  time.Time
 	Aliases     []Alias
 }
 

@@ -22,7 +22,8 @@ type EntityInput struct {
 
 // Entity is a stored canonical entity identifier.
 type Entity struct {
-	ID string
+	ID         string
+	RecordedAt time.Time
 }
 
 // EntityDetail is the private review projection of one canonical entity.
@@ -30,6 +31,7 @@ type EntityDetail struct {
 	ID           string
 	Kind         string
 	DisplayName  string
+	RecordedAt   time.Time
 	Aliases      []string
 	MentionCount int
 	Evidence     []string
@@ -160,11 +162,11 @@ func (repository *EntityRepository) CreateEntity(ctx context.Context, input Enti
 		INSERT INTO stacks.entities (id, kind, display_name, recorded_at)
 		VALUES ($1::uuid, $2, $3, $4)
 		ON CONFLICT (id) DO NOTHING
-		RETURNING id`, input.ID, input.Kind, input.DisplayName, time.Now().UTC()).Scan(&entity.ID)
+		RETURNING id, recorded_at`, input.ID, input.Kind, input.DisplayName, time.Now().UTC()).Scan(&entity.ID, &entity.RecordedAt)
 	if err == pgx.ErrNoRows {
 		var storedKind, storedDisplayName string
 		err = repository.pool.QueryRow(ctx, `
-			SELECT id, kind, display_name FROM stacks.entities WHERE id = $1`, input.ID).Scan(&entity.ID, &storedKind, &storedDisplayName)
+			SELECT id, kind, display_name, recorded_at FROM stacks.entities WHERE id = $1`, input.ID).Scan(&entity.ID, &storedKind, &storedDisplayName, &entity.RecordedAt)
 		if err != nil {
 			return Entity{}, fmt.Errorf("load entity %q: %w", input.ID, err)
 		}
@@ -412,7 +414,7 @@ func (repository *EntityRepository) correctDecision(ctx context.Context, effecti
 // ListEntityDetails returns canonical people for private local review.
 func (repository *EntityRepository) ListEntityDetails(ctx context.Context) ([]EntityDetail, error) {
 	rows, err := repository.pool.Query(ctx, `
-		SELECT id::text, kind, display_name
+		SELECT id::text, kind, display_name, recorded_at
 		FROM stacks.entities
 		ORDER BY display_name, id`)
 	if err != nil {
@@ -422,7 +424,7 @@ func (repository *EntityRepository) ListEntityDetails(ctx context.Context) ([]En
 	entities := make([]EntityDetail, 0)
 	for rows.Next() {
 		var detail EntityDetail
-		if err := rows.Scan(&detail.ID, &detail.Kind, &detail.DisplayName); err != nil {
+		if err := rows.Scan(&detail.ID, &detail.Kind, &detail.DisplayName, &detail.RecordedAt); err != nil {
 			return nil, fmt.Errorf("scan entity: %w", err)
 		}
 		entities = append(entities, detail)
@@ -445,8 +447,8 @@ func (repository *EntityRepository) ListEntityDetails(ctx context.Context) ([]En
 func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entityID string) (EntityDetail, error) {
 	var detail EntityDetail
 	err := repository.pool.QueryRow(ctx, `
-		SELECT id::text, kind, display_name
-		FROM stacks.entities WHERE id = $1`, entityID).Scan(&detail.ID, &detail.Kind, &detail.DisplayName)
+		SELECT id::text, kind, display_name, recorded_at
+		FROM stacks.entities WHERE id = $1`, entityID).Scan(&detail.ID, &detail.Kind, &detail.DisplayName, &detail.RecordedAt)
 	if err != nil {
 		return EntityDetail{}, fmt.Errorf("show entity %q: %w", entityID, err)
 	}
@@ -469,7 +471,7 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 	}
 	if err := repository.pool.QueryRow(ctx, `
 		SELECT count(*) FROM stacks.resolution_decisions
-		WHERE entity_id = $1 AND outcome IN ('accepted', 'created')`, entityID).Scan(&detail.MentionCount); err != nil {
+		WHERE entity_id = $1 AND outcome IN ('accepted', 'created') AND superseded_by_id IS NULL`, entityID).Scan(&detail.MentionCount); err != nil {
 		return EntityDetail{}, fmt.Errorf("count mentions for entity %q: %w", entityID, err)
 	}
 	evidence, err := repository.pool.Query(ctx, `
@@ -478,7 +480,7 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
-		WHERE decision.entity_id = $1 AND decision.outcome IN ('accepted', 'created')
+		WHERE decision.entity_id = $1 AND decision.outcome IN ('accepted', 'created') AND decision.superseded_by_id IS NULL
 		ORDER BY span.quote`, entityID)
 	if err != nil {
 		return EntityDetail{}, fmt.Errorf("list evidence for entity %q: %w", entityID, err)
@@ -584,7 +586,7 @@ func (repository *EntityRepository) CreateReviewPerson(ctx context.Context, inpu
 		if err := transaction.QueryRow(ctx, `
 			INSERT INTO stacks.entities (id, kind, display_name, recorded_at)
 			VALUES ($1::uuid, $2, $3, $4)
-			RETURNING id`, input.EntityID, input.Kind, input.DisplayName, time.Now().UTC()).Scan(&entity.ID); err != nil {
+			RETURNING id, recorded_at`, input.EntityID, input.Kind, input.DisplayName, time.Now().UTC()).Scan(&entity.ID, &entity.RecordedAt); err != nil {
 			return fmt.Errorf("create review entity %q: %w", input.EntityID, err)
 		}
 		for _, alias := range input.Aliases {

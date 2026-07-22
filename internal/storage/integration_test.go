@@ -75,6 +75,9 @@ func TestCorrectionLeavesOneEffectiveDecision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create first entity: %v", err)
 	}
+	if firstEntity.RecordedAt.IsZero() {
+		t.Fatal("first entity recorded time is zero")
+	}
 	secondEntity, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Person B"})
 	if err != nil {
 		t.Fatalf("create second entity: %v", err)
@@ -126,6 +129,20 @@ func TestCorrectionLeavesOneEffectiveDecision(t *testing.T) {
 	}
 	if decisionCount != 2 {
 		t.Fatalf("decision history count = %d, want 2", decisionCount)
+	}
+	firstDetail, err := entities.ShowEntityDetail(ctx, firstEntity.ID)
+	if err != nil {
+		t.Fatalf("show superseded entity: %v", err)
+	}
+	if firstDetail.MentionCount != 0 || len(firstDetail.Evidence) != 0 {
+		t.Fatalf("superseded entity detail = %#v, want no effective mentions or evidence", firstDetail)
+	}
+	secondDetail, err := entities.ShowEntityDetail(ctx, secondEntity.ID)
+	if err != nil {
+		t.Fatalf("show effective entity: %v", err)
+	}
+	if secondDetail.MentionCount != 1 || len(secondDetail.Evidence) != 1 {
+		t.Fatalf("effective entity detail = %#v, want one effective mention and evidence", secondDetail)
 	}
 }
 

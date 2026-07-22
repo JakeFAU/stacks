@@ -32,7 +32,7 @@ func (store *StorageReviewStore) ListEntities(ctx context.Context) ([]EntityView
 	}
 	entities := make([]EntityView, len(details))
 	for index, detail := range details {
-		entities[index] = EntityView{ID: detail.ID, DisplayName: detail.DisplayName, Aliases: detail.Aliases, MentionCount: detail.MentionCount, Evidence: detail.Evidence}
+		entities[index] = EntityView{ID: detail.ID, DisplayName: detail.DisplayName, RecordedAt: detail.RecordedAt, Aliases: detail.Aliases, MentionCount: detail.MentionCount, Evidence: detail.Evidence}
 	}
 	return entities, nil
 }
@@ -46,7 +46,7 @@ func (store *StorageReviewStore) ShowEntity(ctx context.Context, entityID string
 	if err != nil {
 		return EntityView{}, err
 	}
-	return EntityView{ID: detail.ID, DisplayName: detail.DisplayName, Aliases: detail.Aliases, MentionCount: detail.MentionCount, Evidence: detail.Evidence}, nil
+	return EntityView{ID: detail.ID, DisplayName: detail.DisplayName, RecordedAt: detail.RecordedAt, Aliases: detail.Aliases, MentionCount: detail.MentionCount, Evidence: detail.Evidence}, nil
 }
 
 // ListReviewProposals implements ReviewStore.
@@ -79,6 +79,9 @@ func (store *StorageReviewStore) ShowReviewProposal(ctx context.Context, proposa
 
 // AcceptReviewProposal implements ReviewStore.
 func (store *StorageReviewStore) AcceptReviewProposal(ctx context.Context, proposalID, entityID string) (ReviewDecision, error) {
+	if store.repository == nil {
+		return ReviewDecision{}, fmt.Errorf("accept review proposal: repository is not configured")
+	}
 	decision, err := store.repository.RecordReviewDecision(ctx, storage.ResolutionDecisionInput{ProposalID: proposalID, Outcome: storage.ResolutionOutcomeAccepted, EntityID: entityID})
 	if err != nil {
 		return ReviewDecision{}, err
@@ -88,6 +91,9 @@ func (store *StorageReviewStore) AcceptReviewProposal(ctx context.Context, propo
 
 // RejectReviewProposal implements ReviewStore.
 func (store *StorageReviewStore) RejectReviewProposal(ctx context.Context, proposalID string) (ReviewDecision, error) {
+	if store.repository == nil {
+		return ReviewDecision{}, fmt.Errorf("reject review proposal: repository is not configured")
+	}
 	decision, err := store.repository.RecordReviewDecision(ctx, storage.ResolutionDecisionInput{ProposalID: proposalID, Outcome: storage.ResolutionOutcomeRejected})
 	if err != nil {
 		return ReviewDecision{}, err
@@ -119,6 +125,9 @@ func (store *StorageReviewStore) CreateReviewPerson(ctx context.Context, proposa
 
 // CorrectReviewDecision implements ReviewStore.
 func (store *StorageReviewStore) CorrectReviewDecision(ctx context.Context, effectiveDecisionID, entityID string) (ReviewDecision, error) {
+	if store.repository == nil {
+		return ReviewDecision{}, fmt.Errorf("correct review decision: repository is not configured")
+	}
 	decision, err := store.repository.CorrectReviewDecision(ctx, effectiveDecisionID, storage.ResolutionDecisionInput{Outcome: storage.ResolutionOutcomeAccepted, EntityID: entityID})
 	if err != nil {
 		return ReviewDecision{}, err
