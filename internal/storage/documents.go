@@ -16,6 +16,7 @@ import (
 	"stacks/internal/entity"
 	"stacks/internal/ingest"
 	"stacks/internal/knowledge"
+	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 )
 
@@ -288,9 +289,12 @@ func NewIngestionRepository(pool *pgxpool.Pool) *IngestionRepository {
 
 // PrepareVersion stores the immutable source version and independently creates
 // or resumes the exact configured extraction derivation.
-func (repository *IngestionRepository) PrepareVersion(ctx context.Context, version knowledge.DocumentVersion, derivation ingest.DerivationIdentity, leaseDuration time.Duration) (ingest.VersionState, error) {
+func (repository *IngestionRepository) PrepareVersion(ctx context.Context, version knowledge.DocumentVersion, derivation ingest.DerivationIdentity, dataMode modelpolicy.DataMode, leaseDuration time.Duration) (ingest.VersionState, error) {
 	if repository == nil || repository.pool == nil {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: repository is not configured")
+	}
+	if err := (modelpolicy.Invocation{Provider: derivation.Provider, DataMode: dataMode, Region: derivation.Region}).Validate(); err != nil {
+		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: model policy is invalid")
 	}
 	wantDigest, err := ingest.ComputeDerivationDigest(version, derivation)
 	if err != nil || wantDigest != derivation.Digest {
@@ -314,14 +318,15 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 	claimedAt := time.Now().UTC()
 	leaseExpiresAt := claimedAt.Add(leaseDuration)
 	state := ingest.VersionState{ID: stored.ID, DerivationDigest: derivation.Digest}
+	storedRegion := nullableModelRegion(derivation.Provider, derivation.Region)
 	err = transaction.QueryRow(ctx, `
 		INSERT INTO stacks.extraction_runs
-			(document_version_id, derivation_digest, model_id, bedrock_region,
+			(document_version_id, derivation_digest, model_provider, data_mode, model_id, bedrock_region,
 			 max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at,
 			 currently_admissible)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, true)
 		ON CONFLICT (document_version_id, derivation_digest) DO NOTHING
-		RETURNING id`, stored.ID, derivation.Digest[:], derivation.ModelID, derivation.Region,
+		RETURNING id`, stored.ID, derivation.Digest[:], string(derivation.Provider), string(dataMode), derivation.ModelID, storedRegion,
 		derivation.MaxTokens, derivation.PromptVersion, derivation.SchemaDigest[:], claimOwner, leaseExpiresAt, claimedAt).Scan(&state.DerivationID)
 	if err == nil {
 		state.Status = ingest.VersionStatusPending
@@ -332,21 +337,23 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 		var failureCode *string
 		var activeOwner *string
 		var activeUntil *time.Time
-		var storedModelID, storedRegion, storedPromptVersion string
+		var storedProvider, storedDataMode, storedModelID, storedPromptVersion string
+		var storedBedrockRegion *string
 		var storedMaxTokens int
 		var storedSchemaDigest []byte
 		if err := transaction.QueryRow(ctx, `
 			SELECT id, processing_status, retry_count, failure_code, lease_owner, lease_expires_at,
-			       model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest
+			       model_provider, data_mode, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest
 			FROM stacks.extraction_runs
 			WHERE document_version_id = $1 AND derivation_digest = $2
 			FOR UPDATE`, stored.ID, derivation.Digest[:]).Scan(
 			&state.DerivationID, &status, &state.RetryCount, &failureCode, &activeOwner, &activeUntil,
-			&storedModelID, &storedRegion, &storedMaxTokens, &storedPromptVersion, &storedSchemaDigest,
+			&storedProvider, &storedDataMode, &storedModelID, &storedBedrockRegion, &storedMaxTokens, &storedPromptVersion, &storedSchemaDigest,
 		); err != nil {
 			return ingest.VersionState{}, fmt.Errorf("load ingestion derivation state: %w", err)
 		}
-		if storedModelID != derivation.ModelID || storedRegion != derivation.Region ||
+		if storedProvider != string(derivation.Provider) || !modelRegionMatches(derivation.Provider, derivation.Region, storedBedrockRegion) ||
+			storedModelID != derivation.ModelID ||
 			storedMaxTokens != derivation.MaxTokens || storedPromptVersion != derivation.PromptVersion ||
 			string(storedSchemaDigest) != string(derivation.SchemaDigest[:]) {
 			return ingest.VersionState{}, fmt.Errorf("load ingestion derivation state: immutable configuration conflicts")
@@ -364,9 +371,9 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 			if err := transaction.QueryRow(ctx, `
 				UPDATE stacks.extraction_runs
 				SET processing_status = 'pending', failure_code = NULL, retry_count = retry_count + 1,
-				    lease_owner = $2, lease_expires_at = $3
+				    lease_owner = $2, lease_expires_at = $3, data_mode = $4
 				WHERE id = $1
-				RETURNING retry_count`, state.DerivationID, claimOwner, leaseExpiresAt).Scan(&state.RetryCount); err != nil {
+				RETURNING retry_count`, state.DerivationID, claimOwner, leaseExpiresAt, string(dataMode)).Scan(&state.RetryCount); err != nil {
 				return ingest.VersionState{}, fmt.Errorf("resume ingestion derivation: %w", err)
 			}
 			state.Status = ingest.VersionStatusPending
@@ -439,13 +446,13 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	}
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 
-	var storedVersionID, status string
+	var storedVersionID, status, storedDataMode string
 	var activeOwner, completedByOwner *string
 	var activeUntil *time.Time
 	if err := transaction.QueryRow(ctx, `
-		SELECT document_version_id, processing_status, lease_owner, lease_expires_at, completed_by_owner
+		SELECT document_version_id, processing_status, data_mode, lease_owner, lease_expires_at, completed_by_owner
 		FROM stacks.extraction_runs WHERE id = $1 FOR UPDATE`, completion.DerivationID).Scan(
-		&storedVersionID, &status, &activeOwner, &activeUntil, &completedByOwner,
+		&storedVersionID, &status, &storedDataMode, &activeOwner, &activeUntil, &completedByOwner,
 	); err != nil {
 		return fmt.Errorf("lock ingestion derivation: %w", err)
 	}
@@ -457,6 +464,9 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 			return fmt.Errorf("complete ingestion version: completion lease is not owned")
 		}
 		return transaction.Commit(ctx)
+	}
+	if storedDataMode != string(completion.DataMode) {
+		return fmt.Errorf("complete ingestion version: active data mode conflicts")
 	}
 	if activeOwner == nil || activeUntil == nil || *activeOwner != completion.LeaseOwner || !activeUntil.After(time.Now().UTC()) {
 		return fmt.Errorf("complete ingestion version: active lease is not owned")
@@ -698,4 +708,18 @@ func validIngestionFailureCode(code ingest.FailureCode) bool {
 	default:
 		return false
 	}
+}
+
+func nullableModelRegion(provider modelpolicy.Provider, region string) *string {
+	if provider != modelpolicy.ProviderBedrock {
+		return nil
+	}
+	return &region
+}
+
+func modelRegionMatches(provider modelpolicy.Provider, region string, stored *string) bool {
+	if provider == modelpolicy.ProviderBedrock {
+		return stored != nil && *stored == region
+	}
+	return stored == nil
 }

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -29,6 +30,77 @@ const (
 	testMigrationDatabaseURLEnvironmentVariable = "STACKS_TEST_MIGRATION_DATABASE_URL"
 )
 
+func TestModelProviderProvenancePersistsExtractionLeaseWithoutMutatingCompletedCache(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewIngestionRepository(pool)
+	ctx := context.Background()
+	version := testDocumentVersion(t, testIdentifier("document-provider-provenance"))
+	derivation := testExtractionDerivation(t, version)
+
+	personal, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare personal Bedrock extraction: %v", err)
+	}
+	var provider, dataMode, region string
+	if err := pool.QueryRow(ctx, `
+		SELECT model_provider, data_mode, bedrock_region
+		FROM stacks.extraction_runs WHERE id = $1`, personal.DerivationID).Scan(&provider, &dataMode, &region); err != nil {
+		t.Fatalf("load personal Bedrock extraction provenance: %v", err)
+	}
+	if provider != string(modelpolicy.ProviderBedrock) || dataMode != string(modelpolicy.DataModePersonal) || region != derivation.Region {
+		t.Fatalf("personal Bedrock extraction provenance = %q/%q/%q", provider, dataMode, region)
+	}
+	if err := repository.CompleteVersion(ctx, ingest.Completion{
+		VersionID: personal.ID, DerivationID: personal.DerivationID, LeaseOwner: personal.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}); err != nil {
+		t.Fatalf("complete personal Bedrock extraction: %v", err)
+	}
+
+	restricted, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModeRestricted, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("reuse completed Bedrock extraction in restricted mode: %v", err)
+	}
+	if restricted.Status != ingest.VersionStatusComplete || restricted.DerivationID != personal.DerivationID {
+		t.Fatalf("restricted cache state = %#v, want completed personal derivation", restricted)
+	}
+	if err := pool.QueryRow(ctx, `SELECT data_mode FROM stacks.extraction_runs WHERE id = $1`, personal.DerivationID).Scan(&dataMode); err != nil {
+		t.Fatalf("reload completed Bedrock extraction mode: %v", err)
+	}
+	if dataMode != string(modelpolicy.DataModePersonal) {
+		t.Fatalf("completed Bedrock extraction mode = %q, want original personal provenance", dataMode)
+	}
+}
+
+func TestModelProviderProvenanceSeparatesDirectExtractionCaches(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewIngestionRepository(pool)
+	ctx := context.Background()
+	version := testDocumentVersion(t, testIdentifier("document-direct-provider-caches"))
+	states := make(map[modelpolicy.Provider]ingest.VersionState)
+	for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
+		derivation := testExtractionDerivationForProvider(t, version, provider)
+		state, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+		if err != nil {
+			t.Fatalf("prepare %s extraction: %v", provider, err)
+		}
+		var storedProvider, storedMode string
+		var storedRegion *string
+		if err := pool.QueryRow(ctx, `
+			SELECT model_provider, data_mode, bedrock_region
+			FROM stacks.extraction_runs WHERE id = $1`, state.DerivationID).Scan(&storedProvider, &storedMode, &storedRegion); err != nil {
+			t.Fatalf("load %s extraction provenance: %v", provider, err)
+		}
+		if storedProvider != string(provider) || storedMode != string(modelpolicy.DataModePersonal) || storedRegion != nil {
+			t.Fatalf("%s extraction provenance = %q/%q/%v, want provider/personal/NULL", provider, storedProvider, storedMode, storedRegion)
+		}
+		states[provider] = state
+	}
+	if states[modelpolicy.ProviderOpenAI].DerivationID == states[modelpolicy.ProviderAnthropic].DerivationID {
+		t.Fatal("OpenAI and Anthropic extraction identities shared one durable cache row")
+	}
+}
+
 func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	repository := NewIngestionRepository(pool)
@@ -36,7 +108,7 @@ func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	version := testDocumentVersion(t, testIdentifier("document-ingestion-state"))
 	derivation := testExtractionDerivation(t, version)
 
-	first, err := repository.PrepareVersion(ctx, version, derivation, 5*time.Minute)
+	first, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare first ingestion attempt: %v", err)
 	}
@@ -46,20 +118,27 @@ func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	if err := repository.RecordFailure(ctx, first.DerivationID, first.LeaseOwner, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
 		t.Fatalf("record incomplete attempt: %v", err)
 	}
-	second, err := repository.PrepareVersion(ctx, version, derivation, 5*time.Minute)
+	second, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModeRestricted, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare retry: %v", err)
 	}
 	if second.ID != first.ID || second.Status != ingest.VersionStatusPending || second.RetryCount != 1 || second.FailureCode != "" {
 		t.Fatalf("retry state = %#v, want same pending version with retry_count=1", second)
 	}
+	var retriedDataMode string
+	if err := pool.QueryRow(ctx, `SELECT data_mode FROM stacks.extraction_runs WHERE id = $1`, second.DerivationID).Scan(&retriedDataMode); err != nil {
+		t.Fatalf("load retried extraction data mode: %v", err)
+	}
+	if retriedDataMode != string(modelpolicy.DataModeRestricted) {
+		t.Fatalf("retried extraction data mode = %q, want restricted", retriedDataMode)
+	}
 	if err := repository.CompleteVersion(ctx, ingest.Completion{
 		VersionID: second.ID, DerivationID: second.DerivationID, LeaseOwner: second.LeaseOwner,
-		DataMode: modelpolicy.DataModePersonal,
+		DataMode: modelpolicy.DataModeRestricted,
 	}); err != nil {
 		t.Fatalf("complete retry: %v", err)
 	}
-	complete, err := repository.PrepareVersion(ctx, version, derivation, 5*time.Minute)
+	complete, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare completed version: %v", err)
 	}
@@ -108,7 +187,7 @@ func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(
 		t.Fatalf("new Bob evidence span: %v", err)
 	}
 	repository := NewIngestionRepository(pool)
-	state, err := repository.PrepareVersion(ctx, version, testExtractionDerivation(t, version), 5*time.Minute)
+	state, err := repository.PrepareVersion(ctx, version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare unassociated identity derivation: %v", err)
 	}
@@ -187,7 +266,7 @@ func TestConcurrentExtractionClaimAllowsOneActiveOwner(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			<-start
-			state, err := NewIngestionRepository(pool).PrepareVersion(context.Background(), version, derivation, 5*time.Minute)
+			state, err := NewIngestionRepository(pool).PrepareVersion(context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 			results <- claimResult{state: state, err: err}
 		}()
 	}
@@ -216,7 +295,7 @@ func TestExtractionCompletionAndFailureRejectNonOwner(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	repository := NewIngestionRepository(pool)
 	version := testDocumentVersion(t, testIdentifier("document-lease-owner"))
-	state, err := repository.PrepareVersion(context.Background(), version, testExtractionDerivation(t, version), 5*time.Minute)
+	state, err := repository.PrepareVersion(context.Background(), version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("claim extraction derivation: %v", err)
 	}
@@ -242,7 +321,7 @@ func TestExpiredExtractionClaimCanBeRecoveredByNewOwner(t *testing.T) {
 	repository := NewIngestionRepository(pool)
 	version := testDocumentVersion(t, testIdentifier("document-expired-claim"))
 	derivation := testExtractionDerivation(t, version)
-	first, err := repository.PrepareVersion(context.Background(), version, derivation, 5*time.Minute)
+	first, err := repository.PrepareVersion(context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("claim extraction derivation: %v", err)
 	}
@@ -253,7 +332,7 @@ func TestExpiredExtractionClaimCanBeRecoveredByNewOwner(t *testing.T) {
 		t.Fatalf("expire synthetic extraction claim: %v", err)
 	}
 
-	recovered, err := repository.PrepareVersion(context.Background(), version, derivation, 5*time.Minute)
+	recovered, err := repository.PrepareVersion(context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("recover expired extraction claim: %v", err)
 	}
@@ -432,8 +511,15 @@ func TestPre00005LegacyRowsRemainAuditableButNotCurrentlyAdmissible(t *testing.T
 	if pair.Accepted || len(pair.Signals) != 0 {
 		t.Fatalf("legacy pair = %#v, want no currently admitted identities or signals", pair)
 	}
-	if _, found, err := findCompletedAnalysis(ctx, pool, legacyAnalysisDigest); err != nil || found {
-		t.Fatalf("find legacy analysis = (found %t, error %v), want preserved but non-renderable", found, err)
+	var renderableLegacyAnalyses int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM stacks.analysis_runs
+		WHERE input_digest = $1 AND state = 'complete' AND report_json IS NOT NULL
+		  AND currently_admissible`, legacyAnalysisDigest[:]).Scan(&renderableLegacyAnalyses); err != nil {
+		t.Fatalf("count renderable legacy analyses: %v", err)
+	}
+	if renderableLegacyAnalyses != 0 {
+		t.Fatalf("renderable legacy analyses = %d, want zero", renderableLegacyAnalyses)
 	}
 
 	for _, correction := range []struct {
@@ -778,6 +864,188 @@ func TestSnapshotCoherenceAdmissionMigrationQuarantinesHybridRowsAndSafeResyncUs
 	}
 }
 
+func TestModelProviderProvenanceMigrationUpgrades00009RowsWithoutChangingDigests(t *testing.T) {
+	pool := openMigrationIntegrationDatabase(t)
+	ctx := context.Background()
+	schemaName := "stacks_provider_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := `"` + schemaName + `"`
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatalf("create isolated provider-provenance schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+	})
+	applyMigrationsThrough00009ToSchema(t, pool, quotedSchema)
+
+	recordedAt := time.Date(2026, time.July, 22, 10, 0, 0, 0, time.UTC)
+	sourceID := uuid.NewString()
+	versionID := uuid.NewString()
+	extractionID := uuid.NewString()
+	analysisID := uuid.NewString()
+	employeeID := uuid.NewString()
+	managerID := uuid.NewString()
+	ownerID := uuid.NewString()
+	versionDigest := sha256.Sum256([]byte("provider-upgrade-version"))
+	derivationDigest := sha256.Sum256([]byte("provider-upgrade-derivation"))
+	inputDigest := sha256.Sum256([]byte("provider-upgrade-analysis"))
+	schemaDigest := sha256.Sum256([]byte("provider-upgrade-schema"))
+
+	statements := []struct {
+		operation string
+		query     string
+		arguments []any
+	}{
+		{"source", "INSERT INTO " + quotedSchema + `.source_documents (id, provider, provider_document_id, title, locator, recorded_at) VALUES ($1, 'drive', 'provider-upgrade-document', 'Synthetic', 'https://example.invalid/provider-upgrade', $2)`, []any{sourceID, recordedAt}},
+		{"version", "INSERT INTO " + quotedSchema + `.document_versions (id, source_document_id, digest, content_digest_v2, title, locator, recorded_at) VALUES ($1, $2, $3, $3, 'Synthetic', 'https://example.invalid/provider-upgrade', $4)`, []any{versionID, sourceID, versionDigest[:], recordedAt}},
+		{"employee", "INSERT INTO " + quotedSchema + `.entities (id, kind, display_name, recorded_at) VALUES ($1, 'person', 'Synthetic Employee', $2)`, []any{employeeID, recordedAt}},
+		{"manager", "INSERT INTO " + quotedSchema + `.entities (id, kind, display_name, recorded_at) VALUES ($1, 'person', 'Synthetic Manager', $2)`, []any{managerID, recordedAt}},
+		{"extraction", "INSERT INTO " + quotedSchema + `.extraction_runs (id, document_version_id, derivation_digest, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, processing_status, completed_by_owner, recorded_at, completed_at, currently_admissible) VALUES ($1, $2, $3, 'synthetic-model', 'us-east-1', 256, 'extract-v2', $4, 'complete', $5, $6, $6, true)`, []any{extractionID, versionID, derivationDigest[:], schemaDigest[:], ownerID, recordedAt}},
+		{"analysis", "INSERT INTO " + quotedSchema + `.analysis_runs (id, employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version, policy_version, state, recorded_at, completed_at, hypothesis, report_state, bedrock_region, model_id, max_output_tokens, report_json, currently_admissible) VALUES ($1, $2, $3, $4, 'analyze-v1', 'policy-v1', 'complete', $5, $5, 'Synthetic hypothesis', 'mixed_or_conflicting', 'us-east-1', 'synthetic-model', 256, $6::jsonb, true)`, []any{analysisID, employeeID, managerID, inputDigest[:], recordedAt, `{"status":"mixed_or_conflicting"}`}},
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement.query, statement.arguments...); err != nil {
+			t.Fatalf("seed provider-provenance %s: %v", statement.operation, err)
+		}
+	}
+
+	applyMigrationToSchema(t, pool, quotedSchema, "00010_model_provider_provenance.sql")
+
+	var extractionProvider, extractionMode, extractionRegion string
+	var storedDerivationDigest []byte
+	if err := pool.QueryRow(ctx, "SELECT model_provider, data_mode, bedrock_region, derivation_digest FROM "+quotedSchema+`.extraction_runs WHERE id = $1`, extractionID).Scan(
+		&extractionProvider, &extractionMode, &extractionRegion, &storedDerivationDigest,
+	); err != nil {
+		t.Fatalf("load upgraded extraction provenance: %v", err)
+	}
+	if extractionProvider != "bedrock" || extractionMode != "legacy" || extractionRegion != "us-east-1" ||
+		!bytes.Equal(storedDerivationDigest, derivationDigest[:]) {
+		t.Fatalf("upgraded extraction provenance = %q/%q/%q digest-preserved=%t, want bedrock/legacy/us-east-1/true",
+			extractionProvider, extractionMode, extractionRegion, bytes.Equal(storedDerivationDigest, derivationDigest[:]))
+	}
+
+	var analysisProvider, analysisMode, analysisRegion string
+	var storedInputDigest []byte
+	if err := pool.QueryRow(ctx, "SELECT model_provider, data_mode, bedrock_region, input_digest FROM "+quotedSchema+`.analysis_runs WHERE id = $1`, analysisID).Scan(
+		&analysisProvider, &analysisMode, &analysisRegion, &storedInputDigest,
+	); err != nil {
+		t.Fatalf("load upgraded analysis provenance: %v", err)
+	}
+	if analysisProvider != "bedrock" || analysisMode != "legacy" || analysisRegion != "us-east-1" ||
+		!bytes.Equal(storedInputDigest, inputDigest[:]) {
+		t.Fatalf("upgraded analysis provenance = %q/%q/%q digest-preserved=%t, want bedrock/legacy/us-east-1/true",
+			analysisProvider, analysisMode, analysisRegion, bytes.Equal(storedInputDigest, inputDigest[:]))
+	}
+}
+
+func TestModelProviderProvenanceMigrationEnforcesProviderAndModeConstraints(t *testing.T) {
+	pool := openMigrationIntegrationDatabase(t)
+	ctx := context.Background()
+	schemaName := "stacks_provider_constraints_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := `"` + schemaName + `"`
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatalf("create isolated provider-constraint schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+	})
+	applyMigrationsThrough00009ToSchema(t, pool, quotedSchema)
+	applyMigrationToSchema(t, pool, quotedSchema, "00010_model_provider_provenance.sql")
+
+	recordedAt := time.Date(2026, time.July, 22, 11, 0, 0, 0, time.UTC)
+	sourceID := uuid.NewString()
+	versionID := uuid.NewString()
+	employeeID := uuid.NewString()
+	managerID := uuid.NewString()
+	versionDigest := sha256.Sum256([]byte("provider-constraint-version"))
+	for _, statement := range []struct {
+		operation string
+		query     string
+		arguments []any
+	}{
+		{"source", "INSERT INTO " + quotedSchema + `.source_documents (id, provider, provider_document_id, title, locator, recorded_at) VALUES ($1, 'drive', 'provider-constraint-document', 'Synthetic', 'https://example.invalid/provider-constraint', $2)`, []any{sourceID, recordedAt}},
+		{"version", "INSERT INTO " + quotedSchema + `.document_versions (id, source_document_id, digest, content_digest_v2, title, locator, recorded_at) VALUES ($1, $2, $3, $3, 'Synthetic', 'https://example.invalid/provider-constraint', $4)`, []any{versionID, sourceID, versionDigest[:], recordedAt}},
+		{"employee", "INSERT INTO " + quotedSchema + `.entities (id, kind, display_name, recorded_at) VALUES ($1, 'person', 'Synthetic Employee', $2)`, []any{employeeID, recordedAt}},
+		{"manager", "INSERT INTO " + quotedSchema + `.entities (id, kind, display_name, recorded_at) VALUES ($1, 'person', 'Synthetic Manager', $2)`, []any{managerID, recordedAt}},
+	} {
+		if _, err := pool.Exec(ctx, statement.query, statement.arguments...); err != nil {
+			t.Fatalf("seed provider constraint %s: %v", statement.operation, err)
+		}
+	}
+
+	insertExtraction := func(provider, mode string, region *string) error {
+		derivationDigest := sha256.Sum256([]byte(uuid.NewString()))
+		schemaDigest := sha256.Sum256([]byte("provider-constraint-schema"))
+		_, err := pool.Exec(ctx, "INSERT INTO "+quotedSchema+`.extraction_runs (document_version_id, derivation_digest, model_provider, data_mode, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at, currently_admissible) VALUES ($1, $2, $3, $4, 'synthetic-model', $5, 256, 'extract-v2', $6, $7, $8, $9, true)`,
+			versionID, derivationDigest[:], provider, mode, region, schemaDigest[:], uuid.NewString(), recordedAt.Add(time.Hour), recordedAt)
+		return err
+	}
+	region := "us-east-1"
+	for _, testCase := range []struct {
+		name     string
+		provider string
+		mode     string
+		region   *string
+		wantErr  bool
+	}{
+		{name: "bedrock without region", provider: "bedrock", mode: "personal", wantErr: true},
+		{name: "openai with region", provider: "openai", mode: "personal", region: &region, wantErr: true},
+		{name: "invalid provider", provider: "synthetic", mode: "personal", wantErr: true},
+		{name: "invalid mode", provider: "openai", mode: "synthetic", wantErr: true},
+		{name: "personal openai", provider: "openai", mode: "personal"},
+		{name: "personal anthropic", provider: "anthropic", mode: "personal"},
+	} {
+		t.Run("extraction "+testCase.name, func(t *testing.T) {
+			err := insertExtraction(testCase.provider, testCase.mode, testCase.region)
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("insert extraction error = %v, wantErr %t", err, testCase.wantErr)
+			}
+		})
+	}
+
+	insertAnalysis := func(provider, mode string, region *string, withModel bool) error {
+		inputDigest := sha256.Sum256([]byte(uuid.NewString()))
+		var modelID *string
+		var maxTokens *int
+		if withModel {
+			model := "synthetic-model"
+			tokens := 256
+			modelID = &model
+			maxTokens = &tokens
+		}
+		var providerValue, modeValue any
+		if provider != "" {
+			providerValue = provider
+		}
+		if mode != "" {
+			modeValue = mode
+		}
+		_, err := pool.Exec(ctx, "INSERT INTO "+quotedSchema+`.analysis_runs (employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version, policy_version, state, recorded_at, completed_at, report_json, model_provider, data_mode, bedrock_region, model_id, max_output_tokens, currently_admissible) VALUES ($1, $2, $3, 'analyze-v1', 'policy-v1', 'complete', $4, $4, '{}'::jsonb, $5, $6, $7, $8, $9, true)`,
+			employeeID, managerID, inputDigest[:], recordedAt, providerValue, modeValue, region, modelID, maxTokens)
+		return err
+	}
+	for _, testCase := range []struct {
+		name      string
+		provider  string
+		mode      string
+		region    *string
+		withModel bool
+		wantErr   bool
+	}{
+		{name: "bedrock without region", provider: "bedrock", mode: "personal", withModel: true, wantErr: true},
+		{name: "anthropic with region", provider: "anthropic", mode: "personal", region: &region, withModel: true, wantErr: true},
+		{name: "personal openai", provider: "openai", mode: "personal", withModel: true},
+		{name: "personal anthropic", provider: "anthropic", mode: "personal", withModel: true},
+		{name: "deterministic non-model", withModel: false},
+	} {
+		t.Run("analysis "+testCase.name, func(t *testing.T) {
+			err := insertAnalysis(testCase.provider, testCase.mode, testCase.region, testCase.withModel)
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("insert analysis error = %v, wantErr %t", err, testCase.wantErr)
+			}
+		})
+	}
+}
+
 type post00007HybridRows struct {
 	versionID       string
 	extractionRunID string
@@ -891,7 +1159,7 @@ type snapshotCoherenceRepository struct {
 	leaseOwner      string
 }
 
-func (repository *snapshotCoherenceRepository) PrepareVersion(ctx context.Context, version knowledge.DocumentVersion, derivation ingest.DerivationIdentity, leaseDuration time.Duration) (ingest.VersionState, error) {
+func (repository *snapshotCoherenceRepository) PrepareVersion(ctx context.Context, version knowledge.DocumentVersion, derivation ingest.DerivationIdentity, _ modelpolicy.DataMode, leaseDuration time.Duration) (ingest.VersionState, error) {
 	wantDigest, err := ingest.ComputeDerivationDigest(version, derivation)
 	if err != nil || wantDigest != derivation.Digest || leaseDuration <= 0 {
 		return ingest.VersionState{}, errors.New("snapshot-coherence derivation is invalid")
@@ -1143,6 +1411,22 @@ func applyMigrationToSchema(t *testing.T, pool *pgxpool.Pool, quotedSchema, file
 	migration := strings.ReplaceAll(string(contents), "stacks.", quotedSchema+".")
 	if _, err := pool.Exec(context.Background(), migration, pgx.QueryExecModeSimpleProtocol); err != nil {
 		t.Fatalf("apply migration %q to isolated schema: %v", filename, err)
+	}
+}
+
+func applyMigrationsThrough00009ToSchema(t *testing.T, pool *pgxpool.Pool, quotedSchema string) {
+	t.Helper()
+	for _, migration := range []string{
+		"00002_manager_confidence_poc.sql",
+		"00003_ingestion_processing_state.sql",
+		"00004_temporal_pair_analysis.sql",
+		"00005_manager_confidence_final_fixes.sql",
+		"00006_legacy_admission_boundary.sql",
+		"00007_compatibility_admission_boundary.sql",
+		"00008_snapshot_coherence_admission_boundary.sql",
+		"00009_doctor_migration_inspection.sql",
+	} {
+		applyMigrationToSchema(t, pool, quotedSchema, migration)
 	}
 }
 
@@ -1577,6 +1861,123 @@ func TestCompleteAnalysisDeduplicatesStableInput(t *testing.T) {
 	typeConfusedInput.Inputs[0].Kind = AnalysisInputKindSignal
 	if _, _, err := analysis.Complete(ctx, typeConfusedInput); err == nil {
 		t.Fatal("analysis accepted a document version ID as a signal input")
+	}
+}
+
+func TestModelProviderProvenancePersistsAnalysisCompletionAndDeduplicatesAcrossModes(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	entities := NewEntityRepository(pool)
+	repository := NewAnalysisRepository(pool)
+	employee, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Provider Employee"})
+	if err != nil {
+		t.Fatalf("create provider employee: %v", err)
+	}
+	manager, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Provider Manager"})
+	if err != nil {
+		t.Fatalf("create provider manager: %v", err)
+	}
+	acceptSyntheticIdentity(t, pool, employee.ID)
+	acceptSyntheticIdentity(t, pool, manager.ID)
+	pair, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	if err != nil || !pair.Accepted {
+		t.Fatalf("load accepted provider pair = (%#v, %v)", pair, err)
+	}
+
+	identity := analysisdomain.AnalysisIdentity{
+		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
+		PromptVersion: "analyze-provider-v1", PolicyVersion: "policy-provider-v1",
+		Provider: modelpolicy.ProviderBedrock, Region: "us-east-1",
+		ModelID: "synthetic-model", MaxTokens: 256, Inputs: pair.Inputs,
+	}
+	identity.InputDigest, err = analysisdomain.ComputeInputDigest(identity)
+	if err != nil {
+		t.Fatalf("compute provider analysis identity: %v", err)
+	}
+	report := analysisdomain.Report{
+		Status: analysisdomain.StatusInsufficientEvidence, Rationale: "Synthetic provider report.",
+		RecordedAt: time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC),
+		ModelID:    identity.ModelID, Region: identity.Region, MaxTokens: identity.MaxTokens,
+		PromptVersion: identity.PromptVersion, PolicyVersion: identity.PolicyVersion,
+	}
+	personal, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
+		Identity: identity, Report: report, DataMode: modelpolicy.DataModePersonal,
+	})
+	if err != nil {
+		t.Fatalf("complete personal Bedrock analysis: %v", err)
+	}
+	restricted, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
+		Identity: identity, Report: report, DataMode: modelpolicy.DataModeRestricted,
+	})
+	if err != nil {
+		t.Fatalf("deduplicate restricted Bedrock analysis: %v", err)
+	}
+	if restricted.ID != personal.ID {
+		t.Fatalf("restricted analysis ID = %q, want completed personal row %q", restricted.ID, personal.ID)
+	}
+	var provider, dataMode, region string
+	var count int
+	if err := pool.QueryRow(ctx, `
+		SELECT min(model_provider), min(data_mode), min(bedrock_region), count(*)
+		FROM stacks.analysis_runs WHERE input_digest = $1`, identity.InputDigest[:]).Scan(&provider, &dataMode, &region, &count); err != nil {
+		t.Fatalf("load Bedrock analysis provenance: %v", err)
+	}
+	if provider != string(modelpolicy.ProviderBedrock) || dataMode != string(modelpolicy.DataModePersonal) || region != identity.Region || count != 1 {
+		t.Fatalf("Bedrock analysis provenance/count = %q/%q/%q/%d", provider, dataMode, region, count)
+	}
+
+	directIdentity := identity
+	directIdentity.Provider = modelpolicy.ProviderOpenAI
+	directIdentity.Region = ""
+	directIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(directIdentity)
+	if err != nil {
+		t.Fatalf("compute OpenAI analysis identity: %v", err)
+	}
+	directReport := report
+	directReport.Region = ""
+	direct, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
+		Identity: directIdentity, Report: directReport, DataMode: modelpolicy.DataModePersonal,
+	})
+	if err != nil {
+		t.Fatalf("complete OpenAI analysis: %v", err)
+	}
+	var directProvider, directMode string
+	var directRegion *string
+	if err := pool.QueryRow(ctx, `
+		SELECT model_provider, data_mode, bedrock_region
+		FROM stacks.analysis_runs WHERE id = $1`, direct.ID).Scan(&directProvider, &directMode, &directRegion); err != nil {
+		t.Fatalf("load OpenAI analysis provenance: %v", err)
+	}
+	if directProvider != string(modelpolicy.ProviderOpenAI) || directMode != string(modelpolicy.DataModePersonal) || directRegion != nil {
+		t.Fatalf("OpenAI analysis provenance = %q/%q/%v, want openai/personal/NULL", directProvider, directMode, directRegion)
+	}
+
+	deterministicIdentity := directIdentity
+	deterministicIdentity.PromptVersion = "analyze-deterministic-v1"
+	deterministicIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(deterministicIdentity)
+	if err != nil {
+		t.Fatalf("compute deterministic analysis identity: %v", err)
+	}
+	deterministicReport := directReport
+	deterministicReport.PromptVersion = deterministicIdentity.PromptVersion
+	deterministic, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
+		Identity: deterministicIdentity, Report: deterministicReport,
+	})
+	if err != nil {
+		t.Fatalf("complete deterministic non-model analysis: %v", err)
+	}
+	var modelProvider, storedDataMode, modelID, storedRegion *string
+	var maxTokens *int
+	if err := pool.QueryRow(ctx, `
+		SELECT model_provider, data_mode, model_id, bedrock_region, max_output_tokens
+		FROM stacks.analysis_runs WHERE id = $1`, deterministic.ID).Scan(
+		&modelProvider, &storedDataMode, &modelID, &storedRegion, &maxTokens,
+	); err != nil {
+		t.Fatalf("load deterministic analysis provenance: %v", err)
+	}
+	if modelProvider != nil || storedDataMode != nil || modelID != nil || storedRegion != nil || maxTokens != nil {
+		t.Fatalf("deterministic analysis stored model provenance = %v/%v/%v/%v/%v, want all NULL",
+			modelProvider, storedDataMode, modelID, storedRegion, maxTokens)
 	}
 }
 
@@ -2065,12 +2466,19 @@ func testDocumentVersion(t *testing.T, providerDocumentID string) knowledge.Docu
 }
 
 func testExtractionDerivation(t *testing.T, version knowledge.DocumentVersion) ingest.DerivationIdentity {
+	return testExtractionDerivationForProvider(t, version, modelpolicy.ProviderBedrock)
+}
+
+func testExtractionDerivationForProvider(t *testing.T, version knowledge.DocumentVersion, provider modelpolicy.Provider) ingest.DerivationIdentity {
 	t.Helper()
 	identity := ingest.DerivationIdentity{
-		Provider: modelpolicy.ProviderBedrock,
-		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
+		Provider: provider,
+		ModelID:  "synthetic-model", MaxTokens: 256,
 		PromptVersion: extract.ExtractionPromptVersion,
 		SchemaDigest:  sha256.Sum256(extract.ExtractionJSONSchema()),
+	}
+	if provider == modelpolicy.ProviderBedrock {
+		identity.Region = "us-east-1"
 	}
 	var err error
 	identity.Digest, err = ingest.ComputeDerivationDigest(version, identity)

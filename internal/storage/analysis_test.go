@@ -516,7 +516,7 @@ func (lookup *fakeCompletedAnalysisLookup) ValidateEffectivePairDecisions(_ cont
 	return lookup.validateErr
 }
 
-func (lookup *fakeCompletedAnalysisLookup) FindCompleted(context.Context, [sha256.Size]byte) (analysisdomain.Report, bool, error) {
+func (lookup *fakeCompletedAnalysisLookup) FindCompleted(context.Context, analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error) {
 	lookup.calls = append(lookup.calls, "find")
 	return lookup.report, lookup.found, nil
 }

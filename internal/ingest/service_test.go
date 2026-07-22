@@ -1264,7 +1264,7 @@ func newMemoryRepository() *memoryRepository {
 	return &memoryRepository{versions: make(map[string]VersionState), completions: make(map[string]Completion)}
 }
 
-func (repository *memoryRepository) PrepareVersion(_ context.Context, version knowledge.DocumentVersion, derivation DerivationIdentity, leaseDuration time.Duration) (VersionState, error) {
+func (repository *memoryRepository) PrepareVersion(_ context.Context, version knowledge.DocumentVersion, derivation DerivationIdentity, _ modelpolicy.DataMode, leaseDuration time.Duration) (VersionState, error) {
 	if repository.prepareErr != nil {
 		return VersionState{}, repository.prepareErr
 	}

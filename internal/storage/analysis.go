@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	analysisdomain "stacks/internal/analysis"
+	"stacks/internal/modelpolicy"
 )
 
 const (
@@ -85,7 +86,7 @@ type postgresAnalysisSnapshot struct {
 
 type completedAnalysisLookup interface {
 	ValidateEffectivePairDecisions(context.Context, analysisdomain.AnalysisIdentity) error
-	FindCompleted(context.Context, [sha256.Size]byte) (analysisdomain.Report, bool, error)
+	FindCompleted(context.Context, analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error)
 	Commit(context.Context) error
 	Rollback(context.Context) error
 }
@@ -406,8 +407,8 @@ func (lookup *postgresCompletedAnalysisLookup) ValidateEffectivePairDecisions(ct
 	return validateEffectivePairDecisions(ctx, lookup.transaction, identity)
 }
 
-func (lookup *postgresCompletedAnalysisLookup) FindCompleted(ctx context.Context, digest [sha256.Size]byte) (analysisdomain.Report, bool, error) {
-	return findCompletedAnalysis(ctx, lookup.transaction, digest)
+func (lookup *postgresCompletedAnalysisLookup) FindCompleted(ctx context.Context, identity analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error) {
+	return findCompletedAnalysis(ctx, lookup.transaction, identity)
 }
 
 func (lookup *postgresCompletedAnalysisLookup) Commit(ctx context.Context) error {
@@ -471,7 +472,7 @@ func (repository *AnalysisRepository) FindCompleted(ctx context.Context, identit
 	if err := transaction.ValidateEffectivePairDecisions(ctx, identity); err != nil {
 		return analysisdomain.Report{}, false, err
 	}
-	report, found, err := transaction.FindCompleted(ctx, identity.InputDigest)
+	report, found, err := transaction.FindCompleted(ctx, identity)
 	if err != nil {
 		return analysisdomain.Report{}, false, boundedAnalysisError("load completed analysis", err)
 	}
@@ -491,13 +492,12 @@ func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, comp
 	if err != nil || wantDigest != completion.Identity.InputDigest {
 		return analysisdomain.Report{}, fmt.Errorf("complete pair analysis: input digest is invalid")
 	}
-	if err := validateCompletedReport(completion.Report); err != nil {
+	if err := validateCompletedReport(completion.Report, completion.Identity); err != nil {
 		return analysisdomain.Report{}, err
 	}
-	if completion.Report.PromptVersion != completion.Identity.PromptVersion || completion.Report.PolicyVersion != completion.Identity.PolicyVersion ||
-		completion.Report.Region != completion.Identity.Region || completion.Report.ModelID != completion.Identity.ModelID ||
-		completion.Report.MaxTokens != completion.Identity.MaxTokens {
-		return analysisdomain.Report{}, fmt.Errorf("complete pair analysis: report configuration conflicts with input identity")
+	provenance, err := analysisCompletionProvenance(completion)
+	if err != nil {
+		return analysisdomain.Report{}, err
 	}
 	completion.Report.InputDigest = wantDigest
 	completion.Report.ID = uuid.NewSHA1(uuid.NameSpaceOID, wantDigest[:]).String()
@@ -524,19 +524,20 @@ func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, comp
 	result, err := transaction.Exec(ctx, `
 		INSERT INTO stacks.analysis_runs
 			(id, employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version, policy_version,
-			 state, recorded_at, completed_at, hypothesis, report_state, bedrock_region, model_id, max_output_tokens, report_json,
+			 state, recorded_at, completed_at, hypothesis, report_state, model_provider, data_mode,
+			 bedrock_region, model_id, max_output_tokens, report_json,
 			 currently_admissible)
-		VALUES ($1, $2, $3, $4, $5, $6, 'complete', $7, $7, $8, $9, $10, $11, $12, $13, true)
+		VALUES ($1, $2, $3, $4, $5, $6, 'complete', $7, $7, $8, $9, $10, $11, $12, $13, $14, $15, true)
 		ON CONFLICT (input_digest) DO NOTHING`,
 		completion.Report.ID, completion.Identity.EmployeeEntityID, completion.Identity.ManagerEntityID,
 		wantDigest[:], completion.Identity.PromptVersion, completion.Identity.PolicyVersion,
 		completion.Report.RecordedAt, completion.Report.Rationale, string(completion.Report.Status),
-		completion.Identity.Region, completion.Identity.ModelID, completion.Identity.MaxTokens, reportJSON)
+		provenance.provider, provenance.dataMode, provenance.region, provenance.modelID, provenance.maxTokens, reportJSON)
 	if err != nil {
 		return analysisdomain.Report{}, fmt.Errorf("persist pair analysis: %w", err)
 	}
 	if result.RowsAffected() == 0 {
-		report, found, err := findCompletedAnalysis(ctx, transaction, wantDigest)
+		report, found, err := findCompletedAnalysis(ctx, transaction, completion.Identity)
 		if err != nil {
 			return analysisdomain.Report{}, err
 		}
@@ -844,14 +845,18 @@ func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalys
 	return nil
 }
 
-func findCompletedAnalysis(ctx context.Context, queryer completedAnalysisQueryer, digest [sha256.Size]byte) (analysisdomain.Report, bool, error) {
+func findCompletedAnalysis(ctx context.Context, queryer completedAnalysisQueryer, identity analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error) {
 	var reportID string
 	var reportJSON []byte
+	var provider, dataMode, region, modelID *string
+	var maxTokens *int
 	err := queryer.QueryRow(ctx, `
-		SELECT id::text, report_json
+		SELECT id::text, report_json, model_provider, data_mode, bedrock_region, model_id, max_output_tokens
 		FROM stacks.analysis_runs
 		WHERE input_digest = $1 AND state = 'complete' AND report_json IS NOT NULL
-		  AND currently_admissible`, digest[:]).Scan(&reportID, &reportJSON)
+		  AND currently_admissible`, identity.InputDigest[:]).Scan(
+		&reportID, &reportJSON, &provider, &dataMode, &region, &modelID, &maxTokens,
+	)
 	if err == pgx.ErrNoRows {
 		return analysisdomain.Report{}, false, nil
 	}
@@ -862,19 +867,28 @@ func findCompletedAnalysis(ctx context.Context, queryer completedAnalysisQueryer
 	if err := json.Unmarshal(reportJSON, &report); err != nil {
 		return analysisdomain.Report{}, false, fmt.Errorf("load completed pair analysis: stored report is invalid")
 	}
-	if report.ID != reportID || report.InputDigest != digest {
+	if report.ID != reportID || report.InputDigest != identity.InputDigest {
 		return analysisdomain.Report{}, false, fmt.Errorf("load completed pair analysis: stored report identity conflicts")
 	}
-	if err := validateCompletedReport(report); err != nil {
+	if !storedAnalysisProvenanceMatches(identity, analysisModelProvenance{
+		provider: provider, dataMode: dataMode, region: region, modelID: modelID, maxTokens: maxTokens,
+	}) {
+		return analysisdomain.Report{}, false, fmt.Errorf("load completed pair analysis: stored model provenance conflicts")
+	}
+	if err := validateCompletedReport(report, identity); err != nil {
 		return analysisdomain.Report{}, false, fmt.Errorf("load completed pair analysis: stored report metadata is invalid")
 	}
 	return report, true, nil
 }
 
-func validateCompletedReport(report analysisdomain.Report) error {
-	if report.RecordedAt.IsZero() || strings.TrimSpace(report.Region) == "" || strings.TrimSpace(report.ModelID) == "" ||
+func validateCompletedReport(report analysisdomain.Report, identity analysisdomain.AnalysisIdentity) error {
+	if report.RecordedAt.IsZero() || strings.TrimSpace(report.ModelID) == "" || strings.TrimSpace(report.ModelID) != report.ModelID ||
 		report.MaxTokens <= 0 || strings.TrimSpace(report.PromptVersion) == "" || strings.TrimSpace(report.PolicyVersion) == "" {
 		return fmt.Errorf("complete pair analysis: report metadata is invalid")
+	}
+	if report.PromptVersion != identity.PromptVersion || report.PolicyVersion != identity.PolicyVersion ||
+		report.Region != identity.Region || report.ModelID != identity.ModelID || report.MaxTokens != identity.MaxTokens {
+		return fmt.Errorf("complete pair analysis: report configuration conflicts with input identity")
 	}
 	switch report.Status {
 	case analysisdomain.StatusInsufficientEvidence, analysisdomain.StatusNoMaterialChange,
@@ -883,6 +897,53 @@ func validateCompletedReport(report analysisdomain.Report) error {
 		return fmt.Errorf("complete pair analysis: report status is invalid")
 	}
 	return nil
+}
+
+type analysisModelProvenance struct {
+	provider  *string
+	dataMode  *string
+	region    *string
+	modelID   *string
+	maxTokens *int
+}
+
+func analysisCompletionProvenance(completion analysisdomain.Completion) (analysisModelProvenance, error) {
+	if completion.DataMode == "" {
+		return analysisModelProvenance{}, nil
+	}
+	if err := (modelpolicy.Invocation{
+		Provider: completion.Identity.Provider,
+		DataMode: completion.DataMode,
+		Region:   completion.Identity.Region,
+	}).Validate(); err != nil {
+		return analysisModelProvenance{}, fmt.Errorf("complete pair analysis: model policy is invalid")
+	}
+	provider := string(completion.Identity.Provider)
+	dataMode := string(completion.DataMode)
+	modelID := completion.Identity.ModelID
+	maxTokens := completion.Identity.MaxTokens
+	return analysisModelProvenance{
+		provider: &provider, dataMode: &dataMode,
+		region:  nullableModelRegion(completion.Identity.Provider, completion.Identity.Region),
+		modelID: &modelID, maxTokens: &maxTokens,
+	}, nil
+}
+
+func storedAnalysisProvenanceMatches(identity analysisdomain.AnalysisIdentity, stored analysisModelProvenance) bool {
+	if stored.provider == nil && stored.dataMode == nil && stored.region == nil && stored.modelID == nil && stored.maxTokens == nil {
+		return true
+	}
+	if stored.provider == nil || stored.dataMode == nil || stored.modelID == nil || stored.maxTokens == nil {
+		return false
+	}
+	provider := modelpolicy.Provider(*stored.provider)
+	dataMode := modelpolicy.DataMode(*stored.dataMode)
+	if !provider.Valid() || (dataMode != modelpolicy.DataModePersonal && dataMode != modelpolicy.DataModeRestricted && dataMode != modelpolicy.DataModeLegacy) {
+		return false
+	}
+	return provider == identity.Provider &&
+		modelRegionMatches(provider, identity.Region, stored.region) &&
+		*stored.modelID == identity.ModelID && *stored.maxTokens == identity.MaxTokens
 }
 
 func validatePersistedDomainAnalysisInput(ctx context.Context, transaction pgx.Tx, input analysisdomain.InputReference) error {

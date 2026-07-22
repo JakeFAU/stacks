@@ -270,6 +270,39 @@ func TestDoctorInspectionMigrationGrantsOnlyMigrationStatusReadAccess(t *testing
 	}
 }
 
+func TestModelProviderProvenanceMigrationBackfillsAndConstrainsRunMetadata(t *testing.T) {
+	migration := readModelProviderProvenanceMigration(t)
+	for _, required := range []string{
+		"ADD COLUMN model_provider text",
+		"ADD COLUMN data_mode text",
+		"SET model_provider = 'bedrock'",
+		"data_mode = 'legacy'",
+		"ALTER COLUMN bedrock_region DROP NOT NULL",
+		"ALTER COLUMN model_provider SET NOT NULL",
+		"ALTER COLUMN data_mode SET NOT NULL",
+		"model_provider IN ('bedrock', 'openai', 'anthropic')",
+		"data_mode IN ('personal', 'restricted', 'legacy')",
+		"model_provider = 'bedrock'",
+		"model_provider IN ('openai', 'anthropic')",
+		"bedrock_region IS NULL",
+		"report_json IS NOT NULL",
+	} {
+		if !strings.Contains(migration, required) {
+			t.Fatalf("model-provider provenance migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"UPDATE stacks.document_versions",
+		"SET derivation_digest =",
+		"SET input_digest =",
+		"-- +goose Down",
+	} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("model-provider provenance migration rewrites immutable history with %q", forbidden)
+		}
+	}
+}
+
 func readManagerConfidenceMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00002_manager_confidence_poc.sql")
@@ -313,6 +346,16 @@ func readCompatibilityAdmissionMigration(t *testing.T) string {
 func readSnapshotCoherenceAdmissionMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00008_snapshot_coherence_admission_boundary.sql")
+	migration, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", path, err)
+	}
+	return string(migration)
+}
+
+func readModelProviderProvenanceMigration(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join("..", "..", "db", "migrations", "00010_model_provider_provenance.sql")
 	migration, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration %q: %v", path, err)

@@ -213,6 +213,7 @@ func (repository *chronologyRepository) PrepareVersion(
 	_ context.Context,
 	version knowledge.DocumentVersion,
 	derivation ingest.DerivationIdentity,
+	_ modelpolicy.DataMode,
 	leaseDuration time.Duration,
 ) (ingest.VersionState, error) {
 	return ingest.VersionState{

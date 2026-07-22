@@ -172,7 +172,7 @@ type Completion struct {
 
 // Repository owns durable processing state and the atomic completion boundary.
 type Repository interface {
-	PrepareVersion(context.Context, knowledge.DocumentVersion, DerivationIdentity, time.Duration) (VersionState, error)
+	PrepareVersion(context.Context, knowledge.DocumentVersion, DerivationIdentity, modelpolicy.DataMode, time.Duration) (VersionState, error)
 	CompleteVersion(context.Context, Completion) error
 	RecordFailure(context.Context, string, string, VersionStatus, FailureCode) error
 	EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error)
@@ -324,7 +324,7 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if err != nil {
 		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
 	}
-	state, err := service.Repository.PrepareVersion(ctx, version, derivation, service.LeaseDuration)
+	state, err := service.Repository.PrepareVersion(ctx, version, derivation, service.DataMode, service.LeaseDuration)
 	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
 		return Result{}, cancellationErr
 	}
