@@ -20,8 +20,16 @@ func TestDoctorRendersReportAndFailsOnlyForFailedChecks(t *testing.T) {
 			name: "warnings remain executable",
 			report: doctor.Report{Checks: []doctor.Check{
 				{Name: doctor.CheckDatabaseConnectivity, Status: doctor.StatusOK, Message: "PostgreSQL is reachable"},
-				{Name: doctor.CheckInvocationLogging, Status: doctor.StatusWarning, Message: "unknown: invocation logging could not be inspected; do not assume it is disabled"},
+				{Name: doctor.CheckGoogleTabs, Status: doctor.StatusWarning, Message: "synthetic warning"},
 			}},
+		},
+		{
+			name: "restricted disclosure failures stop execution",
+			report: doctor.Report{Checks: []doctor.Check{
+				{Name: doctor.CheckDatabaseConnectivity, Status: doctor.StatusOK, Message: "PostgreSQL is reachable"},
+				{Name: doctor.CheckModelDisclosure, Status: doctor.StatusFailed, Message: "restricted data mode selected; model disclosure safety is not confirmed"},
+			}},
+			wantErr: true,
 		},
 		{
 			name: "failed checks return failure",

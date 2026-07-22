@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 
+	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 )
 
@@ -20,9 +21,9 @@ const (
 	CheckGoogleAuthorization  CheckName = "google.authorization"
 	CheckGoogleFolder         CheckName = "google.folder"
 	CheckGoogleTabs           CheckName = "google.tabs"
-	CheckAWSCredentials       CheckName = "aws.credentials"
-	CheckBedrockModel         CheckName = "bedrock.model"
-	CheckInvocationLogging    CheckName = "bedrock.invocation_logging"
+	CheckModelCredentials     CheckName = "model.credentials"
+	CheckModelAvailability    CheckName = "model.availability"
+	CheckModelDisclosure      CheckName = "model.disclosure"
 )
 
 // Status is the bounded outcome vocabulary rendered by the doctor command.
@@ -86,19 +87,34 @@ type Google interface {
 	GetDocument(context.Context, string) (source.Document, error)
 }
 
-// AWS exposes only credential, model, and logging-configuration inspection.
-type AWS interface {
+// ModelProbe exposes only non-invoking credential and model metadata checks.
+type ModelProbe interface {
 	CheckCredentials(context.Context) error
 	CheckModel(context.Context) error
+}
+
+// DisclosureProbe exposes the read-only provider disclosure state inspected
+// before restricted source content may be read.
+type DisclosureProbe interface {
 	InvocationLogging(context.Context) (InvocationLoggingState, error)
+}
+
+// AWS is retained as the existing combined Bedrock control-plane probe
+// contract until Task 9 updates the composition root.
+type AWS interface {
+	ModelProbe
+	DisclosureProbe
 }
 
 // Service coordinates the read-only checks. It never authenticates, invokes a
 // model, applies migrations, synchronizes documents, or changes cloud config.
 type Service struct {
-	Database Database
-	Google   Google
-	AWS      AWS
+	Database   Database
+	Google     Google
+	Invocation modelpolicy.Invocation
+	Model      ModelProbe
+	Disclosure DisclosureProbe
+	AWS        AWS
 }
 
 // Check performs a fixed number of dependency calls and returns only bounded
@@ -181,36 +197,43 @@ func (service Service) Check(ctx context.Context) Report {
 		}
 	}
 
-	if service.AWS == nil {
-		report.Checks = appendAWSUnavailable(report.Checks, "AWS check is not configured")
+	invocation, model, disclosure := service.modelChecks()
+	if model == nil {
+		report.Checks = appendModelUnavailable(report.Checks, invocation.Provider, fmt.Sprintf("%s model check is not configured", providerName(invocation.Provider)))
 	} else {
-		err := service.AWS.CheckCredentials(ctx)
-		if stop(&report, ctx, CheckAWSCredentials, err) {
+		err := model.CheckCredentials(ctx)
+		if stop(&report, ctx, CheckModelCredentials, err) {
 			return report
 		}
 		if err != nil {
-			report.Checks = appendAWSUnavailable(report.Checks, "AWS credentials are unavailable or expired")
+			report.Checks = appendModelUnavailable(report.Checks, invocation.Provider, fmt.Sprintf("%s credentials are unavailable or invalid", providerName(invocation.Provider)))
 		} else {
-			report.Checks = append(report.Checks, ok(CheckAWSCredentials, "AWS credentials are valid"))
-			err := service.AWS.CheckModel(ctx)
-			if stop(&report, ctx, CheckBedrockModel, err) {
+			report.Checks = append(report.Checks, ok(CheckModelCredentials, fmt.Sprintf("%s credentials are valid", providerName(invocation.Provider))))
+			err := model.CheckModel(ctx)
+			if stop(&report, ctx, CheckModelAvailability, err) {
 				return report
 			}
 			if err != nil {
-				report.Checks = append(report.Checks, failed(CheckBedrockModel, "configured Bedrock model or inference profile is unavailable", "verify STACKS_AWS_REGION, STACKS_BEDROCK_MODEL_ID, model access, and quota"))
+				report.Checks = append(report.Checks, failed(CheckModelAvailability, fmt.Sprintf("configured %s model is unavailable", providerName(invocation.Provider)), "verify STACKS_MODEL_ID, provider access, and quota"))
 			} else {
-				report.Checks = append(report.Checks, ok(CheckBedrockModel, "configured Bedrock model or inference profile is available"))
+				report.Checks = append(report.Checks, ok(CheckModelAvailability, fmt.Sprintf("configured %s model is available", providerName(invocation.Provider))))
 			}
-			state, err := service.AWS.InvocationLogging(ctx)
-			if stop(&report, ctx, CheckInvocationLogging, err) {
-				return report
-			}
-			if err != nil {
-				state = InvocationLoggingUnknown
-			}
-			report.Checks = append(report.Checks, loggingCheck(state))
 		}
 	}
+
+	if invocation.DataMode == modelpolicy.DataModePersonal {
+		report.Checks = append(report.Checks, ok(CheckModelDisclosure, "personal data mode selected; provider logging inspection is not required"))
+		return report
+	}
+	state := InvocationLoggingUnknown
+	var disclosureErr error
+	if disclosure != nil {
+		state, disclosureErr = disclosure.InvocationLogging(ctx)
+		if stop(&report, ctx, CheckModelDisclosure, disclosureErr) {
+			return report
+		}
+	}
+	report.Checks = append(report.Checks, restrictedDisclosureCheck(state, disclosureErr))
 	return report
 }
 
@@ -233,15 +256,11 @@ func classifyTabs(tabs []source.Tab) Check {
 	return ok(CheckGoogleTabs, message)
 }
 
-func loggingCheck(state InvocationLoggingState) Check {
-	switch state {
-	case InvocationLoggingDisabled:
-		return ok(CheckInvocationLogging, string(InvocationLoggingDisabled))
-	case InvocationLoggingEnabled:
-		return Check{Name: CheckInvocationLogging, Status: StatusWarning, Message: "enabled: model inputs and outputs may be disclosed to configured log destinations"}
-	default:
-		return Check{Name: CheckInvocationLogging, Status: StatusWarning, Message: "unknown: invocation logging could not be inspected; do not assume it is disabled"}
+func restrictedDisclosureCheck(state InvocationLoggingState, err error) Check {
+	if err == nil && state == InvocationLoggingDisabled {
+		return ok(CheckModelDisclosure, "restricted data mode selected; Bedrock invocation logging is disabled")
 	}
+	return failed(CheckModelDisclosure, "restricted data mode selected; model disclosure safety is not confirmed", "confirm Bedrock invocation logging is disabled before source access")
 }
 
 func stop(report *Report, ctx context.Context, name CheckName, err error) bool {
@@ -270,12 +289,43 @@ func appendGoogleUnavailable(checks []Check, authorizationMessage string) []Chec
 	)
 }
 
-func appendAWSUnavailable(checks []Check, credentialsMessage string) []Check {
+func appendModelUnavailable(checks []Check, provider modelpolicy.Provider, credentialsMessage string) []Check {
 	return append(checks,
-		failed(CheckAWSCredentials, credentialsMessage, "refresh AWS credentials or the configured profile"),
-		failed(CheckBedrockModel, "not checked because AWS credentials are unavailable", "restore AWS credentials"),
-		loggingCheck(InvocationLoggingUnknown),
+		failed(CheckModelCredentials, credentialsMessage, modelCredentialsRemediation(provider)),
+		failed(CheckModelAvailability, fmt.Sprintf("not checked because %s credentials are unavailable", providerName(provider)), "restore model provider credentials"),
 	)
+}
+
+func (service Service) modelChecks() (modelpolicy.Invocation, ModelProbe, DisclosureProbe) {
+	invocation := service.Invocation
+	model := service.Model
+	disclosure := service.Disclosure
+	if service.AWS != nil {
+		if model == nil {
+			model = service.AWS
+		}
+		if disclosure == nil {
+			disclosure = service.AWS
+		}
+		if invocation.Provider == "" && invocation.DataMode == "" {
+			invocation = modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModePersonal}
+		}
+	}
+	return invocation, model, disclosure
+}
+
+func providerName(provider modelpolicy.Provider) string {
+	if provider.Valid() {
+		return string(provider)
+	}
+	return "model provider"
+}
+
+func modelCredentialsRemediation(provider modelpolicy.Provider) string {
+	if provider == modelpolicy.ProviderBedrock {
+		return "refresh AWS credentials or the configured profile"
+	}
+	return "configure the selected model provider API key"
 }
 
 func ok(name CheckName, message string) Check {

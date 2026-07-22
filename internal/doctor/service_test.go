@@ -6,8 +6,103 @@ import (
 	"strings"
 	"testing"
 
+	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 )
+
+func TestDoctorReportsProviderNeutralModelChecksWithoutRuntimeInvocation(t *testing.T) {
+	model := &fakeModelProbe{}
+	disclosure := &fakeDisclosureProbe{state: InvocationLoggingEnabled}
+	report := (Service{
+		Database:   &fakeDatabase{migrationsCurrent: true},
+		Google:     healthyGoogle(),
+		Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderOpenAI, DataMode: modelpolicy.DataModePersonal},
+		Model:      model,
+		Disclosure: disclosure,
+	}).Check(context.Background())
+
+	assertCheck(t, report, CheckModelCredentials, StatusOK, "openai credentials are valid")
+	assertCheck(t, report, CheckModelAvailability, StatusOK, "configured openai model is available")
+	assertCheck(t, report, CheckModelDisclosure, StatusOK, "personal data mode selected; provider logging inspection is not required")
+	if model.credentialsCalls != 1 || model.modelCalls != 1 || model.invokeCalls != 0 || disclosure.calls != 0 {
+		t.Fatalf("calls = credentials:%d model:%d invoke:%d disclosure:%d, want 1/1/0/0", model.credentialsCalls, model.modelCalls, model.invokeCalls, disclosure.calls)
+	}
+}
+
+func TestDoctorRestrictedDisclosureFailsUnlessDisabledIsConfirmed(t *testing.T) {
+	tests := []struct {
+		name   string
+		state  InvocationLoggingState
+		err    error
+		status Status
+	}{
+		{name: "disabled", state: InvocationLoggingDisabled, status: StatusOK},
+		{name: "enabled", state: InvocationLoggingEnabled, status: StatusFailed},
+		{name: "unknown", state: InvocationLoggingUnknown, status: StatusFailed},
+		{name: "inspection error", err: errors.New("private provider body request-id"), status: StatusFailed},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			disclosure := &fakeDisclosureProbe{state: testCase.state, err: testCase.err}
+			report := (Service{
+				Database:   &fakeDatabase{migrationsCurrent: true},
+				Google:     healthyGoogle(),
+				Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
+				Model:      &fakeModelProbe{},
+				Disclosure: disclosure,
+			}).Check(context.Background())
+			check := findCheck(t, report, CheckModelDisclosure)
+			if check.Status != testCase.status || !strings.Contains(check.Message, "restricted data mode") {
+				t.Fatalf("model disclosure check = %#v", check)
+			}
+			if strings.Contains(check.Message, "private") || len(check.Message) > 160 {
+				t.Fatalf("model disclosure message leaked or is unbounded: %q", check.Message)
+			}
+		})
+	}
+}
+
+func healthyGoogle() *fakeGoogle {
+	return &fakeGoogle{
+		representative:      source.Document{ID: "synthetic-document"},
+		representativeFound: true,
+		document:            source.Document{Tabs: []source.Tab{{Role: source.TabRoleTranscript}}},
+	}
+}
+
+func findCheck(t *testing.T, report Report, name CheckName) Check {
+	t.Helper()
+	for _, check := range report.Checks {
+		if check.Name == name {
+			return check
+		}
+	}
+	t.Fatalf("check %s is missing", name)
+	return Check{}
+}
+
+type fakeModelProbe struct {
+	credentialsErr   error
+	modelErr         error
+	credentialsCalls int
+	modelCalls       int
+	invokeCalls      int
+}
+
+func (fake *fakeModelProbe) CheckCredentials(context.Context) error {
+	fake.credentialsCalls++
+	return fake.credentialsErr
+}
+
+func (fake *fakeModelProbe) CheckModel(context.Context) error {
+	fake.modelCalls++
+	return fake.modelErr
+}
+
+func (fake *fakeModelProbe) Invoke(context.Context) error {
+	fake.invokeCalls++
+	return nil
+}
 
 func TestDoctorChecksEveryReadOnlyDependencyWithoutMutation(t *testing.T) {
 	database := &fakeDatabase{migrationsCurrent: true}
@@ -29,9 +124,9 @@ func TestDoctorChecksEveryReadOnlyDependencyWithoutMutation(t *testing.T) {
 	assertCheck(t, report, CheckGoogleAuthorization, StatusOK, "Google OAuth configuration and token are readable")
 	assertCheck(t, report, CheckGoogleFolder, StatusOK, "configured Google Drive folder is readable")
 	assertCheck(t, report, CheckGoogleTabs, StatusOK, "representative document classified 3 tabs: transcript=1 gemini-notes=1 other=1")
-	assertCheck(t, report, CheckAWSCredentials, StatusOK, "AWS credentials are valid")
-	assertCheck(t, report, CheckBedrockModel, StatusOK, "configured Bedrock model or inference profile is available")
-	assertCheck(t, report, CheckInvocationLogging, StatusOK, "disabled")
+	assertCheck(t, report, CheckModelCredentials, StatusOK, "bedrock credentials are valid")
+	assertCheck(t, report, CheckModelAvailability, StatusOK, "configured bedrock model is available")
+	assertCheck(t, report, CheckModelDisclosure, StatusOK, "personal data mode selected; provider logging inspection is not required")
 	if !report.Healthy() {
 		t.Fatal("Report.Healthy() = false, want true")
 	}
@@ -44,7 +139,7 @@ func TestDoctorChecksEveryReadOnlyDependencyWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestDoctorReportsInvocationLoggingEnabledOrUnknownWithoutClaimingSafety(t *testing.T) {
+func TestDoctorReportsRestrictedInvocationLoggingEnabledOrUnknownAsFailed(t *testing.T) {
 	tests := []struct {
 		name    string
 		state   InvocationLoggingState
@@ -52,15 +147,15 @@ func TestDoctorReportsInvocationLoggingEnabledOrUnknownWithoutClaimingSafety(t *
 		status  Status
 		message string
 	}{
-		{name: "enabled", state: InvocationLoggingEnabled, status: StatusWarning, message: "enabled: model inputs and outputs may be disclosed to configured log destinations"},
-		{name: "access denied", err: errors.New("AccessDeniedException: private account detail"), status: StatusWarning, message: "unknown: invocation logging could not be inspected; do not assume it is disabled"},
-		{name: "other inspection error", err: errors.New("request ID private-request"), status: StatusWarning, message: "unknown: invocation logging could not be inspected; do not assume it is disabled"},
+		{name: "enabled", state: InvocationLoggingEnabled, status: StatusFailed, message: "restricted data mode selected; model disclosure safety is not confirmed"},
+		{name: "access denied", err: errors.New("AccessDeniedException: private account detail"), status: StatusFailed, message: "restricted data mode selected; model disclosure safety is not confirmed"},
+		{name: "other inspection error", err: errors.New("request ID private-request"), status: StatusFailed, message: "restricted data mode selected; model disclosure safety is not confirmed"},
 	}
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			report := healthyService(&fakeAWS{loggingState: testCase.state, loggingErr: testCase.err}).Check(context.Background())
-			check := assertCheck(t, report, CheckInvocationLogging, testCase.status, testCase.message)
+			check := assertCheck(t, report, CheckModelDisclosure, testCase.status, testCase.message)
 			if strings.Contains(check.Message, "private") {
 				t.Fatalf("invocation logging message leaked provider error: %q", check.Message)
 			}
@@ -111,7 +206,7 @@ func TestDoctorBoundsFolderFailureAndSkipsRepresentativeLookup(t *testing.T) {
 func TestDoctorCredentialRemediationSupportsDefaultChainOrConfiguredProfile(t *testing.T) {
 	report := healthyService(&fakeAWS{credentialsErr: errors.New("private AWS identity")}).Check(context.Background())
 
-	check := assertCheck(t, report, CheckAWSCredentials, StatusFailed, "AWS credentials are unavailable or expired")
+	check := assertCheck(t, report, CheckModelCredentials, StatusFailed, "bedrock credentials are unavailable or invalid")
 	if check.Remediation != "refresh AWS credentials or the configured profile" {
 		t.Fatalf("AWS remediation = %q, want credential-chain-neutral guidance", check.Remediation)
 	}
@@ -277,7 +372,8 @@ func TestDoctorStopsAfterSuccessfulCallThatCancelsContext(t *testing.T) {
 
 func healthyService(aws AWS) Service {
 	return Service{
-		Database: &fakeDatabase{migrationsCurrent: true},
+		Database:   &fakeDatabase{migrationsCurrent: true},
+		Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
 		Google: &fakeGoogle{
 			representative:      source.Document{ID: "synthetic-document"},
 			representativeFound: true,

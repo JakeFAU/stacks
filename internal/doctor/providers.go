@@ -16,9 +16,45 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/oauth2"
 
+	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 	"stacks/internal/source/drive"
 )
+
+var (
+	ErrDisclosureNotConfirmed = errors.New("restricted model disclosure is not confirmed")
+	ErrModelAuthentication    = errors.New("model credentials are invalid")
+	ErrModelAuthorization     = errors.New("model metadata access is denied")
+	ErrModelNotFound          = errors.New("configured model was not found")
+	ErrModelUnavailable       = errors.New("model metadata is unavailable")
+	ErrModelInspection        = errors.New("model metadata could not be inspected")
+)
+
+// RequireRestrictedDisclosure enforces the pre-source restricted-data gate.
+// Personal mode performs no logging inspection. Restricted direct providers
+// and every Bedrock state other than confirmed disabled fail closed.
+func RequireRestrictedDisclosure(ctx context.Context, invocation modelpolicy.Invocation, probe DisclosureProbe) error {
+	if invocation.DataMode == modelpolicy.DataModePersonal {
+		return nil
+	}
+	if invocation.DataMode != modelpolicy.DataModeRestricted || invocation.Provider != modelpolicy.ProviderBedrock || probe == nil {
+		return ErrDisclosureNotConfirmed
+	}
+	state, err := probe.InvocationLogging(ctx)
+	if err == nil && state == InvocationLoggingDisabled {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(ErrDisclosureNotConfirmed, ctxErr)
+	}
+	if errors.Is(err, context.Canceled) {
+		return errors.Join(ErrDisclosureNotConfirmed, context.Canceled)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.Join(ErrDisclosureNotConfirmed, context.DeadlineExceeded)
+	}
+	return ErrDisclosureNotConfirmed
+}
 
 const (
 	enableVectorMigrationVersion              int64 = 1

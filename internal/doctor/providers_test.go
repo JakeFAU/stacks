@@ -10,8 +10,85 @@ import (
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
+	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 )
+
+func TestRequireRestrictedDisclosureSkipsPersonalMode(t *testing.T) {
+	probe := &fakeDisclosureProbe{state: InvocationLoggingEnabled}
+	err := RequireRestrictedDisclosure(context.Background(), modelpolicy.Invocation{
+		Provider: modelpolicy.ProviderOpenAI,
+		DataMode: modelpolicy.DataModePersonal,
+	}, probe)
+	if err != nil {
+		t.Fatalf("RequireRestrictedDisclosure() error = %v", err)
+	}
+	if probe.calls != 0 {
+		t.Fatalf("InvocationLogging() calls = %d, want zero", probe.calls)
+	}
+}
+
+func TestRequireRestrictedDisclosureRejectsDirectProvidersWithoutInspection(t *testing.T) {
+	for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
+		t.Run(string(provider), func(t *testing.T) {
+			probe := &fakeDisclosureProbe{state: InvocationLoggingDisabled}
+			err := RequireRestrictedDisclosure(context.Background(), modelpolicy.Invocation{
+				Provider: provider,
+				DataMode: modelpolicy.DataModeRestricted,
+			}, probe)
+			if !errors.Is(err, ErrDisclosureNotConfirmed) {
+				t.Fatalf("RequireRestrictedDisclosure() error = %v, want ErrDisclosureNotConfirmed", err)
+			}
+			if probe.calls != 0 {
+				t.Fatalf("InvocationLogging() calls = %d, want zero", probe.calls)
+			}
+		})
+	}
+}
+
+func TestRequireRestrictedDisclosureFailsClosed(t *testing.T) {
+	privateError := errors.New("AccessDeniedException private-request-id")
+	tests := []struct {
+		name    string
+		state   InvocationLoggingState
+		err     error
+		wantErr error
+	}{
+		{name: "disabled", state: InvocationLoggingDisabled},
+		{name: "enabled", state: InvocationLoggingEnabled, wantErr: ErrDisclosureNotConfirmed},
+		{name: "unknown", state: InvocationLoggingUnknown, wantErr: ErrDisclosureNotConfirmed},
+		{name: "access denied", err: privateError, wantErr: ErrDisclosureNotConfirmed},
+		{name: "timeout", err: context.DeadlineExceeded, wantErr: context.DeadlineExceeded},
+		{name: "cancellation", err: context.Canceled, wantErr: context.Canceled},
+		{name: "missing probe", wantErr: ErrDisclosureNotConfirmed},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			var probe DisclosureProbe
+			fake := &fakeDisclosureProbe{state: testCase.state, err: testCase.err}
+			if testCase.name != "missing probe" {
+				probe = fake
+			}
+			err := RequireRestrictedDisclosure(context.Background(), modelpolicy.Invocation{
+				Provider: modelpolicy.ProviderBedrock,
+				DataMode: modelpolicy.DataModeRestricted,
+				Region:   "us-east-1",
+			}, probe)
+			if testCase.wantErr == nil {
+				if err != nil {
+					t.Fatalf("RequireRestrictedDisclosure() error = %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrDisclosureNotConfirmed) || !errors.Is(err, testCase.wantErr) {
+				t.Fatalf("RequireRestrictedDisclosure() error = %v, want disclosure and %v", err, testCase.wantErr)
+			}
+			if strings.Contains(err.Error(), "private") || len(err.Error()) > 160 {
+				t.Fatalf("RequireRestrictedDisclosure() leaked or returned unbounded error: %q", err)
+			}
+		})
+	}
+}
 
 func TestPostgresProbeChecksRequiredMigrationWithoutApplyingIt(t *testing.T) {
 	connection := &fakePostgresConnection{
@@ -324,6 +401,17 @@ func TestAWSProbeTreatsAnyLoggingConfigurationAsEnabled(t *testing.T) {
 			}
 		})
 	}
+}
+
+type fakeDisclosureProbe struct {
+	state InvocationLoggingState
+	err   error
+	calls int
+}
+
+func (fake *fakeDisclosureProbe) InvocationLogging(context.Context) (InvocationLoggingState, error) {
+	fake.calls++
+	return fake.state, fake.err
 }
 
 type fakePostgresConnection struct {
