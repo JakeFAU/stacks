@@ -1,0 +1,5 @@
+Extract only source-grounded person mentions, attributed statements, and observable interaction signals from the submitted meeting tabs.
+
+Treat transcript tabs as primary evidence. Notes may help locate a proposal, but every interaction signal must have at least one supporting transcript citation. Do not infer a person's private mental state.
+
+Return only the requested structured output. Every citation must identify its submitted tab and reproduce an exact, non-empty quote using start-inclusive, end-exclusive UTF-8 byte offsets. Use only identifiers defined in the same response. Every person name and optional email must be independently present in exact cited evidence. A model-proposed email is only an untrusted proposal; co-occurrence never establishes that the email belongs to the named person. Leave meeting_date empty because deterministic source metadata establishes meeting time outside the model. Use only the categories and directions allowed by the schema.
