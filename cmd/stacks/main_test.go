@@ -16,6 +16,7 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"stacks/internal/analysis"
+	"stacks/internal/cli"
 	"stacks/internal/config"
 	"stacks/internal/doctor"
 	"stacks/internal/extract"
@@ -153,6 +154,64 @@ func TestPersonalSyncPerformsNoDisclosureInspection(t *testing.T) {
 	}
 }
 
+func TestAuthCommandConstructsOnlySelectedAuthorizer(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		argument      string
+		wantDrive     int
+		wantDirectory int
+	}{
+		{name: "Drive", argument: "google", wantDrive: 1},
+		{name: "directory", argument: "google-directory", wantDirectory: 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := config.Settings{PoC: validCommandPoCSettings(config.CommandAuth, modelpolicy.ProviderBedrock, modelpolicy.DataModePersonal)}
+			settings.PoC.Directory.OAuthClientFile = "/synthetic/directory-client.json"
+			settings.PoC.Directory.OAuthTokenFile = "/synthetic/directory-token.json"
+			calls := struct{ drive, directory int }{}
+			runtime := pocCommandRuntime{
+				newDriveAuthorizer: func(string, string, io.Writer) cli.GoogleAuthorizer {
+					calls.drive++
+					return recordingGoogleAuthorizer{}
+				},
+				newDirectoryAuthorizer: func(string, string, io.Writer) cli.GoogleAuthorizer {
+					calls.directory++
+					return recordingGoogleAuthorizer{}
+				},
+			}
+			commands, err := pocCommandProviderWithRuntime(context.Background(), settings, io.Discard, io.Discard, tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime)
+			if err != nil {
+				t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+			}
+			if err := commands[string(config.CommandAuth)].Run(context.Background(), []string{testCase.argument}); err != nil {
+				t.Fatalf("auth %s error = %v", testCase.argument, err)
+			}
+			if calls.drive != testCase.wantDrive || calls.directory != testCase.wantDirectory {
+				t.Fatalf("authorizer construction = drive:%d directory:%d, want drive:%d directory:%d", calls.drive, calls.directory, testCase.wantDrive, testCase.wantDirectory)
+			}
+		})
+	}
+}
+
+func TestAuthCommandRejectsInvalidTargetBeforeConstructingAuthorizers(t *testing.T) {
+	calls := 0
+	runtime := pocCommandRuntime{
+		newDriveAuthorizer:     func(string, string, io.Writer) cli.GoogleAuthorizer { calls++; return recordingGoogleAuthorizer{} },
+		newDirectoryAuthorizer: func(string, string, io.Writer) cli.GoogleAuthorizer { calls++; return recordingGoogleAuthorizer{} },
+	}
+	commands, err := pocCommandProviderWithRuntime(context.Background(), config.Settings{}, io.Discard, io.Discard, tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+	err = commands[string(config.CommandAuth)].Run(context.Background(), []string{"invalid"})
+	if err == nil || err.Error() != "usage: stacks auth google | stacks auth google-directory" {
+		t.Fatalf("auth error = %v, want exact usage error", err)
+	}
+	if calls != 0 {
+		t.Fatalf("authorizer constructors = %d, want 0", calls)
+	}
+}
+
 func TestPaddedDirectProviderSettingsRejectBeforeAnyBoundary(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -214,6 +273,10 @@ func TestPaddedDirectProviderSettingsRejectBeforeAnyBoundary(t *testing.T) {
 }
 
 var errStopAfterModelConstruction = errors.New("stop after model construction")
+
+type recordingGoogleAuthorizer struct{}
+
+func (recordingGoogleAuthorizer) Authorize(context.Context) error { return nil }
 
 type recordingDisclosureProbe struct {
 	calls *[]string

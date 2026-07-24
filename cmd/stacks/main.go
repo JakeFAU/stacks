@@ -23,6 +23,7 @@ import (
 	"stacks/internal/doctor"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
+	"stacks/internal/googledirectory"
 	"stacks/internal/ingest"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
@@ -112,7 +113,8 @@ type doctorDatabase interface {
 }
 
 type pocCommandRuntime struct {
-	newAuthorizer           func(string, string, io.Writer) cli.GoogleAuthorizer
+	newDriveAuthorizer      func(string, string, io.Writer) cli.GoogleAuthorizer
+	newDirectoryAuthorizer  func(string, string, io.Writer) cli.GoogleAuthorizer
 	newDoctorDatabase       func(string) doctorDatabase
 	newDoctorGoogle         func(config.PoCSettings) doctor.Google
 	newDoctorProviderProbe  func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
@@ -124,8 +126,11 @@ type pocCommandRuntime struct {
 
 func defaultPoCCommandRuntime() pocCommandRuntime {
 	return pocCommandRuntime{
-		newAuthorizer: func(clientFile, tokenFile string, output io.Writer) cli.GoogleAuthorizer {
+		newDriveAuthorizer: func(clientFile, tokenFile string, output io.Writer) cli.GoogleAuthorizer {
 			return drive.NewAuthorizer(clientFile, tokenFile, output)
+		},
+		newDirectoryAuthorizer: func(clientFile, tokenFile string, output io.Writer) cli.GoogleAuthorizer {
+			return googledirectory.NewAuthorizer(clientFile, tokenFile, output)
 		},
 		newDoctorDatabase: func(databaseURL string) doctorDatabase {
 			return doctor.NewPostgresProbe(databaseURL)
@@ -173,15 +178,33 @@ func pocCommandProviderWithRuntime(
 ) (map[string]cli.Command, error) {
 	return map[string]cli.Command{
 		string(config.CommandAuth): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			if err := settings.PoC.Validate(config.CommandAuth); err != nil {
-				return err
+			if len(args) != 1 {
+				return (cli.AuthCommand{}).Run(ctx, args)
 			}
-			if runtime.newAuthorizer == nil {
-				return errors.New("google authorization is not configured")
+			switch config.GoogleAuthTarget(args[0]) {
+			case config.GoogleAuthDrive:
+				if err := settings.PoC.ValidateGoogleAuth(config.GoogleAuthDrive); err != nil {
+					return err
+				}
+				if runtime.newDriveAuthorizer == nil {
+					return errors.New("google authorization is not configured")
+				}
+				return (cli.AuthCommand{GoogleDrive: runtime.newDriveAuthorizer(
+					settings.PoC.GoogleOAuthClientFile, settings.PoC.GoogleOAuthTokenFile, stdout,
+				)}).Run(ctx, args)
+			case config.GoogleAuthDirectory:
+				if err := settings.PoC.ValidateGoogleAuth(config.GoogleAuthDirectory); err != nil {
+					return err
+				}
+				if runtime.newDirectoryAuthorizer == nil {
+					return errors.New("google directory authorization is not configured")
+				}
+				return (cli.AuthCommand{GoogleDirectory: runtime.newDirectoryAuthorizer(
+					settings.PoC.Directory.OAuthClientFile, settings.PoC.Directory.OAuthTokenFile, stdout,
+				)}).Run(ctx, args)
+			default:
+				return (cli.AuthCommand{}).Run(ctx, args)
 			}
-			return (cli.AuthCommand{Google: runtime.newAuthorizer(
-				settings.PoC.GoogleOAuthClientFile, settings.PoC.GoogleOAuthTokenFile, stdout,
-			)}).Run(ctx, args)
 		}),
 		string(config.CommandDoctor): cli.CommandFunc(func(ctx context.Context, args []string) error {
 			if err := settings.PoC.Validate(config.CommandDoctor); err != nil {
