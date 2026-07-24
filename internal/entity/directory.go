@@ -177,6 +177,9 @@ func (policy DirectoryPolicy) evaluateEmail(query DirectoryQuery, profiles []Dir
 }
 
 func (policy DirectoryPolicy) canAutomaticallyAccept(query DirectoryQuery, email string, profile DirectoryProfile) bool {
+	if !hasDirectoryIdentityBinding(profile) {
+		return false
+	}
 	if query.EmailEvidence != EmailEvidenceSourceBound && query.EmailEvidence != EmailEvidenceReviewerSupplied {
 		return false
 	}
@@ -184,6 +187,13 @@ func (policy DirectoryPolicy) canAutomaticallyAccept(query DirectoryQuery, email
 		return false
 	}
 	return profile.Source == DirectorySourceDomainProfile
+}
+
+// hasDirectoryIdentityBinding verifies that an automatic decision can retain a
+// provider-scoped directory identity. ObservedAt is intentionally not checked:
+// source observation time may be unknown.
+func hasDirectoryIdentityBinding(profile DirectoryProfile) bool {
+	return strings.TrimSpace(profile.Provider) != "" && strings.TrimSpace(profile.SubjectID) != ""
 }
 
 func matchingDirectoryProfiles(email string, profiles []DirectoryProfile) []DirectoryProfile {

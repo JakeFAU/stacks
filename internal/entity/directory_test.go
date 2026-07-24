@@ -46,6 +46,32 @@ func TestDirectoryPolicyAutoCreatesForUniqueSourceBoundApprovedEmail(t *testing.
 	}
 }
 
+func TestDirectoryPolicyKeepsProfilesWithoutDirectoryBindingReviewOnly(t *testing.T) {
+	policy := directoryPolicy(t)
+	for _, test := range []struct {
+		name     string
+		provider string
+		subject  string
+	}{
+		{name: "blank provider", provider: "", subject: "100"},
+		{name: "whitespace provider", provider: " \t", subject: "100"},
+		{name: "blank subject", provider: "google", subject: ""},
+		{name: "whitespace subject", provider: "google", subject: " \t"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			evaluation := policy.Evaluate(DirectoryQuery{
+				Kind:          DirectoryQueryEmail,
+				Email:         "riya.chen@corp.example",
+				EmailEvidence: EmailEvidenceSourceBound,
+			}, []DirectoryProfile{directoryProfile(test.provider, test.subject, DirectorySourceDomainProfile, "Riya Chen", "riya.chen@corp.example")}, nil, nil)
+
+			if evaluation.Outcome != DirectoryReview || evaluation.CreatePerson || evaluation.EntityID != "" || evaluation.AcceptedEmail != "" || evaluation.Profile != nil {
+				t.Fatalf("evaluation = %#v, want unbound profile to remain review-only", evaluation)
+			}
+		})
+	}
+}
+
 func TestDirectoryPolicyUsesExistingUniqueAcceptedEmailOwner(t *testing.T) {
 	policy := directoryPolicy(t)
 	evaluation := policy.Evaluate(DirectoryQuery{
