@@ -19,6 +19,7 @@ import (
 	openaisdk "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -120,6 +121,9 @@ func TestGenerateSendsOnlyStrictStatelessStructuredResponseRequest(t *testing.T)
 	if !params.Store.Valid() || params.Store.Value || !params.Background.Valid() || params.Background.Value {
 		t.Fatalf("Store/Background = %#v/%#v, want explicit false", params.Store, params.Background)
 	}
+	if params.Reasoning.Effort != shared.ReasoningEffortNone {
+		t.Fatalf("Reasoning.Effort = %q, want none", params.Reasoning.Effort)
+	}
 	format := params.Text.Format.OfJSONSchema
 	if format == nil || format.Name != request.SchemaName || !format.Strict.Valid() || !format.Strict.Value {
 		t.Fatalf("Text.Format = %#v, want strict JSON Schema", params.Text.Format)
@@ -194,6 +198,22 @@ func TestGenerateAcceptsOneCompletedJSONTextResult(t *testing.T) {
 		t.Fatalf("Generate() metadata = %+v", response)
 	}
 	assertOneObservation(t, recorder, OutcomeSuccess, 1)
+}
+
+func TestGenerateAcceptsCompletedReasoningItemBeforeSingleJSONMessage(t *testing.T) {
+	output := decodedResponse(t, responseJSON(testModelID, "completed", `[
+		{"type":"reasoning","status":"completed","summary":[]},
+		{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"answer\":true}"}]}
+	]`, validUsageJSON))
+	client := newTestClient(t, &fakeResponsesAPI{outputs: []*responses.Response{output}}, &recordingInvocationRecorder{}, 1)
+
+	response, err := client.Generate(context.Background(), validRequest())
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if string(response.Output) != `{"answer":true}` {
+		t.Fatalf("Generate() output = %q", response.Output)
+	}
 }
 
 func TestGenerateRejectsEveryNonCanonicalResponseShape(t *testing.T) {
@@ -619,6 +639,7 @@ func assertExactRequestJSON(t *testing.T, encoded []byte, request extract.Reques
 		"input":             request.Input,
 		"max_output_tokens": float64(321),
 		"model":             testModelID,
+		"reasoning":         map[string]any{"effort": "none"},
 		"store":             false,
 		"text": map[string]any{"format": map[string]any{
 			"name": request.SchemaName, "schema": schema, "strict": true, "type": "json_schema",

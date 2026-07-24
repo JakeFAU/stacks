@@ -275,6 +275,13 @@ derivation contract changed. A Drive revision-marker change alone therefore
 does not create a duplicate source version. The original revision remains
 immutable provenance.
 
+Migration 11 gives each logical source document an explicit current completed
+version. A changed document switches that pointer only when its validated
+extraction commits atomically; prior versions and derivations remain immutable
+audit history but no longer contribute identities or signals to current review
+and analysis. Re-observing an already completed version reuses its extraction
+without another model call and makes that version current again.
+
 Doctor's provider availability checks do not invoke a model and therefore
 cannot prove runtime quota, throughput, compatible structured output, or
 successful inference. A credential and model metadata check can pass while

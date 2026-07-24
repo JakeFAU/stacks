@@ -118,6 +118,41 @@ func decodeExtractionForTest(t *testing.T, submitted SubmittedText, output Extra
 	return decoded
 }
 
+func TestDecodeExtractionGroundsUniqueExactQuoteToLocalByteOffsets(t *testing.T) {
+	const prefix = "synthetic prefix. "
+	submitted := validSubmittedText()
+	submitted.Tabs[0].Text = prefix + submitted.Tabs[0].Text
+	output := validExtraction()
+	output.Citations[0].StartOffset = 100
+	output.Citations[0].EndOffset = 100 + len(output.Citations[0].Quote)
+
+	got := decodeExtractionForTest(t, submitted, output)
+	if got.Citations[0].StartOffset != len(prefix) ||
+		got.Citations[0].EndOffset != len(prefix)+len(output.Citations[0].Quote) {
+		t.Fatalf("citation offsets = %d:%d, want %d:%d",
+			got.Citations[0].StartOffset, got.Citations[0].EndOffset,
+			len(prefix), len(prefix)+len(output.Citations[0].Quote))
+	}
+}
+
+func TestDecodeExtractionRejectsWrongOffsetsForRepeatedExactQuote(t *testing.T) {
+	submitted := validSubmittedText()
+	submitted.Tabs[0].Text += " " + submittedTranscript
+	output := validExtraction()
+	output.Citations[0].StartOffset = 100
+	output.Citations[0].EndOffset = 100 + len(output.Citations[0].Quote)
+	output.Signals[0].ContradictingCitationIDs = []string{}
+	raw, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("marshal extraction: %v", err)
+	}
+
+	_, err = DecodeAndValidateExtraction(submitted, raw)
+	if err == nil {
+		t.Fatal("DecodeAndValidateExtraction() error = nil, want ambiguous quote rejection")
+	}
+}
+
 func TestValidateExtractionAcceptsExactUTF8ByteCitations(t *testing.T) {
 	text := SubmittedText{Tabs: []SubmittedTab{
 		{ID: "transcript-tab", Role: TabRoleTranscript, Text: "é assigned the follow-up."},

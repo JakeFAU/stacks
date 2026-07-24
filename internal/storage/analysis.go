@@ -164,12 +164,17 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairIdentity(ctx context.Context, 
 		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+		LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+		LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 		JOIN stacks.entities AS entity ON entity.id = decision.entity_id
 		WHERE decision.superseded_by_id IS NULL
 		  AND decision.outcome IN ('accepted', 'created')
 		  AND decision.currently_admissible
 		  AND mention.currently_admissible
-		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
+		  AND (mention.extraction_run_id IS NULL OR (
+		      extraction_run.currently_admissible
+		      AND source_document.current_document_version_id = extraction_run.document_version_id
+		  ))
 		  AND entity.kind = 'person'
 		  AND decision.entity_id = ANY($2::uuid[])
 		ORDER BY CASE WHEN decision.entity_id = $1::uuid THEN 0 ELSE 1 END,
@@ -211,12 +216,17 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 			FROM stacks.resolution_proposals AS proposal
 			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 			LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+			LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+			LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 			JOIN stacks.resolution_decisions AS decision ON decision.proposal_id = proposal.id
 			WHERE decision.superseded_by_id IS NULL
 			  AND decision.outcome IN ('accepted', 'created')
 			  AND decision.currently_admissible
 			  AND mention.currently_admissible
-			  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
+			  AND (mention.extraction_run_id IS NULL OR (
+			      extraction_run.currently_admissible
+			      AND source_document.current_document_version_id = extraction_run.document_version_id
+			  ))
 		), eligible_signals AS (
 			SELECT signal.id AS signal_id,
 			       signal.digest AS signal_digest,
@@ -247,13 +257,18 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 			FROM stacks.interaction_signals AS signal
 			JOIN stacks.observations AS observation ON observation.id = signal.observation_id
 			LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = observation.extraction_run_id
+			LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+			LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 			JOIN effective_decisions AS subject_decision ON subject_decision.mention_id = observation.subject_mention_id
 			JOIN effective_decisions AS object_decision ON object_decision.mention_id = observation.object_mention_id
 			WHERE subject_decision.entity_id = $2::uuid
 			  AND object_decision.entity_id = $1::uuid
 			  AND signal.currently_admissible
 			  AND observation.currently_admissible
-			  AND (observation.extraction_run_id IS NULL OR extraction_run.currently_admissible)
+			  AND (observation.extraction_run_id IS NULL OR (
+			      extraction_run.currently_admissible
+			      AND source_document.current_document_version_id = extraction_run.document_version_id
+			  ))
 			  AND EXISTS (
 					SELECT 1
 					FROM stacks.signal_evidence AS supporting
@@ -820,12 +835,17 @@ func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalys
 			JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
 			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 			LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+			LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+			LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 			WHERE decision.id = $1
 			  AND decision.superseded_by_id IS NULL
 			  AND decision.outcome IN ('accepted', 'created')
 			  AND decision.currently_admissible
 			  AND mention.currently_admissible
-			  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
+			  AND (mention.extraction_run_id IS NULL OR (
+			      extraction_run.currently_admissible
+			      AND source_document.current_document_version_id = extraction_run.document_version_id
+			  ))
 			FOR SHARE OF decision`, input.ID).Scan(&storedDigest, &entityID)
 		if err == pgx.ErrNoRows {
 			return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)

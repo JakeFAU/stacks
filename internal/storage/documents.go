@@ -318,6 +318,7 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 	claimedAt := time.Now().UTC()
 	leaseExpiresAt := claimedAt.Add(leaseDuration)
 	state := ingest.VersionState{ID: stored.ID, DerivationDigest: derivation.Digest}
+	storedAdmissible := true
 	storedRegion := nullableModelRegion(derivation.Provider, derivation.Region)
 	err = transaction.QueryRow(ctx, `
 		INSERT INTO stacks.extraction_runs
@@ -343,12 +344,14 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 		var storedSchemaDigest []byte
 		if err := transaction.QueryRow(ctx, `
 			SELECT id, processing_status, retry_count, failure_code, lease_owner, lease_expires_at,
-			       model_provider, data_mode, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest
+			       model_provider, data_mode, model_id, bedrock_region, max_output_tokens, prompt_version,
+			       schema_digest, currently_admissible
 			FROM stacks.extraction_runs
 			WHERE document_version_id = $1 AND derivation_digest = $2
 			FOR UPDATE`, stored.ID, derivation.Digest[:]).Scan(
 			&state.DerivationID, &status, &state.RetryCount, &failureCode, &activeOwner, &activeUntil,
-			&storedProvider, &storedDataMode, &storedModelID, &storedBedrockRegion, &storedMaxTokens, &storedPromptVersion, &storedSchemaDigest,
+			&storedProvider, &storedDataMode, &storedModelID, &storedBedrockRegion, &storedMaxTokens,
+			&storedPromptVersion, &storedSchemaDigest, &storedAdmissible,
 		); err != nil {
 			return ingest.VersionState{}, fmt.Errorf("load ingestion derivation state: %w", err)
 		}
@@ -383,6 +386,11 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 		}
 	} else {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion derivation: %w", err)
+	}
+	if state.Status == ingest.VersionStatusComplete && storedAdmissible {
+		if err := setCurrentDocumentVersion(ctx, transaction, stored.ID); err != nil {
+			return ingest.VersionState{}, err
+		}
 	}
 	if err := transaction.Commit(ctx); err != nil {
 		return ingest.VersionState{}, fmt.Errorf("commit ingestion version preparation: %w", err)
@@ -447,12 +455,15 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 
 	var storedVersionID, status, storedDataMode string
+	var storedAdmissible bool
 	var activeOwner, completedByOwner *string
 	var activeUntil *time.Time
 	if err := transaction.QueryRow(ctx, `
-		SELECT document_version_id, processing_status, data_mode, lease_owner, lease_expires_at, completed_by_owner
+		SELECT document_version_id, processing_status, data_mode, lease_owner, lease_expires_at,
+		       completed_by_owner, currently_admissible
 		FROM stacks.extraction_runs WHERE id = $1 FOR UPDATE`, completion.DerivationID).Scan(
 		&storedVersionID, &status, &storedDataMode, &activeOwner, &activeUntil, &completedByOwner,
+		&storedAdmissible,
 	); err != nil {
 		return fmt.Errorf("lock ingestion derivation: %w", err)
 	}
@@ -462,6 +473,11 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if status == string(ingest.VersionStatusComplete) {
 		if completedByOwner == nil || *completedByOwner != completion.LeaseOwner {
 			return fmt.Errorf("complete ingestion version: completion lease is not owned")
+		}
+		if storedAdmissible {
+			if err := setCurrentDocumentVersion(ctx, transaction, completion.VersionID); err != nil {
+				return err
+			}
 		}
 		return transaction.Commit(ctx)
 	}
@@ -495,8 +511,29 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if result.RowsAffected() != 1 {
 		return fmt.Errorf("mark ingestion derivation complete: active lease is not owned")
 	}
+	if storedAdmissible {
+		if err := setCurrentDocumentVersion(ctx, transaction, completion.VersionID); err != nil {
+			return err
+		}
+	}
 	if err := transaction.Commit(ctx); err != nil {
 		return fmt.Errorf("commit ingestion version %q: %w", completion.VersionID, err)
+	}
+	return nil
+}
+
+func setCurrentDocumentVersion(ctx context.Context, transaction pgx.Tx, versionID string) error {
+	result, err := transaction.Exec(ctx, `
+		UPDATE stacks.source_documents AS source
+		SET current_document_version_id = $1
+		FROM stacks.document_versions AS version
+		WHERE version.id = $1
+		  AND source.id = version.source_document_id`, versionID)
+	if err != nil {
+		return fmt.Errorf("set current document version %q: %w", versionID, err)
+	}
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf("set current document version %q: source document does not exist", versionID)
 	}
 	return nil
 }

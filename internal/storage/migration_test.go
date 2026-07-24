@@ -303,6 +303,32 @@ func TestModelProviderProvenanceMigrationBackfillsAndConstrainsRunMetadata(t *te
 	}
 }
 
+func TestCurrentDocumentVersionMigrationAddsOwnedCurrentPointerWithoutRewritingHistory(t *testing.T) {
+	migration := readCurrentDocumentVersionMigration(t)
+	for _, required := range []string{
+		"ADD COLUMN current_document_version_id uuid",
+		"CREATE UNIQUE INDEX document_versions_source_document_identity",
+		"FOREIGN KEY (id, current_document_version_id)",
+		"REFERENCES stacks.document_versions (source_document_id, id)",
+		"processing_status = 'complete'",
+		"extraction_run.currently_admissible",
+	} {
+		if !strings.Contains(migration, required) {
+			t.Fatalf("current-document-version migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"DELETE FROM",
+		"UPDATE stacks.document_versions",
+		"UPDATE stacks.extraction_runs",
+		"-- +goose Down",
+	} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("current-document-version migration rewrites immutable history with %q", forbidden)
+		}
+	}
+}
+
 func readManagerConfidenceMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00002_manager_confidence_poc.sql")
@@ -356,6 +382,16 @@ func readSnapshotCoherenceAdmissionMigration(t *testing.T) string {
 func readModelProviderProvenanceMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00010_model_provider_provenance.sql")
+	migration, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", path, err)
+	}
+	return string(migration)
+}
+
+func readCurrentDocumentVersionMigration(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join("..", "..", "db", "migrations", "00011_current_document_version.sql")
 	migration, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration %q: %v", path, err)

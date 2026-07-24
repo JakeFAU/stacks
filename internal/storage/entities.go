@@ -182,11 +182,21 @@ func (repository *IngestionRepository) EntitySnapshots(ctx context.Context) ([]e
 			SELECT DISTINCT assertion.alias_type, assertion.normalized_value
 			FROM stacks.entity_alias_assertions AS assertion
 			JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+			JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+			LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+			LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+			LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 			WHERE assertion.entity_id = $1
 			  AND decision.entity_id = assertion.entity_id
 			  AND decision.outcome IN ('accepted', 'created')
 			  AND decision.superseded_by_id IS NULL
 			  AND decision.currently_admissible
+			  AND mention.currently_admissible
+			  AND (mention.extraction_run_id IS NULL OR (
+			      extraction_run.currently_admissible
+			      AND source_document.current_document_version_id = extraction_run.document_version_id
+			  ))
 			ORDER BY alias_type, normalized_value`, snapshots[index].ID)
 		if err != nil {
 			return nil, fmt.Errorf("list ingestion entity aliases: %w", err)
@@ -526,11 +536,21 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 		SELECT DISTINCT assertion.normalized_value
 		FROM stacks.entity_alias_assertions AS assertion
 		JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+		LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+		LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 		WHERE assertion.entity_id = $1
 		  AND decision.entity_id = assertion.entity_id
 		  AND decision.outcome IN ('accepted', 'created')
 		  AND decision.superseded_by_id IS NULL
 		  AND decision.currently_admissible
+		  AND mention.currently_admissible
+		  AND (mention.extraction_run_id IS NULL OR (
+		      extraction_run.currently_admissible
+		      AND source_document.current_document_version_id = extraction_run.document_version_id
+		  ))
 		ORDER BY assertion.normalized_value`, entityID)
 	if err != nil {
 		return EntityDetail{}, fmt.Errorf("list aliases for entity %q: %w", entityID, err)
@@ -552,10 +572,15 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+		LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+		LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 		WHERE decision.entity_id = $1 AND decision.outcome IN ('accepted', 'created')
 		  AND decision.superseded_by_id IS NULL AND decision.currently_admissible
 		  AND mention.currently_admissible
-		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)`, entityID).Scan(&detail.MentionCount); err != nil {
+		  AND (mention.extraction_run_id IS NULL OR (
+		      extraction_run.currently_admissible
+		      AND source_document.current_document_version_id = extraction_run.document_version_id
+		  ))`, entityID).Scan(&detail.MentionCount); err != nil {
 		return EntityDetail{}, fmt.Errorf("count mentions for entity %q: %w", entityID, err)
 	}
 	evidence, err := repository.pool.Query(ctx, `
@@ -564,11 +589,16 @@ func (repository *EntityRepository) ShowEntityDetail(ctx context.Context, entity
 		JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+		LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+		LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
 		WHERE decision.entity_id = $1 AND decision.outcome IN ('accepted', 'created')
 		  AND decision.superseded_by_id IS NULL AND decision.currently_admissible
 		  AND mention.currently_admissible
-		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
+		  AND (mention.extraction_run_id IS NULL OR (
+		      extraction_run.currently_admissible
+		      AND source_document.current_document_version_id = extraction_run.document_version_id
+		  ))
 		ORDER BY span.quote`, entityID)
 	if err != nil {
 		return EntityDetail{}, fmt.Errorf("list evidence for entity %q: %w", entityID, err)
@@ -594,10 +624,15 @@ func (repository *EntityRepository) ListResolutionProposalDetails(ctx context.Co
 		FROM stacks.resolution_proposals AS proposal
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+		LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+		LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
 		WHERE proposal.status = 'pending'
 		  AND mention.currently_admissible
-		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)
+		  AND (mention.extraction_run_id IS NULL OR (
+		      extraction_run.currently_admissible
+		      AND source_document.current_document_version_id = extraction_run.document_version_id
+		  ))
 		ORDER BY proposal.recorded_at, proposal.id`)
 	if err != nil {
 		return nil, fmt.Errorf("list resolution proposals: %w", err)
@@ -631,10 +666,15 @@ func (repository *EntityRepository) ShowResolutionProposalDetail(ctx context.Con
 		FROM stacks.resolution_proposals AS proposal
 		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
 		LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+		LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+		LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
 		JOIN stacks.evidence_spans AS span ON span.id = mention.evidence_span_id
 		WHERE proposal.id = $1
 		  AND mention.currently_admissible
-		  AND (mention.extraction_run_id IS NULL OR extraction_run.currently_admissible)`, proposalID).Scan(&proposal.ID, &proposal.Context)
+		  AND (mention.extraction_run_id IS NULL OR (
+		      extraction_run.currently_admissible
+		      AND source_document.current_document_version_id = extraction_run.document_version_id
+		  ))`, proposalID).Scan(&proposal.ID, &proposal.Context)
 	if err != nil {
 		return ResolutionProposalDetail{}, fmt.Errorf("show resolution proposal %q: %w", proposalID, err)
 	}

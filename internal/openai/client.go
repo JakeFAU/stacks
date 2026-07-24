@@ -18,6 +18,7 @@ import (
 	openaisdk "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared"
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
@@ -205,6 +206,7 @@ func (client *Client) responseParams(request extract.Request) (responses.Respons
 		Input:           responses.ResponseNewParamsInputUnion{OfString: openaisdk.String(request.Input)},
 		MaxOutputTokens: openaisdk.Int(client.maxOutputTokens),
 		Model:           responses.ResponsesModel(client.modelID),
+		Reasoning:       shared.ReasoningParam{Effort: shared.ReasoningEffortNone},
 		Store:           openaisdk.Bool(false),
 		Text:            responses.ResponseTextConfigParam{Format: format},
 	}, nil
@@ -212,10 +214,24 @@ func (client *Client) responseParams(request extract.Request) (responses.Respons
 
 func (client *Client) response(promptVersion string, output *responses.Response) (extract.Response, error) {
 	if output == nil || output.Status != responses.ResponseStatusCompleted || string(output.Model) != client.modelID ||
-		!output.JSON.Usage.Valid() || len(output.Output) != 1 {
+		!output.JSON.Usage.Valid() {
 		return extract.Response{}, ErrInvalidOutput
 	}
-	item := output.Output[0]
+	messageIndex := -1
+	for index := range output.Output {
+		itemType := output.Output[index].Type
+		if itemType == "reasoning" && messageIndex == -1 {
+			continue
+		}
+		if itemType != "message" || messageIndex != -1 {
+			return extract.Response{}, ErrInvalidOutput
+		}
+		messageIndex = index
+	}
+	if messageIndex == -1 {
+		return extract.Response{}, ErrInvalidOutput
+	}
+	item := output.Output[messageIndex]
 	if item.Type != "message" || item.Status != string(responses.ResponseOutputMessageStatusCompleted) || len(item.Content) != 1 {
 		return extract.Response{}, ErrInvalidOutput
 	}
