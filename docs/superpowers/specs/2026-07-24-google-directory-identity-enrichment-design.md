@@ -1,7 +1,7 @@
 # Google Directory Identity Enrichment
 
 **Date:** 2026-07-24  
-**Status:** Draft for user review  
+**Status:** Approved for implementation planning
 **Scope:** Optional, on-demand Google Workspace directory identity enrichment for unresolved people in the manager-confidence workflow
 
 ## Context
