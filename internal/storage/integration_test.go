@@ -1981,6 +1981,126 @@ func TestModelProviderProvenancePersistsAnalysisCompletionAndDeduplicatesAcrossM
 	}
 }
 
+func TestPairAnalysisUsesOnlyCurrentCompletedVersionOfEachSourceDocument(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	entities := NewEntityRepository(pool)
+	repository := NewAnalysisRepository(pool)
+
+	employee, err := entities.CreateEntity(ctx, EntityInput{
+		ID: uuid.NewString(), Kind: "person", DisplayName: "Jordan Employee",
+	})
+	if err != nil {
+		t.Fatalf("create employee: %v", err)
+	}
+	manager, err := entities.CreateEntity(ctx, EntityInput{
+		ID: uuid.NewString(), Kind: "person", DisplayName: "Alex Manager",
+	})
+	if err != nil {
+		t.Fatalf("create manager: %v", err)
+	}
+
+	providerDocumentID := testIdentifier("document-current-version-analysis")
+	completeVersionedPairSignal(t, pool, providerDocumentID, "synthetic-revision-1",
+		"Alex Manager assigned planning work to Jordan Employee.", employee.ID, manager.ID)
+	completeVersionedPairSignal(t, pool, providerDocumentID, "synthetic-revision-2",
+		"Alex Manager assigned final review work to Jordan Employee.", employee.ID, manager.ID)
+
+	pair, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	if err != nil {
+		t.Fatalf("load current-version pair inputs: %v", err)
+	}
+	if !pair.Accepted || len(pair.Signals) != 1 {
+		t.Fatalf("current-version pair accepted/signals = %t/%d, want true/1", pair.Accepted, len(pair.Signals))
+	}
+	if len(pair.Signals[0].Citations) != 1 ||
+		pair.Signals[0].Citations[0].Quote != "Alex Manager assigned final review work to Jordan Employee." {
+		t.Fatalf("current-version evidence = %#v, want only the latest completed source version", pair.Signals[0].Citations)
+	}
+}
+
+func completeVersionedPairSignal(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	providerDocumentID string,
+	providerRevision string,
+	transcript string,
+	employeeID string,
+	managerID string,
+) {
+	t.Helper()
+	ctx := context.Background()
+	recordedAt := time.Now().UTC()
+	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider:           "synthetic-drive",
+		ProviderDocumentID: providerDocumentID,
+		Title:              "[2026-07-24] Synthetic current-version meeting",
+		Locator:            "https://docs.example.invalid/document/" + providerDocumentID,
+		ProviderVersion:    "synthetic-version",
+		ProviderRevision:   providerRevision,
+		ModifiedAt:         recordedAt,
+		RecordedAt:         recordedAt,
+		Tabs: []source.Tab{{
+			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
+			Role: source.TabRoleTranscript, Text: transcript,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("new current-version document: %v", err)
+	}
+	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, TabID: "tab-synthetic",
+		StartOffset: 0, EndOffset: len(transcript), Quote: transcript,
+	})
+	if err != nil {
+		t.Fatalf("new current-version evidence: %v", err)
+	}
+	ingestion := NewIngestionRepository(pool)
+	state, err := ingestion.PrepareVersion(
+		ctx,
+		version,
+		testExtractionDerivation(t, version),
+		modelpolicy.DataModePersonal,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare current-version extraction: %v", err)
+	}
+	validTime := time.Date(2026, time.July, 24, 0, 0, 0, 0, time.UTC)
+	observationID := uuid.NewString()
+	if err := ingestion.CompleteVersion(ctx, ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+		Evidence: []ingest.EvidenceRecord{{Key: "evidence", Span: span}},
+		Mentions: []ingest.MentionRecord{
+			{
+				Key: "manager", EvidenceKey: "evidence", Surface: "Alex Manager",
+				NormalizedName: entity.NormalizeName("Alex Manager"), Role: "speaker",
+				Resolution: entity.Resolution{EntityID: managerID, AutoResolved: true},
+			},
+			{
+				Key: "employee", EvidenceKey: "evidence", Surface: "Jordan Employee",
+				NormalizedName: entity.NormalizeName("Jordan Employee"), Role: "reference",
+				Resolution: entity.Resolution{EntityID: employeeID, AutoResolved: true},
+			},
+		},
+		Observations: []ingest.ObservationRecord{{
+			ID: observationID, SubjectEntityID: managerID, ObjectEntityID: employeeID,
+			SubjectMentionKey: "manager", ObjectMentionKey: "employee",
+			Predicate: "interaction_signal", ValidStart: &validTime, EvidenceKeys: []string{"evidence"},
+		}},
+		Signals: []ingest.SignalRecord{{
+			ID: uuid.NewString(), ObservationID: observationID,
+			Category: "delegation_autonomy", Direction: "strengthening",
+			ExtractionModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+			Rationale: "Synthetic source-grounded signal.", Confidence: 0.9,
+			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "evidence", Role: "supporting"}},
+		}},
+	}); err != nil {
+		t.Fatalf("complete current-version extraction: %v", err)
+	}
+}
+
 func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()

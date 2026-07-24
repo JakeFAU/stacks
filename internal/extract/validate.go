@@ -127,11 +127,39 @@ func DecodeAndValidateExtraction(submitted SubmittedText, raw []byte) (Extractio
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return ExtractionOutput{}, fmt.Errorf("extraction output failed schema decoding")
 	}
+	output = groundUniqueCitationOffsets(submitted, output)
 	if err := ValidateExtraction(submitted, output); err != nil {
 		return ExtractionOutput{}, err
 	}
 	output.MeetingDate = groundedMeetingDate(submitted, output)
 	return output, nil
+}
+
+func groundUniqueCitationOffsets(submitted SubmittedText, output ExtractionOutput) ExtractionOutput {
+	tabs := make(map[string]string, len(submitted.Tabs))
+	for _, tab := range submitted.Tabs {
+		tabs[tab.ID] = tab.Text
+	}
+	for index := range output.Citations {
+		citation := &output.Citations[index]
+		text, exists := tabs[citation.TabID]
+		if !exists || citation.Quote == "" || citationMatchesText(*citation, text) {
+			continue
+		}
+		start := strings.Index(text, citation.Quote)
+		if start < 0 || strings.Contains(text[start+len(citation.Quote):], citation.Quote) {
+			continue
+		}
+		citation.StartOffset = start
+		citation.EndOffset = start + len(citation.Quote)
+	}
+	return output
+}
+
+func citationMatchesText(citation Citation, text string) bool {
+	return citation.StartOffset >= 0 && citation.EndOffset > citation.StartOffset &&
+		citation.EndOffset <= len(text) &&
+		text[citation.StartOffset:citation.EndOffset] == citation.Quote
 }
 
 type extractionWire struct {
