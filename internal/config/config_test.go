@@ -161,6 +161,24 @@ func TestGoogleDirectoryEnabledValidationRejectsInvalidSettings(t *testing.T) {
 	}
 }
 
+func TestGoogleDirectoryEnabledValidationDoesNotExposeInvalidDomain(t *testing.T) {
+	const privateDomain = "private-name@example.test"
+	settings := validPoCSettings()
+	settings.Directory = validGoogleDirectorySettings()
+	settings.Directory.EmailDomains = []string{privateDomain}
+
+	err := settings.Validate(CommandSync)
+	if err == nil {
+		t.Fatal("Validate(sync) error = nil, want invalid domain rejection")
+	}
+	if !strings.Contains(err.Error(), GoogleDirectoryDomainsEnvironmentVariable) {
+		t.Fatalf("Validate(sync) error = %v, want bounded configuration variable", err)
+	}
+	if strings.Contains(err.Error(), privateDomain) || strings.Contains(err.Error(), "invalid directory approved domain") {
+		t.Fatalf("Validate(sync) error exposed private or lower-level detail: %v", err)
+	}
+}
+
 func TestPoCSettingsValidateGoogleAuthSeparatesDriveAndDirectoryPaths(t *testing.T) {
 	settings := PoCSettings{}
 	if err := settings.Validate(CommandAuth); err != nil {

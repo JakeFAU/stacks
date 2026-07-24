@@ -245,7 +245,7 @@ func (settings PoCSettings) validateGoogleDirectory(command Command) error {
 		return err
 	}
 	if _, err := entity.NewDirectoryPolicy(settings.Directory.EmailDomains); err != nil {
-		return fmt.Errorf("%s: %w", GoogleDirectoryDomainsEnvironmentVariable, err)
+		return fmt.Errorf("%s is invalid", GoogleDirectoryDomainsEnvironmentVariable)
 	}
 	if settings.Directory.Freshness <= 0 {
 		return fmt.Errorf("%s must be a positive duration", GoogleDirectoryFreshnessEnvironmentVariable)
