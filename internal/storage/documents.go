@@ -474,9 +474,6 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	); err != nil {
 		return fmt.Errorf("lock ingestion derivation: %w", err)
 	}
-	if storedVersionID != completion.VersionID {
-		return fmt.Errorf("complete ingestion version: derivation source version conflicts")
-	}
 	run := owningExtractionRun{
 		ID:            completion.DerivationID,
 		ModelID:       storedModelID,
@@ -491,10 +488,20 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 				completion.DerivationID,
 			)
 		}
+		if storedVersionID != completion.VersionID {
+			return newCompletionBoundaryError(
+				ErrObservationConflict,
+				reasonCompletionWriteSetMismatch,
+				completion.DerivationID,
+			)
+		}
 		if err := compareCompletedWriteSet(ctx, transaction, completion, run); err != nil {
 			return err
 		}
 		return transaction.Commit(ctx)
+	}
+	if storedVersionID != completion.VersionID {
+		return fmt.Errorf("complete ingestion version: derivation source version conflicts")
 	}
 	if !storedAdmissible {
 		return newCompletionBoundaryError(

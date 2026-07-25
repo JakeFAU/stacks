@@ -2422,6 +2422,176 @@ func TestCompleteVersionExactRetryToleratesAdditiveIdentityEnrichment(t *testing
 	}
 }
 
+func TestCompleteVersionExactRetryToleratesAdditionalSharedEvidence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	fixture := newCompletedRetryFixture(t, pool, "additional-shared-evidence")
+	fixture.complete(t)
+
+	transcript := fixture.version.Sections()[0].Text()
+	start := strings.Index(transcript, "assigned")
+	end := start + len("assigned")
+	sharedSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: fixture.version, SectionID: "tab-synthetic",
+		StartOffset: start, EndOffset: end, Quote: transcript[start:end],
+	})
+	if err != nil {
+		t.Fatalf("new additional shared evidence: %v", err)
+	}
+	if _, err := NewDocumentRepository(pool).PutEvidenceSpan(ctx, sharedSpan); err != nil {
+		t.Fatalf("append additional shared evidence: %v", err)
+	}
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	if err := fixture.repository.CompleteVersion(ctx, fixture.completion()); err != nil {
+		t.Fatalf("retry completed write-set with additional shared evidence: %v", err)
+	}
+
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("shared-evidence completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionCompletedOwnerPrecedesVersionMismatch(t *testing.T) {
+	testCases := []struct {
+		name        string
+		changeOwner bool
+		wantReason  string
+	}{
+		{name: "different owner", changeOwner: true, wantReason: reasonCompletionOwnerMismatch},
+		{name: "same owner", wantReason: reasonCompletionWriteSetMismatch},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIntegrationDatabase(t)
+			fixture := newCompletedRetryFixture(t, pool, "owner-version-"+testCase.name)
+			fixture.complete(t)
+			completion := fixture.completion()
+			completion.VersionID = uuid.NewString()
+			if testCase.changeOwner {
+				completion.LeaseOwner = uuid.NewString()
+			}
+			before := snapshotCompletedRetryWriteSet(t, fixture)
+
+			err := fixture.repository.CompleteVersion(context.Background(), completion)
+			if !errors.Is(err, ErrObservationConflict) {
+				t.Fatalf("completed owner/version mismatch error = %v, want ErrObservationConflict", err)
+			}
+			wantError := fmt.Sprintf(
+				"observation boundary run %q: %s",
+				fixture.state.DerivationID,
+				testCase.wantReason,
+			)
+			if err.Error() != wantError {
+				t.Fatalf("completed owner/version mismatch error = %q, want %q", err, wantError)
+			}
+			after := snapshotCompletedRetryWriteSet(t, fixture)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("completed owner/version rejection mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+			}
+		})
+	}
+}
+
+func TestCompleteVersionActiveVersionMismatchBehaviorUnchanged(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCanonicalIngestionFixture(t, pool, "active-version-mismatch")
+	completion := fixture.completion()
+	completion.VersionID = uuid.NewString()
+	before := snapshotCanonicalIngestionCompletion(t, fixture)
+
+	err := fixture.repository.CompleteVersion(context.Background(), completion)
+	if errors.Is(err, ErrObservationConflict) {
+		t.Fatalf("active version mismatch error = %v, unexpectedly became completed conflict", err)
+	}
+	const wantError = "complete ingestion version: derivation source version conflicts"
+	if err == nil || err.Error() != wantError {
+		t.Fatalf("active version mismatch error = %v, want %q", err, wantError)
+	}
+	after := snapshotCanonicalIngestionCompletion(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("active version rejection mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionRejectsCompletedEvidenceContentCorruption(t *testing.T) {
+	testCases := []struct {
+		name    string
+		arrange func(*testing.T, canonicalIngestionFixture)
+	}{
+		{
+			name: "tab content",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture) {
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.document_tabs
+					SET content = content || ' Synthetic corruption.'
+					WHERE document_version_id = $1`,
+					fixture.state.ID,
+				); err != nil {
+					t.Fatalf("corrupt stored tab content: %v", err)
+				}
+			},
+		},
+		{
+			name: "tab content digest",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture) {
+				corruptDigest := sha256.Sum256([]byte("synthetic-corrupt-tab-digest"))
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.document_tabs
+					SET content_digest = $2
+					WHERE document_version_id = $1`,
+					fixture.state.ID, corruptDigest[:],
+				); err != nil {
+					t.Fatalf("corrupt stored tab content digest: %v", err)
+				}
+			},
+		},
+		{
+			name: "canonical version digest",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture) {
+				corruptDigest := sha256.Sum256([]byte("synthetic-corrupt-version-digest"))
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.document_versions
+					SET digest = $2
+					WHERE id = $1`,
+					fixture.state.ID, corruptDigest[:],
+				); err != nil {
+					t.Fatalf("corrupt stored canonical version digest: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIntegrationDatabase(t)
+			fixture := newCompletedRetryFixture(t, pool, "content-corruption-"+testCase.name)
+			fixture.complete(t)
+			testCase.arrange(t, fixture)
+			before := snapshotCompletedRetryWriteSet(t, fixture)
+
+			err := fixture.repository.CompleteVersion(context.Background(), fixture.completion())
+			if !errors.Is(err, ErrObservationConflict) {
+				t.Fatalf("completed content corruption error = %v, want ErrObservationConflict", err)
+			}
+			wantError := fmt.Sprintf(
+				"observation boundary run %q: %s",
+				fixture.state.DerivationID,
+				reasonCompletionWriteSetMismatch,
+			)
+			if err.Error() != wantError {
+				t.Fatalf("completed content corruption error = %q, want privacy-safe %q", err, wantError)
+			}
+			after := snapshotCompletedRetryWriteSet(t, fixture)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("content-corruption rejection mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+			}
+		})
+	}
+}
+
 func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
 	testCases := []struct {
 		name    string
@@ -6761,6 +6931,14 @@ func snapshotCompletedRetryWriteSet(t *testing.T, fixture canonicalIngestionFixt
 				WHERE version.id = $1
 				ORDER BY evidence.id
 			) AS row_data`,
+		"tabs": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.display_order, row_data.id)::text, '[]')
+			FROM (
+				SELECT tab.xmin::text AS row_version, tab.*
+				FROM stacks.document_tabs AS tab
+				WHERE tab.document_version_id = $1
+				ORDER BY tab.display_order, tab.id
+			) AS row_data`,
 		"mentions": `
 			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
 			FROM (
@@ -6867,7 +7045,7 @@ func snapshotCompletedRetryWriteSet(t *testing.T, fixture canonicalIngestionFixt
 	for name, query := range queries {
 		var value string
 		identifier := fixture.state.DerivationID
-		if name == "evidence" || name == "version" {
+		if name == "evidence" || name == "tabs" || name == "version" {
 			identifier = fixture.state.ID
 		}
 		if err := fixture.pool.QueryRow(context.Background(), query, identifier).Scan(&value); err != nil {

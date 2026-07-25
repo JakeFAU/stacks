@@ -3,9 +3,12 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"time"
 
+	knowledge "github.com/JakeFAU/stacks/core/evidence"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
@@ -68,27 +71,19 @@ func loadCompletedEvidenceMap(
 	transaction pgx.Tx,
 	completion ingest.Completion,
 ) (map[string]string, error) {
-	var storedCount int
-	if err := transaction.QueryRow(ctx, `
-		SELECT count(*)
-		FROM stacks.evidence_spans AS evidence
-		JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
-		WHERE tab.document_version_id = $1`,
-		completion.VersionID,
-	).Scan(&storedCount); err != nil {
-		return nil, fmt.Errorf("compare completed evidence count: %w", err)
+	version, err := loadCompletedCanonicalDocumentVersion(ctx, transaction, completion.VersionID)
+	if err != nil {
+		return nil, err
 	}
-	if storedCount != len(completion.Evidence) {
-		return nil, errCompletedWriteSetMismatch
-	}
+	canonicalDocumentDigest := version.Digest()
 
 	identifiers := make(map[string]string, len(completion.Evidence))
+	seenEvidenceIDs := make(map[string]struct{}, len(completion.Evidence))
 	for _, record := range completion.Evidence {
 		span := record.Span
 		var evidenceID, quote string
-		var storedVersionDigest, storedTabDigest []byte
 		if err := transaction.QueryRow(ctx, `
-			SELECT evidence.id::text, evidence.quote, version.content_digest_v2, tab.content_digest
+			SELECT evidence.id::text, evidence.quote
 			FROM stacks.evidence_spans AS evidence
 			JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
 			JOIN stacks.document_versions AS version ON version.id = tab.document_version_id
@@ -105,7 +100,7 @@ func loadCompletedEvidenceMap(
 			span.SectionID(),
 			span.StartOffset(),
 			span.EndOffset(),
-		).Scan(&evidenceID, &quote, &storedVersionDigest, &storedTabDigest); err != nil {
+		).Scan(&evidenceID, &quote); err != nil {
 			if err == pgx.ErrNoRows {
 				return nil, errCompletedWriteSetMismatch
 			}
@@ -113,16 +108,127 @@ func loadCompletedEvidenceMap(
 		}
 		documentDigest := span.DocumentDigest()
 		if quote != span.Text() ||
-			!bytes.Equal(storedVersionDigest, documentDigest[:]) ||
-			len(storedTabDigest) == 0 {
+			documentDigest != canonicalDocumentDigest {
 			return nil, errCompletedWriteSetMismatch
 		}
 		if _, exists := identifiers[record.Key]; exists {
 			return nil, errCompletedWriteSetMismatch
 		}
+		if _, exists := seenEvidenceIDs[evidenceID]; exists {
+			return nil, errCompletedWriteSetMismatch
+		}
 		identifiers[record.Key] = evidenceID
+		seenEvidenceIDs[evidenceID] = struct{}{}
 	}
 	return identifiers, nil
+}
+
+func loadCompletedCanonicalDocumentVersion(
+	ctx context.Context,
+	transaction pgx.Tx,
+	versionID string,
+) (knowledge.DocumentVersion, error) {
+	var input knowledge.DocumentVersionInput
+	var modifiedAt *time.Time
+	var storedDigest, stableDigest []byte
+	if err := transaction.QueryRow(ctx, `
+		SELECT document.provider,
+		       document.provider_document_id,
+		       version.title,
+		       version.locator,
+		       version.provider_version,
+		       version.provider_revision,
+		       version.provider_modified_at,
+		       version.source_meeting_time,
+		       version.recorded_at,
+		       version.digest,
+		       version.content_digest_v2
+		FROM stacks.document_versions AS version
+		JOIN stacks.source_documents AS document ON document.id = version.source_document_id
+		WHERE version.id = $1`,
+		versionID,
+	).Scan(
+		&input.Provider,
+		&input.ProviderDocumentID,
+		&input.Title,
+		&input.Locator,
+		&input.ProviderVersion,
+		&input.ProviderRevision,
+		&modifiedAt,
+		&input.SourceTime,
+		&input.RecordedAt,
+		&storedDigest,
+		&stableDigest,
+	); err != nil {
+		if err == pgx.ErrNoRows {
+			return knowledge.DocumentVersion{}, errCompletedWriteSetMismatch
+		}
+		return knowledge.DocumentVersion{}, fmt.Errorf("compare completed document version: %w", err)
+	}
+	if modifiedAt == nil {
+		return knowledge.DocumentVersion{}, errCompletedWriteSetMismatch
+	}
+	input.ModifiedAt = *modifiedAt
+
+	rows, err := transaction.Query(ctx, `
+		SELECT provider_tab_id,
+		       title,
+		       parent_provider_tab_id,
+		       title_path,
+		       display_order,
+		       role,
+		       content,
+		       content_digest
+		FROM stacks.document_tabs
+		WHERE document_version_id = $1
+		ORDER BY display_order, id`,
+		versionID,
+	)
+	if err != nil {
+		return knowledge.DocumentVersion{}, fmt.Errorf("compare completed document tabs: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sectionInput knowledge.SectionInput
+		var storedContentDigest []byte
+		if err := rows.Scan(
+			&sectionInput.ID,
+			&sectionInput.Title,
+			&sectionInput.ParentID,
+			&sectionInput.Path,
+			&sectionInput.Order,
+			&sectionInput.Role,
+			&sectionInput.Text,
+			&storedContentDigest,
+		); err != nil {
+			return knowledge.DocumentVersion{}, fmt.Errorf("compare completed document tab: %w", err)
+		}
+		computedContentDigest := sha256.Sum256([]byte(sectionInput.Text))
+		if !bytes.Equal(storedContentDigest, computedContentDigest[:]) {
+			return knowledge.DocumentVersion{}, errCompletedWriteSetMismatch
+		}
+		section, err := knowledge.NewSection(sectionInput)
+		if err != nil {
+			return knowledge.DocumentVersion{}, errCompletedWriteSetMismatch
+		}
+		input.Sections = append(input.Sections, section)
+	}
+	if err := rows.Err(); err != nil {
+		return knowledge.DocumentVersion{}, fmt.Errorf("iterate completed document tabs: %w", err)
+	}
+
+	version, err := knowledge.NewDocumentVersion(input)
+	if err != nil {
+		return knowledge.DocumentVersion{}, errCompletedWriteSetMismatch
+	}
+	canonicalDigest := version.Digest()
+	legacyDigest := version.LegacyRevisionInclusiveDigest()
+	if (!bytes.Equal(storedDigest, canonicalDigest[:]) &&
+		!bytes.Equal(storedDigest, legacyDigest[:])) ||
+		(stableDigest != nil && !bytes.Equal(stableDigest, canonicalDigest[:])) {
+		return knowledge.DocumentVersion{}, errCompletedWriteSetMismatch
+	}
+	return version, nil
 }
 
 func loadCompletedMentionMap(
