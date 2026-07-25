@@ -30,6 +30,17 @@ type Summary struct {
 	Unavailable int
 }
 
+// ReviewerVerification contains the bounded lookup and deterministic policy
+// result for one email explicitly supplied by a local reviewer.
+type ReviewerVerification struct {
+	Query        entity.DirectoryQuery
+	Lookup       LookupResult
+	Evaluation   entity.DirectoryEvaluation
+	AttemptCount int
+	RecordedAt   time.Time
+	RetryAfter   *time.Time
+}
+
 // DecisionRecorder records one bounded operational decision without receiving
 // private query values or provider payloads.
 type DecisionRecorder interface {
@@ -50,6 +61,90 @@ type Service struct {
 	Decisions   DecisionRecorder
 	Now         func() time.Time
 	Wait        func(context.Context, time.Duration) error
+}
+
+// VerifyReviewerEmail evaluates one reviewer-supplied email through the same
+// retry and identity policy boundary as enrichment. Provider failures are
+// returned only as bounded lookup outcomes.
+func (service *Service) VerifyReviewerEmail(ctx context.Context, email string) (ReviewerVerification, error) {
+	query := entity.DirectoryQuery{
+		Kind:          entity.DirectoryQueryEmail,
+		Email:         entity.NormalizeEmail(email),
+		EmailEvidence: entity.EmailEvidenceReviewerSupplied,
+	}
+	verification := ReviewerVerification{Query: query}
+	if err := ctx.Err(); err != nil {
+		return ReviewerVerification{}, err
+	}
+	if service == nil || !service.Enabled {
+		verification.Lookup.Outcome = entity.DirectoryDisabled
+		verification.Evaluation.Outcome = entity.DirectoryDisabled
+		return verification, nil
+	}
+	if service.Now == nil {
+		verification.Lookup.Outcome = entity.DirectoryUnavailable
+		verification.Evaluation.Outcome = entity.DirectoryUnavailable
+		return verification, nil
+	}
+	verification.RecordedAt = service.Now().UTC()
+	if !entity.ValidEmail(query.Email) {
+		verification.Lookup.Outcome = entity.DirectoryNoMatch
+		verification.Evaluation.Outcome = entity.DirectoryNoMatch
+		return verification, nil
+	}
+	if service.Repository == nil {
+		verification.Lookup.Outcome = entity.DirectoryUnavailable
+		verification.Evaluation.Outcome = entity.DirectoryUnavailable
+		verification.RetryAfter = service.reviewerRetryAfter(verification.RecordedAt, verification.Lookup)
+		return verification, nil
+	}
+	identityState, err := service.Repository.LoadIdentityState(ctx)
+	if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
+		return ReviewerVerification{}, cancellationErr
+	}
+	if err != nil {
+		verification.Lookup.Outcome = entity.DirectoryUnavailable
+		verification.Evaluation.Outcome = entity.DirectoryUnavailable
+		verification.RetryAfter = service.reviewerRetryAfter(verification.RecordedAt, verification.Lookup)
+		return verification, nil
+	}
+	if service.Lookup == nil {
+		verification.Lookup.Outcome = entity.DirectoryNotConfigured
+		verification.Evaluation.Outcome = entity.DirectoryNotConfigured
+		return verification, nil
+	}
+
+	verification.Lookup, verification.AttemptCount, err = service.search(ctx, query)
+	if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
+		return ReviewerVerification{}, cancellationErr
+	}
+	if err != nil {
+		verification.Lookup = LookupResult{Outcome: entity.DirectoryUnavailable}
+	}
+	if verification.Lookup.Outcome == "" {
+		verification.Evaluation = service.Policy.Evaluate(
+			query,
+			verification.Lookup.Profiles,
+			identityState.Snapshots,
+			identityState.Links,
+		)
+		verification.Lookup.Outcome = verification.Evaluation.Outcome
+	} else {
+		verification.Evaluation.Outcome = verification.Lookup.Outcome
+	}
+	verification.RetryAfter = service.reviewerRetryAfter(
+		verification.RecordedAt,
+		verification.Lookup,
+	)
+	return verification, nil
+}
+
+func (service *Service) reviewerRetryAfter(recordedAt time.Time, lookup LookupResult) *time.Time {
+	if !retryableDirectoryOutcome(lookup.Outcome) {
+		return nil
+	}
+	value := recordedAt.Add(service.retryDelay(lookup))
+	return &value
 }
 
 // Enrich attempts bounded identity enrichment without making directory

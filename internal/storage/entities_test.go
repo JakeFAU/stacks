@@ -46,3 +46,23 @@ func TestDirectoryDecisionDigestPreservesLegacyDigestWhenNoDirectoryEvidence(t *
 		t.Fatalf("resolutionDecisionDigest() = %q, want byte-compatible legacy digest %q", got, legacyDigest)
 	}
 }
+
+func TestMaskReviewEmailRetainsOnlyFirstLocalRuneAndDomain(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		email string
+		want  string
+	}{
+		{name: "ordinary", email: "riya.chen@corp.example", want: "r***@corp.example"},
+		{name: "single local rune", email: "r@corp.example", want: "r***@corp.example"},
+		{name: "unicode local rune", email: "ø.person@corp.example", want: "ø***@corp.example"},
+		{name: "empty local part", email: "@corp.example", want: ""},
+		{name: "missing domain", email: "riya.chen@", want: ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := maskReviewEmail(testCase.email); got != testCase.want {
+				t.Fatalf("maskReviewEmail(%q) = %q, want %q", testCase.email, got, testCase.want)
+			}
+		})
+	}
+}

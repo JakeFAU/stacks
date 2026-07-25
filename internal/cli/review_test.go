@@ -17,6 +17,74 @@ func TestReviewCommandAcceptRequiresExplicitProposalID(t *testing.T) {
 	}
 }
 
+func TestReviewCommandAcceptDirectoryRequiresExactProposalAndSnapshotIDs(t *testing.T) {
+	store := &fakeReviewStore{proposal: ReviewProposal{
+		ID: "proposal-directory",
+		Candidates: []ReviewCandidate{{
+			DirectoryProfileID: "profile-directory",
+		}},
+	}}
+	command := ReviewCommand{Service: &ReviewService{Store: store}}
+
+	for _, args := range [][]string{
+		{"accept-directory"},
+		{"accept-directory", "proposal-directory"},
+	} {
+		err := command.Run(context.Background(), args)
+		if err == nil ||
+			!strings.Contains(err.Error(), "proposal ID") ||
+			!strings.Contains(err.Error(), "directory profile ID") {
+			t.Fatalf("Run(%q) error = %v, want exact proposal/profile ID error", args, err)
+		}
+	}
+	if store.acceptedDirectory != (AcceptDirectoryInput{}) {
+		t.Fatalf("implicit directory acceptance = %#v, want no transition", store.acceptedDirectory)
+	}
+}
+
+func TestReviewCommandAcceptDirectoryParsesOptionalExistingEntity(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		args []string
+		want AcceptDirectoryInput
+	}{
+		{
+			name: "create person",
+			args: []string{"accept-directory", "proposal-directory", "profile-directory"},
+			want: AcceptDirectoryInput{
+				ProposalID:         "proposal-directory",
+				DirectoryProfileID: "profile-directory",
+			},
+		},
+		{
+			name: "existing person",
+			args: []string{
+				"accept-directory",
+				"proposal-directory",
+				"profile-directory",
+				"--entity",
+				"person-existing",
+			},
+			want: AcceptDirectoryInput{
+				ProposalID:         "proposal-directory",
+				DirectoryProfileID: "profile-directory",
+				EntityID:           "person-existing",
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := &fakeReviewStore{}
+			command := ReviewCommand{Service: &ReviewService{Store: store}}
+			if err := command.Run(context.Background(), testCase.args); err != nil {
+				t.Fatalf("Run(%q) error = %v", testCase.args, err)
+			}
+			if store.acceptedDirectory != testCase.want {
+				t.Fatalf("accept-directory input = %#v, want %#v", store.acceptedDirectory, testCase.want)
+			}
+		})
+	}
+}
+
 func TestReviewServiceCorrectDelegatesAppendOnlyReplacement(t *testing.T) {
 	store := &fakeReviewStore{}
 	service := ReviewService{Store: store}
@@ -96,6 +164,77 @@ func TestReviewCommandListBoundsPrivateTextToOneLine(t *testing.T) {
 	}
 }
 
+func TestReviewCommandDirectoryCandidateListIsMaskedAndShowHasRequestedDetail(t *testing.T) {
+	const (
+		providerSubject  = "people/private-subject"
+		rawProviderError = "synthetic raw provider failure"
+	)
+	confidence := 0.75
+	store := &fakeReviewStore{proposal: ReviewProposal{
+		ID:      "proposal-directory",
+		Context: "Synthetic cited review context",
+		Candidates: []ReviewCandidate{{
+			DirectoryProfileID: "profile-directory",
+			DisplayName:        "Synthetic Directory Person",
+			MaskedEmail:        "r***@corp.example",
+			Source:             "domain_profile",
+			Confidence:         &confidence,
+			Reason:             "directory name candidate requires review",
+		}},
+	}}
+
+	var listOutput strings.Builder
+	listCommand := ReviewCommand{
+		Service: &ReviewService{Store: store},
+		Output:  &listOutput,
+	}
+	if err := listCommand.Run(context.Background(), []string{"list"}); err != nil {
+		t.Fatalf("list Run() error = %v", err)
+	}
+	listed := listOutput.String()
+	for _, want := range []string{
+		"guess=profile-directory",
+		`display="Synthetic Directory Person"`,
+		`email="r***@corp.example"`,
+		"source=domain_profile",
+	} {
+		if !strings.Contains(listed, want) {
+			t.Fatalf("list stdout = %q, want %q", listed, want)
+		}
+	}
+	for _, private := range []string{"riya@corp.example", providerSubject, rawProviderError} {
+		if strings.Contains(listed, private) {
+			t.Fatalf("list stdout = %q, must not contain %q", listed, private)
+		}
+	}
+
+	var showOutput strings.Builder
+	showCommand := ReviewCommand{
+		Service: &ReviewService{Store: store},
+		Output:  &showOutput,
+	}
+	if err := showCommand.Run(context.Background(), []string{"show", "proposal-directory"}); err != nil {
+		t.Fatalf("show Run() error = %v", err)
+	}
+	shown := showOutput.String()
+	for _, want := range []string{
+		"profile-directory",
+		"Synthetic Directory Person",
+		"r***@corp.example",
+		"domain_profile",
+		"Synthetic cited review context",
+	} {
+		if !strings.Contains(shown, want) {
+			t.Fatalf("show stdout = %q, want %q", shown, want)
+		}
+	}
+	for _, private := range []string{providerSubject, rawProviderError} {
+		if strings.Contains(shown, private) {
+			t.Fatalf("show stdout = %q, must not contain %q", shown, private)
+		}
+	}
+}
+
 func TestReviewServicePropagatesStaleEffectiveDecisionFailure(t *testing.T) {
 	store := &fakeReviewStore{correctErr: errors.New("decision is not effective")}
 	service := ReviewService{Store: store}
@@ -143,6 +282,7 @@ type fakeReviewStore struct {
 	correctErr        error
 	lastCall          string
 	logMessages       strings.Builder
+	acceptedDirectory AcceptDirectoryInput
 }
 
 func (store *fakeReviewStore) ListReviewProposals(context.Context) ([]ReviewProposal, error) {
@@ -181,6 +321,13 @@ func (store *statefulReviewStore) AcceptReviewProposal(_ context.Context, propos
 	store.actions = append(store.actions, "accept:"+proposalID+":"+entityID)
 	return store.record(proposalID, entityID, "accepted", ""), nil
 }
+func (store *statefulReviewStore) AcceptDirectoryCandidate(_ context.Context, input AcceptDirectoryInput) (ReviewDecision, error) {
+	if _, exists := store.effective[input.ProposalID]; exists {
+		return ReviewDecision{}, errors.New("proposal already has an effective decision")
+	}
+	store.actions = append(store.actions, "accept-directory:"+input.ProposalID+":"+input.DirectoryProfileID+":"+input.EntityID)
+	return store.record(input.ProposalID, input.EntityID, "accepted", ""), nil
+}
 func (store *statefulReviewStore) RejectReviewProposal(_ context.Context, proposalID string) (ReviewDecision, error) {
 	if _, exists := store.effective[proposalID]; exists {
 		return ReviewDecision{}, errors.New("proposal already has an effective decision")
@@ -212,6 +359,11 @@ func (store *statefulReviewStore) record(proposalID, entityID, outcome, supersed
 
 func (store *fakeReviewStore) RejectReviewProposal(_ context.Context, proposalID string) (ReviewDecision, error) {
 	store.lastCall = "reject:" + proposalID
+	return ReviewDecision{}, nil
+}
+
+func (store *fakeReviewStore) AcceptDirectoryCandidate(_ context.Context, input AcceptDirectoryInput) (ReviewDecision, error) {
+	store.acceptedDirectory = input
 	return ReviewDecision{}, nil
 }
 

@@ -71,6 +71,70 @@ func TestServiceMissingOptionalLookupIsUnavailable(t *testing.T) {
 	requireSingleSpanStatus(t, exporter, codes.Ok)
 }
 
+func TestServiceVerifyReviewerEmailUsesReviewerEvidenceAndCurrentIdentityPolicy(t *testing.T) {
+	repository := &fakeDirectoryRepository{}
+	profile := matchedDirectoryProfile()
+	lookup := &fakeDirectoryLookup{results: []LookupResult{{
+		Profiles: []entity.DirectoryProfile{profile},
+	}}}
+	service := newTestDirectoryService(repository, lookup)
+
+	verification, err := service.VerifyReviewerEmail(
+		context.Background(),
+		"  RIYA.CHEN@CORP.EXAMPLE ",
+	)
+	if err != nil {
+		t.Fatalf("VerifyReviewerEmail() error = %v", err)
+	}
+	wantQuery := entity.DirectoryQuery{
+		Kind:          entity.DirectoryQueryEmail,
+		Email:         "riya.chen@corp.example",
+		EmailEvidence: entity.EmailEvidenceReviewerSupplied,
+	}
+	if verification.Query != wantQuery {
+		t.Fatalf("verification query = %#v, want %#v", verification.Query, wantQuery)
+	}
+	if !reflect.DeepEqual(lookup.queries, []entity.DirectoryQuery{wantQuery}) {
+		t.Fatalf("lookup queries = %#v, want reviewer-supplied query", lookup.queries)
+	}
+	if verification.Lookup.Outcome != entity.DirectoryMatched ||
+		verification.Evaluation.Outcome != entity.DirectoryMatched ||
+		!verification.Evaluation.CreatePerson ||
+		verification.Evaluation.Profile == nil ||
+		verification.AttemptCount != 1 ||
+		verification.RecordedAt.IsZero() {
+		t.Fatalf("reviewer verification = %#v, want one unique automatic profile evaluation", verification)
+	}
+	if repository.calls.loadIdentity != 1 {
+		t.Fatalf("LoadIdentityState() calls = %d, want 1", repository.calls.loadIdentity)
+	}
+}
+
+func TestServiceVerifyReviewerEmailReturnsBoundedUnavailableWithoutProviderError(t *testing.T) {
+	repository := &fakeDirectoryRepository{}
+	lookup := &fakeDirectoryLookup{
+		errors: []error{errPrivateDirectoryDetail, errPrivateDirectoryDetail, errPrivateDirectoryDetail},
+	}
+	service := newTestDirectoryService(repository, lookup)
+
+	verification, err := service.VerifyReviewerEmail(
+		context.Background(),
+		"reviewer@corp.example",
+	)
+	if err != nil {
+		t.Fatalf("VerifyReviewerEmail() error = %v, want fail-soft metadata", err)
+	}
+	if verification.Lookup.Outcome != entity.DirectoryUnavailable ||
+		len(verification.Lookup.Profiles) != 0 ||
+		verification.AttemptCount != service.MaxAttempts ||
+		verification.RetryAfter == nil {
+		t.Fatalf("unavailable reviewer verification = %#v, want bounded retry metadata", verification)
+	}
+	if strings.Contains(fmt.Sprint(verification), errPrivateDirectoryDetail.Error()) {
+		t.Fatalf("reviewer verification leaked provider error: %#v", verification)
+	}
+}
+
 func TestServiceRepositoryLoadFailureIsUnavailableWithoutPrivateError(t *testing.T) {
 	repository := &fakeDirectoryRepository{loadWorkErr: errPrivateDirectoryDetail}
 	service := newTestDirectoryService(repository, &fakeDirectoryLookup{})
