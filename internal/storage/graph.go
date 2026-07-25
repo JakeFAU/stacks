@@ -83,7 +83,7 @@ func (repository *GraphRepository) CompleteObservation(
 ) (observation.Observation, *InteractionSignal, error) {
 	origin, err := normalizeLegacyOrigin(observationEvidenceOrigin)
 	if err != nil {
-		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, string(value.ID()))
+		return observation.Observation{}, nil, newLegacyUUIDPreflightError(value.ID())
 	}
 	state, err := canonicalSignalState(value.ID(), signal, signalEvidence)
 	if err != nil {
@@ -137,7 +137,7 @@ func canonicalSignalState(
 	}
 	input, links, err := canonicalizeSignalIdentity(*signal, signalEvidence)
 	if err != nil {
-		return nil, err
+		return nil, newLegacyUUIDPreflightError(observationID)
 	}
 	if err := validateSignalInput(input); err != nil {
 		return nil, err

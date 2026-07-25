@@ -84,6 +84,90 @@ func TestCompleteObservationPreflightRejectsBeforeDatabaseAccess(t *testing.T) {
 	}
 }
 
+func TestCompleteObservationPreflightRejectsUUIDBoundFieldsBeforeDatabaseAccess(t *testing.T) {
+	repository := &GraphRepository{}
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*testing.T, *observation.ObservationInput)
+		origin func() []evidence.EvidenceID
+		signal func() (*SignalInput, []SignalEvidenceInput)
+	}{
+		{name: "observation_id", mutate: func(_ *testing.T, input *observation.ObservationInput) { input.ID = "invalid-observation-id" }},
+		{name: "run_id", mutate: func(_ *testing.T, input *observation.ObservationInput) { input.Derivation.RunID = "invalid-run-id" }},
+		{name: "subject_entity", mutate: func(t *testing.T, input *observation.ObservationInput) {
+			term, err := observation.NewEntityTerm("invalid-subject-entity", "")
+			if err != nil {
+				t.Fatalf("new subject entity term: %v", err)
+			}
+			input.Statement.Subject = term
+		}},
+		{name: "object_entity", mutate: func(t *testing.T, input *observation.ObservationInput) {
+			term, err := observation.NewEntityTerm("invalid-object-entity", "")
+			if err != nil {
+				t.Fatalf("new object entity term: %v", err)
+			}
+			input.Statement.Object = term
+		}},
+		{name: "subject_grounding_mention", mutate: func(t *testing.T, input *observation.ObservationInput) {
+			term, err := observation.NewEntityTerm(string(codecOrigin()[0]), "invalid-subject-grounding")
+			if err != nil {
+				t.Fatalf("new subject grounding term: %v", err)
+			}
+			input.Statement.Subject = term
+		}},
+		{name: "object_grounding_mention", mutate: func(t *testing.T, input *observation.ObservationInput) {
+			term, err := observation.NewEntityTerm(string(codecOrigin()[0]), "invalid-object-grounding")
+			if err != nil {
+				t.Fatalf("new object grounding term: %v", err)
+			}
+			input.Statement.Object = term
+		}},
+		{name: "subject_mention", mutate: func(t *testing.T, input *observation.ObservationInput) {
+			term, err := observation.NewMentionTerm("invalid-subject-mention")
+			if err != nil {
+				t.Fatalf("new subject mention term: %v", err)
+			}
+			input.Statement.Subject = term
+		}},
+		{name: "object_mention", mutate: func(t *testing.T, input *observation.ObservationInput) {
+			term, err := observation.NewMentionTerm("invalid-object-mention")
+			if err != nil {
+				t.Fatalf("new object mention term: %v", err)
+			}
+			input.Statement.Object = term
+		}},
+		{name: "canonical_evidence", mutate: func(_ *testing.T, input *observation.ObservationInput) {
+			input.Evidence = []observation.EvidenceLink{{EvidenceID: "invalid-canonical-evidence", Role: observation.EvidenceSupporting}}
+		}},
+		{name: "origin_evidence", origin: func() []evidence.EvidenceID { return []evidence.EvidenceID{"invalid-origin-evidence"} }},
+		{name: "signal_evidence", signal: func() (*SignalInput, []SignalEvidenceInput) {
+			signal := codecActiveSignal().Input
+			return &signal, []SignalEvidenceInput{{EvidenceSpanID: "invalid-signal-evidence", Role: "supporting"}}
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			value := codecActiveObservation(t, func(input *observation.ObservationInput) {
+				if testCase.mutate != nil {
+					testCase.mutate(t, input)
+				}
+			})
+			origin := codecOrigin()
+			if testCase.origin != nil {
+				origin = testCase.origin()
+			}
+			var signal *SignalInput
+			var signalEvidence []SignalEvidenceInput
+			if testCase.signal != nil {
+				signal, signalEvidence = testCase.signal()
+			}
+			err := completeWithoutDatabase(t, repository, value, origin, signal, signalEvidence)
+			if !errors.Is(err, ErrObservationNotRepresentable) || strings.Contains(err.Error(), "invalid-") {
+				t.Fatalf("UUID preflight error = %v", err)
+			}
+		})
+	}
+}
+
 func completeWithoutDatabase(
 	t *testing.T,
 	repository *GraphRepository,

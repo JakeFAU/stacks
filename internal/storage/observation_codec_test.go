@@ -441,9 +441,9 @@ func TestEncodeLegacyObservationRequiresActiveRunIdentityAndProvenance(t *testin
 }
 
 func TestEncodeLegacyObservationRejectsSignalObservationOwnershipMismatch(t *testing.T) {
-	const privateObservationReference = "private-signal-observation-reference"
+	const otherObservationID = "cccccccc-dddd-eeee-ffff-000000000000"
 	signal := codecActiveSignalWith(func(input *SignalInput) {
-		input.ObservationID = privateObservationReference
+		input.ObservationID = otherObservationID
 	})
 	_, err := encodeLegacyObservation(
 		codecActiveObservation(t, nil),
@@ -452,7 +452,7 @@ func TestEncodeLegacyObservationRejectsSignalObservationOwnershipMismatch(t *tes
 		signal,
 	)
 	if !errors.Is(err, ErrObservationCompatibility) ||
-		strings.Contains(err.Error(), privateObservationReference) {
+		strings.Contains(err.Error(), otherObservationID) {
 		t.Fatalf("encode error = %v", err)
 	}
 }

@@ -268,6 +268,9 @@ func preflightLegacyObservation(
 		confidenceValue := canonicalConfidence.Value()
 		confidence = &confidenceValue
 	}
+	if err := validateLegacyUUIDBoundFields(value, compatibility, signal, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID); err != nil {
+		return legacyObservationPreflight{}, err
+	}
 	if err := validateSignalObservationOwnership(signal, value.ID()); err != nil {
 		return legacyObservationPreflight{}, err
 	}
@@ -280,6 +283,49 @@ func preflightLegacyObservation(
 		objectEntityID: objectEntityID, objectMentionID: objectMentionID,
 		validStart: validStart, validEnd: validEnd, confidence: confidence, origin: origin,
 	}, nil
+}
+
+func validateLegacyUUIDBoundFields(
+	value observation.Observation,
+	compatibility legacyObservationCompatibility,
+	signal *legacySignalState,
+	identifiers ...string,
+) error {
+	if _, err := canonicalUUID(string(value.ID())); err != nil {
+		return newLegacyUUIDPreflightError(value.ID())
+	}
+	if runID := value.Derivation().RunID; runID != "" {
+		identifiers = append(identifiers, runID)
+	}
+	for _, link := range value.EvidenceLinks() {
+		identifiers = append(identifiers, string(link.EvidenceID))
+	}
+	for _, evidenceID := range compatibility.observationEvidenceOrigin {
+		identifiers = append(identifiers, string(evidenceID))
+	}
+	if signal != nil {
+		identifiers = append(identifiers, signal.Input.ID, signal.Input.ObservationID)
+		for _, link := range signal.Evidence {
+			identifiers = append(identifiers, link.EvidenceSpanID)
+		}
+	}
+	for _, identifier := range identifiers {
+		if identifier == "" {
+			continue
+		}
+		if _, err := canonicalUUID(identifier); err != nil {
+			return newLegacyUUIDPreflightError(value.ID())
+		}
+	}
+	return nil
+}
+
+func newLegacyUUIDPreflightError(observationID observation.ObservationID) error {
+	canonicalID, err := canonicalUUID(string(observationID))
+	if err != nil {
+		canonicalID = ""
+	}
+	return newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, canonicalID)
 }
 
 func ensureLegacyValidTimePrecision(value observation.TemporalExtent, observationID observation.ObservationID) error {
