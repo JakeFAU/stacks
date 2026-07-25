@@ -63,7 +63,7 @@ func validateEvidenceIdentities(records []EvidenceRecord) (map[string][sha256.Si
 			EndOffset      int
 		}{
 			Provider: record.Span.Provider(), DocumentID: record.Span.ProviderDocumentID(),
-			DocumentDigest: record.Span.DocumentDigest().String(), TabID: record.Span.TabID(),
+			DocumentDigest: record.Span.DocumentDigest().String(), TabID: record.Span.SectionID(),
 			StartOffset: record.Span.StartOffset(), EndOffset: record.Span.EndOffset(),
 		})
 		if _, exists := byKey[record.Key]; exists {

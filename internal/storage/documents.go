@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -15,9 +16,7 @@ import (
 
 	"stacks/internal/entity"
 	"stacks/internal/ingest"
-	"stacks/internal/knowledge"
 	"stacks/internal/modelpolicy"
-	"stacks/internal/source"
 )
 
 // StoredDocumentVersion identifies a durable immutable document version.
@@ -72,7 +71,7 @@ func (repository *DocumentRepository) InTransaction(ctx context.Context, work fu
 
 // PutDocumentVersion stores a version and its ordered tabs. Repeating the same
 // provider document and digest returns its existing stable ID with created false.
-func (repository *DocumentRepository) PutDocumentVersion(ctx context.Context, version knowledge.DocumentVersion) (StoredDocumentVersion, bool, error) {
+func (repository *DocumentRepository) PutDocumentVersion(ctx context.Context, version evidence.DocumentVersion) (StoredDocumentVersion, bool, error) {
 	if repository.pool != nil {
 		var stored StoredDocumentVersion
 		var created bool
@@ -89,7 +88,7 @@ func (repository *DocumentRepository) PutDocumentVersion(ctx context.Context, ve
 	return repository.putDocumentVersion(ctx, version)
 }
 
-func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, version knowledge.DocumentVersion) (StoredDocumentVersion, bool, error) {
+func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, version evidence.DocumentVersion) (StoredDocumentVersion, bool, error) {
 	var sourceDocumentID string
 	err := repository.query.QueryRow(ctx, `
 		INSERT INTO stacks.source_documents (provider, provider_document_id, title, locator, recorded_at)
@@ -121,7 +120,7 @@ func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, ve
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $2)
 		ON CONFLICT DO NOTHING
 		RETURNING id`, sourceDocumentID, digest[:], version.Title(), version.Locator(),
-		version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt(), version.SourceMeetingTime(), version.RecordedAt()).Scan(&stored.ID)
+		version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt(), version.SourceTime(), version.RecordedAt()).Scan(&stored.ID)
 	if err == pgx.ErrNoRows {
 		stored, exists, err = repository.findCompatibleDocumentVersion(ctx, sourceDocumentID, version)
 		if err != nil {
@@ -136,8 +135,8 @@ func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, ve
 		return StoredDocumentVersion{}, false, fmt.Errorf("persist document version %q: %w", version.Digest().String(), err)
 	}
 
-	for _, tab := range version.Tabs() {
-		if err := repository.putTab(ctx, stored.ID, tab); err != nil {
+	for _, section := range version.Sections() {
+		if err := repository.putSection(ctx, stored.ID, section); err != nil {
 			return StoredDocumentVersion{}, false, fmt.Errorf("persist document version %q: %w", stored.ID, err)
 		}
 	}
@@ -147,7 +146,7 @@ func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, ve
 func (repository *DocumentRepository) findCompatibleDocumentVersion(
 	ctx context.Context,
 	sourceDocumentID string,
-	version knowledge.DocumentVersion,
+	version evidence.DocumentVersion,
 ) (StoredDocumentVersion, bool, error) {
 	stableDigest := version.Digest()
 	legacyDigest := version.LegacyRevisionInclusiveDigest()
@@ -210,9 +209,9 @@ func (repository *DocumentRepository) findCompatibleDocumentVersion(
 	return stored, true, nil
 }
 
-func (repository *DocumentRepository) putTab(ctx context.Context, documentVersionID string, tab source.Tab) error {
-	contentDigest := sha256.Sum256([]byte(tab.Text))
-	titlePath := tab.Path
+func (repository *DocumentRepository) putSection(ctx context.Context, documentVersionID string, section evidence.Section) error {
+	contentDigest := sha256.Sum256([]byte(section.Text()))
+	titlePath := section.Path()
 	if titlePath == nil {
 		titlePath = []string{}
 	}
@@ -220,16 +219,16 @@ func (repository *DocumentRepository) putTab(ctx context.Context, documentVersio
 		INSERT INTO stacks.document_tabs
 			(document_version_id, provider_tab_id, title, parent_provider_tab_id, title_path, display_order, role, content, content_digest)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		documentVersionID, tab.ID, tab.Title, tab.ParentID, titlePath, tab.Order, string(tab.Role), tab.Text, contentDigest[:])
+		documentVersionID, section.ID(), section.Title(), section.ParentID(), titlePath, section.Order(), section.Role(), section.Text(), contentDigest[:])
 	if err != nil {
-		return fmt.Errorf("persist tab %q: %w", tab.ID, err)
+		return fmt.Errorf("persist tab %q: %w", section.ID(), err)
 	}
 	return nil
 }
 
 // PutEvidenceSpan persists an exact citation after its domain validation has
 // already established offsets and matching source text.
-func (repository *DocumentRepository) PutEvidenceSpan(ctx context.Context, span knowledge.EvidenceSpan) (StoredEvidenceSpan, error) {
+func (repository *DocumentRepository) PutEvidenceSpan(ctx context.Context, span evidence.EvidenceSpan) (StoredEvidenceSpan, error) {
 	var stored StoredEvidenceSpan
 	digest := span.DocumentDigest()
 	err := repository.query.QueryRow(ctx, `
@@ -244,7 +243,7 @@ func (repository *DocumentRepository) PutEvidenceSpan(ctx context.Context, span 
 			AND tab.provider_tab_id = $7
 		ON CONFLICT (document_tab_id, start_offset, end_offset) DO NOTHING
 		RETURNING id`,
-		span.StartOffset(), span.EndOffset(), span.Text(), span.Provider(), span.ProviderDocumentID(), digest[:], span.TabID()).Scan(&stored.ID)
+		span.StartOffset(), span.EndOffset(), span.Text(), span.Provider(), span.ProviderDocumentID(), digest[:], span.SectionID()).Scan(&stored.ID)
 	if err == pgx.ErrNoRows {
 		var storedQuote string
 		err = repository.query.QueryRow(ctx, `
@@ -259,17 +258,17 @@ func (repository *DocumentRepository) PutEvidenceSpan(ctx context.Context, span 
 				AND tab.provider_tab_id = $4
 				AND span.start_offset = $5
 				AND span.end_offset = $6`,
-			span.Provider(), span.ProviderDocumentID(), digest[:], span.TabID(), span.StartOffset(), span.EndOffset()).Scan(&stored.ID, &storedQuote)
+			span.Provider(), span.ProviderDocumentID(), digest[:], span.SectionID(), span.StartOffset(), span.EndOffset()).Scan(&stored.ID, &storedQuote)
 		if err != nil {
-			return StoredEvidenceSpan{}, fmt.Errorf("load evidence span for document %q tab %q: %w", span.ProviderDocumentID(), span.TabID(), err)
+			return StoredEvidenceSpan{}, fmt.Errorf("load evidence span for document %q tab %q: %w", span.ProviderDocumentID(), span.SectionID(), err)
 		}
 		if storedQuote != span.Text() {
-			return StoredEvidenceSpan{}, fmt.Errorf("persist evidence span for document %q tab %q: immutable quote conflicts", span.ProviderDocumentID(), span.TabID())
+			return StoredEvidenceSpan{}, fmt.Errorf("persist evidence span for document %q tab %q: immutable quote conflicts", span.ProviderDocumentID(), span.SectionID())
 		}
 		return stored, nil
 	}
 	if err != nil {
-		return StoredEvidenceSpan{}, fmt.Errorf("persist evidence span for document %q tab %q: %w", span.ProviderDocumentID(), span.TabID(), err)
+		return StoredEvidenceSpan{}, fmt.Errorf("persist evidence span for document %q tab %q: %w", span.ProviderDocumentID(), span.SectionID(), err)
 	}
 	return stored, nil
 }
@@ -289,7 +288,7 @@ func NewIngestionRepository(pool *pgxpool.Pool) *IngestionRepository {
 
 // PrepareVersion stores the immutable source version and independently creates
 // or resumes the exact configured extraction derivation.
-func (repository *IngestionRepository) PrepareVersion(ctx context.Context, version knowledge.DocumentVersion, derivation ingest.DerivationIdentity, dataMode modelpolicy.DataMode, leaseDuration time.Duration) (ingest.VersionState, error) {
+func (repository *IngestionRepository) PrepareVersion(ctx context.Context, version evidence.DocumentVersion, derivation ingest.DerivationIdentity, dataMode modelpolicy.DataMode, leaseDuration time.Duration) (ingest.VersionState, error) {
 	if repository == nil || repository.pool == nil {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: repository is not configured")
 	}

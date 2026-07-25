@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/smithy-go"
@@ -26,7 +27,6 @@ import (
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
-	"stacks/internal/knowledge"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
@@ -985,7 +985,7 @@ type noOpRuntimeIngestionRepository struct{}
 
 func (noOpRuntimeIngestionRepository) PrepareVersion(
 	context.Context,
-	knowledge.DocumentVersion,
+	evidence.DocumentVersion,
 	ingest.DerivationIdentity,
 	modelpolicy.DataMode,
 	time.Duration,

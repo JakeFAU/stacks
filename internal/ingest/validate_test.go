@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JakeFAU/stacks/core/evidence"
 	"stacks/internal/entity"
-	"stacks/internal/knowledge"
 	"stacks/internal/modelpolicy"
 )
 
@@ -212,11 +212,11 @@ func TestValidateForPersistenceRejectsWhitespacePaddedLocalIdentifiersAndReferen
 	}
 }
 
-func persistenceEvidence(t *testing.T) knowledge.EvidenceSpan {
+func persistenceEvidence(t *testing.T) evidence.EvidenceSpan {
 	t.Helper()
 	version := documentVersion(t, syntheticDocument("document-persistence-validation", "Synthetic evidence."))
-	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "transcript-tab", StartOffset: 0,
+	span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
+		Document: version, SectionID: "transcript-tab", StartOffset: 0,
 		EndOffset: len("Synthetic evidence."), Quote: "Synthetic evidence.",
 	})
 	if err != nil {

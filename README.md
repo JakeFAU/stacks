@@ -10,6 +10,22 @@ state. It reports dated, transcript-backed signals such as delegation,
 scrutiny, endorsement, support, and future responsibility. Every report keeps
 counterevidence, uncertainty, gaps, and citations visible.
 
+## Public core (experimental)
+
+The provider-neutral [`core`](./core) Go module contains the temporal evidence
+primitives extracted from the application:
+
+- `evidence`: immutable versioned sources and exact spans;
+- `identity`: conservative accepted-alias resolution;
+- `observation`: provenance-bearing claims with separate valid and recorded
+  time; and
+- `temporal`: deterministic aggregation and comparison.
+
+PostgreSQL, model and source providers, operator configuration, and the
+manager-confidence workflow remain downstream in the application during the
+next extraction phases. The public core is experimental and has no independent
+release yet.
+
 ## Requirements
 
 - Go 1.26 or newer
