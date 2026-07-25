@@ -2347,7 +2347,7 @@ func TestIngestionCompletedRetryRejectsRecordedAtMismatchWithoutMutation(t *test
 		t.Fatalf("completed retry with changed recorded time error = %v, want ErrObservationConflict", err)
 	}
 	wantError := fmt.Sprintf(
-		"observation boundary %q: %s", fixture.draft.ID, reasonRecordedAtOwnerMismatch,
+		"observation boundary run %q: %s", fixture.state.DerivationID, reasonCompletionWriteSetMismatch,
 	)
 	if err.Error() != wantError {
 		t.Fatalf("completed retry recorded-time error = %q, want fixed privacy-safe %q", err, wantError)
@@ -2356,6 +2356,232 @@ func TestIngestionCompletedRetryRejectsRecordedAtMismatchWithoutMutation(t *test
 	after := snapshotCanonicalIngestionCompletion(t, fixture)
 	if !reflect.DeepEqual(after, before) {
 		t.Fatalf("rejected completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionExactCompletedRetryIsReadOnly(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCompletedRetryFixture(t, pool, "exact-read-only")
+	fixture.complete(t)
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	if err := fixture.repository.CompleteVersion(context.Background(), fixture.completion()); err != nil {
+		t.Fatalf("retry exact completed write-set: %v", err)
+	}
+
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("exact completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionExactRetryToleratesAdditiveIdentityEnrichment(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	fixture := newCompletedRetryFixture(t, pool, "additive-identity")
+	fixture.complete(t)
+
+	mentionID, proposalID, automaticDecisionID := completedRetryResolutionState(t, fixture)
+	additiveEntityID := uuid.NewString()
+	entities := NewEntityRepository(pool)
+	if _, err := entities.CreateEntity(ctx, EntityInput{
+		ID: additiveEntityID, Kind: "person", DisplayName: "Synthetic Directory Enrichment",
+	}); err != nil {
+		t.Fatalf("create additive directory entity: %v", err)
+	}
+	persistDirectoryNameCandidateForReview(
+		t,
+		pool,
+		directory.PendingMention{
+			MentionID:      mentionID,
+			ProposalID:     proposalID,
+			Surface:        fixture.mentions[0].Surface,
+			NormalizedName: fixture.mentions[0].NormalizedName,
+			NameQuote:      fixture.evidence[0].Span.Text(),
+		},
+		syntheticDirectoryProfile(
+			"completed-retry",
+			"directory-enrichment@synthetic.example",
+			time.Date(2026, time.July, 25, 12, 0, 0, 0, time.UTC),
+		),
+	)
+	if _, err := entities.CorrectReviewDecision(ctx, automaticDecisionID, ResolutionDecisionInput{
+		ProposalID: proposalID, Outcome: ResolutionOutcomeAccepted, EntityID: additiveEntityID,
+	}); err != nil {
+		t.Fatalf("append synthetic reviewer correction: %v", err)
+	}
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	if err := fixture.repository.CompleteVersion(ctx, fixture.completion()); err != nil {
+		t.Fatalf("retry completed write-set after additive identity enrichment: %v", err)
+	}
+
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("enriched completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
+	testCases := []struct {
+		name    string
+		arrange func(*testing.T, canonicalIngestionFixture, *ingest.Completion)
+	}{
+		{
+			name: "evidence span identity",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				first := completion.Evidence[0].Span
+				completion.Evidence[0].Span = completion.Evidence[1].Span
+				completion.Evidence[1].Span = first
+				completion.Mentions[0].EvidenceKey = "manager-name"
+			},
+		},
+		{
+			name: "evidence immutable quote or offsets",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, completion *ingest.Completion) {
+				transcript := fixture.evidence[0].Span.Text()
+				changed, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+					Document: fixture.version, SectionID: fixture.evidence[0].Span.SectionID(),
+					StartOffset: 0, EndOffset: len(transcript) - 1, Quote: transcript[:len(transcript)-1],
+				})
+				if err != nil {
+					t.Fatalf("new changed synthetic evidence: %v", err)
+				}
+				completion.Evidence[0].Span = changed
+			},
+		},
+		{
+			name: "mention identity key",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Mentions[0].Role = "reference"
+			},
+		},
+		{
+			name: "mention evidence binding",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Mentions[0].EvidenceKey = "manager-name"
+				completion.Observations[0].EvidenceKeys = []string{"statement", "manager-name"}
+			},
+		},
+		{
+			name: "completion owned resolution payload",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Mentions[0].Resolution.Candidates[0].Reason = "changed_synthetic_candidate"
+			},
+		},
+		{
+			name: "observation statement time or confidence",
+			arrange: func(t *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				predicate, err := observation.NewPredicate("support_signal")
+				if err != nil {
+					t.Fatalf("new changed synthetic predicate: %v", err)
+				}
+				completion.Observations[0].Predicate = predicate
+			},
+		},
+		{
+			name: "observation origin",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Observations[0].EvidenceKeys = []string{"employee-name"}
+			},
+		},
+		{
+			name: "signal payload",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Signals[0].Category = "support_advocacy"
+			},
+		},
+		{
+			name: "signal evidence role or identity",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Signals[0].Evidence[0].Role = "contradicting"
+			},
+		},
+		{
+			name: "data mode",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.DataMode = modelpolicy.DataModeRestricted
+			},
+		},
+		{
+			name: "stored extraction run admissibility",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *ingest.Completion) {
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.extraction_runs
+					SET currently_admissible = false
+					WHERE id = $1`, fixture.state.DerivationID); err != nil {
+					t.Fatalf("mutate stored run admissibility: %v", err)
+				}
+			},
+		},
+		{
+			name: "stored current version association",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *ingest.Completion) {
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.source_documents AS source
+					SET current_document_version_id = NULL
+					FROM stacks.document_versions AS version
+					WHERE version.id = $1 AND source.id = version.source_document_id`,
+					fixture.state.ID,
+				); err != nil {
+					t.Fatalf("mutate stored current version association: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIntegrationDatabase(t)
+			fixture := newCompletedRetryFixture(t, pool, testIdentifier(testCase.name))
+			fixture.complete(t)
+			completion := fixture.completion()
+			testCase.arrange(t, fixture, &completion)
+			before := snapshotCompletedRetryWriteSet(t, fixture)
+
+			err := fixture.repository.CompleteVersion(context.Background(), completion)
+			if !errors.Is(err, ErrObservationConflict) {
+				t.Fatalf("completed write-set mismatch error = %v, want ErrObservationConflict", err)
+			}
+			wantError := fmt.Sprintf(
+				"observation boundary run %q: %s",
+				fixture.state.DerivationID,
+				reasonCompletionWriteSetMismatch,
+			)
+			if err.Error() != wantError {
+				t.Fatalf("completed write-set mismatch error = %q, want privacy-safe %q", err, wantError)
+			}
+			after := snapshotCompletedRetryWriteSet(t, fixture)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("rejected completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+			}
+		})
+	}
+}
+
+func TestCompleteVersionRejectsCompletedRetryFromDifferentOwner(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCompletedRetryFixture(t, pool, "different-owner")
+	fixture.complete(t)
+	completion := fixture.completion()
+	completion.LeaseOwner = uuid.NewString()
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	err := fixture.repository.CompleteVersion(context.Background(), completion)
+	if !errors.Is(err, ErrObservationConflict) {
+		t.Fatalf("different-owner completed retry error = %v, want ErrObservationConflict", err)
+	}
+	wantError := fmt.Sprintf(
+		"observation boundary run %q: %s",
+		fixture.state.DerivationID,
+		reasonCompletionOwnerMismatch,
+	)
+	if err.Error() != wantError {
+		t.Fatalf("different-owner completed retry error = %q, want privacy-safe %q", err, wantError)
+	}
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("different-owner completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
 	}
 }
 
@@ -2377,8 +2603,13 @@ func TestIngestionCompletionValidationPrecedence(t *testing.T) {
 				fixture.complete(t)
 				completion.LeaseOwner = uuid.NewString()
 			},
-			wantError: func(canonicalIngestionFixture) string {
-				return "complete ingestion version: completion lease is not owned"
+			wantKind: ErrObservationConflict,
+			wantError: func(fixture canonicalIngestionFixture) string {
+				return fmt.Sprintf(
+					"observation boundary run %q: %s",
+					fixture.state.DerivationID,
+					reasonCompletionOwnerMismatch,
+				)
 			},
 		},
 		{
@@ -2415,9 +2646,6 @@ func TestIngestionCompletionValidationPrecedence(t *testing.T) {
 			err := fixture.repository.CompleteVersion(ctx, completion)
 			if err == nil {
 				t.Fatal("completion with competing validation failures succeeded")
-			}
-			if errors.Is(err, ErrObservationConflict) {
-				t.Fatalf("validation precedence error = %v, recorded-time conflict won", err)
 			}
 			if testCase.wantKind != nil && !errors.Is(err, testCase.wantKind) {
 				t.Fatalf("validation precedence error = %v, want %v", err, testCase.wantKind)
@@ -6396,6 +6624,7 @@ type canonicalIngestionFixture struct {
 	repository *IngestionRepository
 	state      ingest.VersionState
 	derivation ingest.DerivationIdentity
+	version    knowledge.DocumentVersion
 	evidence   []ingest.EvidenceRecord
 	mentions   []ingest.MentionRecord
 	draft      ingest.ObservationDraft
@@ -6437,7 +6666,7 @@ func newCanonicalIngestionFixture(t *testing.T, pool *pgxpool.Pool, label string
 	}
 	observationID := observation.ObservationID(uuid.NewString())
 	return canonicalIngestionFixture{
-		pool: pool, repository: repository, state: state, derivation: derivation,
+		pool: pool, repository: repository, state: state, derivation: derivation, version: version,
 		evidence: []ingest.EvidenceRecord{{Key: "statement", Span: span}},
 		mentions: []ingest.MentionRecord{
 			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
@@ -6456,6 +6685,197 @@ func newCanonicalIngestionFixture(t *testing.T, pool *pgxpool.Pool, label string
 			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "statement", Role: "supporting"}},
 		},
 	}
+}
+
+func newCompletedRetryFixture(t *testing.T, pool *pgxpool.Pool, label string) canonicalIngestionFixture {
+	t.Helper()
+	fixture := newCanonicalIngestionFixture(t, pool, label)
+	transcript := fixture.version.Sections()[0].Text()
+	employeeStart := strings.Index(transcript, "Synthetic Employee")
+	employeeEnd := employeeStart + len("Synthetic Employee")
+	employeeSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: fixture.version, SectionID: "tab-synthetic",
+		StartOffset: employeeStart, EndOffset: employeeEnd, Quote: transcript[employeeStart:employeeEnd],
+	})
+	if err != nil {
+		t.Fatalf("new completed-retry employee evidence: %v", err)
+	}
+	fixture.evidence = append(fixture.evidence, ingest.EvidenceRecord{Key: "employee-name", Span: employeeSpan})
+	managerStart := strings.Index(transcript, "Synthetic Manager")
+	managerEnd := managerStart + len("Synthetic Manager")
+	managerSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: fixture.version, SectionID: "tab-synthetic",
+		StartOffset: managerStart, EndOffset: managerEnd, Quote: transcript[managerStart:managerEnd],
+	})
+	if err != nil {
+		t.Fatalf("new completed-retry manager evidence: %v", err)
+	}
+	fixture.evidence = append(fixture.evidence, ingest.EvidenceRecord{Key: "manager-name", Span: managerSpan})
+
+	resolvedEntityID := uuid.NewString()
+	if _, err := NewEntityRepository(pool).CreateEntity(context.Background(), EntityInput{
+		ID: resolvedEntityID, Kind: "person", DisplayName: "Synthetic Completed Retry Person",
+	}); err != nil {
+		t.Fatalf("create completed-retry resolution entity: %v", err)
+	}
+	fixture.mentions[0].Resolution = entity.Resolution{
+		EntityID: resolvedEntityID, AutoResolved: true,
+		Candidates: []entity.Candidate{{
+			EntityID: resolvedEntityID, Confidence: 0.9, Reason: "exact_synthetic_name",
+		}},
+	}
+	return fixture
+}
+
+func completedRetryResolutionState(t *testing.T, fixture canonicalIngestionFixture) (string, string, string) {
+	t.Helper()
+	var mentionID, proposalID, decisionID string
+	if err := fixture.pool.QueryRow(context.Background(), `
+		SELECT mention.id::text, proposal.id::text, decision.id::text
+		FROM stacks.resolution_proposals AS proposal
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		JOIN stacks.resolution_decisions AS decision ON decision.proposal_id = proposal.id
+		WHERE mention.extraction_run_id = $1
+		  AND mention.surface = $2
+		  AND decision.supersedes_id IS NULL`,
+		fixture.state.DerivationID, fixture.mentions[0].Surface,
+	).Scan(&mentionID, &proposalID, &decisionID); err != nil {
+		t.Fatalf("load completed-retry resolution state: %v", err)
+	}
+	return mentionID, proposalID, decisionID
+}
+
+type completedRetryWriteSetSnapshot map[string]string
+
+func snapshotCompletedRetryWriteSet(t *testing.T, fixture canonicalIngestionFixture) completedRetryWriteSetSnapshot {
+	t.Helper()
+	queries := map[string]string{
+		"evidence": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT evidence.xmin::text AS row_version, evidence.*,
+				       encode(tab.content_digest, 'hex') AS tab_content_digest
+				FROM stacks.evidence_spans AS evidence
+				JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
+				JOIN stacks.document_versions AS version ON version.id = tab.document_version_id
+				WHERE version.id = $1
+				ORDER BY evidence.id
+			) AS row_data`,
+		"mentions": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT mention.xmin::text AS row_version, mention.*
+				FROM stacks.mentions AS mention
+				WHERE mention.extraction_run_id = $1
+				ORDER BY mention.id
+			) AS row_data`,
+		"proposals": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT proposal.xmin::text AS row_version, proposal.*
+				FROM stacks.resolution_proposals AS proposal
+				JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+				WHERE mention.extraction_run_id = $1
+				ORDER BY proposal.id
+			) AS row_data`,
+		"candidates": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT candidate.xmin::text AS row_version, candidate.*
+				FROM stacks.resolution_candidates AS candidate
+				JOIN stacks.resolution_proposals AS proposal ON proposal.id = candidate.proposal_id
+				JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+				WHERE mention.extraction_run_id = $1
+				ORDER BY candidate.id
+			) AS row_data`,
+		"decisions": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT decision.xmin::text AS row_version, decision.*
+				FROM stacks.resolution_decisions AS decision
+				JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+				JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+				WHERE mention.extraction_run_id = $1
+				ORDER BY decision.id
+			) AS row_data`,
+		"aliases": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT assertion.xmin::text AS row_version, assertion.*
+				FROM stacks.entity_alias_assertions AS assertion
+				JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+				JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+				JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+				WHERE mention.extraction_run_id = $1
+				ORDER BY assertion.id
+			) AS row_data`,
+		"observations": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT value.xmin::text AS row_version, value.*
+				FROM stacks.observations AS value
+				WHERE value.extraction_run_id = $1
+				ORDER BY value.id
+			) AS row_data`,
+		"observation_evidence": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.observation_id, row_data.evidence_span_id)::text, '[]')
+			FROM (
+				SELECT link.xmin::text AS row_version, link.*
+				FROM stacks.observation_evidence AS link
+				JOIN stacks.observations AS value ON value.id = link.observation_id
+				WHERE value.extraction_run_id = $1
+				ORDER BY link.observation_id, link.evidence_span_id
+			) AS row_data`,
+		"signals": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT signal.xmin::text AS row_version, signal.*
+				FROM stacks.interaction_signals AS signal
+				JOIN stacks.observations AS value ON value.id = signal.observation_id
+				WHERE value.extraction_run_id = $1
+				ORDER BY signal.id
+			) AS row_data`,
+		"signal_evidence": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.signal_id, row_data.evidence_span_id, row_data.role)::text, '[]')
+			FROM (
+				SELECT link.xmin::text AS row_version, link.*
+				FROM stacks.signal_evidence AS link
+				JOIN stacks.interaction_signals AS signal ON signal.id = link.signal_id
+				JOIN stacks.observations AS value ON value.id = signal.observation_id
+				WHERE value.extraction_run_id = $1
+				ORDER BY link.signal_id, link.evidence_span_id, link.role
+			) AS row_data`,
+		"run": `
+			SELECT to_jsonb(row_data)::text
+			FROM (
+				SELECT run.xmin::text AS row_version, run.*
+				FROM stacks.extraction_runs AS run
+				WHERE run.id = $1
+			) AS row_data`,
+		"version": `
+			SELECT to_jsonb(row_data)::text
+			FROM (
+				SELECT version.xmin::text AS version_row_version, version.*,
+				       source.xmin::text AS source_row_version,
+				       source.current_document_version_id
+				FROM stacks.document_versions AS version
+				JOIN stacks.source_documents AS source ON source.id = version.source_document_id
+				WHERE version.id = $1
+			) AS row_data`,
+	}
+	snapshot := make(completedRetryWriteSetSnapshot, len(queries))
+	for name, query := range queries {
+		var value string
+		identifier := fixture.state.DerivationID
+		if name == "evidence" || name == "version" {
+			identifier = fixture.state.ID
+		}
+		if err := fixture.pool.QueryRow(context.Background(), query, identifier).Scan(&value); err != nil {
+			t.Fatalf("snapshot completed-retry %s: %v", name, err)
+		}
+		snapshot[name] = value
+	}
+	return snapshot
 }
 
 func (fixture canonicalIngestionFixture) complete(t *testing.T) {

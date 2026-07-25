@@ -477,17 +477,22 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if storedVersionID != completion.VersionID {
 		return fmt.Errorf("complete ingestion version: derivation source version conflicts")
 	}
+	run := owningExtractionRun{
+		ID:            completion.DerivationID,
+		ModelID:       storedModelID,
+		PromptVersion: storedPromptVersion,
+		RecordedAt:    storedRecordedAt,
+	}
 	if status == string(ingest.VersionStatusComplete) {
 		if completedByOwner == nil || *completedByOwner != completion.LeaseOwner {
-			return fmt.Errorf("complete ingestion version: completion lease is not owned")
+			return newCompletionBoundaryError(
+				ErrObservationConflict,
+				reasonCompletionOwnerMismatch,
+				completion.DerivationID,
+			)
 		}
-		if err := validateIngestionRecordedAt(completion.Observations, storedRecordedAt); err != nil {
+		if err := compareCompletedWriteSet(ctx, transaction, completion, run); err != nil {
 			return err
-		}
-		if storedAdmissible {
-			if err := setCurrentDocumentVersion(ctx, transaction, completion.VersionID); err != nil {
-				return err
-			}
 		}
 		return transaction.Commit(ctx)
 	}
@@ -505,13 +510,6 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if err := validateIngestionRecordedAt(completion.Observations, storedRecordedAt); err != nil {
 		return err
 	}
-	run := owningExtractionRun{
-		ID:            completion.DerivationID,
-		ModelID:       storedModelID,
-		PromptVersion: storedPromptVersion,
-		RecordedAt:    storedRecordedAt,
-	}
-
 	evidenceIDs, err := persistIngestionEvidence(ctx, transaction, completion.Evidence)
 	if err != nil {
 		return err
