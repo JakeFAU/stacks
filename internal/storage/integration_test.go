@@ -4968,6 +4968,76 @@ func TestCompleteObservationAcceptsExactCanonicalRetry(t *testing.T) {
 	}
 }
 
+func TestCompleteObservationCanonicalizesUUIDBoundFieldsForRetry(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	entities := NewEntityRepository(pool)
+
+	subjectEntity, err := entities.CreateEntity(ctx, EntityInput{
+		ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Uppercase Subject",
+	})
+	if err != nil {
+		t.Fatalf("create subject entity: %v", err)
+	}
+	objectEntity, err := entities.CreateEntity(ctx, EntityInput{
+		ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Uppercase Object",
+	})
+	if err != nil {
+		t.Fatalf("create object entity: %v", err)
+	}
+	subjectMentionID, originID := createSyntheticMentionAndSpan(t, pool)
+	objectMentionID, signalOnlyID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-uppercase-uuid-retry")))
+	uppercaseRun := run
+	uppercaseRun.ID = strings.ToUpper(run.ID)
+	observationID := strings.ToUpper(uuid.NewString())
+	value := testCanonicalObservation(
+		t,
+		uppercaseRun,
+		observationID,
+		strings.ToUpper(subjectEntity.ID),
+		strings.ToUpper(subjectMentionID),
+		strings.ToUpper(objectEntity.ID),
+		strings.ToUpper(objectMentionID),
+		"interacted_with",
+		observation.UnknownTime(),
+		strings.ToUpper(originID),
+		strings.ToUpper(signalOnlyID),
+	)
+	signalID := strings.ToUpper(uuid.NewString())
+	signal := &SignalInput{
+		ID: signalID, ObservationID: observationID, Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Rationale: "Synthetic uppercase UUID retry.", Confidence: 0.8,
+	}
+	origin := []knowledge.EvidenceID{knowledge.EvidenceID(strings.ToUpper(originID))}
+	signalEvidence := []SignalEvidenceInput{{EvidenceSpanID: strings.ToUpper(signalOnlyID), Role: "supporting"}}
+
+	first, firstSignal, err := graph.CompleteObservation(ctx, value, origin, signal, signalEvidence)
+	if err != nil {
+		t.Fatalf("complete uppercase UUID observation: %v", err)
+	}
+	second, secondSignal, err := graph.CompleteObservation(ctx, value, origin, signal, signalEvidence)
+	if err != nil {
+		t.Fatalf("retry uppercase UUID observation: %v", err)
+	}
+	if first.ID() != second.ID() || firstSignal == nil || secondSignal == nil || firstSignal.ID != secondSignal.ID {
+		t.Fatalf("uppercase UUID retry = %#v/%#v, want identical completion", second, secondSignal)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.observations WHERE id = $1`, observationID); got != 1 {
+		t.Fatalf("observation rows = %d, want 1", got)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, observationID); got != 1 {
+		t.Fatalf("observation evidence rows = %d, want 1", got)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, signalID); got != 1 {
+		t.Fatalf("signal rows = %d, want 1", got)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, signalID); got != 1 {
+		t.Fatalf("signal evidence rows = %d, want 1", got)
+	}
+}
+
 func TestCompleteObservationRejectsInadmissibleOwningRunWithoutGraphWrites(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()

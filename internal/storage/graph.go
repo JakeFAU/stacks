@@ -102,14 +102,15 @@ func (repository *GraphRepository) CompleteObservation(
 		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, canonicalObservationID)
 	}
 	compatibility := legacyObservationCompatibility{observationEvidenceOrigin: origin}
-	if _, err := preflightLegacyObservation(value, compatibility, state); err != nil {
+	preflight, err := preflightLegacyObservation(value, compatibility, state)
+	if err != nil {
 		return observation.Observation{}, nil, err
 	}
 
 	var stored observation.Observation
 	var storedSignal *InteractionSignal
 	err = repository.withTransaction(ctx, func(transaction pgx.Tx) error {
-		run, err := loadOwningExtractionRun(ctx, transaction, derivation.RunID, boundaryObservationID)
+		run, err := loadOwningExtractionRun(ctx, transaction, preflight.derivationRunID, boundaryObservationID)
 		if err != nil {
 			return err
 		}

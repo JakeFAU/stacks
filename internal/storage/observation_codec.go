@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -115,11 +116,14 @@ type legacyObservationWrite struct {
 
 type legacyObservationPreflight struct {
 	observationID                     string
+	derivationRunID                   string
 	subjectEntityID, subjectMentionID string
 	objectEntityID, objectMentionID   string
 	validStart, validEnd              *time.Time
 	confidence                        *float64
+	evidenceLinks                     []observation.EvidenceLink
 	origin                            []evidence.EvidenceID
+	signal                            *legacySignalState
 }
 
 func decodeLegacyObservation(
@@ -202,10 +206,10 @@ func encodeLegacyObservation(
 	if err != nil {
 		return legacyObservationWrite{}, err
 	}
-	if err := validateOwningRun(value, run); err != nil {
+	if err := validateOwningRun(value, run, preflight.observationID, preflight.derivationRunID); err != nil {
 		return legacyObservationWrite{}, err
 	}
-	if err := validateActiveSignal(signal, run, observation.ObservationID(preflight.observationID)); err != nil {
+	if err := validateActiveSignal(preflight.signal, run, observation.ObservationID(preflight.observationID)); err != nil {
 		return legacyObservationWrite{}, err
 	}
 
@@ -217,10 +221,10 @@ func encodeLegacyObservation(
 			EpistemicStatus: string(value.Status()), ValidStart: preflight.validStart, ValidEnd: preflight.validEnd,
 			RecordedAt: value.RecordedAt(), Confidence: preflight.confidence,
 		},
-		Origin: preflight.origin, Signal: cloneLegacySignalState(signal),
+		Origin: preflight.origin, Signal: cloneLegacySignalState(preflight.signal),
 	}
-	if run != nil && value.Derivation().RunID != "" {
-		write.Row.ExtractionRunID = run.ID
+	if run != nil && preflight.derivationRunID != "" {
+		write.Row.ExtractionRunID = preflight.derivationRunID
 	}
 	digest, err := computeObservationDigestV1(write)
 	if err != nil {
@@ -273,57 +277,106 @@ func preflightLegacyObservation(
 		confidenceValue := canonicalConfidence.Value()
 		confidence = &confidenceValue
 	}
-	if err := validateLegacyUUIDBoundFields(value, compatibility, signal, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID); err != nil {
+	derivationRunID, err := canonicalLegacyUUIDBoundField(value.ID(), value.Derivation().RunID)
+	if err != nil {
 		return legacyObservationPreflight{}, err
 	}
-	if err := validateSignalObservationOwnership(signal, observation.ObservationID(observationID)); err != nil {
+	subjectEntityID, err = canonicalLegacyUUIDBoundField(value.ID(), subjectEntityID)
+	if err != nil {
 		return legacyObservationPreflight{}, err
 	}
-	origin, err := legacyObservationOrigin(value, compatibility, signal)
+	subjectMentionID, err = canonicalLegacyUUIDBoundField(value.ID(), subjectMentionID)
+	if err != nil {
+		return legacyObservationPreflight{}, err
+	}
+	objectEntityID, err = canonicalLegacyUUIDBoundField(value.ID(), objectEntityID)
+	if err != nil {
+		return legacyObservationPreflight{}, err
+	}
+	objectMentionID, err = canonicalLegacyUUIDBoundField(value.ID(), objectMentionID)
+	if err != nil {
+		return legacyObservationPreflight{}, err
+	}
+	evidenceLinks, err := canonicalLegacyEvidenceLinks(value.ID(), value.EvidenceLinks())
+	if err != nil {
+		return legacyObservationPreflight{}, err
+	}
+	origin, err := normalizeLegacyOrigin(compatibility.observationEvidenceOrigin)
+	if err != nil {
+		return legacyObservationPreflight{}, newLegacyUUIDPreflightError(value.ID())
+	}
+	canonicalSignal, err := canonicalLegacySignalState(value.ID(), signal)
+	if err != nil {
+		return legacyObservationPreflight{}, err
+	}
+	if err := validateSignalObservationOwnership(canonicalSignal, observation.ObservationID(observationID)); err != nil {
+		return legacyObservationPreflight{}, err
+	}
+	origin, err = legacyObservationOrigin(observationID, evidenceLinks, origin, canonicalSignal)
 	if err != nil {
 		return legacyObservationPreflight{}, err
 	}
 	return legacyObservationPreflight{
-		observationID:   observationID,
+		observationID: observationID, derivationRunID: derivationRunID,
 		subjectEntityID: subjectEntityID, subjectMentionID: subjectMentionID,
 		objectEntityID: objectEntityID, objectMentionID: objectMentionID,
 		validStart: validStart, validEnd: validEnd, confidence: confidence, origin: origin,
+		evidenceLinks: evidenceLinks, signal: canonicalSignal,
 	}, nil
 }
 
-func validateLegacyUUIDBoundFields(
-	value observation.Observation,
-	compatibility legacyObservationCompatibility,
-	signal *legacySignalState,
-	identifiers ...string,
-) error {
-	if _, err := canonicalUUID(string(value.ID())); err != nil {
-		return newLegacyUUIDPreflightError(value.ID())
+func canonicalLegacyUUIDBoundField(observationID observation.ObservationID, identifier string) (string, error) {
+	if identifier == "" {
+		return "", nil
 	}
-	if runID := value.Derivation().RunID; runID != "" {
-		identifiers = append(identifiers, runID)
+	canonicalID, err := canonicalUUID(identifier)
+	if err != nil {
+		return "", newLegacyUUIDPreflightError(observationID)
 	}
-	for _, link := range value.EvidenceLinks() {
-		identifiers = append(identifiers, string(link.EvidenceID))
-	}
-	for _, evidenceID := range compatibility.observationEvidenceOrigin {
-		identifiers = append(identifiers, string(evidenceID))
-	}
-	if signal != nil {
-		identifiers = append(identifiers, signal.Input.ID, signal.Input.ObservationID)
-		for _, link := range signal.Evidence {
-			identifiers = append(identifiers, link.EvidenceSpanID)
+	return canonicalID, nil
+}
+
+func canonicalLegacyEvidenceLinks(
+	observationID observation.ObservationID,
+	links []observation.EvidenceLink,
+) ([]observation.EvidenceLink, error) {
+	canonical := make([]observation.EvidenceLink, 0, len(links))
+	seen := make(map[observation.EvidenceLink]struct{}, len(links))
+	for _, link := range links {
+		canonicalID, err := canonicalLegacyUUIDBoundField(observationID, string(link.EvidenceID))
+		if err != nil {
+			return nil, err
 		}
-	}
-	for _, identifier := range identifiers {
-		if identifier == "" {
+		canonicalLink := observation.EvidenceLink{EvidenceID: evidence.EvidenceID(canonicalID), Role: link.Role}
+		if _, exists := seen[canonicalLink]; exists {
 			continue
 		}
-		if _, err := canonicalUUID(identifier); err != nil {
-			return newLegacyUUIDPreflightError(value.ID())
-		}
+		seen[canonicalLink] = struct{}{}
+		canonical = append(canonical, canonicalLink)
 	}
-	return nil
+	sort.Slice(canonical, func(left, right int) bool {
+		if canonical[left].EvidenceID == canonical[right].EvidenceID {
+			return canonical[left].Role < canonical[right].Role
+		}
+		return canonical[left].EvidenceID < canonical[right].EvidenceID
+	})
+	return canonical, nil
+}
+
+func canonicalLegacySignalState(
+	observationID observation.ObservationID,
+	signal *legacySignalState,
+) (*legacySignalState, error) {
+	if signal == nil {
+		return nil, nil
+	}
+	input, signalEvidence, err := canonicalizeSignalIdentity(signal.Input, signal.Evidence)
+	if err != nil {
+		return nil, newLegacyUUIDPreflightError(observationID)
+	}
+	return &legacySignalState{
+		Input: input, Evidence: signalEvidence, Digest: signal.Digest,
+	}, nil
 }
 
 func newLegacyUUIDPreflightError(observationID observation.ObservationID) error {
@@ -450,16 +503,24 @@ func canonicalEvidenceLinks(origin []evidence.EvidenceID, signal *legacySignalSt
 	return links, nil
 }
 
-func validateOwningRun(value observation.Observation, run *owningExtractionRun) error {
+func validateOwningRun(
+	value observation.Observation,
+	run *owningExtractionRun,
+	observationID string,
+	derivationRunID string,
+) error {
 	derivation := value.Derivation()
-	observationID := canonicalObservationBoundaryID(value.ID())
 	if derivation.LegacyUnversioned {
 		return newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyDerivationNotRepresentable, observationID)
 	}
 	if run == nil {
 		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, observationID)
 	}
-	if derivation.RunID == "" || run.ID != derivation.RunID {
+	canonicalRunID, err := canonicalLegacyUUIDBoundField(value.ID(), run.ID)
+	if err != nil {
+		return err
+	}
+	if derivationRunID == "" || canonicalRunID != derivationRunID {
 		return newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, observationID)
 	}
 	if (run.ModelID == "") != (run.PromptVersion == "") ||
@@ -493,11 +554,15 @@ func validateSignalObservationOwnership(signal *legacySignalState, observationID
 	return nil
 }
 
-func legacyObservationOrigin(value observation.Observation, compatibility legacyObservationCompatibility, signal *legacySignalState) ([]evidence.EvidenceID, error) {
-	observationID := canonicalObservationBoundaryID(value.ID())
-	origin := cloneEvidenceIDs(compatibility.observationEvidenceOrigin)
-	if compatibility.observationEvidenceOrigin == nil {
-		for _, link := range value.EvidenceLinks() {
+func legacyObservationOrigin(
+	observationID string,
+	evidenceLinks []observation.EvidenceLink,
+	privateOrigin []evidence.EvidenceID,
+	signal *legacySignalState,
+) ([]evidence.EvidenceID, error) {
+	origin := cloneEvidenceIDs(privateOrigin)
+	if privateOrigin == nil {
+		for _, link := range evidenceLinks {
 			if link.Role == observation.EvidenceSupporting {
 				origin = append(origin, link.EvidenceID)
 			}
@@ -511,7 +576,7 @@ func legacyObservationOrigin(value observation.Observation, compatibility legacy
 	if err != nil {
 		return nil, err
 	}
-	if !sameEvidenceLinks(value.EvidenceLinks(), wantLinks) {
+	if !sameEvidenceLinks(evidenceLinks, wantLinks) {
 		return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonEvidenceOwnershipMismatch, observationID)
 	}
 	return origin, nil
