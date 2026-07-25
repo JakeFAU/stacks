@@ -114,6 +114,7 @@ type legacyObservationWrite struct {
 }
 
 type legacyObservationPreflight struct {
+	observationID                     string
 	subjectEntityID, subjectMentionID string
 	objectEntityID, objectMentionID   string
 	validStart, validEnd              *time.Time
@@ -204,13 +205,13 @@ func encodeLegacyObservation(
 	if err := validateOwningRun(value, run); err != nil {
 		return legacyObservationWrite{}, err
 	}
-	if err := validateActiveSignal(signal, run, value.ID()); err != nil {
+	if err := validateActiveSignal(signal, run, observation.ObservationID(preflight.observationID)); err != nil {
 		return legacyObservationWrite{}, err
 	}
 
 	write := legacyObservationWrite{
 		Row: legacyObservationRow{
-			ID: string(value.ID()), SubjectEntityID: preflight.subjectEntityID, ObjectEntityID: preflight.objectEntityID,
+			ID: preflight.observationID, SubjectEntityID: preflight.subjectEntityID, ObjectEntityID: preflight.objectEntityID,
 			SubjectMentionID: preflight.subjectMentionID, ObjectMentionID: preflight.objectMentionID,
 			Predicate: string(value.Statement().Predicate), Derivation: value.Derivation().Method,
 			EpistemicStatus: string(value.Status()), ValidStart: preflight.validStart, ValidEnd: preflight.validEnd,
@@ -223,10 +224,10 @@ func encodeLegacyObservation(
 	}
 	digest, err := computeObservationDigestV1(write)
 	if err != nil {
-		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, string(value.ID()))
+		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, preflight.observationID)
 	}
 	if compatibility.storedDigest != ([sha256.Size]byte{}) && compatibility.storedDigest != digest {
-		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationConflict, reasonObservationDigestMismatch, string(value.ID()))
+		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationConflict, reasonObservationDigestMismatch, preflight.observationID)
 	}
 	write.Row.Digest = digest
 	return write, nil
@@ -237,33 +238,37 @@ func preflightLegacyObservation(
 	compatibility legacyObservationCompatibility,
 	signal *legacySignalState,
 ) (legacyObservationPreflight, error) {
+	observationID, err := canonicalUUID(string(value.ID()))
+	if err != nil {
+		return legacyObservationPreflight{}, newLegacyUUIDPreflightError(value.ID())
+	}
 	if !legacyTimestampRepresentable(value.RecordedAt()) {
 		return legacyObservationPreflight{}, newObservationBoundaryError(
-			ErrObservationNotRepresentable, reasonRecordedAtNotRepresentable, string(value.ID()),
+			ErrObservationNotRepresentable, reasonRecordedAtNotRepresentable, observationID,
 		)
 	}
-	if err := ensureLegacyValidTimePrecision(value.ValidTime(), value.ID()); err != nil {
+	if err := ensureLegacyValidTimePrecision(value.ValidTime(), observation.ObservationID(observationID)); err != nil {
 		return legacyObservationPreflight{}, err
 	}
 	if value.LegacyUncited() {
-		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUncitedNotRepresentable, string(value.ID()))
+		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUncitedNotRepresentable, observationID)
 	}
 	subjectEntityID, subjectMentionID, err := encodeLegacyTerm(value.Statement().Subject)
 	if err != nil {
-		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonTermNotRepresentable, string(value.ID()))
+		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonTermNotRepresentable, observationID)
 	}
 	objectEntityID, objectMentionID, err := encodeLegacyTerm(value.Statement().Object)
 	if err != nil {
-		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonTermNotRepresentable, string(value.ID()))
+		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonTermNotRepresentable, observationID)
 	}
 	validStart, validEnd, err := encodeLegacyValidTime(value.ValidTime())
 	if err != nil {
-		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonValidTimeNotRepresentable, string(value.ID()))
+		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonValidTimeNotRepresentable, observationID)
 	}
 	var confidence *float64
 	if canonicalConfidence, ok := value.Confidence(); ok {
 		if canonicalConfidence.Scale() != observation.ConfidenceUnspecifiedLegacy {
-			return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonConfidenceScaleNotRepresentable, string(value.ID()))
+			return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonConfidenceScaleNotRepresentable, observationID)
 		}
 		confidenceValue := canonicalConfidence.Value()
 		confidence = &confidenceValue
@@ -271,7 +276,7 @@ func preflightLegacyObservation(
 	if err := validateLegacyUUIDBoundFields(value, compatibility, signal, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID); err != nil {
 		return legacyObservationPreflight{}, err
 	}
-	if err := validateSignalObservationOwnership(signal, value.ID()); err != nil {
+	if err := validateSignalObservationOwnership(signal, observation.ObservationID(observationID)); err != nil {
 		return legacyObservationPreflight{}, err
 	}
 	origin, err := legacyObservationOrigin(value, compatibility, signal)
@@ -279,6 +284,7 @@ func preflightLegacyObservation(
 		return legacyObservationPreflight{}, err
 	}
 	return legacyObservationPreflight{
+		observationID:   observationID,
 		subjectEntityID: subjectEntityID, subjectMentionID: subjectMentionID,
 		objectEntityID: objectEntityID, objectMentionID: objectMentionID,
 		validStart: validStart, validEnd: validEnd, confidence: confidence, origin: origin,
@@ -321,11 +327,15 @@ func validateLegacyUUIDBoundFields(
 }
 
 func newLegacyUUIDPreflightError(observationID observation.ObservationID) error {
+	return newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, canonicalObservationBoundaryID(observationID))
+}
+
+func canonicalObservationBoundaryID(observationID observation.ObservationID) string {
 	canonicalID, err := canonicalUUID(string(observationID))
 	if err != nil {
-		canonicalID = ""
+		return ""
 	}
-	return newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, canonicalID)
+	return canonicalID
 }
 
 func ensureLegacyValidTimePrecision(value observation.TemporalExtent, observationID observation.ObservationID) error {
@@ -442,22 +452,23 @@ func canonicalEvidenceLinks(origin []evidence.EvidenceID, signal *legacySignalSt
 
 func validateOwningRun(value observation.Observation, run *owningExtractionRun) error {
 	derivation := value.Derivation()
+	observationID := canonicalObservationBoundaryID(value.ID())
 	if derivation.LegacyUnversioned {
-		return newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyDerivationNotRepresentable, string(value.ID()))
+		return newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyDerivationNotRepresentable, observationID)
 	}
 	if run == nil {
-		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, string(value.ID()))
+		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, observationID)
 	}
 	if derivation.RunID == "" || run.ID != derivation.RunID {
-		return newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, string(value.ID()))
+		return newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, observationID)
 	}
 	if (run.ModelID == "") != (run.PromptVersion == "") ||
 		(derivation.Model == "") != (derivation.PromptVersion == "") ||
 		derivation.Version != run.PromptVersion || run.ModelID != derivation.Model || run.PromptVersion != derivation.PromptVersion {
-		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunProvenanceMismatch, string(value.ID()))
+		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunProvenanceMismatch, observationID)
 	}
 	if !value.RecordedAt().Equal(run.RecordedAt) {
-		return newObservationBoundaryError(ErrObservationCompatibility, reasonRecordedAtOwnerMismatch, string(value.ID()))
+		return newObservationBoundaryError(ErrObservationCompatibility, reasonRecordedAtOwnerMismatch, observationID)
 	}
 	return nil
 }
@@ -483,6 +494,7 @@ func validateSignalObservationOwnership(signal *legacySignalState, observationID
 }
 
 func legacyObservationOrigin(value observation.Observation, compatibility legacyObservationCompatibility, signal *legacySignalState) ([]evidence.EvidenceID, error) {
+	observationID := canonicalObservationBoundaryID(value.ID())
 	origin := cloneEvidenceIDs(compatibility.observationEvidenceOrigin)
 	if compatibility.observationEvidenceOrigin == nil {
 		for _, link := range value.EvidenceLinks() {
@@ -493,14 +505,14 @@ func legacyObservationOrigin(value observation.Observation, compatibility legacy
 	}
 	origin, err := normalizeLegacyOrigin(origin)
 	if err != nil {
-		return nil, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, string(value.ID()))
+		return nil, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, observationID)
 	}
 	wantLinks, err := canonicalEvidenceLinks(origin, signal)
 	if err != nil {
 		return nil, err
 	}
 	if !sameEvidenceLinks(value.EvidenceLinks(), wantLinks) {
-		return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonEvidenceOwnershipMismatch, string(value.ID()))
+		return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonEvidenceOwnershipMismatch, observationID)
 	}
 	return origin, nil
 }

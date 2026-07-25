@@ -81,20 +81,25 @@ func (repository *GraphRepository) CompleteObservation(
 	signal *SignalInput,
 	signalEvidence []SignalEvidenceInput,
 ) (observation.Observation, *InteractionSignal, error) {
+	canonicalObservationID, err := canonicalUUID(string(value.ID()))
+	if err != nil {
+		return observation.Observation{}, nil, newLegacyUUIDPreflightError(value.ID())
+	}
+	boundaryObservationID := observation.ObservationID(canonicalObservationID)
 	origin, err := normalizeLegacyOrigin(observationEvidenceOrigin)
 	if err != nil {
 		return observation.Observation{}, nil, newLegacyUUIDPreflightError(value.ID())
 	}
-	state, err := canonicalSignalState(value.ID(), signal, signalEvidence)
+	state, err := canonicalSignalState(boundaryObservationID, signal, signalEvidence)
 	if err != nil {
 		return observation.Observation{}, nil, err
 	}
 	derivation := value.Derivation()
 	if derivation.LegacyUnversioned {
-		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyDerivationNotRepresentable, string(value.ID()))
+		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyDerivationNotRepresentable, canonicalObservationID)
 	}
 	if derivation.RunID == "" {
-		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, string(value.ID()))
+		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, canonicalObservationID)
 	}
 	compatibility := legacyObservationCompatibility{observationEvidenceOrigin: origin}
 	if _, err := preflightLegacyObservation(value, compatibility, state); err != nil {
@@ -104,7 +109,7 @@ func (repository *GraphRepository) CompleteObservation(
 	var stored observation.Observation
 	var storedSignal *InteractionSignal
 	err = repository.withTransaction(ctx, func(transaction pgx.Tx) error {
-		run, err := loadOwningExtractionRun(ctx, transaction, derivation.RunID, value.ID())
+		run, err := loadOwningExtractionRun(ctx, transaction, derivation.RunID, boundaryObservationID)
 		if err != nil {
 			return err
 		}

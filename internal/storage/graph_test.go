@@ -168,6 +168,91 @@ func TestCompleteObservationPreflightRejectsUUIDBoundFieldsBeforeDatabaseAccess(
 	}
 }
 
+func TestCompleteObservationNeverRendersInvalidObservationIDBeforePreflight(t *testing.T) {
+	const invalidObservationID = "private-invalid-observation-id"
+	repository := &GraphRepository{}
+	for _, testCase := range []struct {
+		name   string
+		value  func(*testing.T) observation.Observation
+		signal func() (*SignalInput, []SignalEvidenceInput, string)
+	}{
+		{
+			name: "legacy_unversioned",
+			value: func(t *testing.T) observation.Observation {
+				return codecObservationWith(t, func(input *observation.ObservationInput) {
+					input.ID = invalidObservationID
+					input.Derivation = observation.Derivation{Method: "codec_derivation", LegacyUnversioned: true}
+				})
+			},
+		},
+		{
+			name: "missing_run_id",
+			value: func(t *testing.T) observation.Observation {
+				return codecActiveObservation(t, func(input *observation.ObservationInput) {
+					input.ID = invalidObservationID
+					input.Derivation.RunID = ""
+				})
+			},
+		},
+		{
+			name: "unrepresentable_recorded_at",
+			value: func(t *testing.T) observation.Observation {
+				return codecActiveObservation(t, func(input *observation.ObservationInput) {
+					input.ID = invalidObservationID
+					input.RecordedAt = time.Date(2026, time.July, 25, 12, 0, 0, 1, time.UTC)
+				})
+			},
+		},
+		{
+			name: "unrepresentable_valid_time",
+			value: func(t *testing.T) observation.Observation {
+				instant, err := observation.AtTime(time.Date(2026, time.July, 25, 12, 0, 0, 1, time.UTC))
+				if err != nil {
+					t.Fatalf("new unrepresentable instant: %v", err)
+				}
+				return codecActiveObservation(t, func(input *observation.ObservationInput) {
+					input.ID = invalidObservationID
+					input.ValidTime = instant
+				})
+			},
+		},
+		{
+			name:  "invalid_signal_id",
+			value: func(t *testing.T) observation.Observation { return codecActiveObservation(t, nil) },
+			signal: func() (*SignalInput, []SignalEvidenceInput, string) {
+				signal := codecActiveSignal().Input
+				const invalidSignalID = "private-invalid-signal-id"
+				signal.ID = invalidSignalID
+				return &signal, codecActiveSignal().Evidence, invalidSignalID
+			},
+		},
+		{
+			name:  "invalid_signal_observation_id",
+			value: func(t *testing.T) observation.Observation { return codecActiveObservation(t, nil) },
+			signal: func() (*SignalInput, []SignalEvidenceInput, string) {
+				signal := codecActiveSignal().Input
+				const invalidSignalObservationID = "private-invalid-signal-observation-id"
+				signal.ObservationID = invalidSignalObservationID
+				return &signal, codecActiveSignal().Evidence, invalidSignalObservationID
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			value := testCase.value(t)
+			var signal *SignalInput
+			var signalEvidence []SignalEvidenceInput
+			invalidValue := invalidObservationID
+			if testCase.signal != nil {
+				signal, signalEvidence, invalidValue = testCase.signal()
+			}
+			err := completeWithoutDatabase(t, repository, value, codecOrigin(), signal, signalEvidence)
+			if !errors.Is(err, ErrObservationNotRepresentable) || strings.Contains(err.Error(), invalidValue) || strings.Contains(err.Error(), invalidObservationID) {
+				t.Fatalf("invalid identifier boundary error = %v", err)
+			}
+		})
+	}
+}
+
 func completeWithoutDatabase(
 	t *testing.T,
 	repository *GraphRepository,
