@@ -33,10 +33,10 @@ const (
 	reasonEvidenceOwnershipMismatch        = "evidence_role_ownership_mismatch"
 	reasonOwningRunRequired                = "owning_run_required"
 	reasonOwningRunProvenanceMismatch      = "owning_run_provenance_mismatch"
+	reasonRecordedAtOwnerMismatch          = "recorded_at_owner_mismatch"
+	reasonLegacyUUIDNotRepresentable       = "legacy_uuid_not_representable"
 	reasonInvalidLegacyShape               = "invalid_legacy_shape"
 )
-
-const legacyObservationDerivationVersion = "legacy_postgres_v1"
 
 type observationBoundaryError struct {
 	kind          error
@@ -117,6 +117,10 @@ func decodeLegacyObservation(
 	signal *legacySignalState,
 	run *owningExtractionRun,
 ) (decodedLegacyObservation, error) {
+	origin, err := normalizeLegacyOrigin(origin)
+	if err != nil {
+		return decodedLegacyObservation{}, newObservationBoundaryError(ErrObservationCompatibility, reasonInvalidLegacyShape, row.ID)
+	}
 	subject, err := decodeLegacyTerm(row.SubjectEntityID, row.SubjectMentionID)
 	if err != nil {
 		return decodedLegacyObservation{}, err
@@ -149,7 +153,7 @@ func decodeLegacyObservation(
 		if (run.ModelID == "") != (run.PromptVersion == "") {
 			return decodedLegacyObservation{}, newCompletionBoundaryError(ErrObservationCompatibility, reasonOwningRunProvenanceMismatch, run.ID)
 		}
-		derivation.Version = legacyObservationDerivationVersion
+		derivation.Version = run.PromptVersion
 		derivation.RunID = run.ID
 		derivation.Model = run.ModelID
 		derivation.PromptVersion = run.PromptVersion
@@ -171,7 +175,7 @@ func decodeLegacyObservation(
 		Observation: value,
 		Signal:      cloneLegacySignalState(signal),
 		Compatibility: legacyObservationCompatibility{
-			observationEvidenceOrigin: append([]evidence.EvidenceID(nil), origin...),
+			observationEvidenceOrigin: cloneEvidenceIDs(origin),
 			storedDigest:              row.Digest,
 		},
 	}, nil
@@ -217,6 +221,9 @@ func encodeLegacyObservation(
 	if err := validateOwningRun(value, run); err != nil {
 		return legacyObservationWrite{}, err
 	}
+	if err := validateActiveSignal(signal, run, value.ID()); err != nil {
+		return legacyObservationWrite{}, err
+	}
 	origin, err := legacyObservationOrigin(value, compatibility, signal)
 	if err != nil {
 		return legacyObservationWrite{}, err
@@ -237,7 +244,7 @@ func encodeLegacyObservation(
 	}
 	digest, err := computeObservationDigestV1(write)
 	if err != nil {
-		return legacyObservationWrite{}, fmt.Errorf("compute legacy observation digest: %w", err)
+		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, string(value.ID()))
 	}
 	if compatibility.storedDigest != ([sha256.Size]byte{}) && compatibility.storedDigest != digest {
 		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationConflict, reasonObservationDigestMismatch, string(value.ID()))
@@ -363,31 +370,45 @@ func validateOwningRun(value observation.Observation, run *owningExtractionRun) 
 	if derivation.LegacyUnversioned {
 		return newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyDerivationNotRepresentable, string(value.ID()))
 	}
-	if derivation.RunID == "" {
-		return nil
-	}
 	if run == nil {
 		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, string(value.ID()))
 	}
-	if run.ID != derivation.RunID {
+	if derivation.RunID == "" || run.ID != derivation.RunID {
 		return newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, string(value.ID()))
 	}
 	if (run.ModelID == "") != (run.PromptVersion == "") ||
 		(derivation.Model == "") != (derivation.PromptVersion == "") ||
-		run.ModelID != derivation.Model || run.PromptVersion != derivation.PromptVersion {
+		derivation.Version != run.PromptVersion || run.ModelID != derivation.Model || run.PromptVersion != derivation.PromptVersion {
 		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunProvenanceMismatch, string(value.ID()))
+	}
+	if !value.RecordedAt().Equal(run.RecordedAt) {
+		return newObservationBoundaryError(ErrObservationCompatibility, reasonRecordedAtOwnerMismatch, string(value.ID()))
+	}
+	return nil
+}
+
+func validateActiveSignal(signal *legacySignalState, run *owningExtractionRun, observationID observation.ObservationID) error {
+	if signal == nil {
+		return nil
+	}
+	if signal.Input.ExtractionModelID != run.ModelID || signal.Input.PromptVersion != run.PromptVersion {
+		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunProvenanceMismatch, string(observationID))
 	}
 	return nil
 }
 
 func legacyObservationOrigin(value observation.Observation, compatibility legacyObservationCompatibility, signal *legacySignalState) ([]evidence.EvidenceID, error) {
-	origin := append([]evidence.EvidenceID(nil), compatibility.observationEvidenceOrigin...)
-	if origin == nil {
+	origin := cloneEvidenceIDs(compatibility.observationEvidenceOrigin)
+	if compatibility.observationEvidenceOrigin == nil {
 		for _, link := range value.EvidenceLinks() {
 			if link.Role == observation.EvidenceSupporting {
 				origin = append(origin, link.EvidenceID)
 			}
 		}
+	}
+	origin, err := normalizeLegacyOrigin(origin)
+	if err != nil {
+		return nil, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, string(value.ID()))
 	}
 	wantLinks, err := canonicalEvidenceLinks(origin, signal)
 	if err != nil {
@@ -418,6 +439,32 @@ func cloneLegacySignalState(value *legacySignalState) *legacySignalState {
 	clone := *value
 	clone.Evidence = append([]SignalEvidenceInput(nil), value.Evidence...)
 	return &clone
+}
+
+func cloneEvidenceIDs(value []evidence.EvidenceID) []evidence.EvidenceID {
+	if value == nil {
+		return nil
+	}
+	return append(make([]evidence.EvidenceID, 0, len(value)), value...)
+}
+
+func normalizeLegacyOrigin(value []evidence.EvidenceID) ([]evidence.EvidenceID, error) {
+	if value == nil {
+		return nil, nil
+	}
+	identifiers := make([]string, len(value))
+	for index, evidenceID := range value {
+		identifiers[index] = string(evidenceID)
+	}
+	identifiers, err := canonicalEvidenceIDs(identifiers)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]evidence.EvidenceID, len(identifiers))
+	for index, identifier := range identifiers {
+		result[index] = evidence.EvidenceID(identifier)
+	}
+	return result, nil
 }
 
 func timePointerCopy(value time.Time) *time.Time { return &value }

@@ -294,9 +294,12 @@ func TestLegacyObservationCodecPreservesEvidencePairsAndPrivateOrigin(t *testing
 		links[2] != (observation.EvidenceLink{EvidenceID: "22222222-3333-4444-5555-666666666666", Role: observation.EvidenceSupporting}) {
 		t.Fatalf("evidence links = %#v", links)
 	}
-	if len(decoded.Compatibility.observationEvidenceOrigin) != len(origin) ||
-		decoded.Compatibility.observationEvidenceOrigin[0] != origin[0] {
-		t.Fatalf("private origin = %#v, want %#v", decoded.Compatibility.observationEvidenceOrigin, origin)
+	wantOrigin := []evidence.EvidenceID{
+		"11111111-2222-3333-4444-555555555555",
+		"22222222-3333-4444-5555-666666666666",
+	}
+	if !sameEvidenceIDs(decoded.Compatibility.observationEvidenceOrigin, wantOrigin) {
+		t.Fatalf("private origin = %#v, want %#v", decoded.Compatibility.observationEvidenceOrigin, wantOrigin)
 	}
 }
 
@@ -321,8 +324,171 @@ func TestLegacyObservationCodecRecoversDerivationFromOwningRun(t *testing.T) {
 		t.Fatalf("decode observation: %v", err)
 	}
 	derivation := decoded.Observation.Derivation()
-	if derivation.Method != row.Derivation || derivation.RunID != run.ID || derivation.Model != run.ModelID || derivation.PromptVersion != run.PromptVersion || derivation.LegacyUnversioned {
+	if derivation.Method != row.Derivation || derivation.Version != run.PromptVersion || derivation.RunID != run.ID || derivation.Model != run.ModelID || derivation.PromptVersion != run.PromptVersion || derivation.LegacyUnversioned {
 		t.Fatalf("decoded derivation = %#v", derivation)
+	}
+}
+
+func TestLegacyObservationCodecRoundTripsNormalizedOriginSet(t *testing.T) {
+	origin := []evidence.EvidenceID{
+		"22222222-3333-4444-5555-666666666666",
+		"11111111-2222-3333-4444-555555555555",
+		"22222222-3333-4444-5555-666666666666",
+	}
+	decoded, err := decodeLegacyObservation(codecLegacyRow(), origin, nil, codecRun())
+	if err != nil {
+		t.Fatalf("decode observation: %v", err)
+	}
+	write, err := encodeLegacyObservation(decoded.Observation, decoded.Compatibility, codecRun(), nil)
+	if err != nil {
+		t.Fatalf("encode observation: %v", err)
+	}
+	wantOrigin := []evidence.EvidenceID{
+		"11111111-2222-3333-4444-555555555555",
+		"22222222-3333-4444-5555-666666666666",
+	}
+	if !sameEvidenceIDs(write.Origin, wantOrigin) {
+		t.Fatalf("encoded origin = %#v, want %#v", write.Origin, wantOrigin)
+	}
+	wantDigest, err := computeObservationDigestV1(legacyObservationWrite{Row: write.Row, Origin: wantOrigin})
+	if err != nil {
+		t.Fatalf("compute expected digest: %v", err)
+	}
+	if write.Row.Digest != wantDigest {
+		t.Fatalf("encoded digest = %x, want %x", write.Row.Digest, wantDigest)
+	}
+}
+
+func TestLegacyObservationCodecKeepsExplicitEmptyOriginWithSignalOnlyEvidence(t *testing.T) {
+	signal := &legacySignalState{
+		Input: SignalInput{
+			ID:                "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+			ObservationID:     "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+			Category:          "delegation_autonomy",
+			Direction:         "strengthening",
+			ExtractionModelID: codecRun().ModelID,
+			PromptVersion:     codecRun().PromptVersion,
+			Confidence:        0.75,
+		},
+		Evidence: []SignalEvidenceInput{{EvidenceSpanID: "11111111-2222-3333-4444-555555555555", Role: "supporting"}},
+	}
+	decoded, err := decodeLegacyObservation(codecLegacyRow(), []evidence.EvidenceID{}, signal, codecRun())
+	if err != nil {
+		t.Fatalf("decode observation: %v", err)
+	}
+	if decoded.Compatibility.observationEvidenceOrigin == nil {
+		t.Fatal("decoded explicit empty origin became absent metadata")
+	}
+	write, err := encodeLegacyObservation(decoded.Observation, decoded.Compatibility, codecRun(), decoded.Signal)
+	if err != nil {
+		t.Fatalf("encode observation: %v", err)
+	}
+	if write.Origin == nil || len(write.Origin) != 0 {
+		t.Fatalf("encoded origin = %#v, want explicit empty set", write.Origin)
+	}
+	wantDigest, err := computeObservationDigestV1(legacyObservationWrite{Row: write.Row, Origin: []evidence.EvidenceID{}})
+	if err != nil {
+		t.Fatalf("compute expected digest: %v", err)
+	}
+	if write.Row.Digest != wantDigest {
+		t.Fatalf("encoded digest = %x, want %x", write.Row.Digest, wantDigest)
+	}
+}
+
+func TestEncodeLegacyObservationRequiresActiveRunIdentityAndProvenance(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		value  observation.Observation
+		run    *owningExtractionRun
+		wantOK bool
+	}{
+		{name: "matching_active_observation", value: codecActiveObservation(t, nil), run: codecRun(), wantOK: true},
+		{name: "missing_run_id", value: codecObservationWith(t, nil), run: codecRun()},
+		{name: "version_mismatch", value: codecActiveObservation(t, func(input *observation.ObservationInput) { input.Derivation.Version = "other-version" }), run: codecRun()},
+		{name: "model_mismatch", value: codecActiveObservation(t, func(input *observation.ObservationInput) { input.Derivation.Model = "other-model" }), run: codecRun()},
+		{name: "prompt_mismatch", value: codecActiveObservation(t, func(input *observation.ObservationInput) { input.Derivation.PromptVersion = "other-prompt" }), run: codecRun()},
+		{name: "recorded_at_mismatch", value: codecActiveObservation(t, func(input *observation.ObservationInput) { input.RecordedAt = codecRecordedAt.Add(time.Microsecond) }), run: codecRun()},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := encodeLegacyObservation(testCase.value, legacyObservationCompatibility{}, testCase.run, nil)
+			if testCase.wantOK {
+				if err != nil {
+					t.Fatalf("encode active observation: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrObservationCompatibility) {
+				t.Fatalf("encode error = %v, want ErrObservationCompatibility", err)
+			}
+		})
+	}
+}
+
+func TestEncodeLegacyObservationValidatesActiveSignalDerivation(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		signal *legacySignalState
+		wantOK bool
+	}{
+		{name: "matching", signal: codecActiveSignal(), wantOK: true},
+		{name: "model_mismatch", signal: codecActiveSignalWith(func(input *SignalInput) { input.ExtractionModelID = "other-model" })},
+		{name: "prompt_mismatch", signal: codecActiveSignalWith(func(input *SignalInput) { input.PromptVersion = "other-prompt" })},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := encodeLegacyObservation(codecActiveObservation(t, nil), legacyObservationCompatibility{}, codecRun(), testCase.signal)
+			if testCase.wantOK {
+				if err != nil {
+					t.Fatalf("encode observation with signal: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrObservationCompatibility) {
+				t.Fatalf("encode error = %v, want ErrObservationCompatibility", err)
+			}
+		})
+	}
+
+	mismatched := codecActiveSignalWith(func(input *SignalInput) { input.ExtractionModelID = "historical-model" })
+	decoded, err := decodeLegacyObservation(codecLegacyRow(), codecOrigin(), mismatched, codecRun())
+	if err != nil {
+		t.Fatalf("decode historical signal state: %v", err)
+	}
+	if decoded.Signal.Input.ExtractionModelID != "historical-model" || decoded.Observation.Derivation().Model != codecRun().ModelID {
+		t.Fatalf("decoded signal/derivation = %#v/%#v", decoded.Signal.Input, decoded.Observation.Derivation())
+	}
+}
+
+func TestEncodeLegacyObservationBoundsNonUUIDIdentifiers(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		value        observation.Observation
+		privateValue string
+	}{
+		{
+			name:         "term",
+			privateValue: "private-non-uuid-term",
+			value: codecActiveObservation(t, func(input *observation.ObservationInput) {
+				term, err := observation.NewEntityTerm("private-non-uuid-term", "")
+				if err != nil {
+					t.Fatalf("create term: %v", err)
+				}
+				input.Statement.Subject = term
+			}),
+		},
+		{
+			name:         "evidence",
+			privateValue: "private-non-uuid-evidence",
+			value: codecActiveObservation(t, func(input *observation.ObservationInput) {
+				input.Evidence = []observation.EvidenceLink{{EvidenceID: "private-non-uuid-evidence", Role: observation.EvidenceSupporting}}
+			}),
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := encodeLegacyObservation(testCase.value, legacyObservationCompatibility{}, codecRun(), nil)
+			if !errors.Is(err, ErrObservationNotRepresentable) || strings.Contains(err.Error(), testCase.privateValue) {
+				t.Fatalf("encode error = %v", err)
+			}
+		})
 	}
 }
 
@@ -387,12 +553,67 @@ func codecObservationWith(t *testing.T, mutate func(*observation.ObservationInpu
 		Evidence:   []observation.EvidenceLink{{EvidenceID: codecOrigin()[0], Role: observation.EvidenceSupporting}},
 		Derivation: observation.Derivation{Method: "codec_derivation", Version: "v1"}, Status: observation.StatusObserved,
 	}
-	mutate(&input)
+	if mutate != nil {
+		mutate(&input)
+	}
 	value, err := observation.NewObservation(input)
 	if err != nil {
 		t.Fatalf("create mutated observation: %v", err)
 	}
 	return value
+}
+
+func codecActiveObservation(t *testing.T, mutate func(*observation.ObservationInput)) observation.Observation {
+	t.Helper()
+	run := codecRun()
+	value := codecObservationWith(t, func(input *observation.ObservationInput) {
+		input.Derivation = observation.Derivation{
+			Method:        "codec_derivation",
+			Version:       run.PromptVersion,
+			RunID:         run.ID,
+			Model:         run.ModelID,
+			PromptVersion: run.PromptVersion,
+		}
+		if mutate != nil {
+			mutate(input)
+		}
+	})
+	return value
+}
+
+func codecActiveSignal() *legacySignalState {
+	return codecActiveSignalWith(nil)
+}
+
+func codecActiveSignalWith(mutate func(*SignalInput)) *legacySignalState {
+	run := codecRun()
+	input := SignalInput{
+		ID:                "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+		ObservationID:     "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		Category:          "delegation_autonomy",
+		Direction:         "strengthening",
+		ExtractionModelID: run.ModelID,
+		PromptVersion:     run.PromptVersion,
+		Confidence:        0.75,
+	}
+	if mutate != nil {
+		mutate(&input)
+	}
+	return &legacySignalState{Input: input, Evidence: []SignalEvidenceInput{{
+		EvidenceSpanID: "11111111-2222-3333-4444-555555555555", Role: "supporting",
+	}}}
+}
+
+func sameEvidenceIDs(left, right []evidence.EvidenceID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func assertCodecTerm(t *testing.T, name string, term observation.Term, wantKind observation.TermKind, wantEntityID, wantMentionID string) {
