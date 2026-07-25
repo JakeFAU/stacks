@@ -395,6 +395,22 @@ func TestLegacyObservationCodecKeepsExplicitEmptyOriginWithSignalOnlyEvidence(t 
 	}
 }
 
+func TestLegacyObservationCodecRoundTripsInterleavedOriginAndSignalEvidence(t *testing.T) {
+	origin := []evidence.EvidenceID{"22222222-3333-4444-5555-666666666666"}
+	signal := codecActiveSignal()
+	decoded, err := decodeLegacyObservation(codecLegacyRow(), origin, signal, codecRun())
+	if err != nil {
+		t.Fatalf("decode observation: %v", err)
+	}
+	write, err := encodeLegacyObservation(decoded.Observation, decoded.Compatibility, codecRun(), decoded.Signal)
+	if err != nil {
+		t.Fatalf("encode observation: %v", err)
+	}
+	if !sameEvidenceIDs(write.Origin, origin) {
+		t.Fatalf("encoded origin = %#v, want %#v", write.Origin, origin)
+	}
+}
+
 func TestEncodeLegacyObservationRequiresActiveRunIdentityAndProvenance(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
@@ -421,6 +437,23 @@ func TestEncodeLegacyObservationRequiresActiveRunIdentityAndProvenance(t *testin
 				t.Fatalf("encode error = %v, want ErrObservationCompatibility", err)
 			}
 		})
+	}
+}
+
+func TestEncodeLegacyObservationRejectsSignalObservationOwnershipMismatch(t *testing.T) {
+	const privateObservationReference = "private-signal-observation-reference"
+	signal := codecActiveSignalWith(func(input *SignalInput) {
+		input.ObservationID = privateObservationReference
+	})
+	_, err := encodeLegacyObservation(
+		codecActiveObservation(t, nil),
+		legacyObservationCompatibility{},
+		codecRun(),
+		signal,
+	)
+	if !errors.Is(err, ErrObservationCompatibility) ||
+		strings.Contains(err.Error(), privateObservationReference) {
+		t.Fatalf("encode error = %v", err)
 	}
 }
 

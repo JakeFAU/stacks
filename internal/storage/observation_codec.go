@@ -391,6 +391,9 @@ func validateActiveSignal(signal *legacySignalState, run *owningExtractionRun, o
 	if signal == nil {
 		return nil
 	}
+	if signal.Input.ObservationID != string(observationID) {
+		return newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, string(observationID))
+	}
 	if signal.Input.ExtractionModelID != run.ModelID || signal.Input.PromptVersion != run.PromptVersion {
 		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunProvenanceMismatch, string(observationID))
 	}
@@ -424,8 +427,12 @@ func sameEvidenceLinks(left, right []observation.EvidenceLink) bool {
 	if len(left) != len(right) {
 		return false
 	}
-	for index := range left {
-		if left[index] != right[index] {
+	leftSet := make(map[observation.EvidenceLink]struct{}, len(left))
+	for _, link := range left {
+		leftSet[link] = struct{}{}
+	}
+	for _, link := range right {
+		if _, exists := leftSet[link]; !exists {
 			return false
 		}
 	}
