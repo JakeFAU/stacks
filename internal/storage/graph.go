@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -70,95 +72,99 @@ func NewGraphRepository(pool *pgxpool.Pool) *GraphRepository {
 	return &GraphRepository{pool: pool}
 }
 
-// CompleteObservation persists an observation and all of its evidence links
-// atomically. Repeating the same ID returns the existing observation.
-func (repository *GraphRepository) CompleteObservation(ctx context.Context, input ObservationInput, evidenceSpanIDs []string) (Observation, error) {
-	canonicalInput, canonicalEvidenceSpanIDs, err := canonicalizeObservationIdentity(input, evidenceSpanIDs)
+// CompleteObservation atomically persists one canonical observation, its
+// private observation-origin evidence, and its optional interaction signal.
+func (repository *GraphRepository) CompleteObservation(
+	ctx context.Context,
+	value observation.Observation,
+	observationEvidenceOrigin []evidence.EvidenceID,
+	signal *SignalInput,
+	signalEvidence []SignalEvidenceInput,
+) (observation.Observation, *InteractionSignal, error) {
+	origin, err := normalizeLegacyOrigin(observationEvidenceOrigin)
 	if err != nil {
-		return Observation{}, err
+		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUUIDNotRepresentable, string(value.ID()))
 	}
-	input = canonicalInput
-	evidenceSpanIDs = canonicalEvidenceSpanIDs
-	if err := validateObservationInput(input); err != nil {
-		return Observation{}, err
-	}
-	if len(evidenceSpanIDs) == 0 {
-		return Observation{}, fmt.Errorf("complete observation %q: evidence span IDs are required", input.ID)
-	}
-	digest, err := ComputeObservationDigest(input, evidenceSpanIDs)
+	state, err := canonicalSignalState(value.ID(), signal, signalEvidence)
 	if err != nil {
-		return Observation{}, err
+		return observation.Observation{}, nil, err
 	}
-	var observation Observation
+	derivation := value.Derivation()
+	if derivation.LegacyUnversioned {
+		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyDerivationNotRepresentable, string(value.ID()))
+	}
+	if derivation.RunID == "" {
+		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, string(value.ID()))
+	}
+
+	var stored observation.Observation
+	var storedSignal *InteractionSignal
 	err = repository.withTransaction(ctx, func(transaction pgx.Tx) error {
-		var err error
-		observation, err = putObservation(ctx, transaction, input, digest[:])
+		run, err := loadOwningExtractionRun(ctx, transaction, derivation.RunID, value.ID())
 		if err != nil {
 			return err
 		}
-		for _, evidenceSpanID := range evidenceSpanIDs {
-			if strings.TrimSpace(evidenceSpanID) == "" {
-				return fmt.Errorf("complete observation %q: evidence span ID is required", input.ID)
-			}
-			if _, err := transaction.Exec(ctx, `
-				INSERT INTO stacks.observation_evidence (observation_id, evidence_span_id)
-				VALUES ($1::uuid, $2::uuid)
-				ON CONFLICT DO NOTHING`, observation.ID, evidenceSpanID); err != nil {
-				return fmt.Errorf("persist observation evidence for observation %q: %w", observation.ID, err)
-			}
+		write, err := encodeLegacyObservation(value, legacyObservationCompatibility{observationEvidenceOrigin: origin}, run, state)
+		if err != nil {
+			return err
+		}
+		stored, storedSignal, err = putLegacyObservation(ctx, transaction, write)
+		if err != nil {
+			return err
 		}
 		return nil
 	})
 	if err != nil {
-		return Observation{}, err
+		return observation.Observation{}, nil, err
 	}
-	return observation, nil
+	return stored, storedSignal, nil
 }
 
-// CompleteSignal persists a signal and evidence links atomically. PostgreSQL's
-// deferred constraint trigger enforces that a supporting transcript span exists
-// before the transaction may commit.
-func (repository *GraphRepository) CompleteSignal(ctx context.Context, input SignalInput, evidence []SignalEvidenceInput) (InteractionSignal, error) {
-	canonicalInput, canonicalEvidence, err := canonicalizeSignalIdentity(input, evidence)
-	if err != nil {
-		return InteractionSignal{}, err
+func canonicalSignalState(
+	observationID observation.ObservationID,
+	signal *SignalInput,
+	signalEvidence []SignalEvidenceInput,
+) (*legacySignalState, error) {
+	if signal == nil {
+		if len(signalEvidence) != 0 {
+			return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonEvidenceOwnershipMismatch, string(observationID))
+		}
+		return nil, nil
 	}
-	input = canonicalInput
-	evidence = canonicalEvidence
+	input, links, err := canonicalizeSignalIdentity(*signal, signalEvidence)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateSignalInput(input); err != nil {
-		return InteractionSignal{}, err
+		return nil, err
 	}
-	if len(evidence) == 0 {
-		return InteractionSignal{}, fmt.Errorf("complete signal %q: evidence is required", input.ID)
+	if len(links) == 0 {
+		return nil, fmt.Errorf("complete signal %q: evidence is required", input.ID)
 	}
-	digest, err := ComputeSignalDigest(input, evidence)
+	digest, err := ComputeSignalDigest(input, links)
 	if err != nil {
-		return InteractionSignal{}, err
+		return nil, err
 	}
-	var signal InteractionSignal
-	err = repository.withTransaction(ctx, func(transaction pgx.Tx) error {
-		var err error
-		signal, err = putSignal(ctx, transaction, input, digest[:])
-		if err != nil {
-			return err
+	return &legacySignalState{Input: input, Evidence: links, Digest: digest}, nil
+}
+
+func loadOwningExtractionRun(
+	ctx context.Context,
+	transaction pgx.Tx,
+	runID string,
+	observationID observation.ObservationID,
+) (*owningExtractionRun, error) {
+	var run owningExtractionRun
+	if err := transaction.QueryRow(ctx, `
+		SELECT id::text, model_id, prompt_version, recorded_at
+		FROM stacks.extraction_runs
+		WHERE id = $1`, runID).Scan(&run.ID, &run.ModelID, &run.PromptVersion, &run.RecordedAt); err != nil {
+		if err != pgx.ErrNoRows {
+			return nil, fmt.Errorf("load owning extraction run %q: %w", runID, err)
 		}
-		for _, signalEvidence := range evidence {
-			if strings.TrimSpace(signalEvidence.EvidenceSpanID) == "" || !validSignalEvidenceRole(signalEvidence.Role) {
-				return fmt.Errorf("complete signal %q: evidence input is invalid", input.ID)
-			}
-			if _, err := transaction.Exec(ctx, `
-				INSERT INTO stacks.signal_evidence (signal_id, evidence_span_id, role)
-				VALUES ($1::uuid, $2::uuid, $3)
-				ON CONFLICT DO NOTHING`, signal.ID, signalEvidence.EvidenceSpanID, signalEvidence.Role); err != nil {
-				return fmt.Errorf("persist signal evidence for signal %q: %w", signal.ID, err)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return InteractionSignal{}, err
+		return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, string(observationID))
 	}
-	return signal, nil
+	return &run, nil
 }
 
 func (repository *GraphRepository) withTransaction(ctx context.Context, work func(pgx.Tx) error) error {

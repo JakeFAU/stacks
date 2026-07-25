@@ -9,12 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	knowledge "github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -4815,18 +4817,18 @@ func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Ti
 		t.Fatalf("create employee proposal: %v", err)
 	}
 	graph := NewGraphRepository(pool)
-	observation, err := graph.CompleteObservation(ctx, ObservationInput{
-		ID: uuid.NewString(), SubjectMentionID: managerMention.ID, ObjectMentionID: employeeMention.ID,
-		Predicate: "interaction_signal", ValidStart: &validTime, Derivation: "model_extraction", EpistemicStatus: "inferred",
-	}, []string{storedSpan.ID})
+	run := testOwningExtractionRun(t, pool, version)
+	canonicalObservation := testCanonicalObservation(t, run, uuid.NewString(), "", managerMention.ID, "", employeeMention.ID,
+		"interaction_signal", testCanonicalInstant(t, validTime), storedSpan.ID)
+	observation, _, err := graph.CompleteObservation(ctx, canonicalObservation, []knowledge.EvidenceID{knowledge.EvidenceID(storedSpan.ID)}, &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(canonicalObservation.ID()), Category: "delegation_autonomy", Direction: direction,
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Rationale: "Synthetic observable pair rationale.", Confidence: 0.5,
+	}, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}})
 	if err != nil {
 		t.Fatalf("complete pair observation: %v", err)
 	}
-	if _, err := graph.CompleteSignal(ctx, SignalInput{
-		ID: uuid.NewString(), ObservationID: observation.ID, Category: "delegation_autonomy", Direction: direction,
-		ExtractionModelID: "synthetic-model", PromptVersion: "extract-v1", Rationale: "Synthetic observable pair rationale.", Confidence: 0.5,
-	}, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}}); err != nil {
-		t.Fatalf("complete pair signal: %v", err)
+	if observation.ID() != canonicalObservation.ID() {
+		t.Fatalf("complete pair observation ID = %q, want %q", observation.ID(), canonicalObservation.ID())
 	}
 	return managerProposal.ID, employeeProposal.ID
 }
@@ -4904,55 +4906,292 @@ func TestStorageRetriesDoNotDuplicateGraphRecords(t *testing.T) {
 		t.Fatalf("repeated candidate ID = %q, want %q", secondCandidate.ID, firstCandidate.ID)
 	}
 
-	observationInput := ObservationInput{
-		ID:              uuid.NewString(),
-		SubjectEntityID: entity.ID,
-		Predicate:       "interacted_with",
-		Derivation:      "synthetic",
-		EpistemicStatus: "inferred",
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-graph-retry")))
+	observationInput := testCanonicalObservation(t, run, uuid.NewString(), entity.ID, "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	signalInput := SignalInput{
+		ID:                uuid.NewString(),
+		ObservationID:     string(observationInput.ID()),
+		Category:          "delegation_autonomy",
+		Direction:         "strengthening",
+		ExtractionModelID: run.ModelID,
+		PromptVersion:     run.PromptVersion,
+		Confidence:        0.8,
 	}
-	firstObservation, err := graph.CompleteObservation(ctx, observationInput, []string{spanID})
+	firstObservation, firstSignal, err := graph.CompleteObservation(ctx, observationInput, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, &signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
 	if err != nil {
 		t.Fatalf("complete observation: %v", err)
 	}
-	secondObservation, err := graph.CompleteObservation(ctx, observationInput, []string{spanID})
+	secondObservation, secondSignal, err := graph.CompleteObservation(ctx, observationInput, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, &signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
 	if err != nil {
 		t.Fatalf("complete repeated observation: %v", err)
 	}
-	if secondObservation.ID != firstObservation.ID {
-		t.Fatalf("repeated observation ID = %q, want %q", secondObservation.ID, firstObservation.ID)
+	if secondObservation.ID() != firstObservation.ID() {
+		t.Fatalf("repeated observation ID = %q, want %q", secondObservation.ID(), firstObservation.ID())
 	}
-
-	signalInput := SignalInput{
-		ID:                uuid.NewString(),
-		ObservationID:     firstObservation.ID,
-		Category:          "delegation_autonomy",
-		Direction:         "strengthening",
-		ExtractionModelID: "synthetic-model",
-		PromptVersion:     "synthetic-v1",
-		Confidence:        0.8,
-	}
-	firstSignal, err := graph.CompleteSignal(ctx, signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
-	if err != nil {
-		t.Fatalf("complete signal: %v", err)
-	}
-	secondSignal, err := graph.CompleteSignal(ctx, signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
-	if err != nil {
-		t.Fatalf("complete repeated signal: %v", err)
-	}
-	if secondSignal.ID != firstSignal.ID {
+	if firstSignal == nil || secondSignal == nil || secondSignal.ID != firstSignal.ID {
 		t.Fatalf("repeated signal ID = %q, want %q", secondSignal.ID, firstSignal.ID)
 	}
 	changedObservation := observationInput
-	changedObservation.Predicate = "different_interaction"
-	if _, err := graph.CompleteObservation(ctx, changedObservation, []string{spanID}); err == nil {
+	changedObservation = testCanonicalObservation(t, run, string(observationInput.ID()), entity.ID, "", "", "", "different_interaction", observation.UnknownTime(), spanID)
+	if _, _, err := graph.CompleteObservation(ctx, changedObservation, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, &signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}}); err == nil {
 		t.Fatal("changed observation payload with existing ID succeeded")
 	}
 	changedSignal := signalInput
 	changedSignal.Direction = "weakening"
-	if _, err := graph.CompleteSignal(ctx, changedSignal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}}); err == nil {
+	if _, _, err := graph.CompleteObservation(ctx, observationInput, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, &changedSignal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}}); err == nil {
 		t.Fatal("changed signal payload with existing ID succeeded")
 	}
+}
+
+func TestCompleteObservationAcceptsExactCanonicalRetry(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, spanID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-canonical-retry")))
+	value := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	signal := &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(value.ID()), Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Rationale: "Synthetic retry rationale.", Confidence: 0.8,
+	}
+	first, firstSignal, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, signal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
+	if err != nil {
+		t.Fatalf("complete canonical observation: %v", err)
+	}
+	second, secondSignal, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, signal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
+	if err != nil {
+		t.Fatalf("retry canonical observation: %v", err)
+	}
+	if second.ID() != first.ID() || firstSignal == nil || secondSignal == nil || secondSignal.ID != firstSignal.ID {
+		t.Fatalf("canonical retry = %#v/%#v, want identical completion", second, secondSignal)
+	}
+}
+
+func TestCompleteObservationRejectsEveryDigestExcludedDifference(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-canonical-differences")))
+	_, originID := createSyntheticMentionAndSpan(t, pool)
+	_, signalOnlyID := createSyntheticMentionAndSpan(t, pool)
+	_, extraSignalID := createSyntheticMentionAndSpan(t, pool)
+
+	for _, testCase := range []struct {
+		name     string
+		complete func(t *testing.T, id, signalID string) error
+		want     error
+	}{
+		{
+			name: "private_origin",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(signalOnlyID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+				}, []SignalEvidenceInput{{EvidenceSpanID: originID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+		{
+			name: "signal_only_evidence",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID, extraSignalID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+				}, []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}, {EvidenceSpanID: extraSignalID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+		{
+			name: "signal_role",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+				}, []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+		{
+			name: "generic_confidence",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservationWithConfidence(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), 0.7, originID, signalOnlyID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+				}, []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+		{
+			name: "vertical_signal_confidence",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.6,
+				}, []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			id := uuid.NewString()
+			value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+			roles := []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}}
+			if testCase.name == "signal_role" {
+				value = testCanonicalObservationWithLinks(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), []observation.EvidenceLink{
+					{EvidenceID: knowledge.EvidenceID(originID), Role: observation.EvidenceSupporting},
+					{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting},
+					{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceContradicting},
+				}, nil)
+				roles = append(roles, SignalEvidenceInput{EvidenceSpanID: signalOnlyID, Role: "contradicting"})
+			}
+			signal := &SignalInput{ID: uuid.NewString(), ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8}
+			if _, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, signal, roles); err != nil {
+				t.Fatalf("seed canonical completion: %v", err)
+			}
+			err := testCase.complete(t, id, signal.ID)
+			if !errors.Is(err, testCase.want) {
+				t.Fatalf("difference error = %v, want %v", err, testCase.want)
+			}
+		})
+	}
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(t *testing.T, id string)
+		want   error
+	}{
+		{name: "recorded_at", mutate: func(t *testing.T, id string) {
+			if _, err := pool.Exec(ctx, `UPDATE stacks.observations SET recorded_at = recorded_at + interval '1 microsecond' WHERE id = $1`, id); err != nil {
+				t.Fatalf("mutate stored recorded_at: %v", err)
+			}
+		}, want: ErrObservationConflict},
+		{name: "stored_digest", mutate: func(t *testing.T, id string) {
+			digest := sha256.Sum256([]byte("stored-digest-" + id))
+			if _, err := pool.Exec(ctx, `UPDATE stacks.observations SET digest = $2 WHERE id = $1`, id, digest[:]); err != nil {
+				t.Fatalf("mutate stored digest: %v", err)
+			}
+		}, want: ErrObservationCompatibility},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			id := uuid.NewString()
+			value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+			signal := &SignalInput{ID: uuid.NewString(), ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8}
+			roles := []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}}
+			if _, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, signal, roles); err != nil {
+				t.Fatalf("seed canonical completion: %v", err)
+			}
+			testCase.mutate(t, id)
+			if _, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, signal, roles); !errors.Is(err, testCase.want) {
+				t.Fatalf("stored difference error = %v, want %v", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestCompleteObservationRejectsDifferentIDWithSameDigest(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, spanID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-canonical-digest-conflict")))
+	first := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	if _, _, err := graph.CompleteObservation(ctx, first, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, nil, nil); err != nil {
+		t.Fatalf("complete first observation: %v", err)
+	}
+	second := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	if _, _, err := graph.CompleteObservation(ctx, second, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, nil, nil); !errors.Is(err, ErrObservationConflict) {
+		t.Fatalf("same-digest error = %v, want ErrObservationConflict", err)
+	}
+}
+
+func TestCompleteObservationRejectsUnrepresentableCanonicalValueBeforeSQL(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, spanID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-unrepresentable-canonical")))
+	run.RecordedAt = run.RecordedAt.Add(time.Nanosecond)
+	value := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	if _, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, nil, nil); !errors.Is(err, ErrObservationNotRepresentable) {
+		t.Fatalf("unrepresentable completion error = %v, want ErrObservationNotRepresentable", err)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.observations WHERE id = $1`, string(value.ID())); got != 0 {
+		t.Fatalf("unrepresentable observation rows = %d, want 0", got)
+	}
+}
+
+func TestCompleteObservationPreservesOriginRelativeSignalEvidence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, observationOnlyID := createSyntheticMentionAndSpan(t, pool)
+	_, signalOnlyID := createSyntheticMentionAndSpan(t, pool)
+	_, bothID := createSyntheticMentionAndSpan(t, pool)
+	_, contradictingOriginID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-origin-relative-signal")))
+	value := testCanonicalObservationWithLinks(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), []observation.EvidenceLink{
+		{EvidenceID: knowledge.EvidenceID(observationOnlyID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(bothID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(contradictingOriginID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(contradictingOriginID), Role: observation.EvidenceContradicting},
+	}, nil)
+	signal := &SignalInput{ID: uuid.NewString(), ObservationID: string(value.ID()), Category: "delegation_autonomy", Direction: "mixed", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8}
+	if _, _, err := graph.CompleteObservation(ctx, value,
+		[]knowledge.EvidenceID{knowledge.EvidenceID(observationOnlyID), knowledge.EvidenceID(bothID), knowledge.EvidenceID(contradictingOriginID)}, signal,
+		[]SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}, {EvidenceSpanID: bothID, Role: "supporting"}, {EvidenceSpanID: contradictingOriginID, Role: "contradicting"}},
+	); err != nil {
+		t.Fatalf("complete origin-relative signal evidence: %v", err)
+	}
+	loaded, err := loadLegacyObservation(ctx, pool, string(value.ID()))
+	if err != nil {
+		t.Fatalf("load completed observation: %v", err)
+	}
+	wantPairs := []observation.EvidenceLink{
+		{EvidenceID: knowledge.EvidenceID(observationOnlyID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(bothID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(contradictingOriginID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(contradictingOriginID), Role: observation.EvidenceContradicting},
+	}
+	if !sameEvidenceLinks(loaded.Observation.EvidenceLinks(), wantPairs) {
+		t.Fatalf("canonical evidence = %#v, want %#v", loaded.Observation.EvidenceLinks(), wantPairs)
+	}
+	wantOrigin := []knowledge.EvidenceID{knowledge.EvidenceID(observationOnlyID), knowledge.EvidenceID(bothID), knowledge.EvidenceID(contradictingOriginID)}
+	sort.Slice(wantOrigin, func(left, right int) bool { return wantOrigin[left] < wantOrigin[right] })
+	if !sameEvidenceIDs(loaded.Compatibility.observationEvidenceOrigin, wantOrigin) {
+		t.Fatalf("private origin = %#v, want %#v", loaded.Compatibility.observationEvidenceOrigin, wantOrigin)
+	}
+	wantRoles := []SignalEvidenceInput{{EvidenceSpanID: bothID, Role: "supporting"}, {EvidenceSpanID: contradictingOriginID, Role: "contradicting"}, {EvidenceSpanID: signalOnlyID, Role: "supporting"}}
+	if loaded.Signal == nil || !sameSignalEvidence(loaded.Signal.Evidence, wantRoles) {
+		t.Fatalf("signal evidence = %#v, want %#v", loaded.Signal, wantRoles)
+	}
+}
+
+func sameSignalEvidence(left, right []SignalEvidenceInput) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[SignalEvidenceInput]int, len(left))
+	for _, value := range left {
+		counts[value]++
+	}
+	for _, value := range right {
+		if counts[value] == 0 {
+			return false
+		}
+		counts[value]--
+	}
+	return true
+}
+
+func testRetryPredicate(id string) string {
+	return "interacted_with_" + id
 }
 
 func TestPutEvidenceSpanRejectsImmutableQuoteConflict(t *testing.T) {
@@ -4980,7 +5219,7 @@ func TestPutEvidenceSpanRejectsImmutableQuoteConflict(t *testing.T) {
 	}
 }
 
-func TestCompleteSignalRejectsNotesOnlyEvidence(t *testing.T) {
+func TestCompleteObservationRejectsNotesOnlySignalEvidence(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
 	version := testDocumentVersionWithRole(t, testIdentifier("document-notes-signal"), source.TabRoleGeminiNotes)
@@ -4999,15 +5238,11 @@ func TestCompleteSignalRejectsNotesOnlyEvidence(t *testing.T) {
 		t.Fatalf("put notes evidence span: %v", err)
 	}
 	graph := NewGraphRepository(pool)
-	observation, err := graph.CompleteObservation(ctx, ObservationInput{
-		ID: uuid.NewString(), Predicate: "interacted_with", Derivation: "synthetic", EpistemicStatus: "inferred",
-	}, []string{storedSpan.ID})
-	if err != nil {
-		t.Fatalf("complete notes observation: %v", err)
-	}
-	_, err = graph.CompleteSignal(ctx, SignalInput{
-		ID: uuid.NewString(), ObservationID: observation.ID, Category: "delegation_autonomy", Direction: "strengthening",
-		ExtractionModelID: "synthetic-model", PromptVersion: "synthetic-v1", Confidence: 0.8,
+	run := testOwningExtractionRun(t, pool, version)
+	canonicalObservation := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), storedSpan.ID)
+	_, _, err = graph.CompleteObservation(ctx, canonicalObservation, []knowledge.EvidenceID{knowledge.EvidenceID(storedSpan.ID)}, &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(canonicalObservation.ID()), Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
 	}, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}})
 	if err == nil {
 		t.Fatal("notes-only signal completion succeeded")
@@ -5546,6 +5781,117 @@ func testDocumentVersion(t *testing.T, providerDocumentID string) knowledge.Docu
 
 func testExtractionDerivation(t *testing.T, version knowledge.DocumentVersion) ingest.DerivationIdentity {
 	return testExtractionDerivationForProvider(t, version, modelpolicy.ProviderBedrock)
+}
+
+func testOwningExtractionRun(t *testing.T, pool *pgxpool.Pool, version knowledge.DocumentVersion) owningExtractionRun {
+	t.Helper()
+	state, err := NewIngestionRepository(pool).PrepareVersion(
+		context.Background(), version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare synthetic extraction run: %v", err)
+	}
+	var run owningExtractionRun
+	if err := pool.QueryRow(context.Background(), `
+		SELECT id::text, model_id, prompt_version, recorded_at
+		FROM stacks.extraction_runs
+		WHERE id = $1`, state.DerivationID).Scan(&run.ID, &run.ModelID, &run.PromptVersion, &run.RecordedAt); err != nil {
+		t.Fatalf("load synthetic extraction run: %v", err)
+	}
+	return run
+}
+
+func testCanonicalObservation(
+	t *testing.T,
+	run owningExtractionRun,
+	id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID string,
+	predicate string,
+	validTime observation.TemporalExtent,
+	evidenceIDs ...string,
+) observation.Observation {
+	t.Helper()
+	links := make([]observation.EvidenceLink, len(evidenceIDs))
+	for index, evidenceID := range evidenceIDs {
+		links[index] = observation.EvidenceLink{EvidenceID: knowledge.EvidenceID(evidenceID), Role: observation.EvidenceSupporting}
+	}
+	return testCanonicalObservationWithLinks(t, run, id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID, predicate, validTime, links, nil)
+}
+
+func testCanonicalObservationWithConfidence(
+	t *testing.T,
+	run owningExtractionRun,
+	id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID string,
+	predicate string,
+	validTime observation.TemporalExtent,
+	confidence float64,
+	evidenceIDs ...string,
+) observation.Observation {
+	t.Helper()
+	legacyConfidence, err := observation.NewLegacyConfidence(confidence)
+	if err != nil {
+		t.Fatalf("new legacy confidence: %v", err)
+	}
+	links := make([]observation.EvidenceLink, len(evidenceIDs))
+	for index, evidenceID := range evidenceIDs {
+		links[index] = observation.EvidenceLink{EvidenceID: knowledge.EvidenceID(evidenceID), Role: observation.EvidenceSupporting}
+	}
+	return testCanonicalObservationWithLinks(t, run, id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID, predicate, validTime, links, &legacyConfidence)
+}
+
+func testCanonicalObservationWithLinks(
+	t *testing.T,
+	run owningExtractionRun,
+	id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID string,
+	predicate string,
+	validTime observation.TemporalExtent,
+	links []observation.EvidenceLink,
+	confidence *observation.Confidence,
+) observation.Observation {
+	t.Helper()
+	subject := testCanonicalTerm(t, subjectEntityID, subjectMentionID)
+	object := testCanonicalTerm(t, objectEntityID, objectMentionID)
+	value, err := observation.NewObservation(observation.ObservationInput{
+		ID:        observation.ObservationID(id),
+		Statement: observation.Statement{Subject: subject, Predicate: observation.Predicate(predicate), Object: object},
+		ValidTime: validTime, RecordedAt: run.RecordedAt, Evidence: links,
+		Derivation: observation.Derivation{
+			Method: "synthetic", Version: run.PromptVersion, RunID: run.ID, Model: run.ModelID, PromptVersion: run.PromptVersion,
+		},
+		Status: observation.StatusInferred, Confidence: confidence,
+	})
+	if err != nil {
+		t.Fatalf("new canonical observation: %v", err)
+	}
+	return value
+}
+
+func testCanonicalTerm(t *testing.T, entityID, mentionID string) observation.Term {
+	t.Helper()
+	var (
+		term observation.Term
+		err  error
+	)
+	switch {
+	case entityID != "":
+		term, err = observation.NewEntityTerm(entityID, mentionID)
+	case mentionID != "":
+		term, err = observation.NewMentionTerm(mentionID)
+	default:
+		return observation.AbsentTerm()
+	}
+	if err != nil {
+		t.Fatalf("new canonical term: %v", err)
+	}
+	return term
+}
+
+func testCanonicalInstant(t *testing.T, value time.Time) observation.TemporalExtent {
+	t.Helper()
+	instant, err := observation.AtTime(value)
+	if err != nil {
+		t.Fatalf("new canonical instant: %v", err)
+	}
+	return instant
 }
 
 func testExtractionDerivationForProvider(t *testing.T, version knowledge.DocumentVersion, provider modelpolicy.Provider) ingest.DerivationIdentity {

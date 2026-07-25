@@ -3,11 +3,14 @@ package storage
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type legacyObservationQuerier interface {
@@ -206,4 +209,157 @@ func loadObservationEvidenceOrigin(
 		)
 	}
 	return origin, nil
+}
+
+// putLegacyObservation writes the complete legacy PostgreSQL projection for a
+// canonical observation. Stable-ID retries load the existing projection.
+func putLegacyObservation(
+	ctx context.Context,
+	transaction pgx.Tx,
+	write legacyObservationWrite,
+) (observation.Observation, *InteractionSignal, error) {
+	var storedID string
+	err := transaction.QueryRow(ctx, `
+		INSERT INTO stacks.observations
+			(id, extraction_run_id, subject_entity_id, object_entity_id, subject_mention_id, object_mention_id,
+			 predicate, valid_start, valid_end, recorded_at, derivation, epistemic_status, confidence, digest,
+			 currently_admissible)
+		VALUES ($1::uuid, $2::uuid, NULLIF($3, '')::uuid, NULLIF($4, '')::uuid, NULLIF($5, '')::uuid, NULLIF($6, '')::uuid,
+		        $7, $8, $9, $10, $11, $12, $13, $14, true)
+		ON CONFLICT (id) DO NOTHING
+		RETURNING id::text`,
+		write.Row.ID, write.Row.ExtractionRunID, write.Row.SubjectEntityID, write.Row.ObjectEntityID,
+		write.Row.SubjectMentionID, write.Row.ObjectMentionID, write.Row.Predicate, write.Row.ValidStart,
+		write.Row.ValidEnd, write.Row.RecordedAt, write.Row.Derivation, write.Row.EpistemicStatus,
+		write.Row.Confidence, write.Row.Digest[:],
+	).Scan(&storedID)
+	if err == pgx.ErrNoRows {
+		stored, err := loadLegacyObservation(ctx, transaction, write.Row.ID)
+		if err != nil {
+			return observation.Observation{}, nil, err
+		}
+		if !equalLegacyObservationRetry(write, stored) {
+			return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, write.Row.ID)
+		}
+		value, signal := legacyCompletionResult(stored)
+		return value, signal, nil
+	}
+	if err != nil {
+		var databaseError *pgconn.PgError
+		if errors.As(err, &databaseError) && databaseError.Code == "23505" {
+			return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, write.Row.ID)
+		}
+		return observation.Observation{}, nil, fmt.Errorf("persist legacy observation %q: %w", write.Row.ID, err)
+	}
+
+	for _, evidenceID := range write.Origin {
+		if _, err := transaction.Exec(ctx, `
+			INSERT INTO stacks.observation_evidence (observation_id, evidence_span_id)
+			VALUES ($1::uuid, $2::uuid)
+			ON CONFLICT DO NOTHING`, write.Row.ID, string(evidenceID)); err != nil {
+			return observation.Observation{}, nil, fmt.Errorf("persist legacy observation evidence %q: %w", write.Row.ID, err)
+		}
+	}
+	if write.Signal != nil {
+		signal, err := putSignal(ctx, transaction, write.Signal.Input, write.Signal.Digest[:])
+		if err != nil {
+			var databaseError *pgconn.PgError
+			if errors.As(err, &databaseError) && databaseError.Code == "23505" {
+				return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, write.Row.ID)
+			}
+			return observation.Observation{}, nil, err
+		}
+		for _, signalEvidence := range write.Signal.Evidence {
+			if _, err := transaction.Exec(ctx, `
+				INSERT INTO stacks.signal_evidence (signal_id, evidence_span_id, role)
+				VALUES ($1::uuid, $2::uuid, $3)
+				ON CONFLICT DO NOTHING`, signal.ID, signalEvidence.EvidenceSpanID, signalEvidence.Role); err != nil {
+				return observation.Observation{}, nil, fmt.Errorf("persist legacy signal evidence %q: %w", signal.ID, err)
+			}
+		}
+	}
+	stored, err := loadLegacyObservation(ctx, transaction, storedID)
+	if err != nil {
+		return observation.Observation{}, nil, err
+	}
+	if !equalLegacyObservationRetry(write, stored) {
+		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, write.Row.ID)
+	}
+	value, signal := legacyCompletionResult(stored)
+	return value, signal, nil
+}
+
+func legacyCompletionResult(stored decodedLegacyObservation) (observation.Observation, *InteractionSignal) {
+	if stored.Signal == nil {
+		return stored.Observation, nil
+	}
+	return stored.Observation, &InteractionSignal{ID: stored.Signal.Input.ID}
+}
+
+func equalLegacyObservationRetry(expected legacyObservationWrite, stored decodedLegacyObservation) bool {
+	if stored.Observation.LegacyUncited() {
+		return false
+	}
+	derivation := stored.Observation.Derivation()
+	if derivation.LegacyUnversioned {
+		return false
+	}
+	run := &owningExtractionRun{
+		ID: derivation.RunID, ModelID: derivation.Model, PromptVersion: derivation.PromptVersion,
+		RecordedAt: stored.Observation.RecordedAt(),
+	}
+	actual, err := encodeLegacyObservation(stored.Observation, stored.Compatibility, run, stored.Signal)
+	if err != nil || !equalLegacyObservationRows(expected.Row, actual.Row) ||
+		!equalLegacyEvidenceOrigin(expected.Origin, actual.Origin) || !equalLegacySignalState(expected.Signal, actual.Signal) {
+		return false
+	}
+	return true
+}
+
+func equalLegacyEvidenceOrigin(left, right []evidence.EvidenceID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalLegacyObservationRows(left, right legacyObservationRow) bool {
+	return left.ID == right.ID && left.ExtractionRunID == right.ExtractionRunID &&
+		left.SubjectEntityID == right.SubjectEntityID && left.ObjectEntityID == right.ObjectEntityID &&
+		left.SubjectMentionID == right.SubjectMentionID && left.ObjectMentionID == right.ObjectMentionID &&
+		left.Predicate == right.Predicate && left.Derivation == right.Derivation && left.EpistemicStatus == right.EpistemicStatus &&
+		equalLegacyTimes(left.ValidStart, right.ValidStart) && equalLegacyTimes(left.ValidEnd, right.ValidEnd) &&
+		left.RecordedAt.Equal(right.RecordedAt) && equalLegacyConfidenceValues(left.Confidence, right.Confidence) && left.Digest == right.Digest
+}
+
+func equalLegacyTimes(left, right *time.Time) bool {
+	return left == nil && right == nil || left != nil && right != nil && left.Equal(*right)
+}
+
+func equalLegacyConfidenceValues(left, right *float64) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
+}
+
+func equalLegacySignalState(left, right *legacySignalState) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Input == right.Input && left.Digest == right.Digest && sameSignalEvidenceInputs(left.Evidence, right.Evidence)
+}
+
+func sameSignalEvidenceInputs(left, right []SignalEvidenceInput) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
