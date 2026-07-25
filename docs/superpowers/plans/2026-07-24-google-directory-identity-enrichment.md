@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Work in `/Users/jacob/dev/personal/stacks` and preserve unrelated work.
-- The current schema ends at migration `00010`; add one forward-only migration, `00011_google_directory_identity.sql`.
+- The current schema ends at the published migration `00011_current_document_version.sql`; add one forward-only migration, `00012_google_directory_identity.sql`.
 - Do not invoke Bedrock, OpenAI, or Anthropic as part of directory tests or doctor checks.
 - Do not deploy, enable cloud logging, push, open a PR, or merge without explicit user approval.
 - Never print, log, trace, commit, or copy OAuth credentials, tokens, directory queries, names, emails, provider person identifiers, private source text, prompts, or model responses.
@@ -46,7 +46,7 @@
 - `internal/googledirectory/probe_test.go`: readiness and secret-redaction tests.
 - `internal/storage/directory.go`: directory work loading, immutable snapshot persistence, automatic-link transaction, and review transaction support.
 - `internal/storage/directory_test.go`: validation and stable-digest unit tests.
-- `db/migrations/00011_google_directory_identity.sql`: forward-only directory provenance and candidate schema.
+- `db/migrations/00012_google_directory_identity.sql`: forward-only directory provenance and candidate schema.
 
 ### Modified files
 
@@ -57,7 +57,7 @@
 - `internal/cli/sync.go` and `internal/cli/sync_test.go`: render bounded directory counts.
 - `internal/storage/entities.go`, `internal/storage/entities_test.go`, and `internal/storage/integration_test.go`: directory candidates, decisions, aliases, corrections, concurrency, and upgrade coverage.
 - `internal/cli/review.go`, `internal/cli/review_test.go`, `internal/cli/storage.go`, and `internal/cli/storage_test.go`: show and accept directory-backed candidates and optionally verify a reviewer-supplied email.
-- `internal/doctor/service.go`, `internal/doctor/service_test.go`, `internal/doctor/postgres_integration_test.go`, and `internal/cli/doctor_test.go`: optional directory readiness with warning semantics and migration `00011`.
+- `internal/doctor/service.go`, `internal/doctor/service_test.go`, `internal/doctor/postgres_integration_test.go`, and `internal/cli/doctor_test.go`: optional directory readiness with warning semantics and migrations through `00012`.
 - `cmd/stacks/main.go` and `cmd/stacks/main_test.go`: lazy composition of the separate authorizer, probe, adapter, directory service, and shared database pool.
 - `Makefile`, `.env.example`, and `README.md`: operator commands, safe configuration, IT authorization contract, and acceptance boundaries.
 
@@ -562,14 +562,14 @@ git commit -m "Add Google directory lookup adapter"
 ### Task 4: Add forward-only directory provenance schema
 
 **Files:**
-- Create: `db/migrations/00011_google_directory_identity.sql`
+- Create: `db/migrations/00012_google_directory_identity.sql`
 - Modify: `internal/storage/migration_test.go`
 - Modify: `internal/storage/integration_test.go`
 - Modify: `internal/doctor/service.go`
 - Modify: `internal/doctor/postgres_integration_test.go`
 
 **Interfaces:**
-- Consumes: existing mentions, proposals, candidates, decisions, entities, and alias assertions through migration `00010`.
+- Consumes: existing mentions, proposals, candidates, decisions, entities, alias assertions, and current-document pointers through migration `00011`.
 - Produces: immutable lookup/profile evidence, directory-backed candidates, and decision-scoped identity assertions.
 
 - [ ] **Step 1: Write the migration contract test**
@@ -592,7 +592,7 @@ validate_effective_directory_identity
 
 Run: `go test ./internal/storage -run TestGoogleDirectoryMigration`
 
-Expected: FAIL because migration `00011` is absent.
+Expected: FAIL because migration `00012` is absent.
 
 - [ ] **Step 3: Create the forward schema**
 
@@ -712,10 +712,10 @@ directory identity referenced by both `OLD.id` and `NEW.id`.
 
 In an isolated migration schema created from `STACKS_TEST_MIGRATION_DATABASE_URL`:
 
-- migrate legacy fixtures through `00010`;
+- migrate legacy fixtures through `00011`;
 - record counts and digests for entities, mentions, proposals, decisions,
   aliases, observations, signals, and analyses;
-- apply `00011`;
+- apply `00012`;
 - assert every count and digest is unchanged;
 - insert one entity-backed candidate and one directory-backed candidate;
 - assert zero-source and two-source candidates fail;
@@ -724,9 +724,10 @@ In an isolated migration schema created from `STACKS_TEST_MIGRATION_DATABASE_URL
 
 - [ ] **Step 5: Update doctor migration requirements**
 
-Add `11` to `requiredMigrationVersions()` only after the RED migration test
-exists. Update the PostgreSQL doctor integration expectation to current through
-`00011`.
+Add the existing current-document migration version `11` and the new directory
+migration version `12` to `requiredMigrationVersions()` only after the RED
+migration test exists. Update the PostgreSQL doctor integration expectation to
+current through `00012`.
 
 - [ ] **Step 6: Apply and inspect the migration locally**
 
@@ -738,7 +739,7 @@ make db-migrate
 make db-status
 ```
 
-Expected: migrations through `00011` applied with no pending migrations.
+Expected: migrations through `00012` applied with no pending migrations.
 
 - [ ] **Step 7: Run migration integration tests**
 
@@ -756,7 +757,7 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add db/migrations/00011_google_directory_identity.sql internal/storage/migration_test.go internal/storage/integration_test.go internal/doctor
+git add db/migrations/00012_google_directory_identity.sql internal/storage/migration_test.go internal/storage/integration_test.go internal/doctor docs/superpowers/plans/2026-07-24-google-directory-identity-enrichment.md
 git commit -m "Persist directory identity provenance"
 ```
 
@@ -1568,7 +1569,7 @@ STACKS_TEST_MIGRATION_DATABASE_URL="$STACKS_TEST_MIGRATION_DATABASE_URL" \
 make test-integration
 ```
 
-Expected: migration `00011` applied, no pending migrations, and every
+Expected: migration `00012` applied, no pending migrations, and every
 PostgreSQL-gated storage/doctor test passes.
 
 - [ ] **Step 10: Run doctor without invoking providers**

@@ -1046,6 +1046,433 @@ func TestModelProviderProvenanceMigrationEnforcesProviderAndModeConstraints(t *t
 	}
 }
 
+func TestMigrationUpgradeToGoogleDirectoryPreservesIdentityHistory(t *testing.T) {
+	pool := openMigrationIntegrationDatabase(t)
+	ctx := context.Background()
+	schemaName := "stacks_directory_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := `"` + schemaName + `"`
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatalf("create isolated directory-upgrade schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+	})
+
+	applyMigrationsThrough00011ToSchema(t, pool, quotedSchema)
+	seedGoogleDirectoryMigrationFixture(t, pool, quotedSchema)
+	before := captureIdentityHistory(t, pool, quotedSchema)
+
+	applyMigrationToSchema(t, pool, quotedSchema, "00012_google_directory_identity.sql")
+
+	after := captureIdentityHistory(t, pool, quotedSchema)
+	for index, want := range before {
+		got := after[index]
+		if got != want {
+			t.Fatalf("%s history after directory migration = count:%d digest:%s, want count:%d digest:%s",
+				want.table, got.count, got.digest, want.count, want.digest)
+		}
+	}
+}
+
+func TestMigrationUpgradeToGoogleDirectoryEnforcesCandidateAndEffectiveIdentityConstraints(t *testing.T) {
+	pool := openMigrationIntegrationDatabase(t)
+	ctx := context.Background()
+	schemaName := "stacks_directory_constraints_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := `"` + schemaName + `"`
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatalf("create isolated directory-constraint schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+	})
+
+	applyMigrationsThrough00011ToSchema(t, pool, quotedSchema)
+	first := seedGoogleDirectoryMigrationFixture(t, pool, quotedSchema)
+	applyMigrationToSchema(t, pool, quotedSchema, "00012_google_directory_identity.sql")
+
+	second := seedAdditionalDirectoryDecision(t, pool, quotedSchema, first)
+	snapshotID := uuid.NewString()
+	lookupAttemptID := uuid.NewString()
+	snapshotDigest := sha256.Sum256([]byte("directory-constraint-snapshot"))
+	queryDigest := sha256.Sum256([]byte("directory-constraint-query"))
+	attemptDigest := sha256.Sum256([]byte("directory-constraint-attempt"))
+	for _, statement := range []struct {
+		operation string
+		query     string
+		arguments []any
+	}{
+		{
+			operation: "directory profile snapshot",
+			query: "INSERT INTO " + quotedSchema + `.directory_profile_snapshots
+				(id, provider, provider_subject_id, source_type, display_name, observed_at, recorded_at, digest)
+				VALUES ($1, 'google_people', 'synthetic-subject', 'domain_profile', 'Synthetic Directory Person', NULL, $2, $3)`,
+			arguments: []any{snapshotID, first.recordedAt, snapshotDigest[:]},
+		},
+		{
+			operation: "directory profile email",
+			query: "INSERT INTO " + quotedSchema + `.directory_profile_emails
+				(snapshot_id, normalized_email, is_primary, position)
+				VALUES ($1, 'synthetic.person@example.invalid', true, 0)`,
+			arguments: []any{snapshotID},
+		},
+		{
+			operation: "directory lookup attempt",
+			query: "INSERT INTO " + quotedSchema + `.directory_lookup_attempts
+				(id, mention_id, provider, query_kind, email_evidence, query_digest, policy_version,
+				 outcome, attempt_count, recorded_at, digest)
+				VALUES ($1, $2, 'google_people', 'email', 'source_bound', $3, 'directory-policy-v1',
+				 'matched', 1, $4, $5)`,
+			arguments: []any{lookupAttemptID, first.mentionID, queryDigest[:], first.recordedAt, attemptDigest[:]},
+		},
+		{
+			operation: "directory lookup match",
+			query: "INSERT INTO " + quotedSchema + `.directory_lookup_matches
+				(lookup_attempt_id, snapshot_id, rank, reason)
+				VALUES ($1, $2, 0, 'exact_email')`,
+			arguments: []any{lookupAttemptID, snapshotID},
+		},
+		{
+			operation: "entity-backed candidate",
+			query: "INSERT INTO " + quotedSchema + `.resolution_candidates
+				(proposal_id, entity_id, rank, confidence, reason)
+				VALUES ($1, $2, 0, 1, 'synthetic entity candidate')`,
+			arguments: []any{first.proposalID, first.entityID},
+		},
+		{
+			operation: "directory-backed candidate",
+			query: "INSERT INTO " + quotedSchema + `.resolution_candidates
+				(proposal_id, directory_profile_snapshot_id, rank, confidence, reason)
+				VALUES ($1, $2, 1, 1, 'synthetic directory candidate')`,
+			arguments: []any{first.proposalID, snapshotID},
+		},
+	} {
+		if _, err := pool.Exec(ctx, statement.query, statement.arguments...); err != nil {
+			t.Fatalf("seed %s: %v", statement.operation, err)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, "INSERT INTO "+quotedSchema+`.resolution_candidates
+		(proposal_id, rank, reason) VALUES ($1, 0, 'synthetic zero-source candidate')`, second.proposalID); err == nil {
+		t.Fatal("zero-source resolution candidate insert succeeded, want source XOR constraint failure")
+	}
+	if _, err := pool.Exec(ctx, "INSERT INTO "+quotedSchema+`.resolution_candidates
+		(proposal_id, entity_id, directory_profile_snapshot_id, rank, reason)
+		VALUES ($1, $2, $3, 0, 'synthetic two-source candidate')`,
+		second.proposalID, second.entityID, snapshotID); err == nil {
+		t.Fatal("two-source resolution candidate insert succeeded, want source XOR constraint failure")
+	}
+
+	if _, err := pool.Exec(ctx, "INSERT INTO "+quotedSchema+`.entity_directory_identity_assertions
+		(decision_id, entity_id, lookup_attempt_id, snapshot_id, provider, provider_subject_id, recorded_at)
+		VALUES ($1, $2, $3, $4, 'google_people', 'synthetic-subject', $5)`,
+		first.decisionID, first.entityID, lookupAttemptID, snapshotID, first.recordedAt); err != nil {
+		t.Fatalf("insert first effective directory identity: %v", err)
+	}
+
+	conflict, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin conflicting directory identity transaction: %v", err)
+	}
+	if _, err := conflict.Exec(ctx, "INSERT INTO "+quotedSchema+`.entity_directory_identity_assertions
+		(decision_id, entity_id, lookup_attempt_id, snapshot_id, provider, provider_subject_id, recorded_at)
+		VALUES ($1, $2, $3, $4, 'google_people', 'synthetic-subject', $5)`,
+		second.decisionID, second.entityID, lookupAttemptID, snapshotID, first.recordedAt); err != nil {
+		_ = conflict.Rollback(ctx)
+		t.Fatalf("insert conflicting directory identity before deferred validation: %v", err)
+	}
+	if err := conflict.Commit(ctx); err == nil {
+		t.Fatal("commit conflicting effective directory identity succeeded, want deferred constraint failure")
+	}
+
+	if _, err := pool.Exec(ctx, "UPDATE "+quotedSchema+`.resolution_decisions
+		SET currently_admissible = false WHERE id = $1`, second.decisionID); err != nil {
+		t.Fatalf("make second directory decision inadmissible: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "INSERT INTO "+quotedSchema+`.entity_directory_identity_assertions
+		(decision_id, entity_id, lookup_attempt_id, snapshot_id, provider, provider_subject_id, recorded_at)
+		VALUES ($1, $2, $3, $4, 'google_people', 'synthetic-subject', $5)`,
+		second.decisionID, second.entityID, lookupAttemptID, snapshotID, first.recordedAt); err != nil {
+		t.Fatalf("insert identity for inadmissible decision: %v", err)
+	}
+	activation, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin conflicting decision activation transaction: %v", err)
+	}
+	if _, err := activation.Exec(ctx, "UPDATE "+quotedSchema+`.resolution_decisions
+		SET currently_admissible = true WHERE id = $1`, second.decisionID); err != nil {
+		_ = activation.Rollback(ctx)
+		t.Fatalf("activate conflicting directory decision before deferred validation: %v", err)
+	}
+	if err := activation.Commit(ctx); err == nil {
+		t.Fatal("commit conflicting directory decision activation succeeded, want deferred constraint failure")
+	}
+
+	correction, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin corrected directory identity transaction: %v", err)
+	}
+	defer correction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
+	if _, err := correction.Exec(ctx, "UPDATE "+quotedSchema+`.resolution_decisions
+		SET superseded_by_id = $1 WHERE id = $2`, second.decisionID, first.decisionID); err != nil {
+		t.Fatalf("supersede first directory decision: %v", err)
+	}
+	if _, err := correction.Exec(ctx, "UPDATE "+quotedSchema+`.resolution_decisions
+		SET supersedes_id = $1, currently_admissible = true WHERE id = $2`,
+		first.decisionID, second.decisionID); err != nil {
+		t.Fatalf("link corrected directory decision: %v", err)
+	}
+	if err := correction.Commit(ctx); err != nil {
+		t.Fatalf("commit corrected directory identity: %v", err)
+	}
+
+	var effectiveEntities int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(DISTINCT assertion.entity_id)
+		FROM `+quotedSchema+`.entity_directory_identity_assertions AS assertion
+		JOIN `+quotedSchema+`.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		WHERE assertion.provider = 'google_people'
+		  AND assertion.provider_subject_id = 'synthetic-subject'
+		  AND decision.superseded_by_id IS NULL
+		  AND decision.outcome IN ('accepted', 'created')
+		  AND decision.currently_admissible`).Scan(&effectiveEntities); err != nil {
+		t.Fatalf("count corrected effective directory identities: %v", err)
+	}
+	if effectiveEntities != 1 {
+		t.Fatalf("corrected effective directory entity count = %d, want 1", effectiveEntities)
+	}
+}
+
+type googleDirectoryMigrationFixture struct {
+	entityID     string
+	mentionID    string
+	proposalID   string
+	decisionID   string
+	recordedAt   time.Time
+	evidenceID   string
+	extractionID string
+}
+
+type identityHistorySnapshot struct {
+	table  string
+	count  int64
+	digest string
+}
+
+func seedGoogleDirectoryMigrationFixture(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	quotedSchema string,
+) googleDirectoryMigrationFixture {
+	t.Helper()
+	ctx := context.Background()
+	fixture := googleDirectoryMigrationFixture{
+		entityID:     uuid.NewString(),
+		mentionID:    uuid.NewString(),
+		proposalID:   uuid.NewString(),
+		decisionID:   uuid.NewString(),
+		recordedAt:   time.Date(2026, time.July, 23, 14, 0, 0, 0, time.UTC),
+		evidenceID:   uuid.NewString(),
+		extractionID: uuid.NewString(),
+	}
+	sourceID := uuid.NewString()
+	versionID := uuid.NewString()
+	tabID := uuid.NewString()
+	observationID := uuid.NewString()
+	signalID := uuid.NewString()
+	analysisID := uuid.NewString()
+	ownerID := uuid.NewString()
+	digest := func(value string) []byte {
+		sum := sha256.Sum256([]byte(value))
+		return sum[:]
+	}
+
+	statements := []struct {
+		operation string
+		query     string
+		arguments []any
+	}{
+		{"source document", "INSERT INTO " + quotedSchema + `.source_documents
+			(id, provider, provider_document_id, title, locator, recorded_at)
+			VALUES ($1, 'drive', 'synthetic-directory-upgrade-document', 'Synthetic Directory Upgrade',
+				'https://example.invalid/directory-upgrade', $2)`, []any{sourceID, fixture.recordedAt}},
+		{"document version", "INSERT INTO " + quotedSchema + `.document_versions
+			(id, source_document_id, digest, content_digest_v2, title, locator, provider_version,
+			 provider_revision, recorded_at)
+			VALUES ($1, $2, $3, $3, 'Synthetic Directory Upgrade',
+				'https://example.invalid/directory-upgrade', 'version-1', 'revision-1', $4)`,
+			[]any{versionID, sourceID, digest("directory-upgrade-version"), fixture.recordedAt}},
+		{"document tab", "INSERT INTO " + quotedSchema + `.document_tabs
+			(id, document_version_id, provider_tab_id, title, title_path, display_order, role, content, content_digest)
+			VALUES ($1, $2, 'synthetic-tab', 'Transcript', ARRAY['Transcript'], 0, 'transcript',
+				'Synthetic person discussed synthetic work.', $3)`,
+			[]any{tabID, versionID, digest("directory-upgrade-tab")}},
+		{"evidence span", "INSERT INTO " + quotedSchema + `.evidence_spans
+			(id, document_tab_id, start_offset, end_offset, quote)
+			VALUES ($1, $2, 0, 16, 'Synthetic person')`, []any{fixture.evidenceID, tabID}},
+		{"entity", "INSERT INTO " + quotedSchema + `.entities
+			(id, kind, display_name, recorded_at)
+			VALUES ($1, 'person', 'Synthetic Person One', $2)`, []any{fixture.entityID, fixture.recordedAt}},
+		{"legacy alias", "INSERT INTO " + quotedSchema + `.entity_aliases
+			(entity_id, normalized_value, alias_type, recorded_at)
+			VALUES ($1, 'synthetic person one', 'name', $2)`, []any{fixture.entityID, fixture.recordedAt}},
+		{"extraction run", "INSERT INTO " + quotedSchema + `.extraction_runs
+			(id, document_version_id, derivation_digest, model_provider, data_mode, model_id, bedrock_region,
+			 max_output_tokens, prompt_version, schema_digest, processing_status, completed_by_owner,
+			 recorded_at, completed_at, currently_admissible)
+			VALUES ($1, $2, $3, 'bedrock', 'personal', 'synthetic-model', 'us-east-1', 256,
+				'extract-directory-v1', $4, 'complete', $5, $6, $6, true)`,
+			[]any{fixture.extractionID, versionID, digest("directory-upgrade-derivation"),
+				digest("directory-upgrade-schema"), ownerID, fixture.recordedAt}},
+		{"mention", "INSERT INTO " + quotedSchema + `.mentions
+			(id, evidence_span_id, extraction_run_id, surface, normalized_name, normalized_email,
+			 role, recorded_at, currently_admissible)
+			VALUES ($1, $2, $3, 'Synthetic Person One', 'synthetic person one',
+				'synthetic.one@example.invalid', 'speaker', $4, true)`,
+			[]any{fixture.mentionID, fixture.evidenceID, fixture.extractionID, fixture.recordedAt}},
+		{"proposal", "INSERT INTO " + quotedSchema + `.resolution_proposals
+			(id, mention_id, status, derivation, recorded_at)
+			VALUES ($1, $2, 'resolved', 'synthetic_directory_upgrade', $3)`,
+			[]any{fixture.proposalID, fixture.mentionID, fixture.recordedAt}},
+		{"decision", "INSERT INTO " + quotedSchema + `.resolution_decisions
+			(id, proposal_id, outcome, entity_id, digest, recorded_at, currently_admissible)
+			VALUES ($1, $2, 'accepted', $3, $4, $5, true)`,
+			[]any{fixture.decisionID, fixture.proposalID, fixture.entityID,
+				digest("directory-upgrade-decision"), fixture.recordedAt}},
+		{"alias assertion", "INSERT INTO " + quotedSchema + `.entity_alias_assertions
+			(decision_id, entity_id, normalized_value, alias_type, recorded_at)
+			VALUES ($1, $2, 'synthetic person one', 'name', $3)`,
+			[]any{fixture.decisionID, fixture.entityID, fixture.recordedAt}},
+		{"observation", "INSERT INTO " + quotedSchema + `.observations
+			(id, extraction_run_id, subject_entity_id, object_entity_id, subject_mention_id,
+			 object_mention_id, predicate, recorded_at, derivation, epistemic_status, digest,
+			 currently_admissible)
+			VALUES ($1, $2, $3, $3, $4, $4, 'interaction_signal', $5,
+				'synthetic_extraction', 'inferred', $6, true)`,
+			[]any{observationID, fixture.extractionID, fixture.entityID, fixture.mentionID,
+				fixture.recordedAt, digest("directory-upgrade-observation")}},
+		{"observation evidence", "INSERT INTO " + quotedSchema + `.observation_evidence
+			(observation_id, evidence_span_id) VALUES ($1, $2)`, []any{observationID, fixture.evidenceID}},
+		{"analysis", "INSERT INTO " + quotedSchema + `.analysis_runs
+			(id, employee_entity_id, manager_entity_id, input_digest, analysis_prompt_version,
+			 policy_version, state, recorded_at, completed_at, hypothesis, report_state,
+			 report_json, currently_admissible)
+			VALUES ($1, $2, $2, $3, 'synthetic-analysis-v1', 'synthetic-policy-v1', 'complete',
+				$4, $4, 'Synthetic hypothesis', 'mixed_or_conflicting',
+				'{"status":"mixed_or_conflicting"}'::jsonb, true)`,
+			[]any{analysisID, fixture.entityID, digest("directory-upgrade-analysis"), fixture.recordedAt}},
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement.query, statement.arguments...); err != nil {
+			t.Fatalf("seed directory-upgrade %s: %v", statement.operation, err)
+		}
+	}
+
+	transaction, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin directory-upgrade signal seed: %v", err)
+	}
+	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
+	if _, err := transaction.Exec(ctx, "INSERT INTO "+quotedSchema+`.interaction_signals
+		(id, observation_id, category, direction, extraction_model_id, prompt_version,
+		 rationale, confidence, digest, currently_admissible)
+		VALUES ($1, $2, 'delegation_autonomy', 'strengthening', 'synthetic-model',
+			'extract-directory-v1', 'Synthetic rationale.', 0.75, $3, true)`,
+		signalID, observationID, digest("directory-upgrade-signal")); err != nil {
+		t.Fatalf("seed directory-upgrade signal: %v", err)
+	}
+	if _, err := transaction.Exec(ctx, "INSERT INTO "+quotedSchema+`.signal_evidence
+		(signal_id, evidence_span_id, role) VALUES ($1, $2, 'supporting')`,
+		signalID, fixture.evidenceID); err != nil {
+		t.Fatalf("seed directory-upgrade signal evidence: %v", err)
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		t.Fatalf("commit directory-upgrade signal seed: %v", err)
+	}
+	return fixture
+}
+
+func seedAdditionalDirectoryDecision(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	quotedSchema string,
+	first googleDirectoryMigrationFixture,
+) googleDirectoryMigrationFixture {
+	t.Helper()
+	ctx := context.Background()
+	second := googleDirectoryMigrationFixture{
+		entityID:   uuid.NewString(),
+		mentionID:  uuid.NewString(),
+		proposalID: uuid.NewString(),
+		decisionID: uuid.NewString(),
+		recordedAt: first.recordedAt.Add(time.Minute),
+	}
+	decisionDigest := sha256.Sum256([]byte("directory-constraint-second-decision"))
+	for _, statement := range []struct {
+		operation string
+		query     string
+		arguments []any
+	}{
+		{"second entity", "INSERT INTO " + quotedSchema + `.entities
+			(id, kind, display_name, recorded_at)
+			VALUES ($1, 'person', 'Synthetic Person Two', $2)`, []any{second.entityID, second.recordedAt}},
+		{"second mention", "INSERT INTO " + quotedSchema + `.mentions
+			(id, evidence_span_id, extraction_run_id, surface, normalized_name, normalized_email,
+			 role, recorded_at, currently_admissible)
+			VALUES ($1, $2, $3, 'Synthetic Person Two', 'synthetic person two', '',
+				'reference', $4, true)`,
+			[]any{second.mentionID, first.evidenceID, first.extractionID, second.recordedAt}},
+		{"second proposal", "INSERT INTO " + quotedSchema + `.resolution_proposals
+			(id, mention_id, status, derivation, recorded_at)
+			VALUES ($1, $2, 'resolved', 'synthetic_directory_constraint', $3)`,
+			[]any{second.proposalID, second.mentionID, second.recordedAt}},
+		{"second decision", "INSERT INTO " + quotedSchema + `.resolution_decisions
+			(id, proposal_id, outcome, entity_id, digest, recorded_at, currently_admissible)
+			VALUES ($1, $2, 'accepted', $3, $4, $5, true)`,
+			[]any{second.decisionID, second.proposalID, second.entityID,
+				decisionDigest[:], second.recordedAt}},
+	} {
+		if _, err := pool.Exec(ctx, statement.query, statement.arguments...); err != nil {
+			t.Fatalf("seed %s: %v", statement.operation, err)
+		}
+	}
+	return second
+}
+
+func captureIdentityHistory(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	quotedSchema string,
+) []identityHistorySnapshot {
+	t.Helper()
+	ctx := context.Background()
+	tables := []string{
+		"entities",
+		"mentions",
+		"resolution_proposals",
+		"resolution_decisions",
+		"entity_aliases",
+		"entity_alias_assertions",
+		"observations",
+		"interaction_signals",
+		"analysis_runs",
+	}
+	snapshots := make([]identityHistorySnapshot, 0, len(tables))
+	for _, table := range tables {
+		snapshot := identityHistorySnapshot{table: table}
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*),
+			       md5(COALESCE(
+			           string_agg(to_jsonb(row_value)::text, '|' ORDER BY to_jsonb(row_value)::text),
+			           ''
+			       ))
+			FROM `+quotedSchema+`.`+table+` AS row_value`).Scan(&snapshot.count, &snapshot.digest); err != nil {
+			t.Fatalf("capture %s history before directory migration: %v", table, err)
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	return snapshots
+}
+
 type post00007HybridRows struct {
 	versionID       string
 	extractionRunID string
@@ -1425,6 +1852,17 @@ func applyMigrationsThrough00009ToSchema(t *testing.T, pool *pgxpool.Pool, quote
 		"00007_compatibility_admission_boundary.sql",
 		"00008_snapshot_coherence_admission_boundary.sql",
 		"00009_doctor_migration_inspection.sql",
+	} {
+		applyMigrationToSchema(t, pool, quotedSchema, migration)
+	}
+}
+
+func applyMigrationsThrough00011ToSchema(t *testing.T, pool *pgxpool.Pool, quotedSchema string) {
+	t.Helper()
+	applyMigrationsThrough00009ToSchema(t, pool, quotedSchema)
+	for _, migration := range []string{
+		"00010_model_provider_provenance.sql",
+		"00011_current_document_version.sql",
 	} {
 		applyMigrationToSchema(t, pool, quotedSchema, migration)
 	}

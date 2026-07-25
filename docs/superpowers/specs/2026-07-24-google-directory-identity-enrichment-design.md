@@ -234,7 +234,7 @@ a global assertion that the normalized name can never refer to that person.
 ## Persistence model
 
 The implementation requires a forward-only migration after the current
-migrations through `00010`. Exact table and column names belong in the
+migrations through the published `00011_current_document_version.sql`. Exact table and column names belong in the
 implementation plan, but the durable contracts are:
 
 ### Directory lookup attempt
