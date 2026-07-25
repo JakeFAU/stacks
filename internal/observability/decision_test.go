@@ -44,6 +44,27 @@ func TestDecisionRecorderAddsEventWithoutChildSpan(t *testing.T) {
 	if spans[0].Events[0].Name != decisionEventName {
 		t.Errorf("event name = %q, want %q", spans[0].Events[0].Name, decisionEventName)
 	}
+	wantAttributeKeys := map[string]bool{
+		"stacks.decision.name":             false,
+		"stacks.decision.outcome":          false,
+		"stacks.decision.input.size":       false,
+		"stacks.decision.output.size":      false,
+		"stacks.decision.duration_seconds": false,
+		"stacks.decision.confidence":       false,
+	}
+	for _, eventAttribute := range spans[0].Events[0].Attributes {
+		key := string(eventAttribute.Key)
+		if _, allowed := wantAttributeKeys[key]; !allowed {
+			t.Errorf("event attribute %q is outside the bounded decision schema", key)
+			continue
+		}
+		wantAttributeKeys[key] = true
+	}
+	for key, found := range wantAttributeKeys {
+		if !found {
+			t.Errorf("event attribute %q is missing", key)
+		}
+	}
 }
 
 func TestDecisionRecorderRecordsDistributions(t *testing.T) {
