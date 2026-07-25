@@ -115,6 +115,10 @@ stacks/
     identity/
     temporal/
   adapters/
+    model/
+      go.mod
+    googleauth/
+      go.mod
     postgres/
       go.mod
       migrations/core/
@@ -150,6 +154,8 @@ app and examples -> adapters -> core
 app and examples ------------> core
 
 core -> Go standard library and reviewed foundational dependencies
+model adapters -> adapters/model
+Drive and directory adapters -> adapters/googleauth
 core -X-> provider SDKs
 core -X-> manager-confidence
 core -X-> operator configuration
@@ -218,8 +224,8 @@ time.
 Owns immutable, evidence-backed propositions:
 
 - stable observation identity for retry idempotency;
-- typed subject and object terms that can refer to bounded text, an unresolved
-  mention, or a resolved entity;
+- typed subject and object terms that can contain bounded text, an unresolved
+  mention, or a resolved entity together with its optional grounding mention;
 - a typed predicate;
 - valid time, including unknown, instant, interval, and uncertainty window;
 - recorded time;
@@ -231,11 +237,13 @@ Owns immutable, evidence-backed propositions:
   metadata rather than truth.
 
 A term is a closed tagged value, not `any` or arbitrary JSON. It represents
-only the three forms already earned by the implementation: exact text,
-source-grounded mention reference, or canonical entity reference. Numeric,
-boolean, time-valued, composite, or provider-specific objects may be added only
-after a real use case establishes their invariants. Unary observations remain
-representable only where required for lossless legacy compatibility.
+only the forms already earned by the implementation: absent for lossless
+legacy or unary observations, exact text, a source-grounded mention reference,
+or a canonical entity reference that may retain the grounding mention
+reference. Keeping both entity and mention is required because the current
+writer deliberately persists both after resolution. Numeric, boolean,
+time-valued, composite, or provider-specific objects may be added only after a
+real use case establishes their invariants.
 
 The public epistemic vocabulary includes every status already accepted by the
 database: observed, inferred, hypothesized, structurally validated,
@@ -270,7 +278,8 @@ Before changing storage, characterization tests record:
 The compatibility mapping is:
 
 - entity and mention columns become tagged canonical terms without resolving
-  or rewriting identity;
+  or rewriting identity; an entity-plus-mention pair remains one entity term
+  with its grounding mention;
 - existing observation evidence is supporting evidence;
 - `signal_evidence.role` supplies supporting and contradicting roles for the
   associated vertical observation;
@@ -372,8 +381,11 @@ freezing the current coupled ingestion lifecycle as an open-source API.
 
 ## Model boundary
 
-The existing provider-neutral structured-generation interface is retained but
-separated from manager-confidence prompt contracts.
+The existing provider-neutral structured-generation interface moves into the
+small shared `github.com/JakeFAU/stacks/adapters/model` module and is separated
+from manager-confidence prompt contracts. Provider adapters consume this
+module; it does not belong in core because model transport is an optional edge
+capability.
 
 The generic adapter contract contains:
 
@@ -396,6 +408,11 @@ and raw provider errors must not enter ordinary logs, metrics, traces, or error
 strings.
 
 ## Source and directory adapters
+
+The existing installed-application OAuth mechanism moves into the focused
+`github.com/JakeFAU/stacks/adapters/googleauth` module. Drive and Directory
+consume it without importing one another or duplicating security-sensitive
+token handling.
 
 Google Drive implements a provider-neutral versioned source boundary. Its
 tab-aware extraction behavior remains an adapter capability, while transcript
@@ -422,7 +439,8 @@ The adapter must persist the canonical domain contract without narrowing it:
 - caller-supplied recorded time is preserved;
 - epistemic status and optional finite confidence value plus scale are
   preserved;
-- derivation method, code version, model, and prompt version are preserved;
+- derivation method, code version, extraction-run identity, model, and prompt
+  version are preserved;
 - observation-to-evidence links are immutable and complete;
 - repeated writes with stable identities are idempotent;
 - document, evidence, identity, and observation writes that form one durable
