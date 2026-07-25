@@ -141,6 +141,39 @@ func TestServiceVerifyReviewerEmailReturnsBoundedUnavailableWithoutProviderError
 	}
 }
 
+func TestServiceVerifyReviewerEmailSkipsUnapprovedDomain(t *testing.T) {
+	const reviewerEmail = "reviewer@personal.example"
+	repository := &fakeDirectoryRepository{}
+	lookup := &fakeDirectoryLookup{}
+	service := newTestDirectoryService(repository, lookup)
+
+	verification, err := service.VerifyReviewerEmail(
+		context.Background(),
+		reviewerEmail,
+	)
+
+	if err != nil {
+		t.Fatalf("VerifyReviewerEmail() error = %v", err)
+	}
+	if lookup.calls != 0 {
+		t.Fatalf("Search() calls = %d, want 0", lookup.calls)
+	}
+	if repository.calls.loadIdentity != 0 {
+		t.Fatalf("LoadIdentityState() calls = %d, want 0", repository.calls.loadIdentity)
+	}
+	if verification.Lookup.Outcome != entity.DirectoryNoMatch ||
+		verification.Evaluation.Outcome != entity.DirectoryNoMatch ||
+		verification.AttemptCount != 0 ||
+		len(verification.Lookup.Profiles) != 0 ||
+		verification.RecordedAt.IsZero() ||
+		verification.RetryAfter != nil {
+		t.Fatalf("unapproved reviewer verification is not a complete non-authoritative result")
+	}
+	if !verification.ValidForEmail(reviewerEmail) {
+		t.Fatalf("unapproved reviewer verification must remain additive to explicit review")
+	}
+}
+
 func TestServiceRepositoryLoadFailureIsUnavailableWithoutPrivateError(t *testing.T) {
 	repository := &fakeDirectoryRepository{loadWorkErr: errPrivateDirectoryDetail}
 	service := newTestDirectoryService(repository, &fakeDirectoryLookup{})
@@ -280,6 +313,44 @@ func TestServiceBuildsEligibleQueriesWithoutCombiningSeparateEvidence(t *testing
 	}
 	if repository.persisted[0].Evaluation.EntityID != "person-1" {
 		t.Fatalf("source-bound evaluation EntityID = %q, want existing identity state owner", repository.persisted[0].Evaluation.EntityID)
+	}
+}
+
+func TestServiceFallsBackToNameForUnapprovedProposedEmail(t *testing.T) {
+	mention := PendingMention{
+		MentionID:      "mention-unapproved-email",
+		ProposalID:     "proposal-unapproved-email",
+		Surface:        "Synthetic Person",
+		NormalizedName: "synthetic person",
+		ProposedEmail:  "synthetic.person@personal.example",
+		NameQuote:      "Synthetic Person",
+		EmailQuote:     "Synthetic Person <synthetic.person@personal.example>",
+	}
+	repository := &fakeDirectoryRepository{
+		work: Workset{Mentions: []PendingMention{mention}},
+	}
+	lookup := &fakeDirectoryLookup{
+		results: []LookupResult{{Outcome: entity.DirectoryNoMatch}},
+	}
+	service := newTestDirectoryService(repository, lookup)
+
+	summary, err := service.Enrich(context.Background(), "derivation-1")
+
+	if err != nil {
+		t.Fatalf("Enrich() error = %v", err)
+	}
+	requireSummary(t, summary, Summary{Attempted: 1, NoMatch: 1})
+	wantQuery := entity.DirectoryQuery{
+		Kind:          entity.DirectoryQueryName,
+		Name:          "synthetic person",
+		EmailEvidence: entity.EmailEvidenceNone,
+	}
+	if !reflect.DeepEqual(lookup.queries, []entity.DirectoryQuery{wantQuery}) {
+		t.Fatalf("Search() did not receive only the source-grounded name query")
+	}
+	if len(repository.persisted) != 1 ||
+		repository.persisted[0].Query != wantQuery {
+		t.Fatalf("Persist() did not receive only the name-query result")
 	}
 }
 

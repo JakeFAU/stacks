@@ -30,6 +30,67 @@ func TestSourceBoundMailboxRequiresOneExactNamedMailbox(t *testing.T) {
 	}
 }
 
+func TestDirectoryPolicyControlsLookupEligibility(t *testing.T) {
+	policy := directoryPolicy(t)
+	tests := []struct {
+		name  string
+		query DirectoryQuery
+		want  bool
+	}{
+		{
+			name: "approved citation email",
+			query: DirectoryQuery{
+				Kind:          DirectoryQueryEmail,
+				Email:         "person@corp.example",
+				EmailEvidence: EmailEvidenceCitationVerified,
+			},
+			want: true,
+		},
+		{
+			name: "approved reviewer email",
+			query: DirectoryQuery{
+				Kind:          DirectoryQueryEmail,
+				Email:         "person@corp.example",
+				EmailEvidence: EmailEvidenceReviewerSupplied,
+			},
+			want: true,
+		},
+		{
+			name: "unapproved email",
+			query: DirectoryQuery{
+				Kind:          DirectoryQueryEmail,
+				Email:         "person@personal.example",
+				EmailEvidence: EmailEvidenceSourceBound,
+			},
+		},
+		{
+			name: "email without eligible evidence",
+			query: DirectoryQuery{
+				Kind:          DirectoryQueryEmail,
+				Email:         "person@corp.example",
+				EmailEvidence: EmailEvidenceNone,
+			},
+		},
+		{
+			name: "source-grounded name",
+			query: DirectoryQuery{
+				Kind:          DirectoryQueryName,
+				Name:          "Person Name",
+				EmailEvidence: EmailEvidenceNone,
+			},
+			want: true,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := policy.LookupEligible(testCase.query); got != testCase.want {
+				t.Fatalf("LookupEligible() = %t, want %t", got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestDirectoryPolicyAutoCreatesForUniqueSourceBoundApprovedEmail(t *testing.T) {
 	policy := directoryPolicy(t)
 	evaluation := policy.Evaluate(DirectoryQuery{

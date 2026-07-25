@@ -119,6 +119,34 @@ func SourceBoundMailbox(surface, email, quote string) bool {
 		NormalizeEmail(parsed.Address) == NormalizeEmail(email)
 }
 
+// LookupEligible reports whether a normalized query may cross the directory
+// disclosure boundary under the configured work-domain policy.
+func (policy DirectoryPolicy) LookupEligible(query DirectoryQuery) bool {
+	switch query.Kind {
+	case DirectoryQueryEmail:
+		email := NormalizeEmail(query.Email)
+		if NormalizeName(query.Name) != "" ||
+			!ValidEmail(email) {
+			return false
+		}
+		switch query.EmailEvidence {
+		case EmailEvidenceSourceBound,
+			EmailEvidenceCitationVerified,
+			EmailEvidenceReviewerSupplied:
+		default:
+			return false
+		}
+		_, approved := policy.approvedDomains[emailDomain(email)]
+		return approved
+	case DirectoryQueryName:
+		return NormalizeName(query.Name) != "" &&
+			NormalizeEmail(query.Email) == "" &&
+			query.EmailEvidence == EmailEvidenceNone
+	default:
+		return false
+	}
+}
+
 // Evaluate applies the deterministic directory authority policy without
 // mutating directory results, entity snapshots, or identity links.
 func (policy DirectoryPolicy) Evaluate(query DirectoryQuery, profiles []DirectoryProfile, snapshots []EntitySnapshot, links []DirectoryIdentityLink) DirectoryEvaluation {

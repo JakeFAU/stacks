@@ -239,7 +239,7 @@ func (service *Service) VerifyReviewerEmail(ctx context.Context, email string) (
 		return verification, nil
 	}
 	verification.RecordedAt = service.Now().UTC()
-	if !entity.ValidEmail(query.Email) {
+	if !service.Policy.LookupEligible(query) {
 		verification.Lookup.Outcome = entity.DirectoryNoMatch
 		verification.Evaluation.Outcome = entity.DirectoryNoMatch
 		return verification, nil
@@ -350,7 +350,7 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 	}
 
 	for _, mention := range work.Mentions {
-		query, eligible := directoryQuery(mention)
+		query, eligible := directoryQuery(service.Policy, mention)
 		if !eligible {
 			continue
 		}
@@ -525,28 +525,32 @@ func (service *Service) retryDelay(result LookupResult) time.Duration {
 	return service.RetryAfter
 }
 
-func directoryQuery(mention PendingMention) (entity.DirectoryQuery, bool) {
+func directoryQuery(
+	policy entity.DirectoryPolicy,
+	mention PendingMention,
+) (entity.DirectoryQuery, bool) {
 	email := entity.NormalizeEmail(mention.ProposedEmail)
 	if entity.ValidEmail(email) {
 		evidence := entity.EmailEvidenceCitationVerified
 		if entity.SourceBoundMailbox(mention.Surface, email, mention.EmailQuote) {
 			evidence = entity.EmailEvidenceSourceBound
 		}
-		return entity.DirectoryQuery{
+		query := entity.DirectoryQuery{
 			Kind:          entity.DirectoryQueryEmail,
 			Email:         email,
 			EmailEvidence: evidence,
-		}, true
+		}
+		if policy.LookupEligible(query) {
+			return query, true
+		}
 	}
 	name := entity.NormalizeName(mention.NormalizedName)
-	if name == "" {
-		return entity.DirectoryQuery{}, false
-	}
-	return entity.DirectoryQuery{
+	query := entity.DirectoryQuery{
 		Kind:          entity.DirectoryQueryName,
 		Name:          name,
 		EmailEvidence: entity.EmailEvidenceNone,
-	}, true
+	}
+	return query, policy.LookupEligible(query)
 }
 
 func directoryCancellation(ctx context.Context, err error) error {
