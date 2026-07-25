@@ -11,8 +11,114 @@ import (
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func TestLegacyObservationStorageErrorsRemainPrivateAndUnwrap(t *testing.T) {
+	const observationID = "11111111-2222-3333-4444-555555555555"
+	const privateMarker = "private driver predicate rationale prompt"
+	cause := errors.New(privateMarker)
+	for _, testCase := range []struct {
+		name       string
+		reason     string
+		querier    legacyObservationQuerier
+		invokeLoad func(legacyObservationQuerier) error
+	}{
+		{
+			name:    "observation_query_row",
+			reason:  "legacy_observation_query_failed",
+			querier: legacyObservationFakeQuerier{row: legacyObservationFakeRow{err: cause}},
+			invokeLoad: func(query legacyObservationQuerier) error {
+				_, _, _, err := scanLegacyObservationState(context.Background(), query, observationID)
+				return err
+			},
+		},
+		{
+			name:    "evidence_query",
+			reason:  "legacy_observation_evidence_query_failed",
+			querier: legacyObservationFakeQuerier{queryErr: cause},
+			invokeLoad: func(query legacyObservationQuerier) error {
+				_, err := loadObservationEvidenceOrigin(context.Background(), query, observationID)
+				return err
+			},
+		},
+		{
+			name:    "evidence_scan",
+			reason:  "legacy_observation_evidence_scan_failed",
+			querier: legacyObservationFakeQuerier{rows: &legacyObservationFakeRows{next: true, scanErr: cause}},
+			invokeLoad: func(query legacyObservationQuerier) error {
+				_, err := loadObservationEvidenceOrigin(context.Background(), query, observationID)
+				return err
+			},
+		},
+		{
+			name:    "evidence_iteration",
+			reason:  "legacy_observation_evidence_iteration_failed",
+			querier: legacyObservationFakeQuerier{rows: &legacyObservationFakeRows{err: cause}},
+			invokeLoad: func(query legacyObservationQuerier) error {
+				_, err := loadObservationEvidenceOrigin(context.Background(), query, observationID)
+				return err
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := testCase.invokeLoad(testCase.querier)
+			if err == nil || strings.Contains(err.Error(), privateMarker) ||
+				!strings.Contains(err.Error(), testCase.reason) || !strings.Contains(err.Error(), observationID) ||
+				!errors.Is(err, cause) {
+				t.Fatalf("storage error = %v", err)
+			}
+		})
+	}
+}
+
+type legacyObservationFakeQuerier struct {
+	row      pgx.Row
+	rows     pgx.Rows
+	queryErr error
+}
+
+func (querier legacyObservationFakeQuerier) QueryRow(context.Context, string, ...any) pgx.Row {
+	return querier.row
+}
+
+func (querier legacyObservationFakeQuerier) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return querier.rows, querier.queryErr
+}
+
+type legacyObservationFakeRow struct{ err error }
+
+func (row legacyObservationFakeRow) Scan(...any) error { return row.err }
+
+type legacyObservationFakeRows struct {
+	next    bool
+	scanErr error
+	err     error
+}
+
+func (rows *legacyObservationFakeRows) Close() {}
+
+func (rows *legacyObservationFakeRows) Err() error { return rows.err }
+
+func (rows *legacyObservationFakeRows) CommandTag() pgconn.CommandTag { return pgconn.CommandTag{} }
+
+func (rows *legacyObservationFakeRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+
+func (rows *legacyObservationFakeRows) Next() bool {
+	next := rows.next
+	rows.next = false
+	return next
+}
+
+func (rows *legacyObservationFakeRows) Scan(...any) error { return rows.scanErr }
+
+func (rows *legacyObservationFakeRows) Values() ([]any, error) { return nil, nil }
+
+func (rows *legacyObservationFakeRows) RawValues() [][]byte { return nil }
+
+func (rows *legacyObservationFakeRows) Conn() *pgx.Conn { return nil }
 
 func TestLoadLegacyObservationDecodesCanonicalReferenceAndTimeShapes(t *testing.T) {
 	pool := openIntegrationDatabase(t)

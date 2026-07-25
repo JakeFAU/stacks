@@ -15,6 +15,37 @@ type legacyObservationQuerier interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }
 
+const (
+	reasonLegacyObservationQueryFailed             = "legacy_observation_query_failed"
+	reasonLegacySignalEvidenceQueryFailed          = "legacy_signal_evidence_query_failed"
+	reasonLegacySignalEvidenceScanFailed           = "legacy_signal_evidence_scan_failed"
+	reasonLegacySignalEvidenceIterationFailed      = "legacy_signal_evidence_iteration_failed"
+	reasonLegacyObservationEvidenceQueryFailed     = "legacy_observation_evidence_query_failed"
+	reasonLegacyObservationEvidenceScanFailed      = "legacy_observation_evidence_scan_failed"
+	reasonLegacyObservationEvidenceIterationFailed = "legacy_observation_evidence_iteration_failed"
+	unknownLegacyObservationOperationIdentifier    = "unknown"
+)
+
+type legacyObservationStorageOperationError struct {
+	reason        string
+	observationID string
+	cause         error
+}
+
+func (err *legacyObservationStorageOperationError) Error() string {
+	return fmt.Sprintf("legacy observation storage %q: %s", err.observationID, err.reason)
+}
+
+func (err *legacyObservationStorageOperationError) Unwrap() error { return err.cause }
+
+func newLegacyObservationStorageOperationError(reason, observationID string, cause error) error {
+	canonicalID, err := canonicalUUID(observationID)
+	if err != nil {
+		canonicalID = unknownLegacyObservationOperationIdentifier
+	}
+	return &legacyObservationStorageOperationError{reason: reason, observationID: canonicalID, cause: cause}
+}
+
 func loadLegacyObservation(
 	ctx context.Context,
 	query legacyObservationQuerier,
@@ -77,7 +108,9 @@ func scanLegacyObservationState(
 		&signalModelID, &signalPromptVersion, &signalRationale, &signalConfidence, &signalDigest,
 	)
 	if err != nil {
-		return legacyObservationRow{}, nil, nil, fmt.Errorf("load legacy observation %q: %w", observationID, err)
+		return legacyObservationRow{}, nil, nil, newLegacyObservationStorageOperationError(
+			reasonLegacyObservationQueryFailed, observationID, err,
+		)
 	}
 	if len(observationDigest) != sha256.Size {
 		return legacyObservationRow{}, nil, nil, newObservationBoundaryError(
@@ -119,18 +152,24 @@ func scanLegacyObservationState(
 		WHERE signal_id = $1
 		ORDER BY evidence_span_id, role`, signal.Input.ID)
 	if err != nil {
-		return legacyObservationRow{}, nil, nil, fmt.Errorf("load legacy signal evidence for observation %q: %w", observationID, err)
+		return legacyObservationRow{}, nil, nil, newLegacyObservationStorageOperationError(
+			reasonLegacySignalEvidenceQueryFailed, observationID, err,
+		)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var signalEvidence SignalEvidenceInput
 		if err := rows.Scan(&signalEvidence.EvidenceSpanID, &signalEvidence.Role); err != nil {
-			return legacyObservationRow{}, nil, nil, fmt.Errorf("scan legacy signal evidence for observation %q: %w", observationID, err)
+			return legacyObservationRow{}, nil, nil, newLegacyObservationStorageOperationError(
+				reasonLegacySignalEvidenceScanFailed, observationID, err,
+			)
 		}
 		signal.Evidence = append(signal.Evidence, signalEvidence)
 	}
 	if err := rows.Err(); err != nil {
-		return legacyObservationRow{}, nil, nil, fmt.Errorf("iterate legacy signal evidence for observation %q: %w", observationID, err)
+		return legacyObservationRow{}, nil, nil, newLegacyObservationStorageOperationError(
+			reasonLegacySignalEvidenceIterationFailed, observationID, err,
+		)
 	}
 	return row, run, signal, nil
 }
@@ -146,19 +185,25 @@ func loadObservationEvidenceOrigin(
 		WHERE observation_id = $1
 		ORDER BY evidence_span_id`, observationID)
 	if err != nil {
-		return nil, fmt.Errorf("load legacy observation evidence for observation %q: %w", observationID, err)
+		return nil, newLegacyObservationStorageOperationError(
+			reasonLegacyObservationEvidenceQueryFailed, observationID, err,
+		)
 	}
 	defer rows.Close()
 	var origin []evidence.EvidenceID
 	for rows.Next() {
 		var evidenceID string
 		if err := rows.Scan(&evidenceID); err != nil {
-			return nil, fmt.Errorf("scan legacy observation evidence for observation %q: %w", observationID, err)
+			return nil, newLegacyObservationStorageOperationError(
+				reasonLegacyObservationEvidenceScanFailed, observationID, err,
+			)
 		}
 		origin = append(origin, evidence.EvidenceID(evidenceID))
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate legacy observation evidence for observation %q: %w", observationID, err)
+		return nil, newLegacyObservationStorageOperationError(
+			reasonLegacyObservationEvidenceIterationFailed, observationID, err,
+		)
 	}
 	return origin, nil
 }
