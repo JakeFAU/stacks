@@ -119,11 +119,11 @@ func TestObservationPreservesStructuredDerivationAndRunID(t *testing.T) {
 		t.Fatalf("NewObservation() error = %v", err)
 	}
 	want := observation.Derivation{
-		Method:        "language-model",
-		Version:       "extractor-v2",
-		RunID:         "run-17",
-		Model:         "synthetic-model",
-		PromptVersion: "prompt-v3",
+		Method:        " language-model ",
+		Version:       " extractor-v2 ",
+		RunID:         " run-17 ",
+		Model:         " synthetic-model ",
+		PromptVersion: " prompt-v3 ",
 	}
 	if got.Derivation() != want {
 		t.Errorf("Derivation() = %#v, want %#v", got.Derivation(), want)
@@ -137,6 +137,57 @@ func TestObservationPreservesStructuredDerivationAndRunID(t *testing.T) {
 	}
 	if _, err := observation.NewObservation(legacy); err != nil {
 		t.Fatalf("NewObservation(legacy) error = %v", err)
+	}
+}
+
+func TestObservationPreservesPredicateBytesExactly(t *testing.T) {
+	const predicateBytes = " \t source predicate \n"
+	predicate, err := observation.NewPredicate(predicateBytes)
+	if err != nil {
+		t.Fatalf("NewPredicate() error = %v", err)
+	}
+	input := validObservationInput(t)
+	input.Statement.Predicate = predicate
+
+	got, err := observation.NewObservation(input)
+	if err != nil {
+		t.Fatalf("NewObservation() error = %v", err)
+	}
+	if got.Statement().Predicate != observation.Predicate(predicateBytes) {
+		t.Errorf("Statement().Predicate = %q, want exact bytes %q", got.Statement().Predicate, predicateBytes)
+	}
+}
+
+func TestObservationAllowsExplicitLegacyUncitedCompatibility(t *testing.T) {
+	input := validObservationInput(t)
+	input.Evidence = nil
+	input.LegacyUncited = true
+
+	got, err := observation.NewObservation(input)
+	if err != nil {
+		t.Fatalf("NewObservation() error = %v", err)
+	}
+	if !got.LegacyUncited() {
+		t.Fatal("LegacyUncited() = false, want true")
+	}
+	if len(got.EvidenceLinks()) != 0 {
+		t.Errorf("EvidenceLinks() = %v, want no invented evidence", got.EvidenceLinks())
+	}
+}
+
+func TestObservationRejectsOrdinaryUncitedWrite(t *testing.T) {
+	input := validObservationInput(t)
+	input.Evidence = nil
+	if _, err := observation.NewObservation(input); err == nil {
+		t.Fatal("NewObservation() error = nil, want ordinary uncited write error")
+	}
+}
+
+func TestObservationRejectsLegacyUncitedMarkerWithEvidence(t *testing.T) {
+	input := validObservationInput(t)
+	input.LegacyUncited = true
+	if _, err := observation.NewObservation(input); err == nil {
+		t.Fatal("NewObservation() error = nil, want ambiguous legacy-uncited marker error")
 	}
 }
 
@@ -208,6 +259,7 @@ func TestObservationRejectsInvalidCanonicalInput(t *testing.T) {
 	}{
 		{name: "missing ID", mutate: func(input *observation.ObservationInput) { input.ID = "" }},
 		{name: "missing predicate", mutate: func(input *observation.ObservationInput) { input.Statement.Predicate = "" }},
+		{name: "whitespace predicate", mutate: func(input *observation.ObservationInput) { input.Statement.Predicate = " \t" }},
 		{name: "missing evidence", mutate: func(input *observation.ObservationInput) { input.Evidence = nil }},
 		{name: "blank evidence ID", mutate: func(input *observation.ObservationInput) {
 			input.Evidence = []observation.EvidenceLink{{Role: observation.EvidenceSupporting}}
@@ -216,10 +268,29 @@ func TestObservationRejectsInvalidCanonicalInput(t *testing.T) {
 			input.Evidence = []observation.EvidenceLink{{EvidenceID: "evidence-1", Role: "neutral"}}
 		}},
 		{name: "missing derivation method", mutate: func(input *observation.ObservationInput) { input.Derivation.Method = "" }},
+		{name: "whitespace derivation method", mutate: func(input *observation.ObservationInput) { input.Derivation.Method = " \t" }},
 		{name: "missing derivation version", mutate: func(input *observation.ObservationInput) { input.Derivation.Version = "" }},
+		{name: "whitespace derivation version", mutate: func(input *observation.ObservationInput) { input.Derivation.Version = " \t" }},
+		{name: "whitespace run ID", mutate: func(input *observation.ObservationInput) { input.Derivation.RunID = " \t" }},
 		{name: "legacy flag with version", mutate: func(input *observation.ObservationInput) { input.Derivation.LegacyUnversioned = true }},
+		{name: "legacy flag with whitespace version", mutate: func(input *observation.ObservationInput) {
+			input.Derivation.LegacyUnversioned = true
+			input.Derivation.Version = " \t"
+		}},
 		{name: "model without prompt", mutate: func(input *observation.ObservationInput) { input.Derivation.Model = "model" }},
 		{name: "prompt without model", mutate: func(input *observation.ObservationInput) { input.Derivation.PromptVersion = "prompt" }},
+		{name: "whitespace model", mutate: func(input *observation.ObservationInput) {
+			input.Derivation.Model = " \t"
+			input.Derivation.PromptVersion = "prompt"
+		}},
+		{name: "whitespace prompt", mutate: func(input *observation.ObservationInput) {
+			input.Derivation.Model = "model"
+			input.Derivation.PromptVersion = " \t"
+		}},
+		{name: "whitespace model and prompt", mutate: func(input *observation.ObservationInput) {
+			input.Derivation.Model = " \t"
+			input.Derivation.PromptVersion = " \n"
+		}},
 		{name: "invalid status", mutate: func(input *observation.ObservationInput) { input.Status = "certain" }},
 		{name: "invalid confidence", mutate: func(input *observation.ObservationInput) { input.Confidence = &invalidConfidence }},
 	}

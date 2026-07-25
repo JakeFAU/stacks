@@ -120,7 +120,7 @@ func validateSummary(name string, summary WindowSummary) (map[string]Fact, map[s
 
 	facts := make(map[string]Fact, len(summary.Facts))
 	for _, fact := range summary.Facts {
-		normalized, err := validateFact(name, fact)
+		normalized, err := validateFact(name, fact, false)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -154,12 +154,13 @@ func validateSummary(name string, summary WindowSummary) (map[string]Fact, map[s
 
 		candidates := make([]Fact, len(item.Candidates))
 		seenValues := make(map[string]struct{}, len(item.Candidates))
+		hasLegacyUncited := false
 		for index, candidate := range item.Candidates {
 			candidate.Key = strings.TrimSpace(candidate.Key)
 			if candidate.Key != item.Key {
 				return nil, nil, fmt.Errorf("%s summary unresolved candidate key must match its parent", name)
 			}
-			normalized, err := validateFact(name, candidate)
+			normalized, err := validateFact(name, candidate, true)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -168,6 +169,10 @@ func validateSummary(name string, summary WindowSummary) (map[string]Fact, map[s
 			}
 			seenValues[normalized.Value] = struct{}{}
 			candidates[index] = normalized
+			hasLegacyUncited = hasLegacyUncited || normalized.LegacyUncited
+		}
+		if item.Reason == UnresolvedLegacyUncited && !hasLegacyUncited {
+			return nil, nil, fmt.Errorf("%s summary legacy-uncited reason requires a legacy-uncited candidate", name)
 		}
 		sort.Slice(candidates, func(left, right int) bool {
 			return candidates[left].Value < candidates[right].Value
@@ -178,7 +183,7 @@ func validateSummary(name string, summary WindowSummary) (map[string]Fact, map[s
 	return facts, unresolved, nil
 }
 
-func validateFact(name string, fact Fact) (Fact, error) {
+func validateFact(name string, fact Fact, allowLegacyUncited bool) (Fact, error) {
 	fact.Key = strings.TrimSpace(fact.Key)
 	fact.Value = strings.TrimSpace(fact.Value)
 	if fact.Key == "" || fact.Value == "" {
@@ -187,7 +192,10 @@ func validateFact(name string, fact Fact) (Fact, error) {
 	if len(fact.ObservationIDs) == 0 {
 		return Fact{}, fmt.Errorf("%s summary fact observation provenance is required", name)
 	}
-	if len(fact.SupportingEvidenceIDs)+len(fact.ContradictingEvidenceIDs) == 0 {
+	if fact.LegacyUncited && !allowLegacyUncited {
+		return Fact{}, fmt.Errorf("%s summary resolved fact cannot be legacy uncited", name)
+	}
+	if len(fact.SupportingEvidenceIDs)+len(fact.ContradictingEvidenceIDs) == 0 && !fact.LegacyUncited {
 		return Fact{}, fmt.Errorf("%s summary fact evidence is required", name)
 	}
 
@@ -215,7 +223,8 @@ func (reason UnresolvedReason) valid() bool {
 		UnresolvedTransition,
 		UnresolvedTemporalUncertainty,
 		UnresolvedHypothesis,
-		UnresolvedCounterevidenceOnly:
+		UnresolvedCounterevidenceOnly,
+		UnresolvedLegacyUncited:
 		return true
 	default:
 		return false

@@ -18,6 +18,7 @@ type Fact struct {
 	ObservationIDs           []observation.ObservationID
 	SupportingEvidenceIDs    []evidence.EvidenceID
 	ContradictingEvidenceIDs []evidence.EvidenceID
+	LegacyUncited            bool
 }
 
 // UnresolvedReason explains why aggregation did not promote a fact to state.
@@ -29,6 +30,7 @@ const (
 	UnresolvedTemporalUncertainty UnresolvedReason = "temporal-uncertainty"
 	UnresolvedHypothesis          UnresolvedReason = "hypothesized"
 	UnresolvedCounterevidenceOnly UnresolvedReason = "counterevidence-only"
+	UnresolvedLegacyUncited       UnresolvedReason = "legacy-uncited"
 )
 
 // UnresolvedFact preserves candidate values and provenance that aggregation
@@ -67,12 +69,14 @@ type factAccumulator struct {
 	supporting    map[evidence.EvidenceID]struct{}
 	contradicting map[evidence.EvidenceID]struct{}
 	extents       []observation.TemporalExtent
+	legacyUncited bool
 }
 
 type keyAccumulator struct {
 	supported        map[string]*factAccumulator
 	tentative        map[string]*factAccumulator
 	counterOnly      map[string]*factAccumulator
+	legacyUncited    map[string]*factAccumulator
 	temporalValues   map[string]struct{}
 	hypothesisValues map[string]struct{}
 }
@@ -134,6 +138,7 @@ func AggregateWindow(
 				supported:        make(map[string]*factAccumulator),
 				tentative:        make(map[string]*factAccumulator),
 				counterOnly:      make(map[string]*factAccumulator),
+				legacyUncited:    make(map[string]*factAccumulator),
 				temporalValues:   make(map[string]struct{}),
 				hypothesisValues: make(map[string]struct{}),
 			}
@@ -142,6 +147,8 @@ func AggregateWindow(
 
 		hasSupporting := observationHasSupportingEvidence(candidate.Observation)
 		switch {
+		case candidate.Observation.LegacyUncited():
+			mergeCandidate(group.legacyUncited, key, value, candidate.Observation)
 		case !hasSupporting:
 			mergeCandidate(group.counterOnly, key, value, candidate.Observation)
 		case temporallyUncertain || candidate.Observation.Status() == observation.StatusHypothesized:
@@ -166,7 +173,8 @@ func observationsEqual(left, right observation.Observation) bool {
 		!left.RecordedAt().Equal(right.RecordedAt()) ||
 		!slices.Equal(left.EvidenceLinks(), right.EvidenceLinks()) ||
 		left.Derivation() != right.Derivation() ||
-		left.Status() != right.Status() {
+		left.Status() != right.Status() ||
+		left.LegacyUncited() != right.LegacyUncited() {
 		return false
 	}
 	leftConfidence, leftHasConfidence := left.Confidence()
@@ -242,6 +250,7 @@ func mergeCandidate(
 	}
 	accumulator.observations[valueObservation.ID()] = struct{}{}
 	accumulator.extents = append(accumulator.extents, valueObservation.ValidTime())
+	accumulator.legacyUncited = accumulator.legacyUncited || valueObservation.LegacyUncited()
 	for _, link := range valueObservation.EvidenceLinks() {
 		switch link.Role {
 		case observation.EvidenceSupporting:
@@ -275,19 +284,21 @@ func summarizeGroups(selection TemporalSelection, groups map[string]*keyAccumula
 		supportedValues := sortedAccumulatorValues(group.supported)
 		tentativeValues := sortedAccumulatorValues(group.tentative)
 		counterOnlyValues := sortedAccumulatorValues(group.counterOnly)
+		legacyUncitedValues := sortedAccumulatorValues(group.legacyUncited)
 
 		if len(counterOnlyValues) == 0 &&
+			len(legacyUncitedValues) == 0 &&
 			len(supportedValues) == 1 &&
 			noAlternativeValues(supportedValues[0], tentativeValues) {
 			summary.Facts = append(summary.Facts, accumulatorFact(group.supported[supportedValues[0]]))
 			continue
 		}
 
-		allCandidates := mergeAccumulators(group.supported, group.tentative, group.counterOnly)
+		allCandidates := mergeAccumulators(group.supported, group.tentative, group.counterOnly, group.legacyUncited)
 		if len(allCandidates) == 0 {
 			continue
 		}
-		reason := unresolvedReason(group, supportedValues, tentativeValues, counterOnlyValues)
+		reason := unresolvedReason(group, supportedValues, tentativeValues, counterOnlyValues, legacyUncitedValues)
 		summary.Unresolved = append(summary.Unresolved, UnresolvedFact{
 			Key:        key,
 			Reason:     reason,
@@ -311,6 +322,7 @@ func unresolvedReason(
 	supported []string,
 	tentative []string,
 	counterOnly []string,
+	legacyUncited []string,
 ) UnresolvedReason {
 	values := make(map[string]struct{}, len(supported)+len(tentative))
 	for _, value := range supported {
@@ -337,6 +349,9 @@ func unresolvedReason(
 	}
 	if len(counterOnly) > 0 {
 		return UnresolvedCounterevidenceOnly
+	}
+	if len(legacyUncited) > 0 {
+		return UnresolvedLegacyUncited
 	}
 	return UnresolvedHypothesis
 }
@@ -423,6 +438,7 @@ func mergeAccumulators(groups ...map[string]*factAccumulator) map[string]*factAc
 			for evidenceID := range source.contradicting {
 				target.contradicting[evidenceID] = struct{}{}
 			}
+			target.legacyUncited = target.legacyUncited || source.legacyUncited
 		}
 	}
 	return merged
@@ -451,6 +467,7 @@ func accumulatorFact(accumulator *factAccumulator) Fact {
 		ObservationIDs:           observationIDs,
 		SupportingEvidenceIDs:    sortedEvidenceIDs(accumulator.supporting),
 		ContradictingEvidenceIDs: sortedEvidenceIDs(accumulator.contradicting),
+		LegacyUncited:            accumulator.legacyUncited,
 	}
 }
 

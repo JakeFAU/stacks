@@ -28,10 +28,9 @@ const (
 // Predicate names the relationship between a statement's subject and object.
 type Predicate string
 
-// NewPredicate validates and normalizes a predicate.
+// NewPredicate validates a predicate while preserving its exact bytes.
 func NewPredicate(value string) (Predicate, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
+	if strings.TrimSpace(value) == "" {
 		return "", fmt.Errorf("observation predicate is required")
 	}
 	return Predicate(value), nil
@@ -81,6 +80,9 @@ type ObservationInput struct {
 	Derivation Derivation
 	Status     EpistemicStatus
 	Confidence *Confidence
+	// LegacyUncited marks a historical observation that has no durable
+	// evidence links. New observations must remain cited.
+	LegacyUncited bool
 }
 
 // Observation is an immutable, evidence-backed proposition. ValidTime says
@@ -95,6 +97,7 @@ type Observation struct {
 	status        EpistemicStatus
 	confidence    Confidence
 	hasConfidence bool
+	legacyUncited bool
 }
 
 // NewObservation validates and constructs a canonical observation.
@@ -114,7 +117,7 @@ func NewObservation(input ObservationInput) (Observation, error) {
 	if input.RecordedAt.IsZero() {
 		return Observation{}, fmt.Errorf("observation recorded time is required")
 	}
-	evidenceLinks, err := normalizeEvidenceLinks(input.Evidence)
+	evidenceLinks, err := normalizeEvidenceLinks(input.Evidence, input.LegacyUncited)
 	if err != nil {
 		return Observation{}, err
 	}
@@ -127,13 +130,14 @@ func NewObservation(input ObservationInput) (Observation, error) {
 	}
 
 	result := Observation{
-		id:         id,
-		statement:  statement,
-		validTime:  input.ValidTime,
-		recordedAt: input.RecordedAt.UTC(),
-		evidence:   evidenceLinks,
-		derivation: derivation,
-		status:     input.Status,
+		id:            id,
+		statement:     statement,
+		validTime:     input.ValidTime,
+		recordedAt:    input.RecordedAt.UTC(),
+		evidence:      evidenceLinks,
+		derivation:    derivation,
+		status:        input.Status,
+		legacyUncited: input.LegacyUncited,
 	}
 	if input.Confidence != nil {
 		if err := validateConfidence(*input.Confidence); err != nil {
@@ -145,9 +149,15 @@ func NewObservation(input ObservationInput) (Observation, error) {
 	return result, nil
 }
 
-func normalizeEvidenceLinks(input []EvidenceLink) ([]EvidenceLink, error) {
+func normalizeEvidenceLinks(input []EvidenceLink, legacyUncited bool) ([]EvidenceLink, error) {
 	if len(input) == 0 {
+		if legacyUncited {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("observation evidence is required")
+	}
+	if legacyUncited {
+		return nil, fmt.Errorf("legacy uncited observation cannot declare evidence")
 	}
 	result := make([]EvidenceLink, len(input))
 	seen := make(map[EvidenceLink]struct{}, len(input))
@@ -175,27 +185,28 @@ func normalizeEvidenceLinks(input []EvidenceLink) ([]EvidenceLink, error) {
 }
 
 func normalizeDerivation(input Derivation) (Derivation, error) {
-	result := Derivation{
-		Method:            strings.TrimSpace(input.Method),
-		Version:           strings.TrimSpace(input.Version),
-		RunID:             strings.TrimSpace(input.RunID),
-		Model:             strings.TrimSpace(input.Model),
-		PromptVersion:     strings.TrimSpace(input.PromptVersion),
-		LegacyUnversioned: input.LegacyUnversioned,
-	}
-	if result.Method == "" {
+	if strings.TrimSpace(input.Method) == "" {
 		return Derivation{}, fmt.Errorf("observation derivation method is required")
 	}
 	switch {
-	case result.LegacyUnversioned && result.Version != "":
+	case input.LegacyUnversioned && input.Version != "":
 		return Derivation{}, fmt.Errorf("legacy unversioned derivation cannot declare a version")
-	case !result.LegacyUnversioned && result.Version == "":
+	case !input.LegacyUnversioned && strings.TrimSpace(input.Version) == "":
 		return Derivation{}, fmt.Errorf("observation derivation version is required")
 	}
-	if (result.Model == "") != (result.PromptVersion == "") {
+	if input.RunID != "" && strings.TrimSpace(input.RunID) == "" {
+		return Derivation{}, fmt.Errorf("observation derivation run ID cannot be whitespace")
+	}
+	if input.Model != "" && strings.TrimSpace(input.Model) == "" {
+		return Derivation{}, fmt.Errorf("observation model cannot be whitespace")
+	}
+	if input.PromptVersion != "" && strings.TrimSpace(input.PromptVersion) == "" {
+		return Derivation{}, fmt.Errorf("observation prompt version cannot be whitespace")
+	}
+	if (input.Model == "") != (input.PromptVersion == "") {
 		return Derivation{}, fmt.Errorf("observation model and prompt version must be provided together")
 	}
-	return result, nil
+	return input, nil
 }
 
 func validateConfidence(confidence Confidence) error {
@@ -270,4 +281,10 @@ func (value Observation) Status() EpistemicStatus {
 // Confidence returns model confidence metadata when one was supplied.
 func (value Observation) Confidence() (Confidence, bool) {
 	return value.confidence, value.hasConfidence
+}
+
+// LegacyUncited reports whether this observation is a lossless historical
+// compatibility value with no durable evidence links.
+func (value Observation) LegacyUncited() bool {
+	return value.legacyUncited
 }
