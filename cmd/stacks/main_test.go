@@ -169,7 +169,7 @@ func TestFailedRestrictedReviewGateConstructsNoDirectoryOrStorage(t *testing.T) 
 		calls = append(calls, "directory")
 		return &recordingRuntimeDirectoryLookup{}, nil
 	}
-	runtime.openReviewRepositories = func(context.Context, string) (*storage.EntityRepository, directory.Repository, func(), error) {
+	runtime.openReviewRepositories = func(context.Context, string, bool) (*storage.EntityRepository, directory.Repository, func(), error) {
 		calls = append(calls, "postgres")
 		return nil, nil, nil, nil
 	}
@@ -305,6 +305,7 @@ func TestDisabledSyncAndReviewDoNotConstructDirectoryBoundaries(t *testing.T) {
 	settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal)
 	var directoryLookupCalls, directoryProbeCalls int
 	var syncRepositoryCalls, reviewRepositoryCalls int
+	var directoryRepositoryConstructions int
 	var closes int
 	runtime := pocCommandRuntime{
 		newDoctorDirectory: func(config.GoogleDirectorySettings) doctor.DirectoryProbe {
@@ -318,13 +319,21 @@ func TestDisabledSyncAndReviewDoNotConstructDirectoryBoundaries(t *testing.T) {
 		newSource: func(context.Context, config.PoCSettings) (source.Source, error) {
 			return emptyRuntimeSource{}, nil
 		},
-		openSyncRepositories: func(context.Context, string) (ingest.Repository, directory.Repository, func(), error) {
+		openSyncRepositories: func(_ context.Context, _ string, includeDirectory bool) (ingest.Repository, directory.Repository, func(), error) {
 			syncRepositoryCalls++
-			return noOpRuntimeIngestionRepository{}, noOpRuntimeDirectoryRepository{}, func() { closes++ }, nil
+			if includeDirectory {
+				directoryRepositoryConstructions++
+				return noOpRuntimeIngestionRepository{}, noOpRuntimeDirectoryRepository{}, func() { closes++ }, nil
+			}
+			return noOpRuntimeIngestionRepository{}, nil, func() { closes++ }, nil
 		},
-		openReviewRepositories: func(context.Context, string) (*storage.EntityRepository, directory.Repository, func(), error) {
+		openReviewRepositories: func(_ context.Context, _ string, includeDirectory bool) (*storage.EntityRepository, directory.Repository, func(), error) {
 			reviewRepositoryCalls++
-			return nil, noOpRuntimeDirectoryRepository{}, func() { closes++ }, nil
+			if includeDirectory {
+				directoryRepositoryConstructions++
+				return nil, noOpRuntimeDirectoryRepository{}, func() { closes++ }, nil
+			}
+			return nil, nil, func() { closes++ }, nil
 		},
 		newModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error) {
 			return noOpRuntimeModel{}, nil
@@ -353,6 +362,9 @@ func TestDisabledSyncAndReviewDoNotConstructDirectoryBoundaries(t *testing.T) {
 	if directoryLookupCalls != 0 || directoryProbeCalls != 0 {
 		t.Fatalf("directory constructors = lookup:%d probe:%d, want 0/0", directoryLookupCalls, directoryProbeCalls)
 	}
+	if directoryRepositoryConstructions != 0 {
+		t.Fatalf("directory repository constructions = %d, want 0", directoryRepositoryConstructions)
+	}
 	if syncRepositoryCalls != 1 || reviewRepositoryCalls != 1 || closes != 2 {
 		t.Fatalf("repositories/closes = sync:%d review:%d closes:%d, want 1/1/2", syncRepositoryCalls, reviewRepositoryCalls, closes)
 	}
@@ -372,7 +384,10 @@ func TestEnabledSyncConstructsOneDirectoryBoundaryAndOneSharedRepositoryOwner(t 
 			calls = append(calls, "drive")
 			return emptyRuntimeSource{}, nil
 		},
-		openSyncRepositories: func(context.Context, string) (ingest.Repository, directory.Repository, func(), error) {
+		openSyncRepositories: func(_ context.Context, _ string, includeDirectory bool) (ingest.Repository, directory.Repository, func(), error) {
+			if !includeDirectory {
+				t.Fatal("enabled sync requested no directory repository")
+			}
 			calls = append(calls, "postgres")
 			return noOpRuntimeIngestionRepository{}, noOpRuntimeDirectoryRepository{}, func() {
 				calls = append(calls, "close")
@@ -409,6 +424,206 @@ func TestEnabledSyncConstructsOneDirectoryBoundaryAndOneSharedRepositoryOwner(t 
 	}
 }
 
+func TestEnabledSyncContinuesWhenDirectoryConstructionIsUnavailable(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal)
+	enableRuntimeDirectory(&settings)
+	const privateDirectoryFailure = "private directory construction failure 7f31"
+	var calls []string
+	runtime := pocCommandRuntime{
+		newDirectoryLookup: func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+			calls = append(calls, "directory")
+			return nil, errors.New(privateDirectoryFailure)
+		},
+		newSource: func(context.Context, config.PoCSettings) (source.Source, error) {
+			calls = append(calls, "drive")
+			return emptyRuntimeSource{}, nil
+		},
+		openSyncRepositories: func(_ context.Context, _ string, includeDirectory bool) (ingest.Repository, directory.Repository, func(), error) {
+			if !includeDirectory {
+				t.Fatal("enabled sync requested no directory repository")
+			}
+			calls = append(calls, "postgres")
+			return noOpRuntimeIngestionRepository{}, noOpRuntimeDirectoryRepository{}, func() {
+				calls = append(calls, "close")
+			}, nil
+		},
+		newModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error) {
+			calls = append(calls, "model")
+			return noOpRuntimeModel{}, nil
+		},
+	}
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(),
+		config.Settings{PoC: settings},
+		io.Discard,
+		io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		nil,
+		runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+
+	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err != nil {
+		t.Fatalf("enabled sync error = %v, want unavailable directory to remain additive", err)
+	}
+	want := []string{"drive", "directory", "postgres", "model", "close"}
+	if strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want fail-soft composition %v", calls, want)
+	}
+}
+
+func TestEnabledReviewUsageContinuesWhenDirectoryConstructionIsUnavailable(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandReview, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal)
+	enableRuntimeDirectory(&settings)
+	const privateDirectoryFailure = "private directory construction failure 92bc"
+	var calls []string
+	runtime := pocCommandRuntime{
+		newDirectoryLookup: func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+			calls = append(calls, "directory")
+			return nil, errors.New(privateDirectoryFailure)
+		},
+		openReviewRepositories: func(_ context.Context, _ string, includeDirectory bool) (*storage.EntityRepository, directory.Repository, func(), error) {
+			if !includeDirectory {
+				t.Fatal("enabled review requested no directory repository")
+			}
+			calls = append(calls, "postgres")
+			return nil, noOpRuntimeDirectoryRepository{}, func() {
+				calls = append(calls, "close")
+			}, nil
+		},
+	}
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(),
+		config.Settings{PoC: settings},
+		io.Discard,
+		io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		nil,
+		runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+
+	err = commands[string(config.CommandReview)].Run(context.Background(), []string{"invalid"})
+	if err == nil || !strings.HasPrefix(err.Error(), "review command usage:") {
+		t.Fatalf("review error = %v, want unrelated review usage result", err)
+	}
+	if strings.Contains(err.Error(), privateDirectoryFailure) {
+		t.Fatalf("review error exposed directory construction detail: %v", err)
+	}
+	want := []string{"directory", "postgres", "close"}
+	if strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want fail-soft composition %v", calls, want)
+	}
+}
+
+func TestDirectoryConstructionCancellationRemainsCanonical(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: fmt.Errorf("directory wrapper: %w", context.Canceled)},
+		{name: "deadline exceeded", err: fmt.Errorf("directory wrapper: %w", context.DeadlineExceeded)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal)
+			enableRuntimeDirectory(&settings)
+			var repositoryCalls, modelCalls int
+			runtime := pocCommandRuntime{
+				newDirectoryLookup: func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+					return nil, testCase.err
+				},
+				newSource: func(context.Context, config.PoCSettings) (source.Source, error) {
+					return emptyRuntimeSource{}, nil
+				},
+				openSyncRepositories: func(_ context.Context, _ string, includeDirectory bool) (ingest.Repository, directory.Repository, func(), error) {
+					if !includeDirectory {
+						t.Fatal("enabled sync requested no directory repository")
+					}
+					repositoryCalls++
+					return noOpRuntimeIngestionRepository{}, noOpRuntimeDirectoryRepository{}, nil, nil
+				},
+				newModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error) {
+					modelCalls++
+					return noOpRuntimeModel{}, nil
+				},
+			}
+			commands, err := pocCommandProviderWithRuntime(
+				context.Background(),
+				config.Settings{PoC: settings},
+				io.Discard,
+				io.Discard,
+				tracenoop.NewTracerProvider().Tracer("synthetic"),
+				nil,
+				nil,
+				runtime,
+			)
+			if err != nil {
+				t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+			}
+
+			err = commands[string(config.CommandSync)].Run(context.Background(), nil)
+			if err != errors.Unwrap(testCase.err) {
+				t.Fatalf("sync error = %v, want canonical %v", err, errors.Unwrap(testCase.err))
+			}
+			if repositoryCalls != 0 || modelCalls != 0 {
+				t.Fatalf("post-cancellation constructions = repositories:%d model:%d, want 0/0", repositoryCalls, modelCalls)
+			}
+		})
+	}
+}
+
+func TestReviewDirectoryConstructionCancellationRemainsCanonical(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: fmt.Errorf("directory wrapper: %w", context.Canceled)},
+		{name: "deadline exceeded", err: fmt.Errorf("directory wrapper: %w", context.DeadlineExceeded)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := validCommandPoCSettings(config.CommandReview, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal)
+			enableRuntimeDirectory(&settings)
+			var repositoryCalls int
+			runtime := pocCommandRuntime{
+				newDirectoryLookup: func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+					return nil, testCase.err
+				},
+				openReviewRepositories: func(context.Context, string, bool) (*storage.EntityRepository, directory.Repository, func(), error) {
+					repositoryCalls++
+					return nil, noOpRuntimeDirectoryRepository{}, nil, nil
+				},
+			}
+			commands, err := pocCommandProviderWithRuntime(
+				context.Background(),
+				config.Settings{PoC: settings},
+				io.Discard,
+				io.Discard,
+				tracenoop.NewTracerProvider().Tracer("synthetic"),
+				nil,
+				nil,
+				runtime,
+			)
+			if err != nil {
+				t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+			}
+
+			err = commands[string(config.CommandReview)].Run(context.Background(), []string{"invalid"})
+			if err != errors.Unwrap(testCase.err) {
+				t.Fatalf("review error = %v, want canonical %v", err, errors.Unwrap(testCase.err))
+			}
+			if repositoryCalls != 0 {
+				t.Fatalf("post-cancellation repository constructions = %d, want 0", repositoryCalls)
+			}
+		})
+	}
+}
+
 func TestRestrictedSyncConstructsDirectoryOnlyAfterDisclosureGate(t *testing.T) {
 	settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
 	enableRuntimeDirectory(&settings)
@@ -432,10 +647,10 @@ func TestRestrictedSyncConstructsDirectoryOnlyAfterDisclosureGate(t *testing.T) 
 	if err != nil {
 		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
 	}
-	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err == nil {
-		t.Fatal("sync error = nil, want directory construction failure")
+	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); !errors.Is(err, errStopAfterModelConstruction) {
+		t.Fatalf("sync error = %v, want sentinel model-construction stop after fail-soft directory construction", err)
 	}
-	want := []string{"logging", "google", "directory"}
+	want := []string{"logging", "google", "directory", "postgres", "model", "close"}
 	if strings.Join(calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v, want disclosure before Drive and directory construction %v", calls, want)
 	}
@@ -883,7 +1098,7 @@ func boundaryOrderRuntime(calls *[]string, state doctor.InvocationLoggingState) 
 			*calls = append(*calls, "google")
 			return nil, nil
 		},
-		openSyncRepositories: func(context.Context, string) (ingest.Repository, directory.Repository, func(), error) {
+		openSyncRepositories: func(context.Context, string, bool) (ingest.Repository, directory.Repository, func(), error) {
 			*calls = append(*calls, "postgres")
 			return nil, nil, func() { *calls = append(*calls, "close") }, nil
 		},

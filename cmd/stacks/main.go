@@ -123,8 +123,8 @@ type pocCommandRuntime struct {
 	newDoctorProviderProbe func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
 	newSource              func(context.Context, config.PoCSettings) (source.Source, error)
 	newDirectoryLookup     func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error)
-	openSyncRepositories   func(context.Context, string) (ingest.Repository, directory.Repository, func(), error)
-	openReviewRepositories func(context.Context, string) (*storage.EntityRepository, directory.Repository, func(), error)
+	openSyncRepositories   func(context.Context, string, bool) (ingest.Repository, directory.Repository, func(), error)
+	openReviewRepositories func(context.Context, string, bool) (*storage.EntityRepository, directory.Repository, func(), error)
 	openAnalysisRepository func(context.Context, string) (analysis.Repository, func(), error)
 	newModel               func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error)
 }
@@ -168,19 +168,27 @@ func defaultPoCCommandRuntime() pocCommandRuntime {
 			}
 			return googledirectory.NewClient(ctx, httpClient, googleDirectoryMaximumResults)
 		},
-		openSyncRepositories: func(ctx context.Context, databaseURL string) (ingest.Repository, directory.Repository, func(), error) {
+		openSyncRepositories: func(ctx context.Context, databaseURL string, includeDirectory bool) (ingest.Repository, directory.Repository, func(), error) {
 			pool, err := storage.Open(ctx, databaseURL)
 			if err != nil {
 				return nil, nil, nil, err
 			}
-			return storage.NewIngestionRepository(pool), storage.NewDirectoryRepository(pool), pool.Close, nil
+			var directoryRepository directory.Repository
+			if includeDirectory {
+				directoryRepository = storage.NewDirectoryRepository(pool)
+			}
+			return storage.NewIngestionRepository(pool), directoryRepository, pool.Close, nil
 		},
-		openReviewRepositories: func(ctx context.Context, databaseURL string) (*storage.EntityRepository, directory.Repository, func(), error) {
+		openReviewRepositories: func(ctx context.Context, databaseURL string, includeDirectory bool) (*storage.EntityRepository, directory.Repository, func(), error) {
 			pool, err := storage.Open(ctx, databaseURL)
 			if err != nil {
 				return nil, nil, nil, err
 			}
-			return storage.NewEntityRepository(pool), storage.NewDirectoryRepository(pool), pool.Close, nil
+			var directoryRepository directory.Repository
+			if includeDirectory {
+				directoryRepository = storage.NewDirectoryRepository(pool)
+			}
+			return storage.NewEntityRepository(pool), directoryRepository, pool.Close, nil
 		},
 		openAnalysisRepository: func(ctx context.Context, databaseURL string) (analysis.Repository, func(), error) {
 			pool, err := storage.Open(ctx, databaseURL)
@@ -281,11 +289,18 @@ func pocCommandProviderWithRuntime(
 			var directoryLookup directory.Lookup
 			if settings.PoC.Directory.Enabled {
 				directoryLookup, err = runtime.newDirectoryLookup(ctx, settings.PoC.Directory)
+				if cancellationErr := canonicalContextError(ctx, err); cancellationErr != nil {
+					return cancellationErr
+				}
 				if err != nil {
-					return err
+					directoryLookup = nil
 				}
 			}
-			repository, directoryRepository, closeRepository, err := runtime.openSyncRepositories(ctx, settings.PoC.DatabaseURL)
+			repository, directoryRepository, closeRepository, err := runtime.openSyncRepositories(
+				ctx,
+				settings.PoC.DatabaseURL,
+				settings.PoC.Directory.Enabled,
+			)
 			if err != nil {
 				return err
 			}
@@ -346,13 +361,17 @@ func pocCommandProviderWithRuntime(
 			var err error
 			if settings.PoC.Directory.Enabled {
 				directoryLookup, err = runtime.newDirectoryLookup(ctx, settings.PoC.Directory)
+				if cancellationErr := canonicalContextError(ctx, err); cancellationErr != nil {
+					return cancellationErr
+				}
 				if err != nil {
-					return err
+					directoryLookup = nil
 				}
 			}
 			entityRepository, directoryRepository, closeRepositories, err := runtime.openReviewRepositories(
 				ctx,
 				settings.PoC.DatabaseURL,
+				settings.PoC.Directory.Enabled,
 			)
 			if err != nil {
 				return err
@@ -423,6 +442,22 @@ func requireRestrictedDisclosure(ctx context.Context, settings config.ModelSetti
 		return err
 	}
 	return doctor.RequireRestrictedDisclosure(ctx, modelInvocation(settings), disclosure)
+}
+
+func canonicalContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+		return context.Canceled
+	}
+	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 func modelInvocation(settings config.ModelSettings) modelpolicy.Invocation {
