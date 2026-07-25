@@ -2304,6 +2304,61 @@ func TestIngestionUsesOwningRunDerivationAndRecordedAt(t *testing.T) {
 	}
 }
 
+func TestIngestionRejectsInadmissibleActiveRunWithoutMutation(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	fixture := newCanonicalIngestionFixture(t, pool, "inactive-owning-run")
+	if _, err := pool.Exec(ctx, `
+		UPDATE stacks.extraction_runs
+		SET currently_admissible = false
+		WHERE id = $1`, fixture.state.DerivationID); err != nil {
+		t.Fatalf("mark synthetic owning run inadmissible: %v", err)
+	}
+	before := snapshotCanonicalIngestionCompletion(t, fixture)
+
+	err := fixture.repository.CompleteVersion(ctx, fixture.completion())
+	if !errors.Is(err, ErrObservationCompatibility) {
+		t.Fatalf("complete with inadmissible owning run error = %v, want ErrObservationCompatibility", err)
+	}
+	wantError := fmt.Sprintf(
+		"observation boundary run %q: %s", fixture.state.DerivationID, reasonOwningRunNotAdmissible,
+	)
+	if err.Error() != wantError {
+		t.Fatalf("inadmissible owning run error = %q, want fixed privacy-safe %q", err, wantError)
+	}
+
+	after := snapshotCanonicalIngestionCompletion(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("inadmissible completion mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestIngestionCompletedRetryRejectsRecordedAtMismatchWithoutMutation(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	fixture := newCanonicalIngestionFixture(t, pool, "completed-recorded-at-mismatch")
+	fixture.complete(t)
+	before := snapshotCanonicalIngestionCompletion(t, fixture)
+	retry := fixture.completion()
+	retry.Observations[0].RecordedAt = fixture.state.RecordedAt.Add(time.Microsecond)
+
+	err := fixture.repository.CompleteVersion(ctx, retry)
+	if !errors.Is(err, ErrObservationConflict) {
+		t.Fatalf("completed retry with changed recorded time error = %v, want ErrObservationConflict", err)
+	}
+	wantError := fmt.Sprintf(
+		"observation boundary %q: %s", fixture.draft.ID, reasonRecordedAtOwnerMismatch,
+	)
+	if err.Error() != wantError {
+		t.Fatalf("completed retry recorded-time error = %q, want fixed privacy-safe %q", err, wantError)
+	}
+
+	after := snapshotCanonicalIngestionCompletion(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("rejected completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
 func TestIngestionCanonicalConstructionFailureRollsBackWholeCompletion(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
@@ -6330,13 +6385,71 @@ func newCanonicalIngestionFixture(t *testing.T, pool *pgxpool.Pool, label string
 
 func (fixture canonicalIngestionFixture) complete(t *testing.T) {
 	t.Helper()
-	if err := fixture.repository.CompleteVersion(context.Background(), ingest.Completion{
+	if err := fixture.repository.CompleteVersion(context.Background(), fixture.completion()); err != nil {
+		t.Fatalf("complete canonical ingestion fixture: %v", err)
+	}
+}
+
+func (fixture canonicalIngestionFixture) completion() ingest.Completion {
+	return ingest.Completion{
 		VersionID: fixture.state.ID, DerivationID: fixture.state.DerivationID, LeaseOwner: fixture.state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal, Evidence: fixture.evidence, Mentions: fixture.mentions,
 		Observations: []ingest.ObservationDraft{fixture.draft}, Signals: []ingest.SignalRecord{fixture.signal},
-	}); err != nil {
-		t.Fatalf("complete canonical ingestion fixture: %v", err)
 	}
+}
+
+type canonicalIngestionCompletionSnapshot struct {
+	evidenceRows, mentionRows, proposalRows, observationRows, signalRows int
+	observationEvidenceRows, signalEvidenceRows                          int
+	processingStatus                                                     string
+	completedAt, leaseExpiresAt                                          *time.Time
+	completedByOwner, leaseOwner, currentVersionID                       *string
+	currentlyAdmissible                                                  bool
+}
+
+func snapshotCanonicalIngestionCompletion(t *testing.T, fixture canonicalIngestionFixture) canonicalIngestionCompletionSnapshot {
+	t.Helper()
+	ctx := context.Background()
+	snapshot := canonicalIngestionCompletionSnapshot{
+		evidenceRows: countRows(t, fixture.pool, `
+			SELECT count(*)
+			FROM stacks.evidence_spans AS evidence
+			JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
+			WHERE tab.document_version_id = $1`, fixture.state.ID),
+		mentionRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.mentions WHERE extraction_run_id = $1`, fixture.state.DerivationID),
+		proposalRows: countRows(t, fixture.pool, `
+			SELECT count(*)
+			FROM stacks.resolution_proposals AS proposal
+			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+			WHERE mention.extraction_run_id = $1`, fixture.state.DerivationID),
+		observationRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.observations WHERE id = $1`, string(fixture.draft.ID)),
+		signalRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, fixture.signal.ID),
+		observationEvidenceRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, string(fixture.draft.ID)),
+		signalEvidenceRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, fixture.signal.ID),
+	}
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT processing_status, completed_at, completed_by_owner, lease_owner, lease_expires_at,
+		       currently_admissible
+		FROM stacks.extraction_runs
+		WHERE id = $1`, fixture.state.DerivationID).Scan(
+		&snapshot.processingStatus, &snapshot.completedAt, &snapshot.completedByOwner,
+		&snapshot.leaseOwner, &snapshot.leaseExpiresAt, &snapshot.currentlyAdmissible,
+	); err != nil {
+		t.Fatalf("snapshot canonical ingestion run: %v", err)
+	}
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT source.current_document_version_id::text
+		FROM stacks.source_documents AS source
+		JOIN stacks.document_versions AS version ON version.source_document_id = source.id
+		WHERE version.id = $1`, fixture.state.ID).Scan(&snapshot.currentVersionID); err != nil {
+		t.Fatalf("snapshot canonical current document pointer: %v", err)
+	}
+	return snapshot
 }
 
 func prepareIngestionEvidence(

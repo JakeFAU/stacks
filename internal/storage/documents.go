@@ -477,6 +477,9 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if storedVersionID != completion.VersionID {
 		return fmt.Errorf("complete ingestion version: derivation source version conflicts")
 	}
+	if err := validateIngestionRecordedAt(completion.Observations, storedRecordedAt); err != nil {
+		return err
+	}
 	if status == string(ingest.VersionStatusComplete) {
 		if completedByOwner == nil || *completedByOwner != completion.LeaseOwner {
 			return fmt.Errorf("complete ingestion version: completion lease is not owned")
@@ -487,6 +490,11 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 			}
 		}
 		return transaction.Commit(ctx)
+	}
+	if !storedAdmissible {
+		return newCompletionBoundaryError(
+			ErrObservationCompatibility, reasonOwningRunNotAdmissible, completion.DerivationID,
+		)
 	}
 	if storedDataMode != string(completion.DataMode) {
 		return fmt.Errorf("complete ingestion version: active data mode conflicts")
@@ -531,6 +539,17 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	}
 	if err := transaction.Commit(ctx); err != nil {
 		return fmt.Errorf("commit ingestion version %q: %w", completion.VersionID, err)
+	}
+	return nil
+}
+
+func validateIngestionRecordedAt(observations []ingest.ObservationDraft, recordedAt time.Time) error {
+	for _, draft := range observations {
+		if !draft.RecordedAt.Equal(recordedAt) {
+			return newObservationBoundaryError(
+				ErrObservationConflict, reasonRecordedAtOwnerMismatch, string(draft.ID),
+			)
+		}
 	}
 	return nil
 }
