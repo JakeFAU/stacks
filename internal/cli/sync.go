@@ -43,8 +43,24 @@ func (command SyncCommand) Run(ctx context.Context, args []string) error {
 			return fmt.Errorf("write sync outcome: %w", err)
 		}
 	}
-	if _, err := fmt.Fprintf(output, "summary unchanged=%d completed=%d incomplete=%d failed=%d\n",
-		summary.Unchanged, summary.Completed, summary.Incomplete, summary.Failed); err != nil {
+	if _, err := fmt.Fprintf(
+		output,
+		"summary unchanged=%d completed=%d incomplete=%d failed=%d"+
+			" directory_attempted=%d directory_reused=%d directory_matched=%d"+
+			" directory_review=%d directory_no_match=%d"+
+			" directory_ambiguous=%d directory_unavailable=%d\n",
+		summary.Unchanged,
+		summary.Completed,
+		summary.Incomplete,
+		summary.Failed,
+		summary.Directory.Attempted,
+		summary.Directory.Reused,
+		summary.Directory.Matched,
+		summary.Directory.Review,
+		summary.Directory.NoMatch,
+		summary.Directory.Ambiguous,
+		summary.Directory.Unavailable,
+	); err != nil {
 		return fmt.Errorf("write sync summary: %w", err)
 	}
 	return syncErr

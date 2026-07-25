@@ -110,7 +110,7 @@ func TestRequireRestrictedDisclosureRejectsCancellationAfterDisabledResult(t *te
 
 func TestPostgresProbeChecksRequiredMigrationWithoutApplyingIt(t *testing.T) {
 	connection := &fakePostgresConnection{
-		appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+		appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
 	}
 	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
 		return connection, nil
@@ -231,6 +231,41 @@ func TestRequiredMigrationVersionsIncludesModelProviderProvenance(t *testing.T) 
 	}
 	if current {
 		t.Fatal("MigrationsCurrent() = true, want migration 10 required")
+	}
+}
+
+func TestRequiredMigrationVersionsIncludesCurrentDocumentAndGoogleDirectory(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		applied []int64
+		missing int64
+	}{
+		{
+			name:    "current document version",
+			applied: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12},
+			missing: 11,
+		},
+		{
+			name:    "Google directory identity",
+			applied: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+			missing: 12,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			connection := &fakePostgresConnection{appliedMigrationVersions: testCase.applied}
+			probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
+				return connection, nil
+			})
+			defer probe.Close()
+
+			current, err := probe.MigrationsCurrent(context.Background())
+			if err != nil {
+				t.Fatalf("MigrationsCurrent() error = %v", err)
+			}
+			if current {
+				t.Fatalf("MigrationsCurrent() = true, want migration %d required", testCase.missing)
+			}
+		})
 	}
 }
 

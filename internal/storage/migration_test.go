@@ -329,6 +329,39 @@ func TestCurrentDocumentVersionMigrationAddsOwnedCurrentPointerWithoutRewritingH
 	}
 }
 
+func TestGoogleDirectoryMigrationAddsForwardOnlyIdentityProvenance(t *testing.T) {
+	migration := readGoogleDirectoryMigration(t)
+	for _, required := range []string{
+		"CREATE TABLE stacks.directory_profile_snapshots",
+		"CREATE TABLE stacks.directory_profile_emails",
+		"CREATE TABLE stacks.directory_lookup_attempts",
+		"CREATE TABLE stacks.directory_lookup_matches",
+		"CREATE TABLE stacks.entity_directory_identity_assertions",
+		"ADD COLUMN directory_profile_snapshot_id",
+		"resolution_candidates_one_source",
+		"validate_effective_directory_identity",
+	} {
+		if !strings.Contains(migration, required) {
+			t.Fatalf("Google directory migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"DELETE FROM",
+		"UPDATE stacks.entities",
+		"UPDATE stacks.mentions",
+		"UPDATE stacks.resolution_proposals",
+		"UPDATE stacks.resolution_candidates",
+		"UPDATE stacks.resolution_decisions",
+		"UPDATE stacks.entity_aliases",
+		"UPDATE stacks.entity_alias_assertions",
+		"-- +goose Down",
+	} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("Google directory migration rewrites identity history with %q", forbidden)
+		}
+	}
+}
+
 func readManagerConfidenceMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00002_manager_confidence_poc.sql")
@@ -392,6 +425,16 @@ func readModelProviderProvenanceMigration(t *testing.T) string {
 func readCurrentDocumentVersionMigration(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "db", "migrations", "00011_current_document_version.sql")
+	migration, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration %q: %v", path, err)
+	}
+	return string(migration)
+}
+
+func readGoogleDirectoryMigration(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join("..", "..", "db", "migrations", "00012_google_directory_identity.sql")
 	migration, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration %q: %v", path, err)

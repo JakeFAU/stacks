@@ -67,6 +67,8 @@ const (
 	snapshotCoherenceAdmissionBoundaryVersion int64 = 8
 	doctorMigrationInspectionVersion          int64 = 9
 	modelProviderProvenanceVersion            int64 = 10
+	currentDocumentMigrationVersion           int64 = 11
+	googleDirectoryIdentityMigrationVersion   int64 = 12
 )
 
 const migrationSetQuery = `
@@ -155,6 +157,8 @@ func requiredMigrationVersions() []int64 {
 		snapshotCoherenceAdmissionBoundaryVersion,
 		doctorMigrationInspectionVersion,
 		modelProviderProvenanceVersion,
+		currentDocumentMigrationVersion,
+		googleDirectoryIdentityMigrationVersion,
 	}
 }
 

@@ -2,10 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
 
+	"stacks/internal/directory"
 	"stacks/internal/entity"
 	"stacks/internal/storage"
 )
@@ -13,12 +15,20 @@ import (
 // StorageReviewStore adapts the PostgreSQL entity repository to private CLI
 // projections. It performs no logging or telemetry of review content.
 type StorageReviewStore struct {
-	repository *storage.EntityRepository
+	repository            *storage.EntityRepository
+	reviewerEmailVerifier ReviewerEmailVerifier
 }
 
 // NewStorageReviewStore creates a CLI store backed by the entity repository.
-func NewStorageReviewStore(repository *storage.EntityRepository) *StorageReviewStore {
-	return &StorageReviewStore{repository: repository}
+func NewStorageReviewStore(
+	repository *storage.EntityRepository,
+	reviewerEmailVerifier ...ReviewerEmailVerifier,
+) *StorageReviewStore {
+	store := &StorageReviewStore{repository: repository}
+	if len(reviewerEmailVerifier) > 0 {
+		store.reviewerEmailVerifier = reviewerEmailVerifier[0]
+	}
+	return store
 }
 
 // ListEntities implements EntityStore.
@@ -89,6 +99,22 @@ func (store *StorageReviewStore) AcceptReviewProposal(ctx context.Context, propo
 	return reviewDecisionFromStorage(decision), nil
 }
 
+// AcceptDirectoryCandidate implements ReviewStore.
+func (store *StorageReviewStore) AcceptDirectoryCandidate(ctx context.Context, input AcceptDirectoryInput) (ReviewDecision, error) {
+	if store.repository == nil {
+		return ReviewDecision{}, fmt.Errorf("accept directory candidate: repository is not configured")
+	}
+	_, decision, err := store.repository.AcceptDirectoryCandidate(ctx, storage.AcceptDirectoryInput{
+		ProposalID:         input.ProposalID,
+		DirectoryProfileID: input.DirectoryProfileID,
+		EntityID:           input.EntityID,
+	})
+	if err != nil {
+		return ReviewDecision{}, err
+	}
+	return reviewDecisionFromStorage(decision), nil
+}
+
 // RejectReviewProposal implements ReviewStore.
 func (store *StorageReviewStore) RejectReviewProposal(ctx context.Context, proposalID string) (ReviewDecision, error) {
 	if store.repository == nil {
@@ -110,17 +136,53 @@ func (store *StorageReviewStore) CreateReviewPerson(ctx context.Context, proposa
 	if input.Email != "" {
 		aliases = append(aliases, storage.AliasInput{Type: string(entity.AliasTypeEmail), NormalizedValue: entity.NormalizeEmail(input.Email)})
 	}
+	verification, err := verifyReviewerEmail(
+		ctx,
+		store.reviewerEmailVerifier,
+		input.Email,
+	)
+	if err != nil {
+		return ReviewDecision{}, err
+	}
 	_, decision, err := store.repository.CreateReviewPerson(ctx, storage.CreateReviewPersonInput{
-		ProposalID:  proposalID,
-		EntityID:    uuid.NewString(),
-		Kind:        string(entity.KindPerson),
-		DisplayName: input.Name,
-		Aliases:     aliases,
+		ProposalID:            proposalID,
+		EntityID:              uuid.NewString(),
+		Kind:                  string(entity.KindPerson),
+		DisplayName:           input.Name,
+		Aliases:               aliases,
+		DirectoryVerification: verification,
 	})
 	if err != nil {
 		return ReviewDecision{}, err
 	}
 	return reviewDecisionFromStorage(decision), nil
+}
+
+func verifyReviewerEmail(
+	ctx context.Context,
+	verifier ReviewerEmailVerifier,
+	email string,
+) (*directory.ReviewerVerification, error) {
+	if verifier == nil || email == "" {
+		return nil, nil
+	}
+	verification, err := verifier.VerifyReviewerEmail(ctx, email)
+	if err == nil {
+		if !verification.ValidForEmail(email) {
+			return nil, nil
+		}
+		return &verification, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if errors.Is(err, context.Canceled) {
+		return nil, context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, context.DeadlineExceeded
+	}
+	return nil, nil
 }
 
 // CorrectReviewDecision implements ReviewStore.
@@ -138,7 +200,15 @@ func (store *StorageReviewStore) CorrectReviewDecision(ctx context.Context, effe
 func reviewProposalFromStorage(detail storage.ResolutionProposalDetail) ReviewProposal {
 	proposal := ReviewProposal{ID: detail.ID, Context: detail.Context, Candidates: make([]ReviewCandidate, len(detail.Candidates))}
 	for index, candidate := range detail.Candidates {
-		proposal.Candidates[index] = ReviewCandidate{EntityID: candidate.EntityID, Confidence: candidate.Confidence, Reason: candidate.Reason}
+		proposal.Candidates[index] = ReviewCandidate{
+			EntityID:           candidate.EntityID,
+			DirectoryProfileID: candidate.DirectoryProfileID,
+			DisplayName:        candidate.DisplayName,
+			MaskedEmail:        candidate.MaskedEmail,
+			Source:             candidate.Source,
+			Confidence:         candidate.Confidence,
+			Reason:             candidate.Reason,
+		}
 	}
 	return proposal
 }

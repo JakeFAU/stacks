@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"stacks/internal/directory"
 	"stacks/internal/ingest"
 )
 
@@ -19,6 +20,10 @@ func TestSyncCommandPrintsOnlyBoundedOutcomesOperationalIDsAndCounts(t *testing.
 			{DocumentID: "document-4", VersionID: "version-4", Outcome: ingest.OutcomeFailed, FailureCode: ingest.FailureInvalidOutput},
 		},
 		Unchanged: 1, Completed: 1, Incomplete: 1, Failed: 1,
+		Directory: directory.Summary{
+			Attempted: 1, Reused: 2, Matched: 3, Review: 4,
+			NoMatch: 5, Ambiguous: 6, Unavailable: 7,
+		},
 	}}
 	var output bytes.Buffer
 	command := SyncCommand{Service: service, Output: &output}
@@ -30,7 +35,10 @@ func TestSyncCommandPrintsOnlyBoundedOutcomesOperationalIDsAndCounts(t *testing.
 		"document_id=document-2 version_id=version-2 outcome=completed retry_count=1\n" +
 		"document_id=document-3 version_id=version-3 outcome=incomplete retry_count=2\n" +
 		"document_id=document-4 version_id=version-4 outcome=failed retry_count=0\n" +
-		"summary unchanged=1 completed=1 incomplete=1 failed=1\n"
+		"summary unchanged=1 completed=1 incomplete=1 failed=1" +
+		" directory_attempted=1 directory_reused=2 directory_matched=3" +
+		" directory_review=4 directory_no_match=5" +
+		" directory_ambiguous=6 directory_unavailable=7\n"
 	if output.String() != want {
 		t.Fatalf("output = %q, want %q", output.String(), want)
 	}

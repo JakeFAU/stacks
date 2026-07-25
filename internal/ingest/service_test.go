@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
+	"stacks/internal/directory"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/knowledge"
@@ -201,6 +202,324 @@ func TestSyncSkipsExtractionForUnchangedVersion(t *testing.T) {
 	}
 	if len(summary.Results) != 1 || summary.Results[0].Outcome != OutcomeUnchanged {
 		t.Fatalf("summary results = %#v, want one unchanged result", summary.Results)
+	}
+}
+
+func TestSyncEnrichesNewDerivationAfterDurableCompletionReleasesLease(t *testing.T) {
+	var calls []string
+	repository := newMemoryRepository()
+	repository.calls = &calls
+	model := &recordingModel{
+		responses: []extract.Response{validEmptyResponse(t)},
+		callsLog:  &calls,
+	}
+	enricher := &recordingIdentityEnricher{
+		repository: repository,
+		model:      model,
+		calls:      &calls,
+		summaries:  []directory.Summary{{Attempted: 1, Matched: 1}},
+	}
+	service := testService(
+		syntheticDocument("document-directory-order", "Synthetic source."),
+		repository,
+		model,
+	)
+	service.IdentityEnricher = enricher
+
+	summary, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if got, want := strings.Join(calls, ","), "prepare,model,complete,enrich"; got != want {
+		t.Fatalf("boundary order = %q, want %q", got, want)
+	}
+	if enricher.ownedLease {
+		t.Fatal("Enrich() observed an extraction lease owner after durable completion")
+	}
+	if !enricher.modelContextCanceled {
+		t.Fatal("Enrich() observed the model attempt context before cancellation")
+	}
+	if len(summary.Results) != 1 ||
+		summary.Results[0].Outcome != OutcomeCompleted ||
+		summary.Results[0].Directory != (directory.Summary{Attempted: 1, Matched: 1}) ||
+		summary.Directory != (directory.Summary{Attempted: 1, Matched: 1}) {
+		t.Fatalf("summary = %#v, want completed result with additive directory counts", summary)
+	}
+}
+
+func TestSyncEnrichesCompleteDerivationWithoutModelInvocation(t *testing.T) {
+	var calls []string
+	document := syntheticDocument("document-directory-complete", "Synthetic source.")
+	repository := newMemoryRepository()
+	repository.calls = &calls
+	version := documentVersion(t, document)
+	derivation := testDerivationIdentity(t, version)
+	repository.versions[derivationKey(version, derivation)] = VersionState{
+		ID: "version-directory-complete", DerivationID: "derivation-directory-complete",
+		DerivationDigest: derivation.Digest, Status: VersionStatusComplete,
+	}
+	model := &recordingModel{
+		responses: []extract.Response{validEmptyResponse(t)},
+		callsLog:  &calls,
+	}
+	enricher := &recordingIdentityEnricher{
+		repository: repository,
+		calls:      &calls,
+		summaries:  []directory.Summary{{Reused: 1}},
+	}
+	service := testService(document, repository, model)
+	service.IdentityEnricher = enricher
+
+	summary, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if got, want := strings.Join(calls, ","), "prepare,enrich"; got != want {
+		t.Fatalf("boundary order = %q, want %q", got, want)
+	}
+	if model.calls != 0 ||
+		len(summary.Results) != 1 ||
+		summary.Results[0].Outcome != OutcomeUnchanged ||
+		summary.Directory.Reused != 1 {
+		t.Fatalf("model/summary = %d/%#v, want unchanged enrichment without model", model.calls, summary)
+	}
+}
+
+func TestSyncNeverEnrichesFailedCompletionOrBusyDerivation(t *testing.T) {
+	tests := []struct {
+		name        string
+		prepare     func(*testing.T, source.Document, *memoryRepository)
+		completeErr error
+		wantCalls   string
+	}{
+		{
+			name:        "failed completion",
+			completeErr: errors.New("synthetic completion failure"),
+			wantCalls:   "prepare,model,complete",
+		},
+		{
+			name: "busy derivation",
+			prepare: func(t *testing.T, document source.Document, repository *memoryRepository) {
+				t.Helper()
+				version := documentVersion(t, document)
+				derivation := testDerivationIdentity(t, version)
+				repository.versions[derivationKey(version, derivation)] = VersionState{
+					ID: "version-directory-busy", DerivationID: "derivation-directory-busy",
+					DerivationDigest: derivation.Digest, Status: VersionStatusPending,
+					LeaseOwner: "other-worker",
+				}
+			},
+			wantCalls: "prepare",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			var calls []string
+			document := syntheticDocument("document-directory-"+strings.ReplaceAll(testCase.name, " ", "-"), "Synthetic source.")
+			repository := newMemoryRepository()
+			repository.calls = &calls
+			repository.completionErr = testCase.completeErr
+			if testCase.prepare != nil {
+				testCase.prepare(t, document, repository)
+			}
+			model := &recordingModel{
+				responses: []extract.Response{validEmptyResponse(t)},
+				callsLog:  &calls,
+			}
+			enricher := &recordingIdentityEnricher{repository: repository, calls: &calls}
+			service := testService(document, repository, model)
+			service.IdentityEnricher = enricher
+
+			if _, err := service.Sync(context.Background()); err != nil {
+				t.Fatalf("Sync() error = %v", err)
+			}
+			if got := strings.Join(calls, ","); got != testCase.wantCalls {
+				t.Fatalf("boundary order = %q, want %q", got, testCase.wantCalls)
+			}
+			if enricher.callsCount != 0 {
+				t.Fatalf("Enrich() calls = %d, want 0", enricher.callsCount)
+			}
+		})
+	}
+}
+
+func TestSyncDirectoryFailureIsAdditiveWithoutChangingDocumentOutcome(t *testing.T) {
+	repository := newMemoryRepository()
+	enricher := &recordingIdentityEnricher{
+		repository: repository,
+		summaries:  []directory.Summary{{Attempted: 1}},
+		errs:       []error{errors.New("synthetic private directory failure")},
+	}
+	service := testService(
+		syntheticDocument("document-directory-failure", "Synthetic source."),
+		repository,
+		&recordingModel{responses: []extract.Response{validEmptyResponse(t)}},
+	)
+	service.IdentityEnricher = enricher
+
+	summary, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync() error = %v, want fail-soft directory error", err)
+	}
+	if len(summary.Results) != 1 ||
+		summary.Results[0].Outcome != OutcomeCompleted ||
+		summary.Results[0].Directory != (directory.Summary{Attempted: 1, Unavailable: 1}) ||
+		summary.Directory != (directory.Summary{Attempted: 1, Unavailable: 1}) {
+		t.Fatalf("summary = %#v, want completed result with additive unavailable count", summary)
+	}
+}
+
+func TestSyncDirectoryCancellationPreservesCompletedResultAndCanonicalError(t *testing.T) {
+	for _, cancellation := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cancellation.Error(), func(t *testing.T) {
+			const privateDetail = "synthetic private directory cancellation"
+			repository := newMemoryRepository()
+			enricher := &recordingIdentityEnricher{
+				repository: repository,
+				summaries:  []directory.Summary{{Attempted: 1}},
+				errs:       []error{fmt.Errorf("%s: %w", privateDetail, cancellation)},
+			}
+			service := testService(
+				syntheticDocument("document-directory-cancellation", "Synthetic source."),
+				repository,
+				&recordingModel{responses: []extract.Response{validEmptyResponse(t)}},
+			)
+			service.IdentityEnricher = enricher
+
+			summary, err := service.Sync(context.Background())
+			if !errors.Is(err, cancellation) || err.Error() != cancellation.Error() {
+				t.Fatalf("Sync() error = %v, want canonical %v", err, cancellation)
+			}
+			if strings.Contains(err.Error(), privateDetail) {
+				t.Fatalf("Sync() error disclosed private directory detail: %v", err)
+			}
+			if len(summary.Results) != 1 ||
+				summary.Results[0].Outcome != OutcomeCompleted ||
+				summary.Results[0].Directory.Attempted != 1 ||
+				summary.Completed != 1 ||
+				summary.Directory.Attempted != 1 {
+				t.Fatalf("summary = %#v, want completed result preserved through cancellation", summary)
+			}
+		})
+	}
+}
+
+func TestSyncDirectoryCancellationDiscardsEarlierAggregateErrorAfterPreservingResults(t *testing.T) {
+	for _, cancellation := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cancellation.Error(), func(t *testing.T) {
+			malformed := extract.Response{
+				Output:        json.RawMessage(`{"unexpected":true}`),
+				ModelID:       "synthetic-model",
+				PromptVersion: extract.ExtractionPromptVersion,
+			}
+			repository := newMemoryRepository()
+			repository.failureRecordErr = errors.New("synthetic persistence failure")
+			enricher := &recordingIdentityEnricher{
+				repository: repository,
+				summaries:  []directory.Summary{{Attempted: 1}},
+				errs:       []error{cancellation},
+			}
+			service := testServiceWithSource(&memorySource{
+				listed: []source.Document{
+					{Provider: "drive", ID: "document-persistence-failure"},
+					{Provider: "drive", ID: "document-directory-cancellation"},
+				},
+				fetched: map[string]source.Document{
+					"document-persistence-failure":    syntheticDocument("document-persistence-failure", "First synthetic source."),
+					"document-directory-cancellation": syntheticDocument("document-directory-cancellation", "Second synthetic source."),
+				},
+			}, repository, &recordingModel{responses: []extract.Response{
+				malformed,
+				validEmptyResponse(t),
+			}})
+			service.IdentityEnricher = enricher
+
+			summary, err := service.Sync(context.Background())
+			if err != cancellation || !errors.Is(err, cancellation) {
+				t.Fatalf("Sync() error = %#v, want direct canonical %v", err, cancellation)
+			}
+			if errors.Is(err, ErrFailurePersistence) {
+				t.Fatalf("Sync() error = %v, want earlier aggregate error discarded", err)
+			}
+			if len(summary.Results) != 2 ||
+				summary.Results[0].Outcome != OutcomeIncomplete ||
+				summary.Results[0].FailureCode != FailureStorage ||
+				summary.Results[1].Outcome != OutcomeCompleted ||
+				summary.Results[1].Directory.Attempted != 1 ||
+				summary.Incomplete != 1 ||
+				summary.Completed != 1 ||
+				summary.Directory.Attempted != 1 {
+				t.Fatalf("summary = %#v, want prior failure and current durable completion preserved", summary)
+			}
+		})
+	}
+}
+
+func TestSyncDirectoryAvailabilityDoesNotCreateNewExtractionDerivation(t *testing.T) {
+	document := syntheticDocument("document-directory-derivation", "Synthetic source.")
+	repository := newMemoryRepository()
+	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
+	service := testService(document, repository, model)
+
+	first, err := service.Sync(context.Background())
+	if err != nil || first.Completed != 1 {
+		t.Fatalf("first Sync() = (%#v, %v), want one completed extraction", first, err)
+	}
+	firstDerivationID := first.Results[0].DerivationID
+	service.IdentityEnricher = &recordingIdentityEnricher{
+		repository: repository,
+		summaries:  []directory.Summary{{Attempted: 1, NoMatch: 1}},
+	}
+
+	second, err := service.Sync(context.Background())
+	if err != nil || second.Unchanged != 1 {
+		t.Fatalf("second Sync() = (%#v, %v), want unchanged extraction plus directory work", second, err)
+	}
+	if second.Results[0].DerivationID != firstDerivationID ||
+		model.calls != 1 ||
+		repository.completionCalls != 1 ||
+		second.Directory != (directory.Summary{Attempted: 1, NoMatch: 1}) {
+		t.Fatalf("derivation/model/completion/directory = %q/%d/%d/%#v, want no extraction rerun",
+			second.Results[0].DerivationID, model.calls, repository.completionCalls, second.Directory)
+	}
+}
+
+func TestSyncAggregatesDirectorySummariesAcrossDocuments(t *testing.T) {
+	repository := newMemoryRepository()
+	enricher := &recordingIdentityEnricher{
+		repository: repository,
+		summaries: []directory.Summary{
+			{Attempted: 1, Matched: 1},
+			{Attempted: 2, Reused: 1, Review: 1, NoMatch: 1},
+		},
+	}
+	service := testServiceWithSource(&memorySource{
+		listed: []source.Document{
+			{Provider: "drive", ID: "document-directory-first"},
+			{Provider: "drive", ID: "document-directory-second"},
+		},
+		fetched: map[string]source.Document{
+			"document-directory-first":  syntheticDocument("document-directory-first", "First synthetic source."),
+			"document-directory-second": syntheticDocument("document-directory-second", "Second synthetic source."),
+		},
+	}, repository, &recordingModel{responses: []extract.Response{
+		validEmptyResponse(t),
+		validEmptyResponse(t),
+	}})
+	service.IdentityEnricher = enricher
+
+	summary, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	want := directory.Summary{Attempted: 3, Reused: 1, Matched: 1, Review: 1, NoMatch: 1}
+	if summary.Directory != want ||
+		len(summary.Results) != 2 ||
+		summary.Results[0].Directory != (directory.Summary{Attempted: 1, Matched: 1}) ||
+		summary.Results[1].Directory != (directory.Summary{Attempted: 2, Reused: 1, Review: 1, NoMatch: 1}) {
+		t.Fatalf("directory summary/results = %#v/%#v, want %#v and ordered per-document counts",
+			summary.Directory, summary.Results, want)
 	}
 }
 
@@ -708,6 +1027,8 @@ func TestSyncKeepsSeparatelyCitedAlexNameAndBobEmailPendingWithoutTeachingAliase
 		repository,
 		&recordingModel{responses: []extract.Response{extractionResponse(t, output)}},
 	)
+	directoryRepository, directoryLookup, enricher := newCompletionBackedDirectoryEnricher(t, repository)
+	service.IdentityEnricher = &enricher
 
 	summary, err := service.Sync(context.Background())
 	if err != nil || summary.Completed != 1 {
@@ -726,6 +1047,7 @@ func TestSyncKeepsSeparatelyCitedAlexNameAndBobEmailPendingWithoutTeachingAliase
 	if mention.NormalizedName != "alex reviewer" || mention.ProposedEmail != "bob.builder@synthetic.example" || mention.ProposedEmailEvidenceKey != "citation-bob" {
 		t.Fatalf("durable identity proposal = %#v, want independently grounded name and non-authoritative email evidence", mention)
 	}
+	requireCitationVerifiedReview(t, summary, directoryRepository, directoryLookup)
 }
 
 func TestSyncNeverUsesCooccurringModelEmailForAutomaticResolution(t *testing.T) {
@@ -749,6 +1071,8 @@ func TestSyncNeverUsesCooccurringModelEmailForAutomaticResolution(t *testing.T) 
 		repository,
 		&recordingModel{responses: []extract.Response{extractionResponse(t, output)}},
 	)
+	directoryRepository, directoryLookup, enricher := newCompletionBackedDirectoryEnricher(t, repository)
+	service.IdentityEnricher = &enricher
 
 	summary, err := service.Sync(context.Background())
 	if err != nil || summary.Completed != 1 {
@@ -764,6 +1088,7 @@ func TestSyncNeverUsesCooccurringModelEmailForAutomaticResolution(t *testing.T) 
 	if mention.NormalizedName != "alex reviewer" || mention.ProposedEmail != "bob.builder@synthetic.example" || mention.ProposedEmailEvidenceKey != "citation-shared" {
 		t.Fatalf("durable identity proposal = %#v, want grounded name plus non-authoritative email provenance", mention)
 	}
+	requireCitationVerifiedReview(t, summary, directoryRepository, directoryLookup)
 }
 
 func TestSyncResolvesGroundedNameIndependentlyOfModelEmail(t *testing.T) {
@@ -1203,7 +1528,9 @@ type recordingModel struct {
 	responses []extract.Response
 	errs      []error
 	requests  []extract.Request
+	contexts  []context.Context
 	calls     int
+	callsLog  *[]string
 }
 
 type deadlineBlockingModel struct {
@@ -1227,7 +1554,11 @@ func (recorder *recordingDecisionRecorder) Record(_ context.Context, observation
 	return nil
 }
 
-func (model *recordingModel) Generate(_ context.Context, request extract.Request) (extract.Response, error) {
+func (model *recordingModel) Generate(ctx context.Context, request extract.Request) (extract.Response, error) {
+	if model.callsLog != nil {
+		*model.callsLog = append(*model.callsLog, "model")
+	}
+	model.contexts = append(model.contexts, ctx)
 	model.requests = append(model.requests, request)
 	index := model.calls
 	model.calls++
@@ -1258,6 +1589,7 @@ type memoryRepository struct {
 	persistedSignals      int
 	prepareClaims         int
 	lastLeaseExpiresAt    time.Time
+	calls                 *[]string
 }
 
 func newMemoryRepository() *memoryRepository {
@@ -1265,6 +1597,9 @@ func newMemoryRepository() *memoryRepository {
 }
 
 func (repository *memoryRepository) PrepareVersion(_ context.Context, version knowledge.DocumentVersion, derivation DerivationIdentity, _ modelpolicy.DataMode, leaseDuration time.Duration) (VersionState, error) {
+	if repository.calls != nil {
+		*repository.calls = append(*repository.calls, "prepare")
+	}
 	if repository.prepareErr != nil {
 		return VersionState{}, repository.prepareErr
 	}
@@ -1305,6 +1640,9 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version kn
 }
 
 func (repository *memoryRepository) CompleteVersion(_ context.Context, completion Completion) error {
+	if repository.calls != nil {
+		*repository.calls = append(*repository.calls, "complete")
+	}
 	repository.completionCalls++
 	if repository.completionErr != nil {
 		return repository.completionErr
@@ -1357,6 +1695,163 @@ func (repository *memoryRepository) RecordFailure(_ context.Context, derivationI
 
 func (repository *memoryRepository) EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error) {
 	return append([]entity.EntitySnapshot(nil), repository.snapshots...), repository.snapshotErr
+}
+
+type recordingIdentityEnricher struct {
+	repository           *memoryRepository
+	model                *recordingModel
+	calls                *[]string
+	summaries            []directory.Summary
+	errs                 []error
+	callsCount           int
+	ownedLease           bool
+	modelContextCanceled bool
+}
+
+func (enricher *recordingIdentityEnricher) Enrich(_ context.Context, derivationID string) (directory.Summary, error) {
+	if enricher.calls != nil {
+		*enricher.calls = append(*enricher.calls, "enrich")
+	}
+	index := enricher.callsCount
+	enricher.callsCount++
+	if enricher.repository != nil {
+		for _, state := range enricher.repository.versions {
+			if state.DerivationID == derivationID && state.LeaseOwner != "" {
+				enricher.ownedLease = true
+			}
+		}
+	}
+	if enricher.model != nil && len(enricher.model.contexts) != 0 {
+		modelContext := enricher.model.contexts[len(enricher.model.contexts)-1]
+		select {
+		case <-modelContext.Done():
+			enricher.modelContextCanceled = true
+		default:
+		}
+	}
+	var summary directory.Summary
+	if index < len(enricher.summaries) {
+		summary = enricher.summaries[index]
+	}
+	var err error
+	if index < len(enricher.errs) {
+		err = enricher.errs[index]
+	}
+	return summary, err
+}
+
+type completionBackedDirectoryRepository struct {
+	ingestion *memoryRepository
+	persisted []directory.PersistInput
+}
+
+func (repository *completionBackedDirectoryRepository) LoadWork(
+	_ context.Context,
+	derivationID string,
+	_ time.Time,
+	_ time.Duration,
+	_ time.Duration,
+) (directory.Workset, error) {
+	completion := repository.ingestion.lastCompletion
+	if completion.DerivationID != derivationID {
+		return directory.Workset{}, errors.New("synthetic derivation is not complete")
+	}
+	quotes := make(map[string]string, len(completion.Evidence))
+	for _, evidence := range completion.Evidence {
+		quotes[evidence.Key] = evidence.Span.Text()
+	}
+	work := directory.Workset{Mentions: make([]directory.PendingMention, 0, len(completion.Mentions))}
+	for _, mention := range completion.Mentions {
+		work.Mentions = append(work.Mentions, directory.PendingMention{
+			MentionID:      mention.Key,
+			ProposalID:     "proposal-" + mention.Key,
+			Surface:        mention.Surface,
+			NormalizedName: mention.NormalizedName,
+			ProposedEmail:  mention.ProposedEmail,
+			NameQuote:      quotes[mention.EvidenceKey],
+			EmailQuote:     quotes[mention.ProposedEmailEvidenceKey],
+		})
+	}
+	return work, nil
+}
+
+func (repository *completionBackedDirectoryRepository) LoadIdentityState(context.Context) (directory.IdentityState, error) {
+	return directory.IdentityState{
+		Snapshots: append([]entity.EntitySnapshot(nil), repository.ingestion.snapshots...),
+	}, nil
+}
+
+func (repository *completionBackedDirectoryRepository) Persist(_ context.Context, input directory.PersistInput) (directory.PersistResult, error) {
+	repository.persisted = append(repository.persisted, input)
+	if input.Evaluation.Outcome == entity.DirectoryMatched {
+		return directory.PersistResult{AutoResolved: true, EntityID: input.Evaluation.EntityID}, nil
+	}
+	return directory.PersistResult{}, nil
+}
+
+type recordingDirectoryLookup struct {
+	queries []entity.DirectoryQuery
+}
+
+func (lookup *recordingDirectoryLookup) Search(_ context.Context, query entity.DirectoryQuery) (directory.LookupResult, error) {
+	lookup.queries = append(lookup.queries, query)
+	return directory.LookupResult{Profiles: []entity.DirectoryProfile{{
+		Provider:    "synthetic_directory",
+		SubjectID:   "synthetic-subject",
+		Source:      entity.DirectorySourceDomainProfile,
+		DisplayName: "Synthetic Directory Person",
+		Emails: []entity.DirectoryEmail{{
+			Value:   "bob.builder@synthetic.example",
+			Primary: true,
+		}},
+	}}}, nil
+}
+
+func newCompletionBackedDirectoryEnricher(
+	t *testing.T,
+	ingestionRepository *memoryRepository,
+) (*completionBackedDirectoryRepository, *recordingDirectoryLookup, directory.Service) {
+	t.Helper()
+	policy, err := entity.NewDirectoryPolicy([]string{"synthetic.example"})
+	if err != nil {
+		t.Fatalf("NewDirectoryPolicy() error = %v", err)
+	}
+	repository := &completionBackedDirectoryRepository{ingestion: ingestionRepository}
+	lookup := &recordingDirectoryLookup{}
+	return repository, lookup, directory.Service{
+		Lookup:      lookup,
+		Repository:  repository,
+		Policy:      policy,
+		Enabled:     true,
+		Freshness:   24 * time.Hour,
+		RetryAfter:  time.Minute,
+		MaxAttempts: 1,
+		Now:         func() time.Time { return recordedAt },
+		Wait:        func(context.Context, time.Duration) error { return nil },
+	}
+}
+
+func requireCitationVerifiedReview(
+	t *testing.T,
+	summary Summary,
+	repository *completionBackedDirectoryRepository,
+	lookup *recordingDirectoryLookup,
+) {
+	t.Helper()
+	if len(lookup.queries) != 1 {
+		t.Fatalf("directory queries = %#v, want one citation-verified email query", lookup.queries)
+	}
+	query := lookup.queries[0]
+	if query.Kind != entity.DirectoryQueryEmail ||
+		query.Email != "bob.builder@synthetic.example" ||
+		query.EmailEvidence != entity.EmailEvidenceCitationVerified {
+		t.Fatalf("directory query = %#v, want citation-verified non-source-bound email", query)
+	}
+	if len(repository.persisted) != 1 ||
+		repository.persisted[0].Evaluation.Outcome != entity.DirectoryReview ||
+		summary.Directory != (directory.Summary{Attempted: 1, Review: 1}) {
+		t.Fatalf("directory decision/summary = %#v/%#v, want review without automatic authority", repository.persisted, summary.Directory)
+	}
 }
 
 func versionKey(version knowledge.DocumentVersion) string {

@@ -30,4 +30,12 @@ func TestPostgresProbeReportsCurrentMigrations(t *testing.T) {
 	if !current {
 		t.Fatal("MigrationsCurrent() = false, want true")
 	}
+
+	var directoryMigrationsApplied bool
+	if err := probe.connection.QueryRow(ctx, migrationSetQuery, []int64{11, 12}).Scan(&directoryMigrationsApplied); err != nil {
+		t.Fatalf("inspect current-document and directory migrations: %v", err)
+	}
+	if !directoryMigrationsApplied {
+		t.Fatal("migration versions 11 and 12 are not both applied")
+	}
 }

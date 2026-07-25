@@ -131,6 +131,34 @@ func Load() (Settings, error) {
 		return Settings{}, fmt.Errorf("%s must leave at least %s before %s expires",
 			IngestionAttemptTimeoutEnvironmentVariable, minimumLeaseCleanupMargin, IngestionLeaseDurationEnvironmentVariable)
 	}
+	googleDirectoryEnabled, err := booleanEnvironment(GoogleDirectoryEnabledEnvironmentVariable, false)
+	if err != nil {
+		return Settings{}, err
+	}
+	googleDirectoryFreshness, err := durationEnvironment(
+		GoogleDirectoryFreshnessEnvironmentVariable,
+		defaultGoogleDirectoryFreshness,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+	googleDirectoryRetryAfter, err := durationEnvironment(
+		GoogleDirectoryRetryAfterEnvironmentVariable,
+		defaultGoogleDirectoryRetryAfter,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+	googleDirectoryMaxAttempts, err := positiveIntegerEnvironment(
+		GoogleDirectoryMaxAttemptsEnvironmentVariable,
+		defaultGoogleDirectoryMaxAttempts,
+	)
+	if err != nil {
+		return Settings{}, err
+	}
+	if googleDirectoryMaxAttempts > defaultGoogleDirectoryMaxAttempts {
+		return Settings{}, fmt.Errorf("%s must be between 1 and %d", GoogleDirectoryMaxAttemptsEnvironmentVariable, defaultGoogleDirectoryMaxAttempts)
+	}
 
 	return Settings{
 		HTTPAddress:       net.JoinHostPort(host, strconv.Itoa(port)),
@@ -149,8 +177,17 @@ func Load() (Settings, error) {
 			GoogleFolderID:        os.Getenv(GoogleFolderIDEnvironmentVariable),
 			GoogleOAuthClientFile: os.Getenv(GoogleOAuthClientFileEnvironmentVariable),
 			GoogleOAuthTokenFile:  os.Getenv(GoogleOAuthTokenFileEnvironmentVariable),
-			TranscriptTitles:      titleSetEnvironment(TranscriptTitlesEnvironmentVariable),
-			NotesTitles:           titleSetEnvironment(NotesTitlesEnvironmentVariable),
+			Directory: GoogleDirectorySettings{
+				Enabled:         googleDirectoryEnabled,
+				OAuthClientFile: os.Getenv(GoogleDirectoryClientFileEnvironmentVariable),
+				OAuthTokenFile:  os.Getenv(GoogleDirectoryTokenFileEnvironmentVariable),
+				EmailDomains:    titleSetEnvironment(GoogleDirectoryDomainsEnvironmentVariable),
+				Freshness:       googleDirectoryFreshness,
+				RetryAfter:      googleDirectoryRetryAfter,
+				MaxAttempts:     googleDirectoryMaxAttempts,
+			},
+			TranscriptTitles: titleSetEnvironment(TranscriptTitlesEnvironmentVariable),
+			NotesTitles:      titleSetEnvironment(NotesTitlesEnvironmentVariable),
 			Model: ModelSettings{
 				DataMode:        modelpolicy.DataMode(os.Getenv(DataModeEnvironmentVariable)),
 				Provider:        modelpolicy.Provider(os.Getenv(ModelProviderEnvironmentVariable)),

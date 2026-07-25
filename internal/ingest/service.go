@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"stacks/internal/analysis"
+	"stacks/internal/directory"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/knowledge"
@@ -189,25 +190,32 @@ type DecisionRecorder interface {
 	Record(context.Context, observability.DecisionObservation) error
 }
 
+// IdentityEnricher adds optional directory-backed identity evidence only after
+// extraction completion is durable.
+type IdentityEnricher interface {
+	Enrich(context.Context, string) (directory.Summary, error)
+}
+
 // Service coordinates one folder sync. Dependencies remain lazy at the
 // command boundary, so unrelated commands do not initialize them.
 type Service struct {
-	Source         source.Source
-	Model          extract.Model
-	Resolver       Resolver
-	Repository     Repository
-	CollectionID   string
-	PromptVersion  string
-	Provider       modelpolicy.Provider
-	DataMode       modelpolicy.DataMode
-	Region         string
-	ModelID        string
-	MaxTokens      int
-	LeaseDuration  time.Duration
-	AttemptTimeout time.Duration
-	Tracer         trace.Tracer
-	Decisions      DecisionRecorder
-	Now            func() time.Time
+	Source           source.Source
+	Model            extract.Model
+	Resolver         Resolver
+	Repository       Repository
+	CollectionID     string
+	PromptVersion    string
+	Provider         modelpolicy.Provider
+	DataMode         modelpolicy.DataMode
+	Region           string
+	ModelID          string
+	MaxTokens        int
+	LeaseDuration    time.Duration
+	AttemptTimeout   time.Duration
+	Tracer           trace.Tracer
+	Decisions        DecisionRecorder
+	IdentityEnricher IdentityEnricher
+	Now              func() time.Time
 }
 
 // Result is one privacy-safe per-document outcome.
@@ -218,6 +226,7 @@ type Result struct {
 	Outcome      Outcome
 	RetryCount   int
 	FailureCode  FailureCode
+	Directory    directory.Summary
 	leaseOwner   string
 }
 
@@ -228,6 +237,7 @@ type Summary struct {
 	Completed  int
 	Incomplete int
 	Failed     int
+	Directory  directory.Summary
 }
 
 // Sync lists direct documents and processes each as an independent failure
@@ -272,7 +282,11 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 		started := service.now()
 		result, documentErr := service.processDocument(ctx, listed)
 		if cancellationErr := boundedCancellation(ctx, documentErr); cancellationErr != nil {
-			return summary, errors.Join(aggregateErr, cancellationErr)
+			if result.Outcome == OutcomeCompleted || result.Outcome == OutcomeUnchanged {
+				summary.add(result)
+				service.recordDecision(ctx, result.Outcome, service.now().Sub(started))
+			}
+			return summary, cancellationErr
 		}
 		if authErr := boundedGlobalAuthentication(documentErr); authErr != nil {
 			return summary, errors.Join(aggregateErr, authErr)
@@ -340,7 +354,7 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	}
 	if state.Status == VersionStatusComplete {
 		result.Outcome = OutcomeUnchanged
-		return result, nil
+		return service.enrich(ctx, result)
 	}
 	if state.Status == VersionStatusBusy {
 		result.Outcome = OutcomeIncomplete
@@ -406,7 +420,23 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 		}
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
 	}
+	cancelAttempt()
 	result.Outcome = OutcomeCompleted
+	return service.enrich(ctx, result)
+}
+
+func (service *Service) enrich(ctx context.Context, result Result) (Result, error) {
+	if service.IdentityEnricher == nil {
+		return result, nil
+	}
+	summary, err := service.IdentityEnricher.Enrich(ctx, result.DerivationID)
+	result.Directory = summary
+	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
+		return result, cancellationErr
+	}
+	if err != nil {
+		result.Directory.Unavailable++
+	}
 	return result, nil
 }
 
@@ -783,6 +813,13 @@ func (service *Service) recordDecision(ctx context.Context, outcome Outcome, dur
 
 func (summary *Summary) add(result Result) {
 	summary.Results = append(summary.Results, result)
+	summary.Directory.Attempted += result.Directory.Attempted
+	summary.Directory.Reused += result.Directory.Reused
+	summary.Directory.Matched += result.Directory.Matched
+	summary.Directory.Review += result.Directory.Review
+	summary.Directory.NoMatch += result.Directory.NoMatch
+	summary.Directory.Ambiguous += result.Directory.Ambiguous
+	summary.Directory.Unavailable += result.Directory.Unavailable
 	switch result.Outcome {
 	case OutcomeUnchanged:
 		summary.Unchanged++

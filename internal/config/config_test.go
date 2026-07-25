@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ func TestLoadDefaults(t *testing.T) {
 	clearModelEnvironment(t)
 	t.Setenv(IngestionLeaseDurationEnvironmentVariable, "")
 	t.Setenv(IngestionAttemptTimeoutEnvironmentVariable, "")
+	clearGoogleDirectoryEnvironment(t)
 
 	settings, err := Load()
 	if err != nil {
@@ -64,6 +66,139 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if settings.PoC.AnalysisPromptVersion != defaultAnalysisPromptVersion {
 		t.Errorf("PoC.AnalysisPromptVersion = %q, want %q", settings.PoC.AnalysisPromptVersion, defaultAnalysisPromptVersion)
+	}
+}
+
+func validGoogleDirectorySettings() GoogleDirectorySettings {
+	return GoogleDirectorySettings{
+		Enabled: true, OAuthClientFile: "/synthetic/directory-client.json", OAuthTokenFile: "/synthetic/directory-token.json",
+		EmailDomains: []string{"corp.example"}, Freshness: 24 * time.Hour, RetryAfter: 15 * time.Minute, MaxAttempts: 3,
+	}
+}
+
+func clearGoogleDirectoryEnvironment(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		GoogleDirectoryEnabledEnvironmentVariable,
+		GoogleDirectoryClientFileEnvironmentVariable,
+		GoogleDirectoryTokenFileEnvironmentVariable,
+		GoogleDirectoryDomainsEnvironmentVariable,
+		GoogleDirectoryFreshnessEnvironmentVariable,
+		GoogleDirectoryRetryAfterEnvironmentVariable,
+		GoogleDirectoryMaxAttemptsEnvironmentVariable,
+	} {
+		t.Setenv(name, "")
+	}
+}
+
+func TestGoogleDirectoryDefaultsDisabled(t *testing.T) {
+	clearGoogleDirectoryEnvironment(t)
+
+	settings, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if settings.PoC.Directory.Enabled {
+		t.Fatal("directory integration is enabled by default")
+	}
+	if settings.PoC.Directory.OAuthClientFile != "" || settings.PoC.Directory.OAuthTokenFile != "" || len(settings.PoC.Directory.EmailDomains) != 0 {
+		t.Fatalf("disabled directory settings = %#v, want zero configuration", settings.PoC.Directory)
+	}
+	if settings.PoC.Directory.Freshness != defaultGoogleDirectoryFreshness || settings.PoC.Directory.RetryAfter != defaultGoogleDirectoryRetryAfter || settings.PoC.Directory.MaxAttempts != defaultGoogleDirectoryMaxAttempts {
+		t.Fatalf("directory defaults = %#v, want named defaults", settings.PoC.Directory)
+	}
+}
+
+func TestLoadReadsGoogleDirectorySettings(t *testing.T) {
+	clearGoogleDirectoryEnvironment(t)
+	t.Setenv(GoogleDirectoryEnabledEnvironmentVariable, "true")
+	t.Setenv(GoogleDirectoryClientFileEnvironmentVariable, "/synthetic/directory-client.json")
+	t.Setenv(GoogleDirectoryTokenFileEnvironmentVariable, "/synthetic/directory-token.json")
+	t.Setenv(GoogleDirectoryDomainsEnvironmentVariable, "corp.example,  ,division.example")
+	t.Setenv(GoogleDirectoryFreshnessEnvironmentVariable, "36h")
+	t.Setenv(GoogleDirectoryRetryAfterEnvironmentVariable, "20m")
+	t.Setenv(GoogleDirectoryMaxAttemptsEnvironmentVariable, "2")
+
+	settings, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := GoogleDirectorySettings{
+		Enabled: true, OAuthClientFile: "/synthetic/directory-client.json", OAuthTokenFile: "/synthetic/directory-token.json",
+		EmailDomains: []string{"corp.example", "division.example"}, Freshness: 36 * time.Hour, RetryAfter: 20 * time.Minute, MaxAttempts: 2,
+	}
+	if !reflect.DeepEqual(settings.PoC.Directory, want) {
+		t.Fatalf("directory settings = %#v, want %#v", settings.PoC.Directory, want)
+	}
+}
+
+func TestGoogleDirectoryEnabledValidationRejectsInvalidSettings(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		invalidate func(*GoogleDirectorySettings)
+	}{
+		{name: "missing client path", invalidate: func(settings *GoogleDirectorySettings) { settings.OAuthClientFile = "" }},
+		{name: "padded client path", invalidate: func(settings *GoogleDirectorySettings) { settings.OAuthClientFile = " /synthetic/client.json " }},
+		{name: "missing token path", invalidate: func(settings *GoogleDirectorySettings) { settings.OAuthTokenFile = "" }},
+		{name: "padded token path", invalidate: func(settings *GoogleDirectorySettings) { settings.OAuthTokenFile = " /synthetic/token.json " }},
+		{name: "missing domains", invalidate: func(settings *GoogleDirectorySettings) { settings.EmailDomains = nil }},
+		{name: "invalid domain", invalidate: func(settings *GoogleDirectorySettings) { settings.EmailDomains = []string{"invalid domain"} }},
+		{name: "nonpositive freshness", invalidate: func(settings *GoogleDirectorySettings) { settings.Freshness = 0 }},
+		{name: "nonpositive retry after", invalidate: func(settings *GoogleDirectorySettings) { settings.RetryAfter = 0 }},
+		{name: "too few attempts", invalidate: func(settings *GoogleDirectorySettings) { settings.MaxAttempts = 0 }},
+		{name: "too many attempts", invalidate: func(settings *GoogleDirectorySettings) { settings.MaxAttempts = 4 }},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := validPoCSettings()
+			settings.Directory = validGoogleDirectorySettings()
+			testCase.invalidate(&settings.Directory)
+			for _, command := range []Command{CommandSync, CommandDoctor, CommandReview} {
+				if err := settings.Validate(command); err == nil {
+					t.Fatalf("Validate(%s) error = nil, want directory setting rejection", command)
+				}
+			}
+		})
+	}
+}
+
+func TestGoogleDirectoryEnabledValidationDoesNotExposeInvalidDomain(t *testing.T) {
+	const privateDomain = "private-name@example.test"
+	settings := validPoCSettings()
+	settings.Directory = validGoogleDirectorySettings()
+	settings.Directory.EmailDomains = []string{privateDomain}
+
+	err := settings.Validate(CommandSync)
+	if err == nil {
+		t.Fatal("Validate(sync) error = nil, want invalid domain rejection")
+	}
+	if !strings.Contains(err.Error(), GoogleDirectoryDomainsEnvironmentVariable) {
+		t.Fatalf("Validate(sync) error = %v, want bounded configuration variable", err)
+	}
+	if strings.Contains(err.Error(), privateDomain) || strings.Contains(err.Error(), "invalid directory approved domain") {
+		t.Fatalf("Validate(sync) error exposed private or lower-level detail: %v", err)
+	}
+}
+
+func TestPoCSettingsValidateGoogleAuthSeparatesDriveAndDirectoryPaths(t *testing.T) {
+	settings := PoCSettings{}
+	if err := settings.Validate(CommandAuth); err != nil {
+		t.Fatalf("Validate(auth) error = %v, want target-specific validation", err)
+	}
+	if err := settings.ValidateGoogleAuth(GoogleAuthDrive); err == nil {
+		t.Fatal("ValidateGoogleAuth(google) error = nil, want Drive path requirement")
+	}
+	if err := settings.ValidateGoogleAuth(GoogleAuthDirectory); err == nil {
+		t.Fatal("ValidateGoogleAuth(google-directory) error = nil, want directory path requirement")
+	}
+	settings.GoogleOAuthClientFile = "/synthetic/drive-client.json"
+	settings.GoogleOAuthTokenFile = "/synthetic/drive-token.json"
+	settings.Directory.OAuthClientFile = "/synthetic/directory-client.json"
+	settings.Directory.OAuthTokenFile = "/synthetic/directory-token.json"
+	if err := settings.ValidateGoogleAuth(GoogleAuthDrive); err != nil {
+		t.Fatalf("ValidateGoogleAuth(google) error = %v", err)
+	}
+	if err := settings.ValidateGoogleAuth(GoogleAuthDirectory); err != nil {
+		t.Fatalf("ValidateGoogleAuth(google-directory) error = %v", err)
 	}
 }
 
