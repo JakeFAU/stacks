@@ -99,10 +99,14 @@ func TestDriveMeetingTitleDatesFlowThroughSyncIntoAnalysisChronology(t *testing.
 		}
 		observation := completion.Observations[0]
 		signal := completion.Signals[0]
+		var validTime *time.Time
+		if start, hasStart, _, _ := observation.ValidTime.Bounds(); hasStart {
+			validTime = &start
+		}
 		converted := analysis.Signal{
 			ID: signal.ID, MeetingID: result.DocumentID,
 			Category: analysis.Category(signal.Category), Direction: analysis.Direction(signal.Direction),
-			ValidTime: observation.ValidStart, Validated: true, TranscriptBacked: true,
+			ValidTime: validTime, Validated: true, TranscriptBacked: true,
 		}
 		if index < 2 {
 			dated = append(dated, converted)

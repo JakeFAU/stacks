@@ -9,6 +9,8 @@ import (
 
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/observation"
+
+	"stacks/internal/ingest"
 )
 
 func TestCompleteObservationPreflightRejectsBeforeDatabaseAccess(t *testing.T) {
@@ -271,50 +273,52 @@ func completeWithoutDatabase(
 	return err
 }
 
-func TestComputeObservationDigestCanonicalizesSemanticIdentity(t *testing.T) {
-	base := ObservationInput{
-		ID:              "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-		SubjectEntityID: "11111111-2222-3333-4444-555555555555",
-		ObjectEntityID:  "66666666-7777-8888-9999-aaaaaaaaaaaa",
-		Predicate:       "interacted_with",
-		Derivation:      "synthetic",
-		EpistemicStatus: "inferred",
+func TestStageCanonicalIngestionWritesRejectsDuplicateDigest(t *testing.T) {
+	recordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 123456000, time.UTC)
+	run := owningExtractionRun{
+		ID:            "11111111-1111-1111-1111-111111111111",
+		ModelID:       "synthetic-model",
+		PromptVersion: "extract-v1",
+		RecordedAt:    recordedAt,
 	}
-	baseline, err := ComputeObservationDigest(base, []string{
-		"99999999-aaaa-bbbb-cccc-dddddddddddd",
-		"00000000-1111-2222-3333-444444444444",
-	})
+	predicate, err := observation.NewPredicate("interaction_signal")
 	if err != nil {
-		t.Fatalf("compute baseline observation digest: %v", err)
+		t.Fatalf("new ingestion predicate: %v", err)
 	}
-
-	equivalent := base
-	equivalent.ID = "BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF"
-	equivalent.SubjectEntityID = "11111111-2222-3333-4444-555555555555"
-	equivalent.ObjectEntityID = "66666666-7777-8888-9999-AAAAAAAAAAAA"
-	got, err := ComputeObservationDigest(equivalent, []string{
-		"99999999-AAAA-BBBB-CCCC-DDDDDDDDDDDD",
-		"00000000-1111-2222-3333-444444444444",
-		"99999999-aaaa-bbbb-cccc-dddddddddddd",
-	})
+	confidence, err := observation.NewUnitIntervalConfidence(0.8)
 	if err != nil {
-		t.Fatalf("compute equivalent observation digest: %v", err)
+		t.Fatalf("new ingestion confidence: %v", err)
 	}
-	if got != baseline {
-		t.Fatal("equivalent observation retry produced a different semantic digest")
+	newDraft := func(id observation.ObservationID) ingest.ObservationDraft {
+		return ingest.ObservationDraft{
+			ID: id, Predicate: predicate, ValidTime: observation.UnknownTime(),
+			RecordedAt: recordedAt, EvidenceKeys: []string{"citation"},
+			SourceConfidence: confidence,
+		}
 	}
-
-	changed := base
-	changed.Predicate = "different_interaction"
-	changedDigest, err := ComputeObservationDigest(changed, []string{
-		"00000000-1111-2222-3333-444444444444",
-		"99999999-aaaa-bbbb-cccc-dddddddddddd",
-	})
-	if err != nil {
-		t.Fatalf("compute changed observation digest: %v", err)
+	newSignal := func(id string, observationID observation.ObservationID) ingest.SignalRecord {
+		return ingest.SignalRecord{
+			ID: id, ObservationID: string(observationID),
+			Category: "delegation_autonomy", Direction: "strengthening",
+			ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion,
+			Rationale: "Synthetic staged duplicate.", Confidence: 0.8,
+			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "citation", Role: "supporting"}},
+		}
 	}
-	if changedDigest == baseline {
-		t.Fatal("changed observation payload retained its semantic digest")
+	firstID := observation.ObservationID("22222222-2222-2222-2222-222222222222")
+	secondID := observation.ObservationID("33333333-3333-3333-3333-333333333333")
+	_, err = stageCanonicalIngestionWrites(
+		run,
+		[]ingest.ObservationDraft{newDraft(firstID), newDraft(secondID)},
+		[]ingest.SignalRecord{
+			newSignal("44444444-4444-4444-4444-444444444444", firstID),
+			newSignal("55555555-5555-5555-5555-555555555555", secondID),
+		},
+		map[string]string{"citation": "66666666-6666-6666-6666-666666666666"},
+		nil,
+	)
+	if !errors.Is(err, ErrObservationConflict) {
+		t.Fatalf("stageCanonicalIngestionWrites() error = %v, want duplicate durable digest conflict", err)
 	}
 }
 

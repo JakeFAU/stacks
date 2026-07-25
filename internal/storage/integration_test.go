@@ -2141,6 +2141,264 @@ func TestPrepareVersionTruncatesRecordedAtOnceToPostgresPrecision(t *testing.T) 
 	}
 }
 
+func TestIngestionPersistsCanonicalObservationWithLegacyConfidenceDowngrade(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCanonicalIngestionFixture(t, pool, "confidence")
+	if fixture.draft.SourceConfidence.Scale() != observation.ConfidenceUnitInterval ||
+		fixture.draft.SourceConfidence.Value() != fixture.signal.Confidence {
+		t.Fatalf("application source confidence = %#v, signal = %v; want bounded matching fixture",
+			fixture.draft.SourceConfidence, fixture.signal.Confidence)
+	}
+
+	fixture.complete(t)
+	loaded, err := loadLegacyObservation(context.Background(), pool, string(fixture.draft.ID))
+	if err != nil {
+		t.Fatalf("load canonical ingestion observation: %v", err)
+	}
+	confidence, ok := loaded.Observation.Confidence()
+	if !ok || confidence.Scale() != observation.ConfidenceUnspecifiedLegacy ||
+		confidence.Value() != fixture.draft.SourceConfidence.Value() {
+		t.Fatalf("canonical confidence = %#v/%t, want unspecified_legacy %v",
+			confidence, ok, fixture.draft.SourceConfidence.Value())
+	}
+	if loaded.Signal == nil || loaded.Signal.Input.Confidence != fixture.signal.Confidence {
+		t.Fatalf("stored signal = %#v, want vertical confidence %v", loaded.Signal, fixture.signal.Confidence)
+	}
+}
+
+func TestIngestionPreservesObservationOriginAndSignalRoles(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	label := testIdentifier("canonical-origin")
+	quotes := map[string]string{
+		"statement":     "Synthetic Manager assigned Synthetic Employee in " + label + ".",
+		"supporting":    "Synthetic supporting evidence for " + label + ".",
+		"contradicting": "Synthetic contradicting evidence for " + label + ".",
+		"shared":        "Synthetic shared evidence for " + label + ".",
+	}
+	transcript := strings.Join([]string{
+		quotes["statement"], quotes["supporting"], quotes["contradicting"], quotes["shared"],
+	}, " ")
+	version := testIngestionDocumentVersion(t, label, "synthetic-version-1", transcript)
+	state, evidenceRecords := prepareIngestionEvidence(t, pool, version, []struct {
+		key   string
+		quote string
+	}{
+		{key: "statement", quote: quotes["statement"]},
+		{key: "supporting", quote: quotes["supporting"]},
+		{key: "contradicting", quote: quotes["contradicting"]},
+		{key: "shared", quote: quotes["shared"]},
+	})
+	predicate, err := observation.NewPredicate("interaction_signal")
+	if err != nil {
+		t.Fatalf("new canonical ingestion predicate: %v", err)
+	}
+	sourceConfidence, err := observation.NewUnitIntervalConfidence(0.8)
+	if err != nil {
+		t.Fatalf("new canonical ingestion confidence: %v", err)
+	}
+	observationID := observation.ObservationID(uuid.NewString())
+	signalID := uuid.NewString()
+	completion := ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal, Evidence: evidenceRecords,
+		Mentions: []ingest.MentionRecord{
+			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
+			{Key: "employee", EvidenceKey: "statement", Surface: "Synthetic Employee", NormalizedName: "synthetic employee", Role: "reference"},
+		},
+		Observations: []ingest.ObservationDraft{{
+			ID: observationID, SubjectMentionKey: "manager", ObjectMentionKey: "employee",
+			Predicate: predicate, ValidTime: observation.UnknownTime(), RecordedAt: state.RecordedAt,
+			EvidenceKeys:     []string{"statement", "supporting", "contradicting", "shared"},
+			SourceConfidence: sourceConfidence,
+		}},
+		Signals: []ingest.SignalRecord{{
+			ID: signalID, ObservationID: string(observationID),
+			Category: "delegation_autonomy", Direction: "mixed",
+			ExtractionModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+			Rationale: "Synthetic source-grounded signal.", Confidence: 0.8,
+			Evidence: []ingest.SignalEvidenceRecord{
+				{EvidenceKey: "supporting", Role: "supporting"},
+				{EvidenceKey: "shared", Role: "supporting"},
+				{EvidenceKey: "contradicting", Role: "contradicting"},
+				{EvidenceKey: "shared", Role: "contradicting"},
+			},
+		}},
+	}
+	if err := NewIngestionRepository(pool).CompleteVersion(ctx, completion); err != nil {
+		t.Fatalf("complete origin-preserving ingestion: %v", err)
+	}
+
+	evidenceIDs := make(map[string]string, len(quotes))
+	for key, quote := range quotes {
+		evidenceIDs[key] = ingestionEvidenceID(t, pool, state.DerivationID, quote)
+	}
+	loaded, err := loadLegacyObservation(ctx, pool, string(observationID))
+	if err != nil {
+		t.Fatalf("load origin-preserving observation: %v", err)
+	}
+	wantOrigin := []knowledge.EvidenceID{
+		knowledge.EvidenceID(evidenceIDs["statement"]),
+		knowledge.EvidenceID(evidenceIDs["supporting"]),
+		knowledge.EvidenceID(evidenceIDs["contradicting"]),
+		knowledge.EvidenceID(evidenceIDs["shared"]),
+	}
+	sort.Slice(wantOrigin, func(left, right int) bool { return wantOrigin[left] < wantOrigin[right] })
+	if !sameEvidenceIDs(loaded.Compatibility.observationEvidenceOrigin, wantOrigin) {
+		t.Fatalf("private observation origin = %#v, want distinct statement/support/contradiction union %#v",
+			loaded.Compatibility.observationEvidenceOrigin, wantOrigin)
+	}
+	wantLinks := []observation.EvidenceLink{
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["statement"]), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["supporting"]), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["contradicting"]), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["shared"]), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["contradicting"]), Role: observation.EvidenceContradicting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["shared"]), Role: observation.EvidenceContradicting},
+	}
+	if !sameEvidenceLinks(loaded.Observation.EvidenceLinks(), wantLinks) {
+		t.Fatalf("canonical evidence links = %#v, want exact-pair union %#v", loaded.Observation.EvidenceLinks(), wantLinks)
+	}
+	wantSignalEvidence := []SignalEvidenceInput{
+		{EvidenceSpanID: evidenceIDs["supporting"], Role: "supporting"},
+		{EvidenceSpanID: evidenceIDs["shared"], Role: "supporting"},
+		{EvidenceSpanID: evidenceIDs["contradicting"], Role: "contradicting"},
+		{EvidenceSpanID: evidenceIDs["shared"], Role: "contradicting"},
+	}
+	if loaded.Signal == nil || !sameSignalEvidence(loaded.Signal.Evidence, wantSignalEvidence) {
+		t.Fatalf("signal evidence = %#v, want exact supporting/contradicting pairs %#v", loaded.Signal, wantSignalEvidence)
+	}
+	row, _, signal, err := scanLegacyObservationState(ctx, pool, string(observationID))
+	if err != nil {
+		t.Fatalf("scan persisted v1 observation: %v", err)
+	}
+	wantDigest, err := computeObservationDigestV1(legacyObservationWrite{Row: row, Origin: wantOrigin, Signal: signal})
+	if err != nil {
+		t.Fatalf("compute origin-based v1 digest: %v", err)
+	}
+	if row.Digest != wantDigest {
+		t.Fatalf("stored v1 digest = %x, want private-origin digest %x", row.Digest, wantDigest)
+	}
+}
+
+func TestIngestionUsesOwningRunDerivationAndRecordedAt(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCanonicalIngestionFixture(t, pool, "owning-run")
+	fixture.complete(t)
+
+	loaded, err := loadLegacyObservation(context.Background(), pool, string(fixture.draft.ID))
+	if err != nil {
+		t.Fatalf("load owning-run ingestion observation: %v", err)
+	}
+	derivation := loaded.Observation.Derivation()
+	if derivation.Method != "model_extraction" ||
+		derivation.Version != fixture.derivation.PromptVersion ||
+		derivation.RunID != fixture.state.DerivationID ||
+		derivation.Model != fixture.derivation.ModelID ||
+		derivation.PromptVersion != fixture.derivation.PromptVersion {
+		t.Fatalf("canonical derivation = %#v, want exact owning extraction run", derivation)
+	}
+	if !loaded.Observation.RecordedAt().Equal(fixture.state.RecordedAt) {
+		t.Fatalf("canonical RecordedAt = %v, want owning run time %v",
+			loaded.Observation.RecordedAt(), fixture.state.RecordedAt)
+	}
+}
+
+func TestIngestionCanonicalConstructionFailureRollsBackWholeCompletion(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	providerDocumentID := testIdentifier("canonical-rollback")
+	firstVersion := testIngestionDocumentVersion(t, providerDocumentID, "synthetic-version-1", "Synthetic prior completed version.")
+	repository := NewIngestionRepository(pool)
+	first, err := repository.PrepareVersion(ctx, firstVersion, testExtractionDerivation(t, firstVersion), modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare prior completed version: %v", err)
+	}
+	if err := repository.CompleteVersion(ctx, ingest.Completion{
+		VersionID: first.ID, DerivationID: first.DerivationID, LeaseOwner: first.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}); err != nil {
+		t.Fatalf("complete prior version: %v", err)
+	}
+
+	transcript := "Synthetic Manager assigned Synthetic Employee."
+	failingVersion := testIngestionDocumentVersion(t, providerDocumentID, "synthetic-version-2", transcript)
+	state, evidenceRecords := prepareIngestionEvidence(t, pool, failingVersion, []struct {
+		key   string
+		quote string
+	}{{key: "statement", quote: transcript}})
+	sourceConfidence, err := observation.NewUnitIntervalConfidence(0.8)
+	if err != nil {
+		t.Fatalf("new rollback confidence: %v", err)
+	}
+	observationID := observation.ObservationID(uuid.NewString())
+	signalID := uuid.NewString()
+	err = repository.CompleteVersion(ctx, ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal, Evidence: evidenceRecords,
+		Mentions: []ingest.MentionRecord{
+			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
+			{Key: "employee", EvidenceKey: "statement", Surface: "Synthetic Employee", NormalizedName: "synthetic employee", Role: "reference"},
+		},
+		Observations: []ingest.ObservationDraft{{
+			ID: observationID, SubjectMentionKey: "manager", ObjectMentionKey: "employee",
+			Predicate: "", ValidTime: observation.UnknownTime(), RecordedAt: state.RecordedAt,
+			EvidenceKeys: []string{"statement"}, SourceConfidence: sourceConfidence,
+		}},
+		Signals: []ingest.SignalRecord{{
+			ID: signalID, ObservationID: string(observationID),
+			Category: "delegation_autonomy", Direction: "strengthening",
+			ExtractionModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+			Rationale: "Synthetic rollback signal.", Confidence: 0.8,
+			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "statement", Role: "supporting"}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("invalid canonical ingestion completion succeeded")
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{name: "evidence", query: `
+			SELECT count(*)
+			FROM stacks.evidence_spans AS evidence
+			JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
+			WHERE tab.document_version_id = $1`, args: []any{state.ID}},
+		{name: "mention", query: `SELECT count(*) FROM stacks.mentions WHERE extraction_run_id = $1`, args: []any{state.DerivationID}},
+		{name: "proposal", query: `
+			SELECT count(*)
+			FROM stacks.resolution_proposals AS proposal
+			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+			WHERE mention.extraction_run_id = $1`, args: []any{state.DerivationID}},
+		{name: "observation", query: `SELECT count(*) FROM stacks.observations WHERE id = $1`, args: []any{string(observationID)}},
+		{name: "signal", query: `SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, args: []any{signalID}},
+	} {
+		if got := countRows(t, pool, testCase.query, testCase.args...); got != 0 {
+			t.Fatalf("failed canonical completion left %s rows = %d, want 0", testCase.name, got)
+		}
+	}
+	var status, currentVersionID string
+	if err := pool.QueryRow(ctx, `SELECT processing_status FROM stacks.extraction_runs WHERE id = $1`, state.DerivationID).Scan(&status); err != nil {
+		t.Fatalf("load failed completion status: %v", err)
+	}
+	if status != string(ingest.VersionStatusPending) {
+		t.Fatalf("failed completion status = %q, want pending", status)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT current_document_version_id::text
+		FROM stacks.source_documents
+		WHERE provider = $1 AND provider_document_id = $2`,
+		failingVersion.Provider(), failingVersion.ProviderDocumentID()).Scan(&currentVersionID); err != nil {
+		t.Fatalf("load current document pointer after rollback: %v", err)
+	}
+	if currentVersionID != first.ID {
+		t.Fatalf("current document pointer = %q, want prior completed version %q", currentVersionID, first.ID)
+	}
+}
+
 func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
@@ -4655,6 +4913,14 @@ func completeVersionedPairSignal(
 		t.Fatalf("prepare current-version extraction: %v", err)
 	}
 	validTime := time.Date(2026, time.July, 24, 0, 0, 0, 0, time.UTC)
+	canonicalValidTime, err := observation.Since(validTime)
+	if err != nil {
+		t.Fatalf("construct current-version valid time: %v", err)
+	}
+	sourceConfidence, err := observation.NewUnitIntervalConfidence(0.9)
+	if err != nil {
+		t.Fatalf("construct current-version source confidence: %v", err)
+	}
 	observationID := uuid.NewString()
 	if err := ingestion.CompleteVersion(ctx, ingest.Completion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
@@ -4672,10 +4938,11 @@ func completeVersionedPairSignal(
 				Resolution: entity.Resolution{EntityID: employeeID, AutoResolved: true},
 			},
 		},
-		Observations: []ingest.ObservationRecord{{
-			ID: observationID, SubjectEntityID: managerID, ObjectEntityID: employeeID,
+		Observations: []ingest.ObservationDraft{{
+			ID: observation.ObservationID(observationID), SubjectEntityID: managerID, ObjectEntityID: employeeID,
 			SubjectMentionKey: "manager", ObjectMentionKey: "employee",
-			Predicate: "interaction_signal", ValidStart: &validTime, EvidenceKeys: []string{"evidence"}, RecordedAt: state.RecordedAt,
+			Predicate: observation.Predicate("interaction_signal"), ValidTime: canonicalValidTime,
+			EvidenceKeys: []string{"evidence"}, SourceConfidence: sourceConfidence, RecordedAt: state.RecordedAt,
 		}},
 		Signals: []ingest.SignalRecord{{
 			ID: uuid.NewString(), ObservationID: observationID,
@@ -4903,8 +5170,17 @@ func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Ti
 	if err != nil {
 		t.Fatalf("create employee proposal: %v", err)
 	}
+	ingestion := NewIngestionRepository(pool)
+	derivation := testExtractionDerivation(t, version)
+	state, err := ingestion.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare pair-analysis extraction run: %v", err)
+	}
+	run := owningExtractionRun{
+		ID: state.DerivationID, ModelID: derivation.ModelID,
+		PromptVersion: derivation.PromptVersion, RecordedAt: state.RecordedAt,
+	}
 	graph := NewGraphRepository(pool)
-	run := testOwningExtractionRun(t, pool, version)
 	canonicalObservation := testCanonicalObservation(t, run, uuid.NewString(), "", managerMention.ID, "", employeeMention.ID,
 		"interaction_signal", testCanonicalInstant(t, validTime), storedSpan.ID)
 	observation, _, err := graph.CompleteObservation(ctx, canonicalObservation, []knowledge.EvidenceID{knowledge.EvidenceID(storedSpan.ID)}, &SignalInput{
@@ -4916,6 +5192,12 @@ func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Ti
 	}
 	if observation.ID() != canonicalObservation.ID() {
 		t.Fatalf("complete pair observation ID = %q, want %q", observation.ID(), canonicalObservation.ID())
+	}
+	if err := ingestion.CompleteVersion(ctx, ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}); err != nil {
+		t.Fatalf("complete pair-analysis extraction run: %v", err)
 	}
 	return managerProposal.ID, employeeProposal.ID
 }
@@ -5977,6 +6259,162 @@ func createSyntheticMentionAndSpan(t *testing.T, pool *pgxpool.Pool) (string, st
 		t.Fatalf("create synthetic mention: %v", err)
 	}
 	return mention.ID, storedSpan.ID
+}
+
+type canonicalIngestionFixture struct {
+	pool       *pgxpool.Pool
+	repository *IngestionRepository
+	state      ingest.VersionState
+	derivation ingest.DerivationIdentity
+	evidence   []ingest.EvidenceRecord
+	mentions   []ingest.MentionRecord
+	draft      ingest.ObservationDraft
+	signal     ingest.SignalRecord
+}
+
+func newCanonicalIngestionFixture(t *testing.T, pool *pgxpool.Pool, label string) canonicalIngestionFixture {
+	t.Helper()
+	providerDocumentID := testIdentifier("canonical-ingestion-" + label)
+	transcript := "Synthetic Manager assigned Synthetic Employee."
+	version := testIngestionDocumentVersion(t, providerDocumentID, "synthetic-version-1", transcript)
+	derivation := testExtractionDerivation(t, version)
+	repository := NewIngestionRepository(pool)
+	state, err := repository.PrepareVersion(
+		context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare canonical ingestion fixture: %v", err)
+	}
+	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0,
+		EndOffset: len(transcript), Quote: transcript,
+	})
+	if err != nil {
+		t.Fatalf("new canonical ingestion evidence: %v", err)
+	}
+	predicate, err := observation.NewPredicate("interaction_signal")
+	if err != nil {
+		t.Fatalf("new canonical ingestion predicate: %v", err)
+	}
+	validStart := time.Date(2026, time.July, 24, 0, 0, 0, 0, time.UTC)
+	validTime, err := observation.Since(validStart)
+	if err != nil {
+		t.Fatalf("new canonical ingestion valid time: %v", err)
+	}
+	sourceConfidence, err := observation.NewUnitIntervalConfidence(0.8)
+	if err != nil {
+		t.Fatalf("new canonical ingestion source confidence: %v", err)
+	}
+	observationID := observation.ObservationID(uuid.NewString())
+	return canonicalIngestionFixture{
+		pool: pool, repository: repository, state: state, derivation: derivation,
+		evidence: []ingest.EvidenceRecord{{Key: "statement", Span: span}},
+		mentions: []ingest.MentionRecord{
+			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
+			{Key: "employee", EvidenceKey: "statement", Surface: "Synthetic Employee", NormalizedName: "synthetic employee", Role: "reference"},
+		},
+		draft: ingest.ObservationDraft{
+			ID: observationID, SubjectMentionKey: "manager", ObjectMentionKey: "employee",
+			Predicate: predicate, ValidTime: validTime, RecordedAt: state.RecordedAt,
+			EvidenceKeys: []string{"statement"}, SourceConfidence: sourceConfidence,
+		},
+		signal: ingest.SignalRecord{
+			ID: uuid.NewString(), ObservationID: string(observationID),
+			Category: "delegation_autonomy", Direction: "strengthening",
+			ExtractionModelID: derivation.ModelID, PromptVersion: derivation.PromptVersion,
+			Rationale: "Synthetic source-grounded signal.", Confidence: 0.8,
+			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "statement", Role: "supporting"}},
+		},
+	}
+}
+
+func (fixture canonicalIngestionFixture) complete(t *testing.T) {
+	t.Helper()
+	if err := fixture.repository.CompleteVersion(context.Background(), ingest.Completion{
+		VersionID: fixture.state.ID, DerivationID: fixture.state.DerivationID, LeaseOwner: fixture.state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal, Evidence: fixture.evidence, Mentions: fixture.mentions,
+		Observations: []ingest.ObservationDraft{fixture.draft}, Signals: []ingest.SignalRecord{fixture.signal},
+	}); err != nil {
+		t.Fatalf("complete canonical ingestion fixture: %v", err)
+	}
+}
+
+func prepareIngestionEvidence(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	version knowledge.DocumentVersion,
+	inputs []struct {
+		key   string
+		quote string
+	},
+) (ingest.VersionState, []ingest.EvidenceRecord) {
+	t.Helper()
+	repository := NewIngestionRepository(pool)
+	state, err := repository.PrepareVersion(
+		context.Background(), version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare ingestion evidence fixture: %v", err)
+	}
+	transcript := version.Sections()[0].Text()
+	records := make([]ingest.EvidenceRecord, 0, len(inputs))
+	for _, input := range inputs {
+		start := strings.Index(transcript, input.quote)
+		if start < 0 {
+			t.Fatalf("synthetic evidence quote %q is absent", input.key)
+		}
+		span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+			Document: version, SectionID: "tab-synthetic", StartOffset: start,
+			EndOffset: start + len(input.quote), Quote: input.quote,
+		})
+		if err != nil {
+			t.Fatalf("new synthetic ingestion evidence %q: %v", input.key, err)
+		}
+		records = append(records, ingest.EvidenceRecord{Key: input.key, Span: span})
+	}
+	return state, records
+}
+
+func ingestionEvidenceID(t *testing.T, pool *pgxpool.Pool, derivationID, quote string) string {
+	t.Helper()
+	var evidenceID string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT evidence.id::text
+		FROM stacks.evidence_spans AS evidence
+		JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
+		JOIN stacks.extraction_runs AS run ON run.document_version_id = tab.document_version_id
+		WHERE run.id = $1 AND evidence.quote = $2`, derivationID, quote).Scan(&evidenceID); err != nil {
+		t.Fatalf("load synthetic ingestion evidence ID: %v", err)
+	}
+	return evidenceID
+}
+
+func testIngestionDocumentVersion(
+	t *testing.T,
+	providerDocumentID string,
+	providerVersion string,
+	transcript string,
+) knowledge.DocumentVersion {
+	t.Helper()
+	recordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 0, time.UTC)
+	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider:           "synthetic-drive",
+		ProviderDocumentID: providerDocumentID,
+		Title:              "Synthetic ingestion meeting",
+		Locator:            "https://docs.example.invalid/document/" + providerDocumentID,
+		ProviderVersion:    providerVersion,
+		ProviderRevision:   providerVersion + "-revision",
+		ModifiedAt:         recordedAt,
+		RecordedAt:         recordedAt,
+		Sections: testEvidenceSections(t, []source.Tab{{
+			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
+			Role: source.TabRoleTranscript, Text: transcript,
+		}}),
+	})
+	if err != nil {
+		t.Fatalf("new synthetic ingestion document version: %v", err)
+	}
+	return version
 }
 
 func testIdentifier(prefix string) string {

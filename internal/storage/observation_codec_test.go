@@ -755,36 +755,6 @@ func TestComputeObservationDigestV1ChangesOnlyWithLegacyOrigin(t *testing.T) {
 	}
 }
 
-func TestComputeObservationDigestV1MatchesOldWriterDigest(t *testing.T) {
-	validStart := codecRecordedAt
-	validEnd := validStart.Add(time.Hour)
-	confidence := 0.75
-	input := ObservationInput{
-		ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", ExtractionRunID: "99999999-aaaa-bbbb-cccc-dddddddddddd",
-		SubjectEntityID: "22222222-3333-4444-5555-666666666666", ObjectEntityID: "33333333-4444-5555-6666-777777777777",
-		SubjectMentionID: "44444444-5555-6666-7777-888888888888", ObjectMentionID: "55555555-6666-7777-8888-999999999999",
-		Predicate: "digest_predicate", Derivation: "digest_derivation", EpistemicStatus: "observed",
-		ValidStart: &validStart, ValidEnd: &validEnd, Confidence: &confidence,
-	}
-	origin := []string{"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
-	oldDigest, err := ComputeObservationDigest(input, origin)
-	if err != nil {
-		t.Fatalf("compute old writer digest: %v", err)
-	}
-	newDigest, err := computeObservationDigestV1(legacyObservationWrite{Row: legacyObservationRow{
-		ExtractionRunID: input.ExtractionRunID, SubjectEntityID: input.SubjectEntityID, ObjectEntityID: input.ObjectEntityID,
-		SubjectMentionID: input.SubjectMentionID, ObjectMentionID: input.ObjectMentionID, Predicate: input.Predicate,
-		Derivation: input.Derivation, EpistemicStatus: input.EpistemicStatus, ValidStart: input.ValidStart, ValidEnd: input.ValidEnd,
-		Confidence: input.Confidence,
-	}, Origin: []evidence.EvidenceID{evidence.EvidenceID(origin[0]), evidence.EvidenceID(origin[1]), evidence.EvidenceID(origin[2])}})
-	if err != nil {
-		t.Fatalf("compute v1 digest: %v", err)
-	}
-	if newDigest != oldDigest {
-		t.Fatalf("new v1 digest = %x, old writer digest = %x", newDigest, oldDigest)
-	}
-}
-
 func codecDigestWrite() legacyObservationWrite {
 	confidence := 0.75
 	return legacyObservationWrite{Row: legacyObservationRow{
