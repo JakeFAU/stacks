@@ -108,6 +108,9 @@ func TestServiceVerifyReviewerEmailUsesReviewerEvidenceAndCurrentIdentityPolicy(
 	if repository.calls.loadIdentity != 1 {
 		t.Fatalf("LoadIdentityState() calls = %d, want 1", repository.calls.loadIdentity)
 	}
+	if !verification.ValidForEmail("riya.chen@corp.example") {
+		t.Fatalf("reviewer verification = %#v, want complete durable boundary metadata", verification)
+	}
 }
 
 func TestServiceVerifyReviewerEmailReturnsBoundedUnavailableWithoutProviderError(t *testing.T) {
@@ -132,6 +135,9 @@ func TestServiceVerifyReviewerEmailReturnsBoundedUnavailableWithoutProviderError
 	}
 	if strings.Contains(fmt.Sprint(verification), errPrivateDirectoryDetail.Error()) {
 		t.Fatalf("reviewer verification leaked provider error: %#v", verification)
+	}
+	if !verification.ValidForEmail("reviewer@corp.example") {
+		t.Fatalf("unavailable reviewer verification = %#v, want complete bounded metadata", verification)
 	}
 }
 

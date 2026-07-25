@@ -414,6 +414,13 @@ func (repository *EntityRepository) recordDecision(ctx context.Context, input Re
 	}
 	var decision ResolutionDecision
 	err := repository.withTransaction(ctx, func(transaction pgx.Tx) error {
+		if err := lockResolutionProposal(
+			ctx,
+			transaction,
+			input.ProposalID,
+		); err != nil {
+			return fmt.Errorf("record resolution decision: %w", err)
+		}
 		existing, err := loadEffectiveDecision(ctx, transaction, input.ProposalID)
 		if err == nil {
 			if !strict && existing.Outcome == input.Outcome && existing.EntityID == input.EntityID {
@@ -455,15 +462,16 @@ func (repository *EntityRepository) correctDecision(ctx context.Context, effecti
 	}
 	var replacement ResolutionDecision
 	err := repository.withTransaction(ctx, func(transaction pgx.Tx) error {
-		var proposalID, supersededByID string
-		err := transaction.QueryRow(ctx, `
-			SELECT proposal_id, COALESCE(superseded_by_id::text, '')
-			FROM stacks.resolution_decisions WHERE id = $1 FOR UPDATE`, effectiveDecisionID).Scan(&proposalID, &supersededByID)
-		if err == pgx.ErrNoRows {
+		var proposalID string
+		if err := transaction.QueryRow(ctx, `
+			SELECT proposal_id::text
+			FROM stacks.resolution_decisions
+			WHERE id = $1`,
+			effectiveDecisionID,
+		).Scan(&proposalID); err == pgx.ErrNoRows {
 			return fmt.Errorf("correct resolution decision %q: decision does not exist", effectiveDecisionID)
-		}
-		if err != nil {
-			return fmt.Errorf("lock resolution decision %q: %w", effectiveDecisionID, err)
+		} else if err != nil {
+			return fmt.Errorf("load resolution decision %q: %w", effectiveDecisionID, err)
 		}
 		if input.ProposalID != "" && input.ProposalID != proposalID {
 			return fmt.Errorf("correct resolution decision %q: proposal ID does not match", effectiveDecisionID)
@@ -472,18 +480,8 @@ func (repository *EntityRepository) correctDecision(ctx context.Context, effecti
 		if err := validateDecisionInput(input); err != nil {
 			return err
 		}
-		if supersededByID != "" {
-			if strict {
-				return fmt.Errorf("correct resolution decision %q: decision is not effective", effectiveDecisionID)
-			}
-			replacement, err = loadDecision(ctx, transaction, supersededByID)
-			if err != nil {
-				return fmt.Errorf("load correction for resolution decision %q: %w", effectiveDecisionID, err)
-			}
-			if replacement.Outcome == input.Outcome && replacement.EntityID == input.EntityID {
-				return nil
-			}
-			return fmt.Errorf("correct resolution decision %q: existing correction conflicts", effectiveDecisionID)
+		if err := lockResolutionProposal(ctx, transaction, proposalID); err != nil {
+			return fmt.Errorf("correct resolution decision %q: %w", effectiveDecisionID, err)
 		}
 		directoryEvidence, err := loadDirectoryDecisionEvidence(
 			ctx,
@@ -503,6 +501,34 @@ func (repository *EntityRepository) correctDecision(ctx context.Context, effecti
 			); err != nil {
 				return fmt.Errorf("correct resolution decision: lock provider identity")
 			}
+		}
+
+		var supersededByID string
+		err = transaction.QueryRow(ctx, `
+			SELECT proposal_id, COALESCE(superseded_by_id::text, '')
+			FROM stacks.resolution_decisions WHERE id = $1 FOR UPDATE`, effectiveDecisionID).Scan(&proposalID, &supersededByID)
+		if err == pgx.ErrNoRows {
+			return fmt.Errorf("correct resolution decision %q: decision does not exist", effectiveDecisionID)
+		}
+		if err != nil {
+			return fmt.Errorf("lock resolution decision %q: %w", effectiveDecisionID, err)
+		}
+		if input.ProposalID != "" && input.ProposalID != proposalID {
+			return fmt.Errorf("correct resolution decision %q: proposal ID does not match", effectiveDecisionID)
+		}
+		input.ProposalID = proposalID
+		if supersededByID != "" {
+			if strict {
+				return fmt.Errorf("correct resolution decision %q: decision is not effective", effectiveDecisionID)
+			}
+			replacement, err = loadDecision(ctx, transaction, supersededByID)
+			if err != nil {
+				return fmt.Errorf("load correction for resolution decision %q: %w", effectiveDecisionID, err)
+			}
+			if replacement.Outcome == input.Outcome && replacement.EntityID == input.EntityID {
+				return nil
+			}
+			return fmt.Errorf("correct resolution decision %q: existing correction conflicts", effectiveDecisionID)
 		}
 		replacementID := uuid.NewString()
 		result, err := transaction.Exec(ctx, `
@@ -907,12 +933,22 @@ func (repository *EntityRepository) CreateReviewPerson(ctx context.Context, inpu
 		if status != "pending" {
 			return fmt.Errorf("create review person: proposal is not pending")
 		}
-		if _, err := loadEffectiveDecision(ctx, transaction, input.ProposalID); err == nil {
-			return fmt.Errorf("create review person for proposal %q: proposal already has an effective decision", input.ProposalID)
-		} else if err != pgx.ErrNoRows {
-			return fmt.Errorf("load effective resolution decision for proposal %q: %w", input.ProposalID, err)
+		emailAuthorities := make([]string, 0, len(input.Aliases))
+		for _, alias := range input.Aliases {
+			if alias.Type == string(entity.AliasTypeEmail) {
+				emailAuthorities = append(
+					emailAuthorities,
+					alias.NormalizedValue,
+				)
+			}
 		}
-
+		if err := lockDirectoryEmailAuthorities(
+			ctx,
+			transaction,
+			emailAuthorities,
+		); err != nil {
+			return fmt.Errorf("create review person: lock accepted email authority")
+		}
 		directoryEvidence, err := persistReviewerDirectoryVerification(
 			ctx,
 			transaction,
@@ -921,6 +957,11 @@ func (repository *EntityRepository) CreateReviewPerson(ctx context.Context, inpu
 		)
 		if err != nil {
 			return err
+		}
+		if _, err := loadEffectiveDecision(ctx, transaction, input.ProposalID); err == nil {
+			return fmt.Errorf("create review person for proposal %q: proposal already has an effective decision", input.ProposalID)
+		} else if err != pgx.ErrNoRows {
+			return fmt.Errorf("load effective resolution decision for proposal %q: %w", input.ProposalID, err)
 		}
 		recordedAt := directoryDatabaseTime(time.Now().UTC())
 		if err := transaction.QueryRow(ctx, `
@@ -1047,7 +1088,15 @@ func persistReviewerDirectoryVerification(
 		exactProfile.Profile.Provider,
 		exactProfile.Profile.SubjectID,
 	); err != nil {
-		return nil, fmt.Errorf("create review person: lock provider identity")
+		return nil, fmt.Errorf("create review person: lock directory authority")
+	}
+	emailOwners, err := loadCurrentAcceptedEmailOwners(
+		ctx,
+		transaction,
+		email,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create review person: load accepted email authority")
 	}
 	providerOwners, err := loadTriggerEffectiveDirectoryIdentityOwners(
 		ctx,
@@ -1066,6 +1115,14 @@ func persistReviewerDirectoryVerification(
 		!verification.Evaluation.CreatePerson ||
 		verification.Evaluation.EntityID != "" ||
 		verification.Evaluation.Profile == nil {
+		return nil, nil
+	}
+	postLockEntityID, createPerson, conflict := automaticDirectoryEntity(
+		verification.Evaluation,
+		emailOwners,
+		providerOwners,
+	)
+	if conflict || !createPerson || postLockEntityID != "" {
 		return nil, nil
 	}
 	evaluatedProfile, err := findStoredDirectoryProfile(

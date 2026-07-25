@@ -3,6 +3,7 @@ package directory
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -16,6 +17,7 @@ const (
 	directoryEnrichmentSpanName = "stacks.directory.enrich"
 	directoryLookupDecisionName = "directory_lookup"
 	directoryInstrumentation    = "stacks"
+	reviewerDirectoryProvider   = "google_people"
 )
 
 // Summary contains only bounded directory enrichment counts suitable for
@@ -39,6 +41,156 @@ type ReviewerVerification struct {
 	AttemptCount int
 	RecordedAt   time.Time
 	RetryAfter   *time.Time
+}
+
+// ValidForEmail reports whether a nil-error verifier result is complete enough
+// to cross the durable reviewer boundary. Invalid metadata is intentionally
+// fail-soft: the explicit reviewer decision remains authoritative without
+// directory evidence.
+func (verification ReviewerVerification) ValidForEmail(email string) bool {
+	normalizedEmail := entity.NormalizeEmail(email)
+	if !entity.ValidEmail(normalizedEmail) ||
+		verification.Query.Kind != entity.DirectoryQueryEmail ||
+		entity.NormalizeEmail(verification.Query.Email) != normalizedEmail ||
+		entity.NormalizeName(verification.Query.Name) != "" ||
+		verification.Query.EmailEvidence != entity.EmailEvidenceReviewerSupplied ||
+		verification.RecordedAt.IsZero() ||
+		verification.AttemptCount < 0 ||
+		!boundedDirectoryOutcome(verification.Lookup.Outcome) ||
+		verification.Evaluation.Outcome != verification.Lookup.Outcome ||
+		verification.Lookup.RetryAfter < 0 ||
+		(verification.RetryAfter != nil && verification.RetryAfter.IsZero()) {
+		return false
+	}
+	if retryableDirectoryOutcome(verification.Lookup.Outcome) {
+		if verification.RetryAfter == nil {
+			return false
+		}
+	} else if verification.RetryAfter != nil {
+		return false
+	}
+	for _, profile := range verification.Lookup.Profiles {
+		if !validReviewerDirectoryProfile(profile) {
+			return false
+		}
+	}
+
+	switch verification.Lookup.Outcome {
+	case entity.DirectoryMatched:
+		return validMatchedReviewerVerification(normalizedEmail, verification)
+	case entity.DirectoryAmbiguous, entity.DirectoryReview:
+		return len(verification.Lookup.Profiles) > 0 &&
+			len(verification.Evaluation.Candidates) > 0 &&
+			verification.Evaluation.EntityID == "" &&
+			!verification.Evaluation.CreatePerson &&
+			verification.Evaluation.AcceptedEmail == "" &&
+			verification.Evaluation.Profile == nil
+	default:
+		return len(verification.Lookup.Profiles) == 0 &&
+			verification.Evaluation.EntityID == "" &&
+			!verification.Evaluation.CreatePerson &&
+			verification.Evaluation.AcceptedEmail == "" &&
+			verification.Evaluation.Profile == nil &&
+			len(verification.Evaluation.Candidates) == 0
+	}
+}
+
+func validMatchedReviewerVerification(
+	email string,
+	verification ReviewerVerification,
+) bool {
+	if len(verification.Lookup.Profiles) == 0 ||
+		verification.Evaluation.Profile == nil ||
+		entity.NormalizeEmail(verification.Evaluation.AcceptedEmail) != email ||
+		(verification.Evaluation.CreatePerson &&
+			verification.Evaluation.EntityID != "") ||
+		(!verification.Evaluation.CreatePerson &&
+			strings.TrimSpace(verification.Evaluation.EntityID) == "") ||
+		len(verification.Evaluation.Candidates) != 0 {
+		return false
+	}
+	evaluated := *verification.Evaluation.Profile
+	if !validReviewerDirectoryProfile(evaluated) ||
+		evaluated.Source != entity.DirectorySourceDomainProfile ||
+		!reviewerDirectoryProfileHasEmail(evaluated, email) {
+		return false
+	}
+	for _, profile := range verification.Lookup.Profiles {
+		if sameReviewerDirectoryProfile(profile, evaluated) {
+			return true
+		}
+	}
+	return false
+}
+
+func validReviewerDirectoryProfile(profile entity.DirectoryProfile) bool {
+	if strings.TrimSpace(profile.Provider) != reviewerDirectoryProvider ||
+		strings.TrimSpace(profile.SubjectID) == "" ||
+		strings.TrimSpace(profile.DisplayName) == "" ||
+		len(profile.Emails) == 0 {
+		return false
+	}
+	switch profile.Source {
+	case entity.DirectorySourceDomainProfile, entity.DirectorySourceDomainContact:
+	default:
+		return false
+	}
+	for _, email := range profile.Emails {
+		if !entity.ValidEmail(entity.NormalizeEmail(email.Value)) {
+			return false
+		}
+	}
+	return true
+}
+
+func reviewerDirectoryProfileHasEmail(
+	profile entity.DirectoryProfile,
+	email string,
+) bool {
+	for _, candidate := range profile.Emails {
+		if entity.NormalizeEmail(candidate.Value) == email {
+			return true
+		}
+	}
+	return false
+}
+
+func sameReviewerDirectoryProfile(
+	left entity.DirectoryProfile,
+	right entity.DirectoryProfile,
+) bool {
+	if strings.TrimSpace(left.Provider) != strings.TrimSpace(right.Provider) ||
+		strings.TrimSpace(left.SubjectID) != strings.TrimSpace(right.SubjectID) ||
+		left.Source != right.Source ||
+		strings.TrimSpace(left.DisplayName) != strings.TrimSpace(right.DisplayName) ||
+		!left.ObservedAt.UTC().Truncate(time.Microsecond).Equal(
+			right.ObservedAt.UTC().Truncate(time.Microsecond),
+		) {
+		return false
+	}
+	leftEmails := reviewerDirectoryEmails(left.Emails)
+	rightEmails := reviewerDirectoryEmails(right.Emails)
+	if len(leftEmails) != len(rightEmails) {
+		return false
+	}
+	for email, leftPrimary := range leftEmails {
+		if rightPrimary, found := rightEmails[email]; !found ||
+			rightPrimary != leftPrimary {
+			return false
+		}
+	}
+	return true
+}
+
+func reviewerDirectoryEmails(
+	emails []entity.DirectoryEmail,
+) map[string]bool {
+	result := make(map[string]bool, len(emails))
+	for _, email := range emails {
+		value := entity.NormalizeEmail(email.Value)
+		result[value] = result[value] || email.Primary
+	}
+	return result
 }
 
 // DecisionRecorder records one bounded operational decision without receiving

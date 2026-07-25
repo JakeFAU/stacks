@@ -316,15 +316,30 @@ func (repository *DirectoryRepository) Persist(ctx context.Context, input direct
 }
 
 func lockDirectoryProposal(ctx context.Context, transaction pgx.Tx, proposalID string) error {
+	if err := lockResolutionProposal(ctx, transaction, proposalID); err != nil {
+		return fmt.Errorf("persist directory lookup: %w", err)
+	}
+	return nil
+}
+
+// Identity mutations use one global lock order: proposal row, then sorted
+// email/provider advisory authority, then effective decision row. Callers may
+// inspect immutable decision evidence before the advisory locks, but must not
+// lock a decision row before them.
+func lockResolutionProposal(
+	ctx context.Context,
+	transaction pgx.Tx,
+	proposalID string,
+) error {
 	var locked bool
 	if err := transaction.QueryRow(ctx, `
 		SELECT true
 		FROM stacks.resolution_proposals
 		WHERE id = $1
 		FOR UPDATE`, proposalID).Scan(&locked); err == pgx.ErrNoRows {
-		return fmt.Errorf("persist directory lookup: proposal does not exist")
+		return fmt.Errorf("resolution proposal does not exist")
 	} else if err != nil {
-		return fmt.Errorf("persist directory lookup: lock proposal: %w", err)
+		return fmt.Errorf("lock resolution proposal: %w", err)
 	}
 	return nil
 }
@@ -788,17 +803,61 @@ func lockDirectoryAuthority(
 	provider string,
 	subject string,
 ) error {
-	locks := []directoryAuthorityLock{
-		{namespace: "directory_email", key: email},
-		{namespace: provider, key: subject},
+	var locks []directoryAuthorityLock
+	if email = entity.NormalizeEmail(email); email != "" {
+		locks = append(locks, directoryAuthorityLock{
+			namespace: "directory_email",
+			key:       email,
+		})
 	}
+	provider = strings.TrimSpace(provider)
+	subject = strings.TrimSpace(subject)
+	if (provider == "") != (subject == "") {
+		return fmt.Errorf("persist directory lookup: provider authority is incomplete")
+	}
+	if provider != "" {
+		locks = append(locks, directoryAuthorityLock{
+			namespace: provider,
+			key:       subject,
+		})
+	}
+	return acquireDirectoryAuthorityLocks(ctx, transaction, locks)
+}
+
+func lockDirectoryEmailAuthorities(
+	ctx context.Context,
+	transaction pgx.Tx,
+	emails []string,
+) error {
+	locks := make([]directoryAuthorityLock, 0, len(emails))
+	for _, email := range emails {
+		normalized := entity.NormalizeEmail(email)
+		if normalized == "" {
+			continue
+		}
+		locks = append(locks, directoryAuthorityLock{
+			namespace: "directory_email",
+			key:       normalized,
+		})
+	}
+	return acquireDirectoryAuthorityLocks(ctx, transaction, locks)
+}
+
+func acquireDirectoryAuthorityLocks(
+	ctx context.Context,
+	transaction pgx.Tx,
+	locks []directoryAuthorityLock,
+) error {
 	sort.Slice(locks, func(left, right int) bool {
 		if locks[left].namespace == locks[right].namespace {
 			return locks[left].key < locks[right].key
 		}
 		return locks[left].namespace < locks[right].namespace
 	})
-	for _, lock := range locks {
+	for index, lock := range locks {
+		if index > 0 && lock == locks[index-1] {
+			continue
+		}
 		if _, err := transaction.Exec(ctx, `
 			SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
 			lock.namespace,

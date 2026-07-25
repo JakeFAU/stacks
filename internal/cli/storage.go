@@ -168,8 +168,7 @@ func verifyReviewerEmail(
 	}
 	verification, err := verifier.VerifyReviewerEmail(ctx, email)
 	if err == nil {
-		if verification.RecordedAt.IsZero() &&
-			verification.Evaluation.Outcome != "" {
+		if !verification.ValidForEmail(email) {
 			return nil, nil
 		}
 		return &verification, nil

@@ -600,6 +600,162 @@ func TestDirectoryReviewCorrectionCopiesEvidenceAndSupersedesAuthority(t *testin
 	assertSnapshotAlias(t, snapshots, second.ID, mention.NormalizedName, true)
 }
 
+func TestDirectoryReviewCorrectionAndPersistUseOneAuthorityLockOrder(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, mention := createDirectoryPendingMentionFixture(t, pool, "review-correction-lock-order")
+	profile := syntheticDirectoryProfile(
+		"review-correction-lock-order-"+mention.MentionID,
+		mention.ProposedEmail,
+		time.Time{},
+	)
+	snapshotID := persistDirectoryNameCandidateForReview(t, pool, mention, profile)
+	entityRepository := NewEntityRepository(pool)
+	first, err := entityRepository.CreateEntity(ctx, EntityInput{
+		ID:          uuid.NewString(),
+		Kind:        string(entity.KindPerson),
+		DisplayName: "Synthetic Lock Order Owner A",
+	})
+	if err != nil {
+		t.Fatalf("create first lock-order owner: %v", err)
+	}
+	second, err := entityRepository.CreateEntity(ctx, EntityInput{
+		ID:          uuid.NewString(),
+		Kind:        string(entity.KindPerson),
+		DisplayName: "Synthetic Lock Order Owner B",
+	})
+	if err != nil {
+		t.Fatalf("create second lock-order owner: %v", err)
+	}
+	_, accepted, err := entityRepository.AcceptDirectoryCandidate(ctx, AcceptDirectoryInput{
+		ProposalID:         mention.ProposalID,
+		DirectoryProfileID: snapshotID,
+		EntityID:           first.ID,
+	})
+	if err != nil {
+		t.Fatalf("accept lock-order directory candidate: %v", err)
+	}
+
+	persistRepository := NewDirectoryRepository(pool)
+	persistLocked := make(chan struct{})
+	releasePersist := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releasePersist) })
+	}
+	defer release()
+	persistRepository.testHooks.afterAuthorityLocks = func() error {
+		close(persistLocked)
+		<-releasePersist
+		return nil
+	}
+	type persistCallResult struct {
+		result directory.PersistResult
+		err    error
+	}
+	persistResult := make(chan persistCallResult, 1)
+	go func() {
+		result, callErr := persistRepository.Persist(
+			ctx,
+			matchedDirectoryPersistInput(
+				mention,
+				profile,
+				time.Date(2026, time.July, 24, 13, 0, 0, 0, time.UTC),
+			),
+		)
+		persistResult <- persistCallResult{result: result, err: callErr}
+	}()
+	<-persistLocked
+
+	applicationName := "stacks-correction-lock-order-" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	correctionPool := openNamedIntegrationDatabase(t, pool, applicationName)
+	type correctionCallResult struct {
+		decision ResolutionDecision
+		err      error
+	}
+	correctionResult := make(chan correctionCallResult, 1)
+	correctionDone := make(chan struct{})
+	go func() {
+		defer close(correctionDone)
+		decision, callErr := NewEntityRepository(correctionPool).CorrectReviewDecision(
+			ctx,
+			accepted.ID,
+			ResolutionDecisionInput{
+				Outcome:  ResolutionOutcomeAccepted,
+				EntityID: second.ID,
+			},
+		)
+		correctionResult <- correctionCallResult{decision: decision, err: callErr}
+	}()
+	if !waitForNamedBackendLockOrCompletion(
+		t,
+		pool,
+		applicationName,
+		correctionDone,
+	) {
+		release()
+		<-persistResult
+		correction := <-correctionResult
+		t.Fatalf("correction completed before lock-order boundary: %v", correction.err)
+	}
+	release()
+
+	persisted := <-persistResult
+	correction := <-correctionResult
+	if persisted.err != nil || correction.err != nil {
+		t.Fatalf(
+			"ordered persistence/correction errors = %v / %v, want both complete",
+			persisted.err,
+			correction.err,
+		)
+	}
+	if correction.decision.SupersedesID != accepted.ID ||
+		correction.decision.EntityID != second.ID {
+		t.Fatalf(
+			"ordered correction = %#v, want replacement of %q for %q",
+			correction.decision,
+			accepted.ID,
+			second.ID,
+		)
+	}
+	var history, effectiveDecisions, effectiveProviderOwners int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*)
+		     FROM stacks.resolution_decisions
+		     WHERE proposal_id = $1),
+		    (SELECT count(*)
+		     FROM stacks.resolution_decisions
+		     WHERE proposal_id = $1
+		       AND superseded_by_id IS NULL),
+		    (SELECT count(DISTINCT assertion.entity_id)
+		     FROM stacks.entity_directory_identity_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision
+		       ON decision.id = assertion.decision_id
+		     WHERE assertion.provider = $2
+		       AND assertion.provider_subject_id = $3
+		       AND assertion.entity_id = $4
+		       AND decision.superseded_by_id IS NULL
+		       AND decision.currently_admissible)`,
+		mention.ProposalID,
+		profile.Provider,
+		profile.SubjectID,
+		second.ID,
+	).Scan(&history, &effectiveDecisions, &effectiveProviderOwners); err != nil {
+		t.Fatalf("load lock-order integrity: %v", err)
+	}
+	if history != 2 || effectiveDecisions != 1 || effectiveProviderOwners != 1 {
+		t.Fatalf(
+			"lock-order history/effective decisions/provider owners = %d/%d/%d, want 2/1/1",
+			history,
+			effectiveDecisions,
+			effectiveProviderOwners,
+		)
+	}
+}
+
 func TestDirectoryReviewerEmailVerificationAddsProviderEvidence(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
@@ -697,6 +853,304 @@ func TestDirectoryReviewerEmailVerificationAddsProviderEvidence(t *testing.T) {
 			nameAliases,
 			emailAliases,
 			emailEvidence,
+		)
+	}
+}
+
+func TestDirectoryReviewerEmailConcurrentAcceptedOwnerDowngradesStaleMatch(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	email := "stale.reviewer." + strings.ReplaceAll(uuid.NewString(), "-", "") + "@synthetic.example"
+	_, ownerMention := createDirectoryPendingMentionFixtureWithEmail(
+		t,
+		pool,
+		"reviewer-email-stale-owner",
+		email,
+	)
+	ownerProfile := syntheticDirectoryProfile(
+		"reviewer-email-stale-owner-"+ownerMention.MentionID,
+		email,
+		time.Time{},
+	)
+	_, reviewerMention := createDirectoryPendingMentionFixtureWithEmail(
+		t,
+		pool,
+		"reviewer-email-stale-explicit",
+		email,
+	)
+	reviewerProfile := syntheticDirectoryProfile(
+		"reviewer-email-stale-explicit-"+reviewerMention.MentionID,
+		email,
+		time.Time{},
+	)
+	staleVerification := matchedReviewerVerification(email, reviewerProfile)
+
+	ownerRepository := NewDirectoryRepository(pool)
+	ownerLocked := make(chan struct{})
+	releaseOwner := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseOwner) })
+	}
+	defer release()
+	ownerRepository.testHooks.afterAuthorityLocks = func() error {
+		close(ownerLocked)
+		<-releaseOwner
+		return nil
+	}
+	type ownerCallResult struct {
+		result directory.PersistResult
+		err    error
+	}
+	ownerResult := make(chan ownerCallResult, 1)
+	go func() {
+		result, callErr := ownerRepository.Persist(
+			ctx,
+			matchedDirectoryPersistInput(
+				ownerMention,
+				ownerProfile,
+				time.Date(2026, time.July, 24, 13, 0, 0, 0, time.UTC),
+			),
+		)
+		ownerResult <- ownerCallResult{result: result, err: callErr}
+	}()
+	<-ownerLocked
+
+	applicationName := "stacks-reviewer-stale-" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	reviewerPool := openNamedIntegrationDatabase(t, pool, applicationName)
+	type reviewerCallResult struct {
+		storedEntity Entity
+		decision     ResolutionDecision
+		err          error
+	}
+	reviewerResult := make(chan reviewerCallResult, 1)
+	reviewerDone := make(chan struct{})
+	go func() {
+		defer close(reviewerDone)
+		storedEntity, decision, callErr := NewEntityRepository(reviewerPool).CreateReviewPerson(
+			ctx,
+			CreateReviewPersonInput{
+				ProposalID:  reviewerMention.ProposalID,
+				EntityID:    uuid.NewString(),
+				Kind:        string(entity.KindPerson),
+				DisplayName: "Synthetic Explicit Reviewer Person",
+				Aliases: []AliasInput{
+					{
+						NormalizedValue: reviewerMention.NormalizedName,
+						Type:            string(entity.AliasTypeName),
+					},
+					{
+						NormalizedValue: email,
+						Type:            string(entity.AliasTypeEmail),
+					},
+				},
+				DirectoryVerification: &staleVerification,
+			},
+		)
+		reviewerResult <- reviewerCallResult{
+			storedEntity: storedEntity,
+			decision:     decision,
+			err:          callErr,
+		}
+	}()
+	if !waitForNamedBackendLockOrCompletion(
+		t,
+		pool,
+		applicationName,
+		reviewerDone,
+	) {
+		release()
+		owner := <-ownerResult
+		reviewer := <-reviewerResult
+		t.Fatalf(
+			"stale reviewer write completed before accepted-email authority committed: owner=%v reviewer=%v",
+			owner.err,
+			reviewer.err,
+		)
+	}
+	release()
+
+	owner := <-ownerResult
+	reviewer := <-reviewerResult
+	if owner.err != nil || reviewer.err != nil {
+		t.Fatalf(
+			"concurrent owner/reviewer errors = %v / %v, want additive completion",
+			owner.err,
+			reviewer.err,
+		)
+	}
+	if !owner.result.AutoResolved ||
+		owner.result.EntityID == "" ||
+		reviewer.storedEntity.ID == "" ||
+		reviewer.decision.Outcome != ResolutionOutcomeCreated ||
+		reviewer.decision.EntityID != reviewer.storedEntity.ID ||
+		reviewer.storedEntity.ID == owner.result.EntityID {
+		t.Fatalf(
+			"concurrent owner/reviewer results = %#v / entity %#v decision %#v, want distinct accepted and explicit entities",
+			owner.result,
+			reviewer.storedEntity,
+			reviewer.decision,
+		)
+	}
+
+	var reviewerAttempts, reviewerMatches, reviewerProviderAssertions int
+	var ownerProviderOwners, staleProviderOwners, emailOwners int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*)
+		     FROM stacks.directory_lookup_attempts
+		     WHERE mention_id = $1),
+		    (SELECT count(*)
+		     FROM stacks.directory_lookup_matches AS match
+		     JOIN stacks.directory_lookup_attempts AS attempt
+		       ON attempt.id = match.lookup_attempt_id
+		     WHERE attempt.mention_id = $1),
+		    (SELECT count(*)
+		     FROM stacks.entity_directory_identity_assertions
+		     WHERE decision_id = $2),
+		    (SELECT count(DISTINCT assertion.entity_id)
+		     FROM stacks.entity_directory_identity_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision
+		       ON decision.id = assertion.decision_id
+		     WHERE assertion.provider = $3
+		       AND assertion.provider_subject_id = $4
+		       AND decision.superseded_by_id IS NULL
+		       AND decision.currently_admissible),
+		    (SELECT count(DISTINCT assertion.entity_id)
+		     FROM stacks.entity_directory_identity_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision
+		       ON decision.id = assertion.decision_id
+		     WHERE assertion.provider = $3
+		       AND assertion.provider_subject_id = $5
+		       AND decision.superseded_by_id IS NULL
+		       AND decision.currently_admissible),
+		    (SELECT count(DISTINCT assertion.entity_id)
+		     FROM stacks.entity_alias_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision
+		       ON decision.id = assertion.decision_id
+		     WHERE assertion.alias_type = 'email'
+		       AND assertion.normalized_value = $6
+		       AND decision.superseded_by_id IS NULL
+		       AND decision.currently_admissible)`,
+		reviewerMention.MentionID,
+		reviewer.decision.ID,
+		ownerProfile.Provider,
+		ownerProfile.SubjectID,
+		reviewerProfile.SubjectID,
+		email,
+	).Scan(
+		&reviewerAttempts,
+		&reviewerMatches,
+		&reviewerProviderAssertions,
+		&ownerProviderOwners,
+		&staleProviderOwners,
+		&emailOwners,
+	); err != nil {
+		t.Fatalf("load stale reviewer authority result: %v", err)
+	}
+	if reviewerAttempts != 1 ||
+		reviewerMatches != 1 ||
+		reviewerProviderAssertions != 0 ||
+		ownerProviderOwners != 1 ||
+		staleProviderOwners != 0 ||
+		emailOwners != 2 {
+		t.Fatalf(
+			"stale reviewer attempts/matches/assertions/owner provider/stale provider/email owners = %d/%d/%d/%d/%d/%d, want 1/1/0/1/0/2",
+			reviewerAttempts,
+			reviewerMatches,
+			reviewerProviderAssertions,
+			ownerProviderOwners,
+			staleProviderOwners,
+			emailOwners,
+		)
+	}
+}
+
+func TestCreateReviewPersonParticipatesInAcceptedEmailAuthorityLock(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	email := "reviewer.email.lock." + strings.ReplaceAll(uuid.NewString(), "-", "") + "@synthetic.example"
+	_, mention := createDirectoryPendingMentionFixtureWithEmail(
+		t,
+		pool,
+		"reviewer-email-authority-lock",
+		email,
+	)
+	authorityTransaction, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin accepted-email authority transaction: %v", err)
+	}
+	defer authorityTransaction.Rollback(context.Background()) //nolint:errcheck // committed transactions are already closed.
+	if _, err := authorityTransaction.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(
+			hashtext('directory_email'),
+			hashtext($1)
+		)`,
+		email,
+	); err != nil {
+		t.Fatalf("hold accepted-email authority lock: %v", err)
+	}
+
+	applicationName := "stacks-reviewer-email-lock-" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	reviewerPool := openNamedIntegrationDatabase(t, pool, applicationName)
+	type createCallResult struct {
+		storedEntity Entity
+		decision     ResolutionDecision
+		err          error
+	}
+	result := make(chan createCallResult, 1)
+	completed := make(chan struct{})
+	go func() {
+		defer close(completed)
+		storedEntity, decision, callErr := NewEntityRepository(reviewerPool).CreateReviewPerson(
+			ctx,
+			CreateReviewPersonInput{
+				ProposalID:  mention.ProposalID,
+				EntityID:    uuid.NewString(),
+				Kind:        string(entity.KindPerson),
+				DisplayName: "Synthetic Email Lock Reviewer",
+				Aliases: []AliasInput{{
+					NormalizedValue: email,
+					Type:            string(entity.AliasTypeEmail),
+				}},
+			},
+		)
+		result <- createCallResult{
+			storedEntity: storedEntity,
+			decision:     decision,
+			err:          callErr,
+		}
+	}()
+	if !waitForNamedBackendLockOrCompletion(
+		t,
+		pool,
+		applicationName,
+		completed,
+	) {
+		_ = authorityTransaction.Rollback(context.Background())
+		created := <-result
+		t.Fatalf(
+			"explicit email creation bypassed accepted-email authority lock: %v",
+			created.err,
+		)
+	}
+	if err := authorityTransaction.Commit(ctx); err != nil {
+		t.Fatalf("release accepted-email authority lock: %v", err)
+	}
+	created := <-result
+	if created.err != nil ||
+		created.storedEntity.ID == "" ||
+		created.decision.EntityID != created.storedEntity.ID ||
+		created.decision.Outcome != ResolutionOutcomeCreated {
+		t.Fatalf(
+			"explicit email creation after authority lock = entity %#v decision %#v error %v, want created",
+			created.storedEntity,
+			created.decision,
+			created.err,
 		)
 	}
 }
@@ -4581,6 +5035,59 @@ func openIntegrationDatabaseFromEnvironment(t *testing.T, environmentVariable st
 	}
 	t.Cleanup(pool.Close)
 	return pool
+}
+
+func openNamedIntegrationDatabase(
+	t *testing.T,
+	base *pgxpool.Pool,
+	applicationName string,
+) *pgxpool.Pool {
+	t.Helper()
+	config := base.Config().Copy()
+	config.MaxConns = 1
+	config.MinConns = 0
+	config.ConnConfig.RuntimeParams["application_name"] = applicationName
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatalf("open named integration database: %v", err)
+	}
+	if err := pool.Ping(context.Background()); err != nil {
+		pool.Close()
+		t.Fatalf("ping named integration database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+func waitForNamedBackendLockOrCompletion(
+	t *testing.T,
+	observer *pgxpool.Pool,
+	applicationName string,
+	completed <-chan struct{},
+) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for {
+		select {
+		case <-completed:
+			return false
+		default:
+		}
+		var waiting bool
+		err := observer.QueryRow(ctx, `
+			SELECT COALESCE(bool_or(wait_event_type = 'Lock'), false)
+			FROM pg_stat_activity
+			WHERE application_name = $1`,
+			applicationName,
+		).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("inspect named backend lock state: %v", err)
+		}
+		if waiting {
+			return true
+		}
+	}
 }
 
 func createSyntheticMention(t *testing.T, pool *pgxpool.Pool) string {
