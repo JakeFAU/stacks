@@ -1,4 +1,6 @@
-package query
+// Package temporal provides deterministic temporal planning, aggregation, and
+// comparison over canonical observations.
+package temporal
 
 import (
 	"fmt"
@@ -41,11 +43,7 @@ func At(label string, instant time.Time) (TemporalSelection, error) {
 	if instant.IsZero() {
 		return TemporalSelection{}, fmt.Errorf("temporal selection instant is required")
 	}
-	return TemporalSelection{
-		kind:  SelectionPoint,
-		label: label,
-		start: instant.UTC(),
-	}, nil
+	return TemporalSelection{kind: SelectionPoint, label: label, start: instant.UTC()}, nil
 }
 
 // Between selects the half-open valid-time window [start, end).
@@ -103,7 +101,7 @@ type KnowledgeScope struct {
 	asOf time.Time
 }
 
-// CurrentKnowledge uses all observations currently known to Stacks.
+// CurrentKnowledge uses all observations currently known.
 func CurrentKnowledge() KnowledgeScope {
 	return KnowledgeScope{kind: KnowledgeCurrent}
 }
@@ -147,8 +145,7 @@ type PlanInput struct {
 	KnowledgeScope KnowledgeScope
 }
 
-// Plan is the validated contract consumed by temporal retrieval. It contains
-// no raw user query and requires no interpretation from the narrator.
+// Plan is the validated contract consumed by temporal retrieval.
 type Plan struct {
 	intent         Intent
 	entityIDs      []string
@@ -172,7 +169,6 @@ func NewPlan(input PlanInput) (Plan, error) {
 	if input.KnowledgeScope.kind != KnowledgeCurrent && input.KnowledgeScope.kind != KnowledgeAsOf {
 		return Plan{}, fmt.Errorf("query knowledge scope is invalid")
 	}
-
 	return Plan{
 		intent:         input.Intent,
 		entityIDs:      entityIDs,
@@ -206,7 +202,6 @@ func validateSelections(intent Intent, selections []TemporalSelection) error {
 	if intent == IntentTrendComparison && !selections[1].start.After(selections[0].start) {
 		return fmt.Errorf("trend comparison windows must be ordered by start time")
 	}
-
 	seenLabels := make(map[string]struct{}, len(selections))
 	for _, selection := range selections {
 		if selection.kind != wantKind {
@@ -244,7 +239,6 @@ func normalizeUniqueStrings(name string, values []string) ([]string, error) {
 	if len(values) == 0 {
 		return nil, fmt.Errorf("%s is required", name)
 	}
-
 	normalized := make([]string, len(values))
 	seen := make(map[string]struct{}, len(values))
 	for index, value := range values {
