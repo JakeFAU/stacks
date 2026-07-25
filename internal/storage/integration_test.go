@@ -19,6 +19,7 @@ import (
 	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	analysisdomain "stacks/internal/analysis"
@@ -4967,6 +4968,40 @@ func TestCompleteObservationAcceptsExactCanonicalRetry(t *testing.T) {
 	}
 }
 
+func TestCompleteObservationRejectsInadmissibleOwningRunWithoutGraphWrites(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, spanID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-inadmissible-owning-run")))
+	if _, err := pool.Exec(ctx, `UPDATE stacks.extraction_runs SET currently_admissible = false WHERE id = $1`, run.ID); err != nil {
+		t.Fatalf("mark synthetic run inadmissible: %v", err)
+	}
+	value := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	signal := &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(value.ID()), Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+	}
+	_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, signal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
+	if !errors.Is(err, ErrObservationCompatibility) || strings.Contains(err.Error(), "synthetic") {
+		t.Fatalf("inadmissible run error = %v", err)
+	}
+	for _, testCase := range []struct {
+		name  string
+		query string
+		id    string
+	}{
+		{name: "observation", query: `SELECT count(*) FROM stacks.observations WHERE id = $1`, id: string(value.ID())},
+		{name: "observation_evidence", query: `SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, id: string(value.ID())},
+		{name: "signal", query: `SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, id: signal.ID},
+		{name: "signal_evidence", query: `SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, id: signal.ID},
+	} {
+		if got := countRows(t, pool, testCase.query, testCase.id); got != 0 {
+			t.Fatalf("%s writes = %d, want 0", testCase.name, got)
+		}
+	}
+}
+
 func TestCompleteObservationRejectsEveryDigestExcludedDifference(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
@@ -5104,7 +5139,9 @@ func TestCompleteObservationRejectsDifferentIDWithSameDigest(t *testing.T) {
 		t.Fatalf("complete first observation: %v", err)
 	}
 	second := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
-	if _, _, err := graph.CompleteObservation(ctx, second, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, nil, nil); !errors.Is(err, ErrObservationConflict) {
+	_, _, err := graph.CompleteObservation(ctx, second, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, nil, nil)
+	var databaseError *pgconn.PgError
+	if !errors.Is(err, ErrObservationConflict) || !errors.As(err, &databaseError) || strings.Contains(err.Error(), databaseError.Message) {
 		t.Fatalf("same-digest error = %v, want ErrObservationConflict", err)
 	}
 }
@@ -5240,12 +5277,27 @@ func TestCompleteObservationRejectsNotesOnlySignalEvidence(t *testing.T) {
 	graph := NewGraphRepository(pool)
 	run := testOwningExtractionRun(t, pool, version)
 	canonicalObservation := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), storedSpan.ID)
-	_, _, err = graph.CompleteObservation(ctx, canonicalObservation, []knowledge.EvidenceID{knowledge.EvidenceID(storedSpan.ID)}, &SignalInput{
+	signal := &SignalInput{
 		ID: uuid.NewString(), ObservationID: string(canonicalObservation.ID()), Category: "delegation_autonomy", Direction: "strengthening",
 		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
-	}, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}})
+	}
+	_, _, err = graph.CompleteObservation(ctx, canonicalObservation, []knowledge.EvidenceID{knowledge.EvidenceID(storedSpan.ID)}, signal, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}})
 	if err == nil {
 		t.Fatal("notes-only signal completion succeeded")
+	}
+	for _, testCase := range []struct {
+		name  string
+		query string
+		id    string
+	}{
+		{name: "observation", query: `SELECT count(*) FROM stacks.observations WHERE id = $1`, id: string(canonicalObservation.ID())},
+		{name: "observation_evidence", query: `SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, id: string(canonicalObservation.ID())},
+		{name: "signal", query: `SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, id: signal.ID},
+		{name: "signal_evidence", query: `SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, id: signal.ID},
+	} {
+		if got := countRows(t, pool, testCase.query, testCase.id); got != 0 {
+			t.Fatalf("failed notes-only completion left %s rows = %d, want 0", testCase.name, got)
+		}
 	}
 }
 

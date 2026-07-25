@@ -231,6 +231,29 @@ func TestLoadLegacyObservationPreservesSignalVertical(t *testing.T) {
 	}
 }
 
+func TestLoadLegacyObservationRejectsSignalDigestMismatchPrivately(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	fixture := createLegacyObservationFixture(t, pool)
+	observationID := uuid.NewString()
+	insertLegacyObservation(t, ctx, pool, legacyObservationInsert{
+		id: observationID, extractionRunID: fixture.extractionRunID, epistemicStatus: "inferred",
+	})
+	insertLegacySignal(t, ctx, pool, observationID, fixture.evidenceSpanID, fixture.runModelID, fixture.runPromptVersion)
+	corruptDigest := sha256.Sum256([]byte("private signal digest corruption " + observationID))
+	if _, err := pool.Exec(ctx, `
+		UPDATE stacks.interaction_signals
+		SET digest = $2
+		WHERE observation_id = $1`, observationID, corruptDigest[:]); err != nil {
+		t.Fatalf("corrupt stored signal digest: %v", err)
+	}
+	_, err := loadLegacyObservation(ctx, pool, observationID)
+	if !errors.Is(err, ErrObservationCompatibility) || !strings.Contains(err.Error(), "signal_digest_mismatch") ||
+		strings.Contains(err.Error(), "private signal digest corruption") {
+		t.Fatalf("signal digest corruption error = %v", err)
+	}
+}
+
 func TestLoadLegacyObservationPreservesHistoricalSignalDerivationMismatch(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
@@ -412,7 +435,18 @@ func updateLegacyObservationDigest(t *testing.T, ctx context.Context, pool *pgxp
 func insertLegacySignal(t *testing.T, ctx context.Context, pool *pgxpool.Pool, observationID, evidenceID, modelID, promptVersion string) [sha256.Size]byte {
 	t.Helper()
 	signalID := uuid.NewString()
-	digest := sha256.Sum256([]byte(signalID))
+	input := SignalInput{
+		ID: signalID, ObservationID: observationID, Category: "delegation_autonomy", Direction: "weakening",
+		ExtractionModelID: modelID, PromptVersion: promptVersion, Rationale: "Synthetic source-grounded rationale.", Confidence: 0.75,
+	}
+	evidence := []SignalEvidenceInput{
+		{EvidenceSpanID: evidenceID, Role: "supporting"},
+		{EvidenceSpanID: evidenceID, Role: "contradicting"},
+	}
+	digest, err := ComputeSignalDigest(input, evidence)
+	if err != nil {
+		t.Fatalf("compute legacy signal digest: %v", err)
+	}
 	transaction, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("start legacy signal transaction: %v", err)

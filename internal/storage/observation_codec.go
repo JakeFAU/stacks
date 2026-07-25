@@ -22,6 +22,7 @@ const legacyPostgresTimestampPrecision = time.Microsecond
 const (
 	reasonObservationOriginMismatch        = "observation_origin_mismatch"
 	reasonObservationDigestMismatch        = "observation_digest_mismatch"
+	reasonSignalDigestMismatch             = "signal_digest_mismatch"
 	reasonConfidenceScaleNotRepresentable  = "confidence_scale_not_representable"
 	reasonRecordedAtNotRepresentable       = "recorded_at_not_representable"
 	reasonCompletionOwnerMismatch          = "completion_owner_mismatch"
@@ -32,6 +33,7 @@ const (
 	reasonLegacyDerivationNotRepresentable = "legacy_derivation_not_representable"
 	reasonEvidenceOwnershipMismatch        = "evidence_role_ownership_mismatch"
 	reasonOwningRunRequired                = "owning_run_required"
+	reasonOwningRunNotAdmissible           = "owning_run_not_admissible"
 	reasonOwningRunProvenanceMismatch      = "owning_run_provenance_mismatch"
 	reasonRecordedAtOwnerMismatch          = "recorded_at_owner_mismatch"
 	reasonLegacyUUIDNotRepresentable       = "legacy_uuid_not_representable"
@@ -111,6 +113,14 @@ type legacyObservationWrite struct {
 	Signal *legacySignalState
 }
 
+type legacyObservationPreflight struct {
+	subjectEntityID, subjectMentionID string
+	objectEntityID, objectMentionID   string
+	validStart, validEnd              *time.Time
+	confidence                        *float64
+	origin                            []evidence.EvidenceID
+}
+
 func decodeLegacyObservation(
 	row legacyObservationRow,
 	origin []evidence.EvidenceID,
@@ -187,36 +197,9 @@ func encodeLegacyObservation(
 	run *owningExtractionRun,
 	signal *legacySignalState,
 ) (legacyObservationWrite, error) {
-	if !legacyTimestampRepresentable(value.RecordedAt()) {
-		return legacyObservationWrite{}, newObservationBoundaryError(
-			ErrObservationNotRepresentable, reasonRecordedAtNotRepresentable, string(value.ID()),
-		)
-	}
-	if err := ensureLegacyValidTimePrecision(value.ValidTime(), value.ID()); err != nil {
+	preflight, err := preflightLegacyObservation(value, compatibility, signal)
+	if err != nil {
 		return legacyObservationWrite{}, err
-	}
-	if value.LegacyUncited() {
-		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUncitedNotRepresentable, string(value.ID()))
-	}
-	subjectEntityID, subjectMentionID, err := encodeLegacyTerm(value.Statement().Subject)
-	if err != nil {
-		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonTermNotRepresentable, string(value.ID()))
-	}
-	objectEntityID, objectMentionID, err := encodeLegacyTerm(value.Statement().Object)
-	if err != nil {
-		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonTermNotRepresentable, string(value.ID()))
-	}
-	validStart, validEnd, err := encodeLegacyValidTime(value.ValidTime())
-	if err != nil {
-		return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonValidTimeNotRepresentable, string(value.ID()))
-	}
-	var confidence *float64
-	if canonicalConfidence, ok := value.Confidence(); ok {
-		if canonicalConfidence.Scale() != observation.ConfidenceUnspecifiedLegacy {
-			return legacyObservationWrite{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonConfidenceScaleNotRepresentable, string(value.ID()))
-		}
-		confidenceValue := canonicalConfidence.Value()
-		confidence = &confidenceValue
 	}
 	if err := validateOwningRun(value, run); err != nil {
 		return legacyObservationWrite{}, err
@@ -224,20 +207,16 @@ func encodeLegacyObservation(
 	if err := validateActiveSignal(signal, run, value.ID()); err != nil {
 		return legacyObservationWrite{}, err
 	}
-	origin, err := legacyObservationOrigin(value, compatibility, signal)
-	if err != nil {
-		return legacyObservationWrite{}, err
-	}
 
 	write := legacyObservationWrite{
 		Row: legacyObservationRow{
-			ID: string(value.ID()), SubjectEntityID: subjectEntityID, ObjectEntityID: objectEntityID,
-			SubjectMentionID: subjectMentionID, ObjectMentionID: objectMentionID,
+			ID: string(value.ID()), SubjectEntityID: preflight.subjectEntityID, ObjectEntityID: preflight.objectEntityID,
+			SubjectMentionID: preflight.subjectMentionID, ObjectMentionID: preflight.objectMentionID,
 			Predicate: string(value.Statement().Predicate), Derivation: value.Derivation().Method,
-			EpistemicStatus: string(value.Status()), ValidStart: validStart, ValidEnd: validEnd,
-			RecordedAt: value.RecordedAt(), Confidence: confidence,
+			EpistemicStatus: string(value.Status()), ValidStart: preflight.validStart, ValidEnd: preflight.validEnd,
+			RecordedAt: value.RecordedAt(), Confidence: preflight.confidence,
 		},
-		Origin: origin, Signal: cloneLegacySignalState(signal),
+		Origin: preflight.origin, Signal: cloneLegacySignalState(signal),
 	}
 	if run != nil && value.Derivation().RunID != "" {
 		write.Row.ExtractionRunID = run.ID
@@ -251,6 +230,56 @@ func encodeLegacyObservation(
 	}
 	write.Row.Digest = digest
 	return write, nil
+}
+
+func preflightLegacyObservation(
+	value observation.Observation,
+	compatibility legacyObservationCompatibility,
+	signal *legacySignalState,
+) (legacyObservationPreflight, error) {
+	if !legacyTimestampRepresentable(value.RecordedAt()) {
+		return legacyObservationPreflight{}, newObservationBoundaryError(
+			ErrObservationNotRepresentable, reasonRecordedAtNotRepresentable, string(value.ID()),
+		)
+	}
+	if err := ensureLegacyValidTimePrecision(value.ValidTime(), value.ID()); err != nil {
+		return legacyObservationPreflight{}, err
+	}
+	if value.LegacyUncited() {
+		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonLegacyUncitedNotRepresentable, string(value.ID()))
+	}
+	subjectEntityID, subjectMentionID, err := encodeLegacyTerm(value.Statement().Subject)
+	if err != nil {
+		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonTermNotRepresentable, string(value.ID()))
+	}
+	objectEntityID, objectMentionID, err := encodeLegacyTerm(value.Statement().Object)
+	if err != nil {
+		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonTermNotRepresentable, string(value.ID()))
+	}
+	validStart, validEnd, err := encodeLegacyValidTime(value.ValidTime())
+	if err != nil {
+		return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonValidTimeNotRepresentable, string(value.ID()))
+	}
+	var confidence *float64
+	if canonicalConfidence, ok := value.Confidence(); ok {
+		if canonicalConfidence.Scale() != observation.ConfidenceUnspecifiedLegacy {
+			return legacyObservationPreflight{}, newObservationBoundaryError(ErrObservationNotRepresentable, reasonConfidenceScaleNotRepresentable, string(value.ID()))
+		}
+		confidenceValue := canonicalConfidence.Value()
+		confidence = &confidenceValue
+	}
+	if err := validateSignalObservationOwnership(signal, value.ID()); err != nil {
+		return legacyObservationPreflight{}, err
+	}
+	origin, err := legacyObservationOrigin(value, compatibility, signal)
+	if err != nil {
+		return legacyObservationPreflight{}, err
+	}
+	return legacyObservationPreflight{
+		subjectEntityID: subjectEntityID, subjectMentionID: subjectMentionID,
+		objectEntityID: objectEntityID, objectMentionID: objectMentionID,
+		validStart: validStart, validEnd: validEnd, confidence: confidence, origin: origin,
+	}, nil
 }
 
 func ensureLegacyValidTimePrecision(value observation.TemporalExtent, observationID observation.ObservationID) error {
@@ -391,11 +420,18 @@ func validateActiveSignal(signal *legacySignalState, run *owningExtractionRun, o
 	if signal == nil {
 		return nil
 	}
-	if signal.Input.ObservationID != string(observationID) {
-		return newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, string(observationID))
+	if err := validateSignalObservationOwnership(signal, observationID); err != nil {
+		return err
 	}
 	if signal.Input.ExtractionModelID != run.ModelID || signal.Input.PromptVersion != run.PromptVersion {
 		return newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunProvenanceMismatch, string(observationID))
+	}
+	return nil
+}
+
+func validateSignalObservationOwnership(signal *legacySignalState, observationID observation.ObservationID) error {
+	if signal != nil && signal.Input.ObservationID != string(observationID) {
+		return newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, string(observationID))
 	}
 	return nil
 }

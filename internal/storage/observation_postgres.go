@@ -35,6 +35,28 @@ type legacyObservationStorageOperationError struct {
 	cause         error
 }
 
+type observationConflictStorageError struct {
+	reason        string
+	observationID string
+	cause         error
+}
+
+func (err *observationConflictStorageError) Error() string {
+	return fmt.Sprintf("observation boundary %q: %s", err.observationID, err.reason)
+}
+
+func (err *observationConflictStorageError) Unwrap() []error {
+	return []error{ErrObservationConflict, err.cause}
+}
+
+func newObservationConflictStorageError(reason, observationID string, cause error) error {
+	canonicalID, err := canonicalUUID(observationID)
+	if err != nil {
+		canonicalID = unknownLegacyObservationOperationIdentifier
+	}
+	return &observationConflictStorageError{reason: reason, observationID: canonicalID, cause: cause}
+}
+
 func (err *legacyObservationStorageOperationError) Error() string {
 	return fmt.Sprintf("legacy observation storage %q: %s", err.observationID, err.reason)
 }
@@ -73,6 +95,14 @@ func loadLegacyObservation(
 		return decodedLegacyObservation{}, newObservationBoundaryError(
 			ErrObservationCompatibility, reasonObservationDigestMismatch, observationID,
 		)
+	}
+	if signal != nil {
+		expectedSignalDigest, err := ComputeSignalDigest(signal.Input, signal.Evidence)
+		if err != nil || expectedSignalDigest != signal.Digest {
+			return decodedLegacyObservation{}, newObservationBoundaryError(
+				ErrObservationCompatibility, reasonSignalDigestMismatch, observationID,
+			)
+		}
 	}
 	return decoded, nil
 }
@@ -247,7 +277,7 @@ func putLegacyObservation(
 	if err != nil {
 		var databaseError *pgconn.PgError
 		if errors.As(err, &databaseError) && databaseError.Code == "23505" {
-			return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, write.Row.ID)
+			return observation.Observation{}, nil, newObservationConflictStorageError(reasonCompletionWriteSetMismatch, write.Row.ID, databaseError)
 		}
 		return observation.Observation{}, nil, fmt.Errorf("persist legacy observation %q: %w", write.Row.ID, err)
 	}
@@ -265,7 +295,7 @@ func putLegacyObservation(
 		if err != nil {
 			var databaseError *pgconn.PgError
 			if errors.As(err, &databaseError) && databaseError.Code == "23505" {
-				return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, write.Row.ID)
+				return observation.Observation{}, nil, newObservationConflictStorageError(reasonCompletionWriteSetMismatch, write.Row.ID, databaseError)
 			}
 			return observation.Observation{}, nil, err
 		}

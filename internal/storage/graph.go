@@ -96,6 +96,10 @@ func (repository *GraphRepository) CompleteObservation(
 	if derivation.RunID == "" {
 		return observation.Observation{}, nil, newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, string(value.ID()))
 	}
+	compatibility := legacyObservationCompatibility{observationEvidenceOrigin: origin}
+	if _, err := preflightLegacyObservation(value, compatibility, state); err != nil {
+		return observation.Observation{}, nil, err
+	}
 
 	var stored observation.Observation
 	var storedSignal *InteractionSignal
@@ -104,7 +108,7 @@ func (repository *GraphRepository) CompleteObservation(
 		if err != nil {
 			return err
 		}
-		write, err := encodeLegacyObservation(value, legacyObservationCompatibility{observationEvidenceOrigin: origin}, run, state)
+		write, err := encodeLegacyObservation(value, compatibility, run, state)
 		if err != nil {
 			return err
 		}
@@ -141,6 +145,11 @@ func canonicalSignalState(
 	if len(links) == 0 {
 		return nil, fmt.Errorf("complete signal %q: evidence is required", input.ID)
 	}
+	for _, link := range links {
+		if !validSignalEvidenceRole(link.Role) {
+			return nil, fmt.Errorf("complete signal %q: evidence input is invalid", input.ID)
+		}
+	}
 	digest, err := ComputeSignalDigest(input, links)
 	if err != nil {
 		return nil, err
@@ -158,11 +167,11 @@ func loadOwningExtractionRun(
 	if err := transaction.QueryRow(ctx, `
 		SELECT id::text, model_id, prompt_version, recorded_at
 		FROM stacks.extraction_runs
-		WHERE id = $1`, runID).Scan(&run.ID, &run.ModelID, &run.PromptVersion, &run.RecordedAt); err != nil {
+		WHERE id = $1 AND currently_admissible`, runID).Scan(&run.ID, &run.ModelID, &run.PromptVersion, &run.RecordedAt); err != nil {
 		if err != pgx.ErrNoRows {
 			return nil, fmt.Errorf("load owning extraction run %q: %w", runID, err)
 		}
-		return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunRequired, string(observationID))
+		return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonOwningRunNotAdmissible, string(observationID))
 	}
 	return &run, nil
 }

@@ -186,6 +186,19 @@ func TestLegacyObservationCompatibilityShapes(t *testing.T) {
 		updateLegacyObservationDigest(t, ctx, pool, observationID, []knowledge.EvidenceID{knowledge.EvidenceID(fixture.evidenceSpanID)})
 
 		signalID := uuid.NewString()
+		signalInput := SignalInput{
+			ID: signalID, ObservationID: observationID, Category: "delegation_autonomy", Direction: "weakening",
+			ExtractionModelID: "synthetic-compatibility-model", PromptVersion: "compatibility-v1",
+			Rationale: "Synthetic source-grounded rationale.", Confidence: 0.75,
+		}
+		signalEvidence := []SignalEvidenceInput{
+			{EvidenceSpanID: fixture.evidenceSpanID, Role: "supporting"},
+			{EvidenceSpanID: fixture.evidenceSpanID, Role: "contradicting"},
+		}
+		signalDigest, err := ComputeSignalDigest(signalInput, signalEvidence)
+		if err != nil {
+			t.Fatalf("compute compatibility signal digest: %v", err)
+		}
 		transaction, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatalf("start legacy signal transaction: %v", err)
@@ -196,7 +209,7 @@ func TestLegacyObservationCompatibilityShapes(t *testing.T) {
 				(id, observation_id, category, direction, extraction_model_id, prompt_version, rationale, confidence, digest)
 			VALUES ($1, $2, 'delegation_autonomy', 'weakening', 'synthetic-compatibility-model',
 			        'compatibility-v1', 'Synthetic source-grounded rationale.', 0.75, $3)`,
-			signalID, observationID, legacyObservationDigest(signalID)); err != nil {
+			signalID, observationID, signalDigest[:]); err != nil {
 			t.Fatalf("insert legacy interaction signal: %v", err)
 		}
 		for _, role := range []string{"supporting", "contradicting"} {
