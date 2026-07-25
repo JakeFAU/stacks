@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -30,5 +31,18 @@ func TestCreateMentionRejectsMalformedEmailBeforePersistence(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "email is invalid") {
 		t.Fatalf("CreateMention() error = %v, want malformed email rejection", err)
+	}
+}
+
+func TestDirectoryDecisionDigestPreservesLegacyDigestWhenNoDirectoryEvidence(t *testing.T) {
+	digest := resolutionDecisionDigest(ResolutionDecisionInput{
+		ProposalID: "11111111-2222-3333-4444-555555555555",
+		Outcome:    ResolutionOutcomeAccepted,
+		EntityID:   "66666666-7777-8888-9999-aaaaaaaaaaaa",
+	}, "")
+
+	const legacyDigest = "87b89f76caa59c004884826d40c650621f11c9d586c1fa32ba6339ad78e671cd"
+	if got := hex.EncodeToString(digest[:]); got != legacyDigest {
+		t.Fatalf("resolutionDecisionDigest() = %q, want byte-compatible legacy digest %q", got, legacyDigest)
 	}
 }

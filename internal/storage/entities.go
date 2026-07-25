@@ -144,6 +144,24 @@ type EntityRepository struct {
 	pool *pgxpool.Pool
 }
 
+const currentAcceptedAliasAuthoritySQL = `
+	FROM stacks.entity_alias_assertions AS assertion
+	JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+	JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+	JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+	LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
+	LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
+	LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
+	WHERE decision.entity_id = assertion.entity_id
+	  AND decision.outcome IN ('accepted', 'created')
+	  AND decision.superseded_by_id IS NULL
+	  AND decision.currently_admissible
+	  AND mention.currently_admissible
+	  AND (mention.extraction_run_id IS NULL OR (
+	      extraction_run.currently_admissible
+	      AND source_document.current_document_version_id = extraction_run.document_version_id
+	  ))`
+
 // NewEntityRepository creates an identity repository backed by pool.
 func NewEntityRepository(pool *pgxpool.Pool) *EntityRepository {
 	return &EntityRepository{pool: pool}
@@ -179,25 +197,10 @@ func (repository *IngestionRepository) EntitySnapshots(ctx context.Context) ([]e
 	}
 	for index := range snapshots {
 		aliases, err := repository.pool.Query(ctx, `
-			SELECT DISTINCT assertion.alias_type, assertion.normalized_value
-			FROM stacks.entity_alias_assertions AS assertion
-			JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
-			JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
-			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
-			LEFT JOIN stacks.extraction_runs AS extraction_run ON extraction_run.id = mention.extraction_run_id
-			LEFT JOIN stacks.document_versions AS extraction_version ON extraction_version.id = extraction_run.document_version_id
-			LEFT JOIN stacks.source_documents AS source_document ON source_document.id = extraction_version.source_document_id
-			WHERE assertion.entity_id = $1
-			  AND decision.entity_id = assertion.entity_id
-			  AND decision.outcome IN ('accepted', 'created')
-			  AND decision.superseded_by_id IS NULL
-			  AND decision.currently_admissible
-			  AND mention.currently_admissible
-			  AND (mention.extraction_run_id IS NULL OR (
-			      extraction_run.currently_admissible
-			      AND source_document.current_document_version_id = extraction_run.document_version_id
-			  ))
-			ORDER BY alias_type, normalized_value`, snapshots[index].ID)
+			SELECT DISTINCT assertion.alias_type, assertion.normalized_value`+
+			currentAcceptedAliasAuthoritySQL+`
+			  AND assertion.entity_id = $1
+			ORDER BY assertion.alias_type, assertion.normalized_value`, snapshots[index].ID)
 		if err != nil {
 			return nil, fmt.Errorf("list ingestion entity aliases: %w", err)
 		}
@@ -884,8 +887,14 @@ func validateAliasInput(alias AliasInput) error {
 	return nil
 }
 
-func resolutionDecisionDigest(input ResolutionDecisionInput, supersedesID string) [sha256.Size]byte {
-	return sha256.Sum256([]byte(strings.Join([]string{input.ProposalID, string(input.Outcome), input.EntityID, supersedesID}, "\x00")))
+func resolutionDecisionDigest(input ResolutionDecisionInput, supersedesID string, directoryEvidence ...string) [sha256.Size]byte {
+	fields := []string{input.ProposalID, string(input.Outcome), input.EntityID, supersedesID}
+	if len(directoryEvidence) == 0 {
+		return sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+	}
+	fields = append([]string{"stacks.resolution-decision.v2.directory"}, fields...)
+	fields = append(fields, directoryEvidence...)
+	return sha256.Sum256([]byte(strings.Join(fields, "\x00")))
 }
 
 func loadEffectiveDecision(ctx context.Context, transaction pgx.Tx, proposalID string) (ResolutionDecision, error) {

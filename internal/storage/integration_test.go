@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	analysisdomain "stacks/internal/analysis"
+	"stacks/internal/directory"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
@@ -29,6 +31,599 @@ const (
 	testDatabaseURLEnvironmentVariable          = "STACKS_TEST_DATABASE_URL"
 	testMigrationDatabaseURLEnvironmentVariable = "STACKS_TEST_MIGRATION_DATABASE_URL"
 )
+
+func TestDirectoryLoadWorkReturnsCurrentAdmissiblePendingMentionEvidence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	derivationID, mention := createDirectoryPendingMentionFixture(t, pool, "load-work")
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+
+	work, err := NewDirectoryRepository(pool).LoadWork(ctx, derivationID, now, 24*time.Hour, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("load directory work: %v", err)
+	}
+	if work.Reused != 0 || len(work.Mentions) != 1 {
+		t.Fatalf("directory work counts = reused %d, mentions %d; want 0/1", work.Reused, len(work.Mentions))
+	}
+	if work.Mentions[0] != mention {
+		t.Fatalf("directory pending mention = %#v, want exact synthetic evidence %#v", work.Mentions[0], mention)
+	}
+
+	seedDirectoryLookupAttempt(t, pool, mention.MentionID, entity.DirectoryNoMatch, now.Add(-time.Hour), nil)
+	work, err = NewDirectoryRepository(pool).LoadWork(ctx, derivationID, now, 24*time.Hour, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("reuse fresh directory work: %v", err)
+	}
+	if work.Reused != 1 || len(work.Mentions) != 0 {
+		t.Fatalf("fresh directory work counts = reused %d, mentions %d; want 1/0", work.Reused, len(work.Mentions))
+	}
+}
+
+func TestDirectoryLoadWorkRetriesOnlyExpiredTransientAttempt(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	derivationID, mention := createDirectoryPendingMentionFixture(t, pool, "retry-work")
+	recordedAt := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	retryAfter := recordedAt.Add(10 * time.Minute)
+	seedDirectoryLookupAttempt(t, pool, mention.MentionID, entity.DirectoryUnavailable, recordedAt, &retryAfter)
+
+	blocked, err := NewDirectoryRepository(pool).LoadWork(ctx, derivationID, recordedAt.Add(time.Minute), 24*time.Hour, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("load retry-blocked directory work: %v", err)
+	}
+	if blocked.Reused != 0 || len(blocked.Mentions) != 0 {
+		t.Fatalf("retry-blocked work counts = reused %d, mentions %d; want 0/0", blocked.Reused, len(blocked.Mentions))
+	}
+
+	expired, err := NewDirectoryRepository(pool).LoadWork(ctx, derivationID, retryAfter.Add(time.Nanosecond), 24*time.Hour, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("load expired directory work: %v", err)
+	}
+	if expired.Reused != 0 || len(expired.Mentions) != 1 || expired.Mentions[0] != mention {
+		t.Fatalf("expired retry work = %#v, want one pending synthetic mention", expired)
+	}
+}
+
+func TestDirectoryLoadIdentityStateMatchesAcceptedAliasAuthority(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	_, mention := createDirectoryPendingMentionFixture(t, pool, "identity-state")
+	entityID := uuid.NewString()
+	storedEntity, decision, err := NewEntityRepository(pool).CreateReviewPerson(ctx, CreateReviewPersonInput{
+		ProposalID:  mention.ProposalID,
+		EntityID:    entityID,
+		Kind:        string(entity.KindPerson),
+		DisplayName: "Synthetic Canonical Person",
+		Aliases: []AliasInput{{
+			NormalizedValue: mention.ProposedEmail,
+			Type:            string(entity.AliasTypeEmail),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create synthetic accepted identity: %v", err)
+	}
+	profile := syntheticDirectoryProfile(
+		"identity-state-"+mention.MentionID,
+		mention.ProposedEmail,
+		time.Time{},
+	)
+	snapshotID, attemptID := seedDirectoryProfileEvidence(t, pool, mention.MentionID, profile)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO stacks.entity_directory_identity_assertions
+			(decision_id, entity_id, lookup_attempt_id, snapshot_id, provider, provider_subject_id, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		decision.ID, storedEntity.ID, attemptID, snapshotID, profile.Provider, profile.SubjectID,
+		time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("seed synthetic directory identity assertion: %v", err)
+	}
+
+	wantSnapshots, err := NewIngestionRepository(pool).EntitySnapshots(ctx)
+	if err != nil {
+		t.Fatalf("load ingestion entity snapshots: %v", err)
+	}
+	state, err := NewDirectoryRepository(pool).LoadIdentityState(ctx)
+	if err != nil {
+		t.Fatalf("load directory identity state: %v", err)
+	}
+	wantLink := entity.DirectoryIdentityLink{
+		Provider: profile.Provider, SubjectID: profile.SubjectID, EntityID: entityID,
+	}
+	if !containsDirectoryIdentityLink(state.Links, wantLink) {
+		t.Fatalf("directory identity links = %#v, want current synthetic link %#v", state.Links, wantLink)
+	}
+	if !sameEntitySnapshots(state.Snapshots, wantSnapshots) {
+		t.Fatalf("directory snapshots = %#v, want accepted-alias projection %#v", state.Snapshots, wantSnapshots)
+	}
+}
+
+func TestDirectoryPersistIsIdempotentAndPreservesChangedSnapshots(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	_, mention := createDirectoryPendingMentionFixture(t, pool, "persist-idempotent")
+	profile := syntheticDirectoryProfile(
+		"persist-idempotent-"+mention.MentionID,
+		mention.ProposedEmail,
+		time.Time{},
+	)
+	recordedAt := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	input := matchedDirectoryPersistInput(mention, profile, recordedAt)
+	repository := NewDirectoryRepository(pool)
+
+	first, err := repository.Persist(ctx, input)
+	if err != nil {
+		t.Fatalf("persist initial directory match: %v", err)
+	}
+	second, err := repository.Persist(ctx, input)
+	if err != nil {
+		t.Fatalf("repeat identical directory match: %v", err)
+	}
+	if !first.AutoResolved || first.EntityID == "" || second != first {
+		t.Fatalf("directory persist results = %#v then %#v, want one idempotent automatic entity", first, second)
+	}
+
+	assertDirectoryAuthorityCounts(t, pool, mention, profile, first.EntityID, 1, 1)
+	var observedAt *time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT observed_at
+		FROM stacks.directory_profile_snapshots
+		WHERE provider = $1 AND provider_subject_id = $2`,
+		profile.Provider, profile.SubjectID).Scan(&observedAt); err != nil {
+		t.Fatalf("load nullable synthetic directory observation time: %v", err)
+	}
+	if observedAt != nil {
+		t.Fatalf("directory observed_at = %v, want unknown source time preserved as NULL", observedAt)
+	}
+
+	changed := profile
+	changed.DisplayName = "Synthetic Directory Person Updated"
+	changed.ObservedAt = recordedAt.Add(time.Hour)
+	changedInput := matchedDirectoryPersistInput(mention, changed, recordedAt.Add(2*time.Hour))
+	changedResult, err := repository.Persist(ctx, changedInput)
+	if err != nil {
+		t.Fatalf("persist changed directory profile: %v", err)
+	}
+	if !changedResult.AutoResolved || changedResult.EntityID != first.EntityID {
+		t.Fatalf("changed directory result = %#v, want existing automatic entity %q", changedResult, first.EntityID)
+	}
+	assertDirectoryAuthorityCounts(t, pool, mention, profile, first.EntityID, 2, 2)
+	var originalDisplayName string
+	if err := pool.QueryRow(ctx, `
+		SELECT display_name
+		FROM stacks.directory_profile_snapshots
+		WHERE provider = $1 AND provider_subject_id = $2 AND observed_at IS NULL`,
+		profile.Provider, profile.SubjectID).Scan(&originalDisplayName); err != nil {
+		t.Fatalf("load original immutable directory snapshot: %v", err)
+	}
+	if originalDisplayName != profile.DisplayName {
+		t.Fatalf("original directory snapshot display name = %q, want %q", originalDisplayName, profile.DisplayName)
+	}
+}
+
+func TestDirectoryPersistUsesExistingAcceptedEmailOwner(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	email := "existing.owner." + strings.ReplaceAll(uuid.NewString(), "-", "") + "@synthetic.example"
+	_, ownerMention := createDirectoryPendingMentionFixtureWithEmail(t, pool, "existing-owner", email)
+	ownerID := uuid.NewString()
+	if _, _, err := NewEntityRepository(pool).CreateReviewPerson(ctx, CreateReviewPersonInput{
+		ProposalID:  ownerMention.ProposalID,
+		EntityID:    ownerID,
+		Kind:        string(entity.KindPerson),
+		DisplayName: "Synthetic Existing Owner",
+		Aliases: []AliasInput{{
+			NormalizedValue: email,
+			Type:            string(entity.AliasTypeEmail),
+		}},
+	}); err != nil {
+		t.Fatalf("create existing accepted email owner: %v", err)
+	}
+	_, mention := createDirectoryPendingMentionFixtureWithEmail(t, pool, "existing-match", email)
+	profile := syntheticDirectoryProfile("existing-owner-"+mention.MentionID, email, time.Time{})
+	input := matchedDirectoryPersistInput(mention, profile, time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC))
+	input.Evaluation.CreatePerson = false
+	input.Evaluation.EntityID = ownerID
+
+	result, err := NewDirectoryRepository(pool).Persist(ctx, input)
+	if err != nil {
+		t.Fatalf("persist directory match for existing owner: %v", err)
+	}
+	if !result.AutoResolved || result.EntityID != ownerID {
+		t.Fatalf("existing-owner directory result = %#v, want entity %q", result, ownerID)
+	}
+	var nameAliases, emailAliases int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE assertion.alias_type = 'name'),
+		       count(*) FILTER (WHERE assertion.alias_type = 'email')
+		FROM stacks.entity_alias_assertions AS assertion
+		JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		WHERE decision.proposal_id = $1`, mention.ProposalID).Scan(&nameAliases, &emailAliases); err != nil {
+		t.Fatalf("count automatic existing-owner aliases: %v", err)
+	}
+	if nameAliases != 0 || emailAliases != 1 {
+		t.Fatalf("automatic name/email aliases = %d/%d, want email only", nameAliases, emailAliases)
+	}
+}
+
+func TestDirectoryPersistNameCandidateCreatesNoAuthority(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	_, mention := createDirectoryPendingMentionFixture(t, pool, "name-candidate")
+	profile := syntheticDirectoryProfile(
+		"name-candidate-"+mention.MentionID,
+		mention.ProposedEmail,
+		time.Time{},
+	)
+	profile.DisplayName = "Synthetic Name Candidate " + mention.MentionID
+	existingEntityID := uuid.NewString()
+	if _, err := NewEntityRepository(pool).CreateEntity(ctx, EntityInput{
+		ID: existingEntityID, Kind: string(entity.KindPerson), DisplayName: "Synthetic Existing Candidate",
+	}); err != nil {
+		t.Fatalf("create existing entity candidate: %v", err)
+	}
+	confidence := 0.5
+	if _, err := NewEntityRepository(pool).PutCandidate(ctx, ResolutionCandidateInput{
+		ProposalID: mention.ProposalID, EntityID: existingEntityID, Rank: 0,
+		Confidence: &confidence, Reason: "synthetic existing candidate",
+	}); err != nil {
+		t.Fatalf("put existing entity candidate: %v", err)
+	}
+	input := directory.PersistInput{
+		Mention: mention,
+		Query: entity.DirectoryQuery{
+			Kind: entity.DirectoryQueryName, Name: mention.NormalizedName,
+			EmailEvidence: entity.EmailEvidenceNone,
+		},
+		Lookup: directory.LookupResult{
+			Outcome: entity.DirectoryMatched, Profiles: []entity.DirectoryProfile{profile},
+		},
+		Evaluation: entity.DirectoryEvaluation{
+			Outcome: entity.DirectoryReview, Candidates: []entity.DirectoryProfile{profile},
+		},
+		AttemptCount: 1,
+		RecordedAt:   time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC),
+	}
+
+	result, err := NewDirectoryRepository(pool).Persist(ctx, input)
+	if err != nil {
+		t.Fatalf("persist directory name candidate: %v", err)
+	}
+	repeated, err := NewDirectoryRepository(pool).Persist(ctx, input)
+	if err != nil {
+		t.Fatalf("repeat identical directory name candidate: %v", err)
+	}
+	if result != (directory.PersistResult{}) {
+		t.Fatalf("name-candidate directory result = %#v, want no authority", result)
+	}
+	if repeated != (directory.PersistResult{}) {
+		t.Fatalf("repeated name-candidate directory result = %#v, want no authority", repeated)
+	}
+	var decisions, directoryCandidates, createdEntities int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM stacks.resolution_decisions WHERE proposal_id = $1),
+		    (SELECT count(*) FROM stacks.resolution_candidates
+		     WHERE proposal_id = $1 AND directory_profile_snapshot_id IS NOT NULL),
+		    (SELECT count(*) FROM stacks.entities
+		     WHERE display_name = $2)`,
+		mention.ProposalID, profile.DisplayName).Scan(
+		&decisions, &directoryCandidates, &createdEntities,
+	); err != nil {
+		t.Fatalf("count directory name-candidate authority: %v", err)
+	}
+	if decisions != 0 || directoryCandidates != 1 || createdEntities != 0 {
+		t.Fatalf("name-candidate decisions/candidates/entities = %d/%d/%d, want 0/1/0", decisions, directoryCandidates, createdEntities)
+	}
+	var rank int
+	var reason string
+	if err := pool.QueryRow(ctx, `
+		SELECT rank, reason
+		FROM stacks.resolution_candidates
+		WHERE proposal_id = $1 AND directory_profile_snapshot_id IS NOT NULL`,
+		mention.ProposalID).Scan(&rank, &reason); err != nil {
+		t.Fatalf("load directory name candidate: %v", err)
+	}
+	if rank != 1 || reason != "directory name candidate requires review" {
+		t.Fatalf("directory name candidate rank/reason = %d/%q, want 1/bounded reason", rank, reason)
+	}
+}
+
+func TestDirectoryPersistBoundedProviderFailureStoresNoProfiles(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	_, mention := createDirectoryPendingMentionFixture(t, pool, "bounded-failure")
+	recordedAt := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	retryAfter := recordedAt.Add(5 * time.Minute)
+	input := directory.PersistInput{
+		Mention: mention,
+		Query: entity.DirectoryQuery{
+			Kind: entity.DirectoryQueryName, Name: mention.NormalizedName,
+			EmailEvidence: entity.EmailEvidenceNone,
+		},
+		Lookup:       directory.LookupResult{Outcome: entity.DirectoryUnavailable},
+		AttemptCount: 2,
+		RecordedAt:   recordedAt,
+		RetryAfter:   &retryAfter,
+	}
+	if _, err := NewDirectoryRepository(pool).Persist(ctx, input); err != nil {
+		t.Fatalf("persist bounded directory provider failure: %v", err)
+	}
+	var attempts, matches int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM stacks.directory_lookup_attempts WHERE mention_id = $1),
+		    (SELECT count(*)
+		     FROM stacks.directory_lookup_matches AS match
+		     JOIN stacks.directory_lookup_attempts AS attempt ON attempt.id = match.lookup_attempt_id
+		     WHERE attempt.mention_id = $1)`,
+		mention.MentionID).Scan(&attempts, &matches); err != nil {
+		t.Fatalf("count bounded directory failure evidence: %v", err)
+	}
+	if attempts != 1 || matches != 0 {
+		t.Fatalf("bounded failure attempts/matches = %d/%d, want 1/0", attempts, matches)
+	}
+}
+
+func TestDirectoryPersistRollsBackAfterInjectedEntityFailure(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	_, mention := createDirectoryPendingMentionFixture(t, pool, "rollback")
+	profile := syntheticDirectoryProfile("rollback-"+mention.MentionID, mention.ProposedEmail, time.Time{})
+	profile.DisplayName = "Synthetic Rollback " + mention.MentionID
+	input := matchedDirectoryPersistInput(
+		mention,
+		profile,
+		time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC),
+	)
+	repository := NewDirectoryRepository(pool)
+	repository.testHooks.afterEntityCreated = func() error {
+		return errors.New("synthetic injected transaction failure")
+	}
+
+	if _, err := repository.Persist(ctx, input); err == nil ||
+		!strings.Contains(err.Error(), "injected transaction failure") {
+		t.Fatalf("persist with injected failure error = %v, want bounded synthetic failure", err)
+	}
+	var snapshots, attempts, entities, decisions, aliases, links int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM stacks.directory_profile_snapshots
+		     WHERE provider = $1 AND provider_subject_id = $2),
+		    (SELECT count(*) FROM stacks.directory_lookup_attempts WHERE mention_id = $3),
+		    (SELECT count(*) FROM stacks.entities WHERE display_name = $4),
+		    (SELECT count(*) FROM stacks.resolution_decisions WHERE proposal_id = $5),
+		    (SELECT count(*)
+		     FROM stacks.entity_alias_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		     WHERE decision.proposal_id = $5),
+		    (SELECT count(*)
+		     FROM stacks.entity_directory_identity_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		     WHERE decision.proposal_id = $5)`,
+		profile.Provider, profile.SubjectID, mention.MentionID, profile.DisplayName,
+		mention.ProposalID).Scan(
+		&snapshots, &attempts, &entities, &decisions, &aliases, &links,
+	); err != nil {
+		t.Fatalf("count rolled-back directory rows: %v", err)
+	}
+	if snapshots+attempts+entities+decisions+aliases+links != 0 {
+		t.Fatalf("rolled-back snapshot/attempt/entity/decision/alias/link counts = %d/%d/%d/%d/%d/%d, want all zero",
+			snapshots, attempts, entities, decisions, aliases, links)
+	}
+}
+
+func TestDirectoryPersistConcurrentExactEmailCreatesOneAuthority(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	email := "concurrent.owner." + strings.ReplaceAll(uuid.NewString(), "-", "") + "@synthetic.example"
+	_, firstMention := createDirectoryPendingMentionFixtureWithEmail(t, pool, "concurrent-first", email)
+	_, secondMention := createDirectoryPendingMentionFixtureWithEmail(t, pool, "concurrent-second", email)
+	profile := syntheticDirectoryProfile("concurrent-"+uuid.NewString(), email, time.Time{})
+	secondProfile := profile
+	secondProfile.DisplayName = profile.DisplayName + " Updated"
+	recordedAt := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	firstRepository := NewDirectoryRepository(pool)
+	secondRepository := NewDirectoryRepository(pool)
+	firstLocked := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstRepository.testHooks.afterAuthorityLocks = func() error {
+		close(firstLocked)
+		<-releaseFirst
+		return nil
+	}
+	secondRepository.testHooks.beforeAuthorityLocks = func() {
+		close(secondStarted)
+	}
+	type persistResult struct {
+		result directory.PersistResult
+		err    error
+	}
+	firstResult := make(chan persistResult, 1)
+	secondResult := make(chan persistResult, 1)
+	go func() {
+		result, err := firstRepository.Persist(ctx, matchedDirectoryPersistInput(firstMention, profile, recordedAt))
+		firstResult <- persistResult{result: result, err: err}
+	}()
+	<-firstLocked
+	go func() {
+		result, err := secondRepository.Persist(ctx, matchedDirectoryPersistInput(secondMention, secondProfile, recordedAt.Add(time.Second)))
+		secondResult <- persistResult{result: result, err: err}
+	}()
+	<-secondStarted
+	close(releaseFirst)
+
+	first := <-firstResult
+	second := <-secondResult
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent directory persistence errors = %v / %v", first.err, second.err)
+	}
+	if !first.result.AutoResolved || !second.result.AutoResolved ||
+		first.result.EntityID == "" || second.result.EntityID != first.result.EntityID {
+		t.Fatalf("concurrent directory results = %#v / %#v, want one shared authority", first.result, second.result)
+	}
+	var entities, emailOwners, providerOwners int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(DISTINCT assertion.entity_id)
+		     FROM stacks.entity_directory_identity_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		     WHERE assertion.provider = $1
+		       AND assertion.provider_subject_id = $2
+		       AND decision.superseded_by_id IS NULL
+		       AND decision.currently_admissible),
+		    (SELECT count(DISTINCT assertion.entity_id)
+		     FROM stacks.entity_alias_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		     WHERE assertion.alias_type = 'email'
+		       AND assertion.normalized_value = $3
+		       AND decision.superseded_by_id IS NULL
+		       AND decision.currently_admissible),
+		    (SELECT count(*) FROM stacks.entities
+		     WHERE id IN (
+		         SELECT assertion.entity_id
+		         FROM stacks.entity_directory_identity_assertions AS assertion
+		         WHERE assertion.provider = $1
+		           AND assertion.provider_subject_id = $2
+		     ))`,
+		profile.Provider, profile.SubjectID, email).Scan(
+		&providerOwners, &emailOwners, &entities,
+	); err != nil {
+		t.Fatalf("count concurrent directory authority: %v", err)
+	}
+	if entities != 1 || emailOwners != 1 || providerOwners != 1 {
+		t.Fatalf("concurrent entities/email owners/provider owners = %d/%d/%d, want 1/1/1",
+			entities, emailOwners, providerOwners)
+	}
+}
+
+func TestDirectoryPersistDowngradesPostLockAuthorityConflictToReview(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	targetEmail := "conflict.target." + strings.ReplaceAll(uuid.NewString(), "-", "") + "@synthetic.example"
+	otherEmail := "conflict.other." + strings.ReplaceAll(uuid.NewString(), "-", "") + "@synthetic.example"
+
+	_, emailOwnerMention := createDirectoryPendingMentionFixtureWithEmail(t, pool, "conflict-email-owner", targetEmail)
+	emailOwnerID := uuid.NewString()
+	if _, _, err := NewEntityRepository(pool).CreateReviewPerson(ctx, CreateReviewPersonInput{
+		ProposalID:  emailOwnerMention.ProposalID,
+		EntityID:    emailOwnerID,
+		Kind:        string(entity.KindPerson),
+		DisplayName: "Synthetic Conflict Email Owner",
+		Aliases: []AliasInput{{
+			NormalizedValue: targetEmail,
+			Type:            string(entity.AliasTypeEmail),
+		}},
+	}); err != nil {
+		t.Fatalf("create synthetic conflict email owner: %v", err)
+	}
+
+	_, providerOwnerMention := createDirectoryPendingMentionFixtureWithEmail(t, pool, "conflict-provider-owner", otherEmail)
+	providerOwnerID := uuid.NewString()
+	_, providerDecision, err := NewEntityRepository(pool).CreateReviewPerson(ctx, CreateReviewPersonInput{
+		ProposalID:  providerOwnerMention.ProposalID,
+		EntityID:    providerOwnerID,
+		Kind:        string(entity.KindPerson),
+		DisplayName: "Synthetic Conflict Provider Owner",
+		Aliases: []AliasInput{{
+			NormalizedValue: otherEmail,
+			Type:            string(entity.AliasTypeEmail),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create synthetic conflict provider owner: %v", err)
+	}
+	sharedSubject := "conflict-shared-" + uuid.NewString()
+	providerProfile := syntheticDirectoryProfile(sharedSubject, otherEmail, time.Time{})
+	snapshotID, attemptID := seedDirectoryProfileEvidence(t, pool, providerOwnerMention.MentionID, providerProfile)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO stacks.entity_directory_identity_assertions
+			(decision_id, entity_id, lookup_attempt_id, snapshot_id,
+			 provider, provider_subject_id, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		providerDecision.ID,
+		providerOwnerID,
+		attemptID,
+		snapshotID,
+		providerProfile.Provider,
+		providerProfile.SubjectID,
+		time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC),
+	); err != nil {
+		t.Fatalf("seed synthetic conflicting provider authority: %v", err)
+	}
+
+	_, targetMention := createDirectoryPendingMentionFixtureWithEmail(t, pool, "conflict-target", targetEmail)
+	targetProfile := syntheticDirectoryProfile(sharedSubject, targetEmail, time.Time{})
+	input := matchedDirectoryPersistInput(
+		targetMention,
+		targetProfile,
+		time.Date(2026, time.July, 24, 13, 0, 0, 0, time.UTC),
+	)
+	result, err := NewDirectoryRepository(pool).Persist(ctx, input)
+	if err != nil {
+		t.Fatalf("persist conflicting directory authority: %v", err)
+	}
+	if result != (directory.PersistResult{}) {
+		t.Fatalf("conflicting directory result = %#v, want review fallback", result)
+	}
+	var decisions, candidates int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM stacks.resolution_decisions WHERE proposal_id = $1),
+		    (SELECT count(*) FROM stacks.resolution_candidates
+		     WHERE proposal_id = $1
+		       AND directory_profile_snapshot_id IS NOT NULL
+		       AND reason = 'directory exact email requires review')`,
+		targetMention.ProposalID,
+	).Scan(&decisions, &candidates); err != nil {
+		t.Fatalf("count conflict review fallback: %v", err)
+	}
+	if decisions != 0 || candidates != 1 {
+		t.Fatalf("conflict decisions/review candidates = %d/%d, want 0/1", decisions, candidates)
+	}
+}
+
+func TestDirectoryPersistRejectsImmutableSnapshotConflict(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	_, mention := createDirectoryPendingMentionFixture(t, pool, "immutable-conflict")
+	profile := syntheticDirectoryProfile("immutable-conflict-"+mention.MentionID, mention.ProposedEmail, time.Time{})
+	digest, err := directoryProfileDigest(profile)
+	if err != nil {
+		t.Fatalf("digest synthetic conflicting directory profile: %v", err)
+	}
+	snapshotID := uuid.NewSHA1(uuid.NameSpaceOID, digest[:]).String()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO stacks.directory_profile_snapshots
+			(id, provider, provider_subject_id, source_type, display_name,
+			 observed_at, recorded_at, digest)
+		VALUES ($1, 'google_people', $2, 'domain_profile', $3, NULL, $4, $5)`,
+		snapshotID,
+		"different-"+profile.SubjectID,
+		profile.DisplayName,
+		time.Date(2026, time.July, 24, 11, 0, 0, 0, time.UTC),
+		digest[:],
+	); err != nil {
+		t.Fatalf("seed immutable directory snapshot conflict: %v", err)
+	}
+
+	_, err = NewDirectoryRepository(pool).Persist(
+		ctx,
+		matchedDirectoryPersistInput(
+			mention,
+			profile,
+			time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC),
+		),
+	)
+	if err == nil || !strings.Contains(err.Error(), "stored profile snapshot conflicts") {
+		t.Fatalf("immutable directory snapshot conflict error = %v, want loud bounded conflict", err)
+	}
+	if got := countRows(t, pool, `
+		SELECT count(*) FROM stacks.directory_lookup_attempts WHERE mention_id = $1`,
+		mention.MentionID,
+	); got != 0 {
+		t.Fatalf("directory attempts after immutable conflict = %d, want rollback", got)
+	}
+}
 
 func TestModelProviderProvenancePersistsExtractionLeaseWithoutMutatingCompletedCache(t *testing.T) {
 	pool := openIntegrationDatabase(t)
@@ -3135,6 +3730,279 @@ func createSyntheticMention(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
 	mentionID, _ := createSyntheticMentionAndSpan(t, pool)
 	return mentionID
+}
+
+func createDirectoryPendingMentionFixture(t *testing.T, pool *pgxpool.Pool, label string) (string, directory.PendingMention) {
+	t.Helper()
+	email := "synthetic.person." + strings.ReplaceAll(uuid.NewString(), "-", "") + "@synthetic.example"
+	return createDirectoryPendingMentionFixtureWithEmail(t, pool, label, email)
+}
+
+func createDirectoryPendingMentionFixtureWithEmail(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	label string,
+	email string,
+) (string, directory.PendingMention) {
+	t.Helper()
+	const surface = "Synthetic Person"
+	quote := surface + " <" + email + ">"
+	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider:           "synthetic-drive",
+		ProviderDocumentID: testIdentifier("directory-" + label),
+		Title:              "Synthetic directory identity",
+		Locator:            "https://docs.example.invalid/directory-identity",
+		ProviderVersion:    "synthetic-version-1",
+		ModifiedAt:         time.Date(2026, time.July, 24, 10, 0, 0, 0, time.UTC),
+		RecordedAt:         time.Date(2026, time.July, 24, 11, 0, 0, 0, time.UTC),
+		Tabs: []source.Tab{{
+			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
+			Role: source.TabRoleTranscript, Text: quote,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("new synthetic directory document: %v", err)
+	}
+	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, TabID: "tab-synthetic", StartOffset: 0,
+		EndOffset: len(quote), Quote: quote,
+	})
+	if err != nil {
+		t.Fatalf("new synthetic directory evidence: %v", err)
+	}
+	repository := NewIngestionRepository(pool)
+	state, err := repository.PrepareVersion(
+		context.Background(),
+		version,
+		testExtractionDerivation(t, version),
+		modelpolicy.DataModePersonal,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare synthetic directory derivation: %v", err)
+	}
+	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+		Evidence: []ingest.EvidenceRecord{{Key: "identity", Span: span}},
+		Mentions: []ingest.MentionRecord{{
+			Key: "person", EvidenceKey: "identity", Surface: surface,
+			NormalizedName: "synthetic person", ProposedEmail: email,
+			ProposedEmailEvidenceKey: "identity", Role: "speaker",
+		}},
+	}); err != nil {
+		t.Fatalf("complete synthetic directory derivation: %v", err)
+	}
+	var mention directory.PendingMention
+	if err := pool.QueryRow(context.Background(), `
+		SELECT mention.id::text, proposal.id::text
+		FROM stacks.mentions AS mention
+		JOIN stacks.resolution_proposals AS proposal ON proposal.mention_id = mention.id
+		WHERE mention.extraction_run_id = $1`, state.DerivationID).Scan(
+		&mention.MentionID, &mention.ProposalID,
+	); err != nil {
+		t.Fatalf("load synthetic directory mention IDs: %v", err)
+	}
+	mention.Surface = surface
+	mention.NormalizedName = "synthetic person"
+	mention.ProposedEmail = email
+	mention.NameQuote = quote
+	mention.EmailQuote = quote
+	return state.DerivationID, mention
+}
+
+func matchedDirectoryPersistInput(
+	mention directory.PendingMention,
+	profile entity.DirectoryProfile,
+	recordedAt time.Time,
+) directory.PersistInput {
+	return directory.PersistInput{
+		Mention: mention,
+		Query: entity.DirectoryQuery{
+			Kind:          entity.DirectoryQueryEmail,
+			Email:         mention.ProposedEmail,
+			EmailEvidence: entity.EmailEvidenceSourceBound,
+		},
+		Lookup: directory.LookupResult{
+			Outcome:  entity.DirectoryMatched,
+			Profiles: []entity.DirectoryProfile{profile},
+		},
+		Evaluation: entity.DirectoryEvaluation{
+			Outcome:       entity.DirectoryMatched,
+			CreatePerson:  true,
+			AcceptedEmail: mention.ProposedEmail,
+			Profile:       &profile,
+		},
+		AttemptCount: 1,
+		RecordedAt:   recordedAt,
+	}
+}
+
+func assertDirectoryAuthorityCounts(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	mention directory.PendingMention,
+	profile entity.DirectoryProfile,
+	entityID string,
+	wantSnapshots int,
+	wantAttempts int,
+) {
+	t.Helper()
+	var snapshots, emails, attempts, matches, decisions, nameAliases, emailAliases, links int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT
+		    (SELECT count(*) FROM stacks.directory_profile_snapshots
+		     WHERE provider = $1 AND provider_subject_id = $2),
+		    (SELECT count(*)
+		     FROM stacks.directory_profile_emails AS email
+		     JOIN stacks.directory_profile_snapshots AS snapshot ON snapshot.id = email.snapshot_id
+		     WHERE snapshot.provider = $1 AND snapshot.provider_subject_id = $2),
+		    (SELECT count(*) FROM stacks.directory_lookup_attempts WHERE mention_id = $3),
+		    (SELECT count(*)
+		     FROM stacks.directory_lookup_matches AS match
+		     JOIN stacks.directory_lookup_attempts AS attempt ON attempt.id = match.lookup_attempt_id
+		     WHERE attempt.mention_id = $3),
+		    (SELECT count(*) FROM stacks.resolution_decisions WHERE proposal_id = $4),
+		    (SELECT count(*)
+		     FROM stacks.entity_alias_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		     WHERE decision.proposal_id = $4 AND assertion.alias_type = 'name'),
+		    (SELECT count(*)
+		     FROM stacks.entity_alias_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		     WHERE decision.proposal_id = $4 AND assertion.alias_type = 'email'),
+		    (SELECT count(*)
+		     FROM stacks.entity_directory_identity_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		     WHERE decision.proposal_id = $4 AND assertion.entity_id = $5)`,
+		profile.Provider, profile.SubjectID, mention.MentionID, mention.ProposalID, entityID,
+	).Scan(
+		&snapshots, &emails, &attempts, &matches, &decisions,
+		&nameAliases, &emailAliases, &links,
+	); err != nil {
+		t.Fatalf("count synthetic directory authority: %v", err)
+	}
+	if snapshots != wantSnapshots || emails != wantSnapshots ||
+		attempts != wantAttempts || matches != wantAttempts ||
+		decisions != 1 || nameAliases != 0 || emailAliases != 1 || links != 1 {
+		t.Fatalf(
+			"directory snapshot/email/attempt/match/decision/name/email/link counts = %d/%d/%d/%d/%d/%d/%d/%d, want %d/%d/%d/%d/1/0/1/1",
+			snapshots, emails, attempts, matches, decisions, nameAliases, emailAliases, links,
+			wantSnapshots, wantSnapshots, wantAttempts, wantAttempts,
+		)
+	}
+}
+
+func seedDirectoryLookupAttempt(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	mentionID string,
+	outcome entity.DirectoryOutcome,
+	recordedAt time.Time,
+	retryAfter *time.Time,
+) string {
+	t.Helper()
+	attemptID := uuid.NewString()
+	queryDigest := sha256.Sum256([]byte("synthetic-directory-query-" + attemptID))
+	attemptDigest := sha256.Sum256([]byte("synthetic-directory-attempt-" + attemptID))
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO stacks.directory_lookup_attempts
+			(id, mention_id, provider, query_kind, email_evidence, query_digest,
+			 policy_version, outcome, attempt_count, retry_after, recorded_at, digest)
+		VALUES ($1, $2, 'google_people', 'email', 'source_bound', $3,
+		        $4, $5, 1, $6, $7, $8)`,
+		attemptID, mentionID, queryDigest[:], entity.DirectoryPolicyVersion,
+		string(outcome), retryAfter, recordedAt, attemptDigest[:]); err != nil {
+		t.Fatalf("seed synthetic directory lookup attempt: %v", err)
+	}
+	return attemptID
+}
+
+func syntheticDirectoryProfile(label, email string, observedAt time.Time) entity.DirectoryProfile {
+	return entity.DirectoryProfile{
+		Provider:    "google_people",
+		SubjectID:   "synthetic-subject-" + label,
+		Source:      entity.DirectorySourceDomainProfile,
+		DisplayName: "Synthetic Directory Person",
+		Emails: []entity.DirectoryEmail{{
+			Value: email, Primary: true,
+		}},
+		ObservedAt: observedAt,
+	}
+}
+
+func seedDirectoryProfileEvidence(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	mentionID string,
+	profile entity.DirectoryProfile,
+) (string, string) {
+	t.Helper()
+	canonical, err := canonicalDirectoryProfile(profile)
+	if err != nil {
+		t.Fatalf("canonicalize synthetic directory profile: %v", err)
+	}
+	digest, err := directoryProfileDigest(canonical)
+	if err != nil {
+		t.Fatalf("digest synthetic directory profile: %v", err)
+	}
+	snapshotID := uuid.NewSHA1(uuid.NameSpaceOID, digest[:]).String()
+	var observedAt *time.Time
+	if !canonical.ObservedAt.IsZero() {
+		value := canonical.ObservedAt
+		observedAt = &value
+	}
+	recordedAt := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO stacks.directory_profile_snapshots
+			(id, provider, provider_subject_id, source_type, display_name, observed_at, recorded_at, digest)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		snapshotID, canonical.Provider, canonical.SubjectID, string(canonical.Source),
+		canonical.DisplayName, observedAt, recordedAt, digest[:]); err != nil {
+		t.Fatalf("seed synthetic directory profile: %v", err)
+	}
+	for position, email := range canonical.Emails {
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO stacks.directory_profile_emails
+				(snapshot_id, normalized_email, is_primary, position)
+			VALUES ($1, $2, $3, $4)`,
+			snapshotID, email.Value, email.Primary, position); err != nil {
+			t.Fatalf("seed synthetic directory profile email: %v", err)
+		}
+	}
+	attemptID := seedDirectoryLookupAttempt(
+		t, pool, mentionID, entity.DirectoryMatched, recordedAt, nil,
+	)
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO stacks.directory_lookup_matches
+			(lookup_attempt_id, snapshot_id, rank, reason)
+		VALUES ($1, $2, 0, 'exact_email')`,
+		attemptID, snapshotID); err != nil {
+		t.Fatalf("seed synthetic directory lookup match: %v", err)
+	}
+	return snapshotID, attemptID
+}
+
+func sameEntitySnapshots(left, right []entity.EntitySnapshot) bool {
+	return reflect.DeepEqual(left, right)
+}
+
+func containsDirectoryIdentityLink(links []entity.DirectoryIdentityLink, target entity.DirectoryIdentityLink) bool {
+	for _, link := range links {
+		if link == target {
+			return true
+		}
+	}
+	return false
+}
+
+func countRows(t *testing.T, pool *pgxpool.Pool, query string, arguments ...any) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(context.Background(), query, arguments...).Scan(&count); err != nil {
+		t.Fatalf("count synthetic rows: %v", err)
+	}
+	return count
 }
 
 func createSyntheticMentionAndSpan(t *testing.T, pool *pgxpool.Pool) (string, string) {
