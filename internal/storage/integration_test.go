@@ -2359,6 +2359,81 @@ func TestIngestionCompletedRetryRejectsRecordedAtMismatchWithoutMutation(t *test
 	}
 }
 
+func TestIngestionCompletionValidationPrecedence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	testCases := []struct {
+		name      string
+		label     string
+		arrange   func(*testing.T, canonicalIngestionFixture, *ingest.Completion)
+		wantKind  error
+		wantError func(canonicalIngestionFixture) string
+	}{
+		{
+			name:  "completed wrong owner precedes recorded-time mismatch",
+			label: "precedence-completed-owner",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, completion *ingest.Completion) {
+				t.Helper()
+				fixture.complete(t)
+				completion.LeaseOwner = uuid.NewString()
+			},
+			wantError: func(canonicalIngestionFixture) string {
+				return "complete ingestion version: completion lease is not owned"
+			},
+		},
+		{
+			name:  "inadmissible active run precedes recorded-time mismatch",
+			label: "precedence-active-admissibility",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *ingest.Completion) {
+				t.Helper()
+				if _, err := fixture.pool.Exec(ctx, `
+					UPDATE stacks.extraction_runs
+					SET currently_admissible = false
+					WHERE id = $1`, fixture.state.DerivationID); err != nil {
+					t.Fatalf("mark precedence owning run inadmissible: %v", err)
+				}
+			},
+			wantKind: ErrObservationCompatibility,
+			wantError: func(fixture canonicalIngestionFixture) string {
+				return fmt.Sprintf(
+					"observation boundary run %q: %s",
+					fixture.state.DerivationID,
+					reasonOwningRunNotAdmissible,
+				)
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newCanonicalIngestionFixture(t, pool, testCase.label)
+			completion := fixture.completion()
+			testCase.arrange(t, fixture, &completion)
+			completion.Observations[0].RecordedAt = fixture.state.RecordedAt.Add(time.Microsecond)
+			before := snapshotCanonicalIngestionCompletion(t, fixture)
+
+			err := fixture.repository.CompleteVersion(ctx, completion)
+			if err == nil {
+				t.Fatal("completion with competing validation failures succeeded")
+			}
+			if errors.Is(err, ErrObservationConflict) {
+				t.Fatalf("validation precedence error = %v, recorded-time conflict won", err)
+			}
+			if testCase.wantKind != nil && !errors.Is(err, testCase.wantKind) {
+				t.Fatalf("validation precedence error = %v, want %v", err, testCase.wantKind)
+			}
+			if want := testCase.wantError(fixture); err.Error() != want {
+				t.Fatalf("validation precedence error = %q, want authoritative %q", err, want)
+			}
+
+			after := snapshotCanonicalIngestionCompletion(t, fixture)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("rejected precedence completion mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+			}
+		})
+	}
+}
+
 func TestIngestionCanonicalConstructionFailureRollsBackWholeCompletion(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()

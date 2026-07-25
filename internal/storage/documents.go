@@ -477,12 +477,12 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if storedVersionID != completion.VersionID {
 		return fmt.Errorf("complete ingestion version: derivation source version conflicts")
 	}
-	if err := validateIngestionRecordedAt(completion.Observations, storedRecordedAt); err != nil {
-		return err
-	}
 	if status == string(ingest.VersionStatusComplete) {
 		if completedByOwner == nil || *completedByOwner != completion.LeaseOwner {
 			return fmt.Errorf("complete ingestion version: completion lease is not owned")
+		}
+		if err := validateIngestionRecordedAt(completion.Observations, storedRecordedAt); err != nil {
+			return err
 		}
 		if storedAdmissible {
 			if err := setCurrentDocumentVersion(ctx, transaction, completion.VersionID); err != nil {
@@ -501,6 +501,9 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	}
 	if activeOwner == nil || activeUntil == nil || *activeOwner != completion.LeaseOwner || !activeUntil.After(time.Now().UTC()) {
 		return fmt.Errorf("complete ingestion version: active lease is not owned")
+	}
+	if err := validateIngestionRecordedAt(completion.Observations, storedRecordedAt); err != nil {
+		return err
 	}
 	run := owningExtractionRun{
 		ID:            completion.DerivationID,
