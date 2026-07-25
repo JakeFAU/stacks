@@ -582,6 +582,114 @@ func TestDirectoryPersistDowngradesPostLockAuthorityConflictToReview(t *testing.
 	}
 }
 
+func TestDirectoryPersistDowngradesTriggerEffectiveStaleSourceAuthorityToReview(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	priorEmail := "stale.prior." + strings.ReplaceAll(uuid.NewString(), "-", "") + "@synthetic.example"
+	targetEmail := "stale.target." + strings.ReplaceAll(uuid.NewString(), "-", "") + "@synthetic.example"
+
+	_, priorMention := createDirectoryPendingMentionFixtureWithEmail(t, pool, "stale-source-prior", priorEmail)
+	priorOwnerID := uuid.NewString()
+	_, priorDecision, err := NewEntityRepository(pool).CreateReviewPerson(ctx, CreateReviewPersonInput{
+		ProposalID:  priorMention.ProposalID,
+		EntityID:    priorOwnerID,
+		Kind:        string(entity.KindPerson),
+		DisplayName: "Synthetic Stale Source Owner",
+		Aliases: []AliasInput{{
+			NormalizedValue: priorEmail,
+			Type:            string(entity.AliasTypeEmail),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create synthetic stale-source owner: %v", err)
+	}
+	sharedSubject := "stale-source-shared-" + uuid.NewString()
+	priorProfile := syntheticDirectoryProfile(sharedSubject, priorEmail, time.Time{})
+	priorSnapshotID, priorAttemptID := seedDirectoryProfileEvidence(
+		t,
+		pool,
+		priorMention.MentionID,
+		priorProfile,
+	)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO stacks.entity_directory_identity_assertions
+			(decision_id, entity_id, lookup_attempt_id, snapshot_id,
+			 provider, provider_subject_id, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		priorDecision.ID,
+		priorOwnerID,
+		priorAttemptID,
+		priorSnapshotID,
+		priorProfile.Provider,
+		priorProfile.SubjectID,
+		time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC),
+	); err != nil {
+		t.Fatalf("seed synthetic stale-source provider authority: %v", err)
+	}
+	advanceDirectoryMentionSourceVersion(t, pool, priorMention.MentionID)
+
+	_, targetMention := createDirectoryPendingMentionFixtureWithEmail(t, pool, "stale-source-target", targetEmail)
+	targetProfile := syntheticDirectoryProfile(sharedSubject, targetEmail, time.Time{})
+	targetProfile.DisplayName = "Synthetic Stale Source Target " + targetMention.MentionID
+	result, err := NewDirectoryRepository(pool).Persist(
+		ctx,
+		matchedDirectoryPersistInput(
+			targetMention,
+			targetProfile,
+			time.Date(2026, time.July, 24, 14, 0, 0, 0, time.UTC),
+		),
+	)
+	if err != nil {
+		t.Fatalf("persist against trigger-effective stale-source authority: %v", err)
+	}
+	if result != (directory.PersistResult{}) {
+		t.Fatalf("stale-source authority result = %#v, want review fallback", result)
+	}
+	var attempts, candidates, decisions, newEntities, providerOwners int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM stacks.directory_lookup_attempts WHERE mention_id = $1),
+		    (SELECT count(*) FROM stacks.resolution_candidates
+		     WHERE proposal_id = $2
+		       AND directory_profile_snapshot_id IS NOT NULL
+		       AND reason = 'directory exact email requires review'),
+		    (SELECT count(*) FROM stacks.resolution_decisions WHERE proposal_id = $2),
+		    (SELECT count(*) FROM stacks.entities WHERE display_name = $3),
+		    (SELECT count(DISTINCT assertion.entity_id)
+		     FROM stacks.entity_directory_identity_assertions AS assertion
+		     JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		     WHERE assertion.provider = $4
+		       AND assertion.provider_subject_id = $5
+		       AND decision.superseded_by_id IS NULL
+		       AND decision.outcome IN ('accepted', 'created')
+		       AND decision.currently_admissible)`,
+		targetMention.MentionID,
+		targetMention.ProposalID,
+		targetProfile.DisplayName,
+		targetProfile.Provider,
+		targetProfile.SubjectID,
+	).Scan(
+		&attempts,
+		&candidates,
+		&decisions,
+		&newEntities,
+		&providerOwners,
+	); err != nil {
+		t.Fatalf("count stale-source review fallback: %v", err)
+	}
+	if attempts != 1 || candidates != 1 || decisions != 0 ||
+		newEntities != 0 || providerOwners != 1 {
+		t.Fatalf(
+			"stale-source attempts/candidates/decisions/entities/provider owners = %d/%d/%d/%d/%d, want 1/1/0/0/1",
+			attempts,
+			candidates,
+			decisions,
+			newEntities,
+			providerOwners,
+		)
+	}
+}
+
 func TestDirectoryPersistRejectsImmutableSnapshotConflict(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
@@ -3809,6 +3917,58 @@ func createDirectoryPendingMentionFixtureWithEmail(
 	mention.NameQuote = quote
 	mention.EmailQuote = quote
 	return state.DerivationID, mention
+}
+
+func advanceDirectoryMentionSourceVersion(t *testing.T, pool *pgxpool.Pool, mentionID string) {
+	t.Helper()
+	var providerDocumentID string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT source_document.provider_document_id
+		FROM stacks.mentions AS mention
+		JOIN stacks.extraction_runs AS extraction_run
+		  ON extraction_run.id = mention.extraction_run_id
+		JOIN stacks.document_versions AS document_version
+		  ON document_version.id = extraction_run.document_version_id
+		JOIN stacks.source_documents AS source_document
+		  ON source_document.id = document_version.source_document_id
+		WHERE mention.id = $1`,
+		mentionID,
+	).Scan(&providerDocumentID); err != nil {
+		t.Fatalf("load synthetic stale-source document identity: %v", err)
+	}
+	laterVersion, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider:           "synthetic-drive",
+		ProviderDocumentID: providerDocumentID,
+		Title:              "Synthetic later directory version",
+		Locator:            "https://docs.example.invalid/directory-identity",
+		ProviderVersion:    "synthetic-version-2",
+		ModifiedAt:         time.Date(2026, time.July, 24, 15, 0, 0, 0, time.UTC),
+		RecordedAt:         time.Date(2026, time.July, 24, 16, 0, 0, 0, time.UTC),
+		Tabs: []source.Tab{{
+			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
+			Role: source.TabRoleTranscript, Text: "Synthetic later directory content.",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("new synthetic later directory version: %v", err)
+	}
+	repository := NewIngestionRepository(pool)
+	state, err := repository.PrepareVersion(
+		context.Background(),
+		laterVersion,
+		testExtractionDerivation(t, laterVersion),
+		modelpolicy.DataModePersonal,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare synthetic later directory version: %v", err)
+	}
+	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}); err != nil {
+		t.Fatalf("complete synthetic later directory version: %v", err)
+	}
 }
 
 func matchedDirectoryPersistInput(

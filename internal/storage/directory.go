@@ -659,7 +659,7 @@ func (repository *DirectoryRepository) persistAutomaticDirectoryAuthority(
 	if err != nil {
 		return directory.PersistResult{}, err
 	}
-	providerOwners, err := loadCurrentDirectoryIdentityOwners(
+	providerOwners, err := loadTriggerEffectiveDirectoryIdentityOwners(
 		ctx,
 		transaction,
 		profile.Profile.Provider,
@@ -841,7 +841,10 @@ func loadCurrentAcceptedEmailOwners(
 	return owners, nil
 }
 
-func loadCurrentDirectoryIdentityOwners(
+// loadTriggerEffectiveDirectoryIdentityOwners intentionally mirrors migration
+// 00012's deferred authority constraint. Source-current projection rules do
+// not narrow the owners that can make the constraint reject a transaction.
+func loadTriggerEffectiveDirectoryIdentityOwners(
 	ctx context.Context,
 	transaction pgx.Tx,
 	provider string,
@@ -852,30 +855,11 @@ func loadCurrentDirectoryIdentityOwners(
 		FROM stacks.entity_directory_identity_assertions AS assertion
 		JOIN stacks.resolution_decisions AS decision
 		  ON decision.id = assertion.decision_id
-		JOIN stacks.resolution_proposals AS proposal
-		  ON proposal.id = decision.proposal_id
-		JOIN stacks.mentions AS mention
-		  ON mention.id = proposal.mention_id
-		LEFT JOIN stacks.extraction_runs AS extraction_run
-		  ON extraction_run.id = mention.extraction_run_id
-		LEFT JOIN stacks.document_versions AS extraction_version
-		  ON extraction_version.id = extraction_run.document_version_id
-		LEFT JOIN stacks.source_documents AS source_document
-		  ON source_document.id = extraction_version.source_document_id
 		WHERE assertion.provider = $1
 		  AND assertion.provider_subject_id = $2
-		  AND decision.entity_id = assertion.entity_id
-		  AND decision.outcome IN ('accepted', 'created')
 		  AND decision.superseded_by_id IS NULL
+		  AND decision.outcome IN ('accepted', 'created')
 		  AND decision.currently_admissible
-		  AND mention.currently_admissible
-		  AND (
-		      mention.extraction_run_id IS NULL
-		      OR (
-		          extraction_run.currently_admissible
-		          AND source_document.current_document_version_id = extraction_run.document_version_id
-		      )
-		  )
 		ORDER BY assertion.entity_id::text`,
 		provider,
 		subject,
