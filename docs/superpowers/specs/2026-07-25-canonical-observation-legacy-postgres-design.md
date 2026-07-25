@@ -112,8 +112,11 @@ The active write path is:
 
 Any failure rolls back the entire existing completion transaction. The
 completion path and SQL adapter must not call `time.Now` for observations or
-normalize their time. A direct `GraphRepository` caller must supply an already
-UTC, microsecond-representable `RecordedAt`.
+normalize their time. `core/observation.NewObservation` already normalizes the
+caller's instant to UTC, so the storage boundary treats that canonical UTC
+instant as authoritative and rejects sub-microsecond values that PostgreSQL
+would truncate. The caller's original location is not retained and therefore
+cannot be revalidated by storage.
 
 ## Legacy codec
 
@@ -285,10 +288,11 @@ values retain their exact bytes.
 Timestamps use the existing PostgreSQL UTC and microsecond semantics.
 `PrepareVersion` normalizes and stores the extraction-run instant once, and
 returns it through preparation state for canonical observation construction.
-All other canonical timestamps must already be representable; the codec rejects
-values that PostgreSQL would silently truncate or round. No timestamp is
-normalized inside completion or the codec. Equality compares UTC instants at
-stored precision, not Go location or monotonic-clock metadata.
+`core/observation.NewObservation` supplies canonical UTC instants. The codec
+rejects sub-microsecond values that PostgreSQL would silently truncate or
+round; it cannot and does not recover the caller's pre-construction location.
+No timestamp is normalized inside completion or the codec. Equality compares
+UTC instants at stored precision, not Go location or monotonic-clock metadata.
 
 ## Digest v1 compatibility
 
@@ -361,7 +365,8 @@ must not return early. It reconstructs the complete expected durable write-set
 from the supplied completion using read-only identity resolution, then compares:
 
 - evidence-span identities and immutable payload digests;
-- mention identities, evidence bindings, resolutions, and immutable fields;
+- mention identities, evidence bindings, original completion-owned resolution
+  rows, and immutable fields;
 - canonical observations, private origin/digest metadata, and signal
   extensions;
 - version/run association and data mode; and
@@ -372,6 +377,16 @@ Reconstruction uses the persisted extraction-run `RecordedAt`, never a new
 clock value. Only complete equality accepts the retry. The completed-run path
 performs no insert, update, current-pointer repair, or other fresh write. A
 different owner or any write-set difference returns a conflict.
+
+Identity data remains additive after ingestion. The comparison requires every
+proposal, candidate, automatic decision, and alias assertion created by the
+original completion to remain present with its original immutable payload and
+digest. It permits lifecycle fields to reflect later append-only authority,
+including proposal status and decision supersession links. It does not reject
+later directory candidates, reviewer decisions, aliases, directory assertions,
+or other append-only enrichment that was not part of the original completion.
+Such later evidence neither rewrites nor excuses a mismatch in
+completion-owned payload.
 
 ## Interfaces and removal
 
@@ -389,9 +404,12 @@ decoded result contains the canonical observation plus the unchanged optional
 vertical signal and private exact observation-evidence origin/stored-digest
 metadata; it is not another domain observation DTO. The metadata cannot escape
 the storage compatibility path or be reconstructed from canonical evidence
-pairs. The important boundary is that public repository methods accept or
-return canonical observations and the existing signal extension, while
-unexported row/write carriers contain only SQL mechanics.
+pairs. The important boundary is that public repository completion accepts a
+canonical observation, the exact observation-evidence origin entering the
+storage compatibility path, and its optional existing signal extension so
+stable-ID retry equality can cover the complete write-set atomically. The
+origin is not returned as domain evidence or reconstructed from canonical
+pairs. Unexported row/write carriers contain only SQL mechanics.
 
 After all callers use the codec:
 
@@ -417,9 +435,11 @@ The boundary distinguishes three behaviors:
 Fixed privacy-safe reason codes include
 `observation_origin_mismatch`, `observation_digest_mismatch`,
 `confidence_scale_not_representable`, and
-`completion_write_set_mismatch`. Origin, digest, and write-set reasons map to
-compatibility or conflict according to whether stored data or a retry exposed
-the mismatch. `confidence_scale_not_representable` maps to
+`completion_owner_mismatch`, and `completion_write_set_mismatch`. Origin,
+digest, and write-set reasons map to compatibility or conflict according to
+whether stored data or a retry exposed the mismatch.
+`completion_owner_mismatch` maps to `ErrObservationConflict`.
+`confidence_scale_not_representable` maps to
 `ErrObservationNotRepresentable`.
 
 Errors must preserve `errors.Is`/`errors.As` behavior through operation-context
@@ -535,8 +555,8 @@ Plan B is complete only when:
 - predicate/derivation bytes, exact observation-evidence origin, digest v1, and
   vertical signal behavior round-trip exactly;
 - canonical `RecordedAt` is the owning extraction run's once-persisted
-  `recorded_at`, while direct graph callers provide an already representable
-  instant;
+  `recorded_at`, while direct graph callers provide a canonical instant whose
+  precision is already representable;
 - source and vertical manager-confidence scores retain their validated
   `unit_interval` meaning and exact number, while generic durable observations
   explicitly use `unspecified_legacy`;
