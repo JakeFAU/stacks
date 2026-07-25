@@ -1242,6 +1242,161 @@ func TestMigrationUpgradeToGoogleDirectoryEnforcesCandidateAndEffectiveIdentityC
 	}
 }
 
+func TestMigrationUpgradeToGoogleDirectorySerializesConcurrentEffectiveIdentityAssignments(t *testing.T) {
+	pool := openMigrationIntegrationDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	schemaName := "stacks_directory_concurrency_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := `"` + schemaName + `"`
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatalf("create isolated directory-concurrency schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE")
+	})
+
+	applyMigrationsThrough00011ToSchema(t, pool, quotedSchema)
+	first := seedGoogleDirectoryMigrationFixture(t, pool, quotedSchema)
+	applyMigrationToSchema(t, pool, quotedSchema, "00012_google_directory_identity.sql")
+	second := seedAdditionalDirectoryDecision(t, pool, quotedSchema, first)
+
+	snapshotID := uuid.NewString()
+	lookupAttemptID := uuid.NewString()
+	snapshotDigest := sha256.Sum256([]byte("directory-concurrency-snapshot"))
+	queryDigest := sha256.Sum256([]byte("directory-concurrency-query"))
+	attemptDigest := sha256.Sum256([]byte("directory-concurrency-attempt"))
+	for _, statement := range []struct {
+		operation string
+		query     string
+		arguments []any
+	}{
+		{
+			operation: "concurrent directory profile snapshot",
+			query: "INSERT INTO " + quotedSchema + `.directory_profile_snapshots
+				(id, provider, provider_subject_id, source_type, display_name, recorded_at, digest)
+				VALUES ($1, 'google_people', 'synthetic-concurrent-subject', 'domain_profile',
+					'Synthetic Concurrent Person', $2, $3)`,
+			arguments: []any{snapshotID, first.recordedAt, snapshotDigest[:]},
+		},
+		{
+			operation: "concurrent directory lookup attempt",
+			query: "INSERT INTO " + quotedSchema + `.directory_lookup_attempts
+				(id, mention_id, provider, query_kind, email_evidence, query_digest, policy_version,
+				 outcome, attempt_count, recorded_at, digest)
+				VALUES ($1, $2, 'google_people', 'email', 'source_bound', $3,
+					'directory-policy-v1', 'matched', 1, $4, $5)`,
+			arguments: []any{lookupAttemptID, first.mentionID, queryDigest[:], first.recordedAt, attemptDigest[:]},
+		},
+	} {
+		if _, err := pool.Exec(ctx, statement.query, statement.arguments...); err != nil {
+			t.Fatalf("seed %s: %v", statement.operation, err)
+		}
+	}
+
+	firstTransaction, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin first concurrent directory identity transaction: %v", err)
+	}
+	defer firstTransaction.Rollback(context.Background()) //nolint:errcheck // committed transactions are already closed.
+	secondTransaction, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin second concurrent directory identity transaction: %v", err)
+	}
+	defer secondTransaction.Rollback(context.Background()) //nolint:errcheck // committed transactions are already closed.
+
+	var firstBackendPID, secondBackendPID int32
+	if err := firstTransaction.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&firstBackendPID); err != nil {
+		t.Fatalf("load first directory identity backend PID: %v", err)
+	}
+	if err := secondTransaction.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&secondBackendPID); err != nil {
+		t.Fatalf("load second directory identity backend PID: %v", err)
+	}
+	if firstBackendPID == secondBackendPID {
+		t.Fatalf("concurrent directory identity transactions share backend PID %d", firstBackendPID)
+	}
+
+	insertAssertion := func(transaction pgx.Tx, decisionID, entityID string) error {
+		_, err := transaction.Exec(ctx, "INSERT INTO "+quotedSchema+`.entity_directory_identity_assertions
+			(decision_id, entity_id, lookup_attempt_id, snapshot_id, provider, provider_subject_id, recorded_at)
+			VALUES ($1, $2, $3, $4, 'google_people', 'synthetic-concurrent-subject', $5)`,
+			decisionID, entityID, lookupAttemptID, snapshotID, first.recordedAt)
+		return err
+	}
+	if err := insertAssertion(firstTransaction, first.decisionID, first.entityID); err != nil {
+		t.Fatalf("insert first concurrent directory identity: %v", err)
+	}
+	if err := insertAssertion(secondTransaction, second.decisionID, second.entityID); err != nil {
+		t.Fatalf("insert second concurrent directory identity: %v", err)
+	}
+
+	if _, err := firstTransaction.Exec(ctx, "SET CONSTRAINTS ALL IMMEDIATE"); err != nil {
+		t.Fatalf("validate first concurrent directory identity: %v", err)
+	}
+	secondValidation := make(chan error, 1)
+	go func() {
+		_, validationErr := secondTransaction.Exec(ctx, "SET CONSTRAINTS ALL IMMEDIATE")
+		secondValidation <- validationErr
+	}()
+
+	var secondValidationErr error
+	secondValidationCompleted := false
+	secondWaitingForLock := false
+	for !secondWaitingForLock && !secondValidationCompleted {
+		select {
+		case secondValidationErr = <-secondValidation:
+			secondValidationCompleted = true
+		default:
+			if err := pool.QueryRow(ctx, `
+				SELECT COALESCE(wait_event_type = 'Lock', false)
+				FROM pg_stat_activity
+				WHERE pid = $1`, secondBackendPID).Scan(&secondWaitingForLock); err != nil {
+				t.Fatalf("inspect second directory identity transaction wait state: %v", err)
+			}
+		}
+	}
+
+	firstCommitErr := firstTransaction.Commit(ctx)
+	if secondWaitingForLock {
+		secondValidationErr = <-secondValidation
+	}
+	var secondCommitErr error
+	if secondValidationErr == nil {
+		secondCommitErr = secondTransaction.Commit(ctx)
+	} else {
+		secondCommitErr = secondValidationErr
+		_ = secondTransaction.Rollback(context.Background())
+	}
+	if firstCommitErr != nil {
+		t.Fatalf("first concurrent directory identity commit error = %v, want winner", firstCommitErr)
+	}
+	if secondCommitErr == nil {
+		t.Fatal("both concurrent conflicting directory identities committed, want exactly one failure")
+	}
+	if errors.Is(secondCommitErr, context.DeadlineExceeded) || errors.Is(secondCommitErr, context.Canceled) {
+		t.Fatalf("second concurrent directory identity ended by context instead of conflict: %v", secondCommitErr)
+	}
+	if !strings.Contains(secondCommitErr.Error(), "directory identity has conflicting effective entities") {
+		t.Fatalf("second concurrent directory identity error = %v, want effective-identity conflict", secondCommitErr)
+	}
+
+	var assertionCount, effectiveEntityCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), count(DISTINCT assertion.entity_id)
+		FROM `+quotedSchema+`.entity_directory_identity_assertions AS assertion
+		JOIN `+quotedSchema+`.resolution_decisions AS decision ON decision.id = assertion.decision_id
+		WHERE assertion.provider = 'google_people'
+		  AND assertion.provider_subject_id = 'synthetic-concurrent-subject'
+		  AND decision.superseded_by_id IS NULL
+		  AND decision.outcome IN ('accepted', 'created')
+		  AND decision.currently_admissible`).Scan(&assertionCount, &effectiveEntityCount); err != nil {
+		t.Fatalf("load concurrent effective directory identity result: %v", err)
+	}
+	if assertionCount != 1 || effectiveEntityCount != 1 {
+		t.Fatalf("concurrent effective directory identities = assertions:%d entities:%d, want 1/1",
+			assertionCount, effectiveEntityCount)
+	}
+}
+
 type googleDirectoryMigrationFixture struct {
 	entityID     string
 	mentionID    string

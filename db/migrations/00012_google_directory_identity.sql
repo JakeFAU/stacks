@@ -114,6 +114,11 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtext(checked_provider),
+        hashtext(checked_subject)
+    );
+
     IF (
         SELECT count(DISTINCT assertion.entity_id)
         FROM stacks.entity_directory_identity_assertions AS assertion
@@ -136,14 +141,30 @@ CREATE FUNCTION stacks.require_effective_directory_identity_for_assertion()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    checked_identity record;
 BEGIN
-    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+    IF TG_OP = 'UPDATE' THEN
+        FOR checked_identity IN
+            SELECT DISTINCT identity.provider, identity.provider_subject_id
+            FROM (
+                VALUES
+                    (OLD.provider, OLD.provider_subject_id),
+                    (NEW.provider, NEW.provider_subject_id)
+            ) AS identity(provider, provider_subject_id)
+            ORDER BY identity.provider, identity.provider_subject_id
+        LOOP
+            PERFORM stacks.validate_effective_directory_identity(
+                checked_identity.provider,
+                checked_identity.provider_subject_id
+            );
+        END LOOP;
+    ELSIF TG_OP = 'DELETE' THEN
         PERFORM stacks.validate_effective_directory_identity(
             OLD.provider,
             OLD.provider_subject_id
         );
-    END IF;
-    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+    ELSE
         PERFORM stacks.validate_effective_directory_identity(
             NEW.provider,
             NEW.provider_subject_id
