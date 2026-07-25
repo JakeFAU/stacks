@@ -1,5 +1,5 @@
-// Package entity owns deterministic, reviewable identity resolution policy.
-package entity
+// Package identity defines provider-neutral, conservative identity resolution.
+package identity
 
 import (
 	"net/mail"
@@ -44,8 +44,8 @@ type EntitySnapshot struct {
 	Aliases     []Alias
 }
 
-// Mention is the private source-grounded surface supplied to a resolver.
-// It must be kept out of logs and telemetry by callers.
+// Mention is the source-grounded surface supplied to a resolver. It must be
+// kept out of logs and telemetry by callers.
 type Mention struct {
 	Name  string
 	Email string
