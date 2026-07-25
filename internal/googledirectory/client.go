@@ -62,8 +62,14 @@ func (client *Client) Search(ctx context.Context, query entity.DirectoryQuery) (
 
 	profiles := make([]entity.DirectoryProfile, 0)
 	resultCount := 0
+	pageRequests := 0
 	pageToken := ""
+	seenPageTokens := make(map[string]struct{})
 	for {
+		if pageRequests >= client.maximumResults {
+			return directory.LookupResult{Outcome: entity.DirectoryResultLimitExceeded}, nil
+		}
+		pageRequests++
 		call := client.people.People.SearchDirectoryPeople().
 			ReadMask(directoryReadMask).
 			Sources(directoryProfileSource).
@@ -97,6 +103,10 @@ func (client *Client) Search(ctx context.Context, query entity.DirectoryQuery) (
 		if resultCount >= client.maximumResults {
 			return directory.LookupResult{Outcome: entity.DirectoryResultLimitExceeded}, nil
 		}
+		if _, repeated := seenPageTokens[response.NextPageToken]; repeated {
+			return directory.LookupResult{Outcome: entity.DirectoryInvalidResponse}, nil
+		}
+		seenPageTokens[response.NextPageToken] = struct{}{}
 		pageToken = response.NextPageToken
 	}
 	profiles = deduplicateProfiles(profiles)

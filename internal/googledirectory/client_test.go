@@ -146,6 +146,64 @@ func TestClientSearchReturnsLimitExceededForOversizedPage(t *testing.T) {
 	}
 }
 
+func TestClientSearchRejectsRepeatedNextPageToken(t *testing.T) {
+	const maximumResults = 3
+	requests := 0
+	client, err := NewClient(context.Background(), &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		if requests > maximumResults {
+			return nil, errors.New("synthetic request cap")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"nextPageToken":"cycle"}`)),
+			Request:    request,
+		}, nil
+	})}, maximumResults)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+
+	result, err := client.Search(context.Background(), entity.DirectoryQuery{Kind: entity.DirectoryQueryName, Name: "Sample"})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if result.Outcome != entity.DirectoryInvalidResponse || len(result.Profiles) != 0 || requests != 2 {
+		t.Fatal("Search() did not stop a repeated page token without authority")
+	}
+}
+
+func TestClientSearchBoundsDistinctEmptyPagesByMaximumResults(t *testing.T) {
+	const maximumResults = 3
+	nextPageTokens := map[string]string{"": "first", "first": "second", "second": "third"}
+	requests := 0
+	client, err := NewClient(context.Background(), &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		if requests > maximumResults {
+			return nil, errors.New("synthetic request cap")
+		}
+		nextPageToken := nextPageTokens[request.URL.Query().Get("pageToken")]
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"nextPageToken":"` + nextPageToken + `"}`)),
+			Request:    request,
+		}, nil
+	})}, maximumResults)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+
+	result, err := client.Search(context.Background(), entity.DirectoryQuery{Kind: entity.DirectoryQueryName, Name: "Sample"})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if result.Outcome != entity.DirectoryResultLimitExceeded || len(result.Profiles) != 0 || requests != maximumResults {
+		t.Fatal("Search() did not bound distinct empty pages without authority")
+	}
+}
+
 func TestClientSearchClassifiesGoogleAPIErrors(t *testing.T) {
 	for _, testCase := range []struct {
 		name       string
