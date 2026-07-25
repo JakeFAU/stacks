@@ -58,13 +58,6 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 	if service == nil || !service.Enabled {
 		return summary, nil
 	}
-	if err := ctx.Err(); err != nil {
-		return summary, err
-	}
-	if service.Repository == nil || service.Now == nil {
-		summary.Unavailable++
-		return summary, nil
-	}
 
 	tracer := service.Tracer
 	if tracer == nil {
@@ -75,22 +68,36 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 		observability.FinishSpan(span, resultErr)
 	}()
 
+	if err := ctx.Err(); err != nil {
+		return summary, err
+	}
+	if service.Repository == nil || service.Now == nil {
+		summary.Unavailable++
+		return summary, nil
+	}
+
 	now := service.Now().UTC()
+	if err := ctx.Err(); err != nil {
+		return summary, err
+	}
 	work, err := service.Repository.LoadWork(ctx, derivationID, now, service.Freshness, service.RetryAfter)
+	if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
+		return Summary{}, cancellationErr
+	}
 	if err != nil {
-		if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
-			return Summary{}, cancellationErr
-		}
 		summary.Unavailable++
 		return summary, nil
 	}
 	summary.Reused = work.Reused
 
+	if err := ctx.Err(); err != nil {
+		return summary, err
+	}
 	identityState, err := service.Repository.LoadIdentityState(ctx)
+	if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
+		return Summary{}, cancellationErr
+	}
 	if err != nil {
-		if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
-			return Summary{}, cancellationErr
-		}
 		summary.Unavailable++
 		return summary, nil
 	}
@@ -102,19 +109,23 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 		}
 		started := service.Now().UTC()
 		summary.Attempted++
-		if service.Lookup == nil {
-			summary.Unavailable++
-			service.recordDecision(ctx, entity.DirectoryUnavailable, 0, 0, started)
-			continue
-		}
 
-		lookup, attemptCount, lookupErr := service.search(ctx, query)
+		lookup := LookupResult{Outcome: entity.DirectoryNotConfigured}
+		attemptCount := 0
+		var lookupErr error
+		if service.Lookup != nil {
+			lookup, attemptCount, lookupErr = service.search(ctx, query)
+		}
 		if cancellationErr := directoryCancellation(ctx, lookupErr); cancellationErr != nil {
-			outcome := lookup.Outcome
-			if outcome == "" {
-				outcome = entity.DirectoryUnavailable
+			if decisionErr := service.recordDecision(
+				ctx,
+				entity.DirectoryUnavailable,
+				attemptCount,
+				0,
+				started,
+			); decisionErr != nil {
+				return summary, decisionErr
 			}
-			service.recordDecision(ctx, outcome, attemptCount, len(lookup.Profiles), started)
 			return summary, cancellationErr
 		}
 		recordedAt := service.Now().UTC()
@@ -122,6 +133,8 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 		if lookup.Outcome == "" {
 			evaluation = service.Policy.Evaluate(query, lookup.Profiles, identityState.Snapshots, identityState.Links)
 			lookup.Outcome = evaluation.Outcome
+		} else if lookup.Outcome == entity.DirectoryNoMatch {
+			evaluation.Outcome = entity.DirectoryNoMatch
 		}
 		var retryAfter *time.Time
 		if retryableDirectoryOutcome(lookup.Outcome) {
@@ -129,6 +142,9 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 			retryAfter = &value
 		}
 
+		if err := ctx.Err(); err != nil {
+			return summary, err
+		}
 		persisted, persistErr := service.Repository.Persist(ctx, PersistInput{
 			Mention:      mention,
 			Query:        query,
@@ -139,28 +155,40 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 			RetryAfter:   retryAfter,
 		})
 		if cancellationErr := directoryCancellation(ctx, persistErr); cancellationErr != nil {
-			service.recordDecision(
+			if decisionErr := service.recordDecision(
 				ctx,
 				entity.DirectoryUnavailable,
 				attemptCount,
-				len(lookup.Profiles),
+				0,
 				started,
-			)
+			); decisionErr != nil {
+				return summary, decisionErr
+			}
 			return summary, cancellationErr
 		}
 		if persistErr != nil {
 			summary.Unavailable++
-			service.recordDecision(ctx, entity.DirectoryUnavailable, attemptCount, len(lookup.Profiles), started)
+			if decisionErr := service.recordDecision(
+				ctx,
+				entity.DirectoryUnavailable,
+				attemptCount,
+				0,
+				started,
+			); decisionErr != nil {
+				return summary, decisionErr
+			}
 			continue
 		}
 		summary.add(lookup.Outcome, persisted)
-		service.recordDecision(
+		if decisionErr := service.recordDecision(
 			ctx,
 			effectiveDirectoryOutcome(lookup.Outcome, persisted),
 			attemptCount,
 			len(lookup.Profiles),
 			started,
-		)
+		); decisionErr != nil {
+			return summary, decisionErr
+		}
 	}
 	return summary, nil
 }
@@ -172,13 +200,17 @@ func (service *Service) search(ctx context.Context, query entity.DirectoryQuery)
 	}
 	var result LookupResult
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		var err error
-		result, err = service.Lookup.Search(ctx, query)
+		if err := ctx.Err(); err != nil {
+			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt - 1, err
+		}
+		untrusted, err := service.Lookup.Search(ctx, query)
 		if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
-			return result, attempt, cancellationErr
+			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, cancellationErr
 		}
 		if err != nil {
 			result = LookupResult{Outcome: entity.DirectoryUnavailable}
+		} else {
+			result = normalizeLookupResult(untrusted)
 		}
 		if !retryableDirectoryOutcome(result.Outcome) || attempt == maxAttempts {
 			return result, attempt, nil
@@ -186,10 +218,14 @@ func (service *Service) search(ctx context.Context, query entity.DirectoryQuery)
 		if service.Wait == nil {
 			return result, attempt, nil
 		}
-		if err := service.Wait(ctx, service.retryDelay(result)); err != nil {
-			if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
-				return result, attempt, cancellationErr
-			}
+		if err := ctx.Err(); err != nil {
+			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, err
+		}
+		waitErr := service.Wait(ctx, service.retryDelay(result))
+		if cancellationErr := directoryCancellation(ctx, waitErr); cancellationErr != nil {
+			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, cancellationErr
+		}
+		if waitErr != nil {
 			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, nil
 		}
 	}
@@ -198,6 +234,41 @@ func (service *Service) search(ctx context.Context, query entity.DirectoryQuery)
 
 func retryableDirectoryOutcome(outcome entity.DirectoryOutcome) bool {
 	return outcome == entity.DirectoryRateLimited || outcome == entity.DirectoryUnavailable
+}
+
+func normalizeLookupResult(result LookupResult) LookupResult {
+	if result.Outcome == "" {
+		result.RetryAfter = 0
+		return result
+	}
+	if !boundedDirectoryOutcome(result.Outcome) {
+		return LookupResult{Outcome: entity.DirectoryInvalidResponse}
+	}
+	result.Profiles = nil
+	if !retryableDirectoryOutcome(result.Outcome) {
+		result.RetryAfter = 0
+	}
+	return result
+}
+
+func boundedDirectoryOutcome(outcome entity.DirectoryOutcome) bool {
+	switch outcome {
+	case entity.DirectoryMatched,
+		entity.DirectoryNoMatch,
+		entity.DirectoryAmbiguous,
+		entity.DirectoryReview,
+		entity.DirectoryDisabled,
+		entity.DirectoryNotConfigured,
+		entity.DirectoryUnauthorized,
+		entity.DirectoryForbidden,
+		entity.DirectoryRateLimited,
+		entity.DirectoryUnavailable,
+		entity.DirectoryInvalidResponse,
+		entity.DirectoryResultLimitExceeded:
+		return true
+	default:
+		return false
+	}
 }
 
 func (service *Service) retryDelay(result LookupResult) time.Duration {
@@ -275,19 +346,33 @@ func (service *Service) recordDecision(
 	attemptCount int,
 	profileCount int,
 	started time.Time,
-) {
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if service.Decisions == nil {
-		return
+		return nil
 	}
 	duration := service.Now().UTC().Sub(started)
 	if duration < 0 {
 		duration = 0
 	}
-	_ = service.Decisions.Record(ctx, observability.DecisionObservation{
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := service.Decisions.Record(ctx, observability.DecisionObservation{
 		Name:       directoryLookupDecisionName,
-		Outcome:    string(outcome),
+		Outcome:    string(normalizeDirectoryOutcome(outcome)),
 		Duration:   duration,
 		InputSize:  int64(attemptCount),
 		OutputSize: int64(profileCount),
 	})
+	return directoryCancellation(ctx, err)
+}
+
+func normalizeDirectoryOutcome(outcome entity.DirectoryOutcome) entity.DirectoryOutcome {
+	if !boundedDirectoryOutcome(outcome) {
+		return entity.DirectoryUnavailable
+	}
+	return outcome
 }

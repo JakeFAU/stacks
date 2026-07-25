@@ -49,18 +49,26 @@ func TestServiceMissingOptionalLookupIsUnavailable(t *testing.T) {
 		work: Workset{Mentions: []PendingMention{pendingEmailMention()}},
 	}
 	service := newTestDirectoryService(repository, nil)
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	service.Tracer = provider.Tracer("directory-service-test")
 
 	summary, err := service.Enrich(context.Background(), "derivation-1")
 
 	if err != nil {
 		t.Fatalf("Enrich() error = %v", err)
 	}
-	if summary.Unavailable != 1 {
-		t.Fatalf("Enrich() Unavailable = %d, want 1", summary.Unavailable)
+	requireSummary(t, summary, Summary{Attempted: 1, Unavailable: 1})
+	if repository.calls.persist != 1 || len(repository.persisted) != 1 {
+		t.Fatalf("Persist() calls = %d, want 1", repository.calls.persist)
 	}
-	if repository.calls.persist != 0 {
-		t.Fatalf("Persist() calls = %d, want 0", repository.calls.persist)
+	input := repository.persisted[0]
+	if input.Lookup.Outcome != entity.DirectoryNotConfigured ||
+		input.AttemptCount != 0 ||
+		!reflect.DeepEqual(input.Evaluation, entity.DirectoryEvaluation{}) {
+		t.Fatalf("Persist() input is not one bounded not-configured terminal result")
 	}
+	requireSingleSpanStatus(t, exporter, codes.Ok)
 }
 
 func TestServiceRepositoryLoadFailureIsUnavailableWithoutPrivateError(t *testing.T) {
@@ -412,8 +420,12 @@ func TestServicePersistsOneTerminalBoundedOutcome(t *testing.T) {
 			if input.Lookup.Outcome != outcome || input.AttemptCount != 1 || input.RecordedAt.IsZero() {
 				t.Fatalf("Persist() terminal input = %#v", input)
 			}
-			if !reflect.DeepEqual(input.Evaluation, entity.DirectoryEvaluation{}) {
-				t.Fatalf("Persist() evaluation = %#v, want zero for bounded provider outcome", input.Evaluation)
+			wantEvaluation := entity.DirectoryEvaluation{}
+			if outcome == entity.DirectoryNoMatch {
+				wantEvaluation.Outcome = entity.DirectoryNoMatch
+			}
+			if !reflect.DeepEqual(input.Evaluation, wantEvaluation) {
+				t.Fatalf("Persist() evaluation = %#v, want %#v", input.Evaluation, wantEvaluation)
 			}
 		})
 	}
@@ -521,6 +533,98 @@ func TestServiceCancellationDuringPersistenceReturnsCanonicalError(t *testing.T)
 	requireSummary(t, summary, Summary{Attempted: 1})
 }
 
+func TestServiceStopsBeforeLoadIdentityWhenWorkLoadCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	repository := &fakeDirectoryRepository{afterLoadWork: cancel}
+	service := newTestDirectoryService(repository, &fakeDirectoryLookup{})
+
+	_, err := service.Enrich(ctx, "derivation-1")
+
+	if err != context.Canceled {
+		t.Fatalf("Enrich() error = %v, want canonical context.Canceled", err)
+	}
+	if repository.calls.loadIdentity != 0 {
+		t.Fatalf("LoadIdentityState() calls = %d, want 0", repository.calls.loadIdentity)
+	}
+}
+
+func TestServiceStopsBeforeLookupWhenIdentityLoadCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	repository := &fakeDirectoryRepository{
+		work:              Workset{Mentions: []PendingMention{pendingEmailMention()}},
+		afterLoadIdentity: cancel,
+	}
+	lookup := &fakeDirectoryLookup{}
+	service := newTestDirectoryService(repository, lookup)
+
+	_, err := service.Enrich(ctx, "derivation-1")
+
+	if err != context.Canceled {
+		t.Fatalf("Enrich() error = %v, want canonical context.Canceled", err)
+	}
+	if lookup.calls != 0 {
+		t.Fatalf("Search() calls = %d, want 0", lookup.calls)
+	}
+}
+
+func TestServiceStopsBeforePersistWhenContextCancelsAfterLookup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	repository := &fakeDirectoryRepository{
+		work: Workset{Mentions: []PendingMention{pendingEmailMention()}},
+	}
+	lookup := &fakeDirectoryLookup{
+		results: []LookupResult{{Outcome: entity.DirectoryNoMatch}},
+	}
+	service := newTestDirectoryService(repository, lookup)
+	nowCalls := 0
+	service.Now = func() time.Time {
+		nowCalls++
+		if nowCalls == 3 {
+			cancel()
+		}
+		return time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	}
+
+	_, err := service.Enrich(ctx, "derivation-1")
+
+	if err != context.Canceled {
+		t.Fatalf("Enrich() error = %v, want canonical context.Canceled", err)
+	}
+	if repository.calls.persist != 0 {
+		t.Fatalf("Persist() calls = %d, want 0", repository.calls.persist)
+	}
+}
+
+func TestServiceCancellationAfterSuccessfulWaitStopsBeforeRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	repository := &fakeDirectoryRepository{
+		work: Workset{Mentions: []PendingMention{pendingEmailMention()}},
+	}
+	lookup := &fakeDirectoryLookup{
+		results: []LookupResult{
+			{Outcome: entity.DirectoryRateLimited},
+			{Outcome: entity.DirectoryNoMatch},
+		},
+	}
+	service := newTestDirectoryService(repository, lookup)
+	service.Wait = func(context.Context, time.Duration) error {
+		cancel()
+		return nil
+	}
+
+	_, err := service.Enrich(ctx, "derivation-1")
+
+	if err != context.Canceled {
+		t.Fatalf("Enrich() error = %v, want canonical context.Canceled", err)
+	}
+	if lookup.calls != 1 {
+		t.Fatalf("Search() calls = %d, want 1", lookup.calls)
+	}
+	if repository.calls.persist != 0 {
+		t.Fatalf("Persist() calls = %d, want 0", repository.calls.persist)
+	}
+}
+
 func TestServicePreCanceledContextStopsBeforeRepositoryCalls(t *testing.T) {
 	repository := &fakeDirectoryRepository{
 		work: Workset{Mentions: []PendingMention{pendingEmailMention()}},
@@ -529,6 +633,9 @@ func TestServicePreCanceledContextStopsBeforeRepositoryCalls(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	service := newTestDirectoryService(repository, lookup)
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	service.Tracer = provider.Tracer("directory-service-test")
 
 	summary, err := service.Enrich(ctx, "derivation-1")
 
@@ -540,6 +647,170 @@ func TestServicePreCanceledContextStopsBeforeRepositoryCalls(t *testing.T) {
 	}
 	if repository.calls != (repositoryCallCounts{}) || lookup.calls != 0 {
 		t.Fatalf("calls after pre-cancellation = repository:%#v search:%d", repository.calls, lookup.calls)
+	}
+	requireSingleSpanStatus(t, exporter, codes.Error)
+}
+
+func TestServiceMissingDependenciesEndsOKSpan(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	service := Service{
+		Enabled: true,
+		Tracer:  provider.Tracer("directory-service-test"),
+	}
+
+	summary, err := service.Enrich(context.Background(), "derivation-1")
+
+	if err != nil {
+		t.Fatalf("Enrich() error = %v", err)
+	}
+	requireSummary(t, summary, Summary{Unavailable: 1})
+	requireSingleSpanStatus(t, exporter, codes.Ok)
+}
+
+func TestServiceDecisionRecorderCancellationIsCanonical(t *testing.T) {
+	tests := []struct {
+		name      string
+		recorder  *recordingDirectoryDecisions
+		ctx       context.Context
+		wantError error
+	}{
+		{
+			name: "recorder error",
+			recorder: &recordingDirectoryDecisions{
+				err: errors.Join(errPrivateDirectoryDetail, context.DeadlineExceeded),
+			},
+			ctx:       context.Background(),
+			wantError: context.DeadlineExceeded,
+		},
+		{
+			name:      "context canceled after record",
+			recorder:  &recordingDirectoryDecisions{},
+			wantError: context.Canceled,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := testCase.ctx
+			if ctx == nil {
+				cancelCtx, cancel := context.WithCancel(context.Background())
+				ctx = cancelCtx
+				testCase.recorder.afterRecord = cancel
+			}
+			repository := &fakeDirectoryRepository{
+				work: Workset{Mentions: []PendingMention{pendingEmailMention()}},
+			}
+			lookup := &fakeDirectoryLookup{
+				results: []LookupResult{{Outcome: entity.DirectoryNoMatch}},
+			}
+			exporter := tracetest.NewInMemoryExporter()
+			provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+			service := newTestDirectoryService(repository, lookup)
+			service.Tracer = provider.Tracer("directory-service-test")
+			service.Decisions = testCase.recorder
+
+			_, err := service.Enrich(ctx, "derivation-1")
+
+			if err != testCase.wantError {
+				t.Fatalf("Enrich() error = %v, want canonical %v", err, testCase.wantError)
+			}
+			requireSingleSpanStatus(t, exporter, codes.Error)
+		})
+	}
+}
+
+func TestServiceDecisionRecorderNonContextFailureIsFailSoft(t *testing.T) {
+	repository := &fakeDirectoryRepository{
+		work: Workset{Mentions: []PendingMention{pendingEmailMention()}},
+	}
+	lookup := &fakeDirectoryLookup{
+		results: []LookupResult{{Outcome: entity.DirectoryNoMatch}},
+	}
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	service := newTestDirectoryService(repository, lookup)
+	service.Tracer = provider.Tracer("directory-service-test")
+	service.Decisions = &recordingDirectoryDecisions{err: errPrivateDirectoryDetail}
+
+	summary, err := service.Enrich(context.Background(), "derivation-1")
+
+	if err != nil {
+		t.Fatalf("Enrich() error = %v, want fail-soft telemetry error", err)
+	}
+	requireSummary(t, summary, Summary{Attempted: 1, NoMatch: 1})
+	requireSingleSpanStatus(t, exporter, codes.Ok)
+}
+
+func TestServiceDiscardsErroredLookupResultFromTelemetryAndPersistence(t *testing.T) {
+	const privateMarker = "private-provider-marker-42f1"
+	for _, testCase := range []struct {
+		name        string
+		lookupError error
+		wantError   error
+		wantPersist int
+		wantStatus  codes.Code
+	}{
+		{
+			name:        "provider failure",
+			lookupError: errors.New(privateMarker),
+			wantPersist: 1,
+			wantStatus:  codes.Ok,
+		},
+		{
+			name:        "provider cancellation",
+			lookupError: errors.Join(errors.New(privateMarker), context.Canceled),
+			wantError:   context.Canceled,
+			wantStatus:  codes.Error,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			repository := &fakeDirectoryRepository{
+				work: Workset{Mentions: []PendingMention{pendingEmailMention()}},
+			}
+			lookup := &fakeDirectoryLookup{
+				results: []LookupResult{{
+					Outcome: entity.DirectoryOutcome(privateMarker),
+					Profiles: []entity.DirectoryProfile{{
+						Provider:    privateMarker,
+						SubjectID:   privateMarker,
+						DisplayName: privateMarker,
+					}},
+				}},
+				errors: []error{testCase.lookupError},
+			}
+			exporter := tracetest.NewInMemoryExporter()
+			provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+			decisions := &recordingDirectoryDecisions{}
+			service := newTestDirectoryService(repository, lookup)
+			service.MaxAttempts = 1
+			service.Tracer = provider.Tracer("directory-service-test")
+			service.Decisions = decisions
+
+			_, err := service.Enrich(context.Background(), "derivation-1")
+
+			if err != testCase.wantError {
+				t.Fatalf("Enrich() error = %v, want %v", err, testCase.wantError)
+			}
+			if repository.calls.persist != testCase.wantPersist {
+				t.Fatalf("Persist() calls = %d, want %d", repository.calls.persist, testCase.wantPersist)
+			}
+			if testCase.wantPersist == 1 {
+				input := repository.persisted[0]
+				if input.Lookup.Outcome != entity.DirectoryUnavailable ||
+					len(input.Lookup.Profiles) != 0 {
+					t.Fatalf("Persist() did not receive a normalized unavailable outcome")
+				}
+			}
+			if len(decisions.observations) != 1 ||
+				decisions.observations[0].Outcome != string(entity.DirectoryUnavailable) {
+				t.Fatalf("decision did not receive a normalized unavailable outcome")
+			}
+			requireSingleSpanStatus(t, exporter, testCase.wantStatus)
+			telemetry := fmt.Sprintf("%#v %#v", decisions.observations, exporter.GetSpans())
+			if strings.Contains(telemetry, privateMarker) {
+				t.Fatalf("telemetry contains a provider-controlled private marker")
+			}
+		})
 	}
 }
 
@@ -608,6 +879,8 @@ func TestServiceRecordsPrivacySafeDecisionAndExplicitOKSpan(t *testing.T) {
 
 type recordingDirectoryDecisions struct {
 	observations []observability.DecisionObservation
+	err          error
+	afterRecord  func()
 }
 
 func (recorder *recordingDirectoryDecisions) Record(
@@ -615,7 +888,10 @@ func (recorder *recordingDirectoryDecisions) Record(
 	observation observability.DecisionObservation,
 ) error {
 	recorder.observations = append(recorder.observations, observation)
-	return nil
+	if recorder.afterRecord != nil {
+		recorder.afterRecord()
+	}
+	return recorder.err
 }
 
 type repositoryCallCounts struct {
@@ -625,16 +901,18 @@ type repositoryCallCounts struct {
 }
 
 type fakeDirectoryRepository struct {
-	work           Workset
-	identity       IdentityState
-	persisted      []PersistInput
-	loadWorkErr    error
-	identityErr    error
-	persistErr     error
-	persistErrs    []error
-	persistResults []PersistResult
-	beforePersist  func()
-	calls          repositoryCallCounts
+	work              Workset
+	identity          IdentityState
+	persisted         []PersistInput
+	loadWorkErr       error
+	identityErr       error
+	persistErr        error
+	persistErrs       []error
+	persistResults    []PersistResult
+	afterLoadWork     func()
+	afterLoadIdentity func()
+	beforePersist     func()
+	calls             repositoryCallCounts
 }
 
 func (repository *fakeDirectoryRepository) LoadWork(
@@ -645,11 +923,17 @@ func (repository *fakeDirectoryRepository) LoadWork(
 	time.Duration,
 ) (Workset, error) {
 	repository.calls.loadWork++
+	if repository.afterLoadWork != nil {
+		repository.afterLoadWork()
+	}
 	return repository.work, repository.loadWorkErr
 }
 
 func (repository *fakeDirectoryRepository) LoadIdentityState(context.Context) (IdentityState, error) {
 	repository.calls.loadIdentity++
+	if repository.afterLoadIdentity != nil {
+		repository.afterLoadIdentity()
+	}
 	return repository.identity, repository.identityErr
 }
 
@@ -745,5 +1029,16 @@ func requireSummary(t *testing.T, got, want Summary) {
 	t.Helper()
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Enrich() summary = %#v, want %#v", got, want)
+	}
+}
+
+func requireSingleSpanStatus(t *testing.T, exporter *tracetest.InMemoryExporter, want codes.Code) {
+	t.Helper()
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("span count = %d, want 1", len(spans))
+	}
+	if spans[0].Name != "stacks.directory.enrich" || spans[0].Status.Code != want {
+		t.Fatalf("span = %q status %v, want stacks.directory.enrich status %v", spans[0].Name, spans[0].Status.Code, want)
 	}
 }
