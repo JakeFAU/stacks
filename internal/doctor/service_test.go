@@ -29,6 +29,122 @@ func TestDoctorReportsProviderNeutralModelChecksWithoutRuntimeInvocation(t *test
 	}
 }
 
+func TestDoctorReportsOptionalDirectoryReadinessWithoutEnumeratingProfiles(t *testing.T) {
+	tests := []struct {
+		name                 string
+		enabled              bool
+		probe                *fakeDirectoryProbe
+		authorizationStatus  Status
+		authorizationMessage string
+	}{
+		{
+			name:                 "disabled",
+			authorizationStatus:  StatusWarning,
+			authorizationMessage: "not checked because disabled",
+		},
+		{
+			name:                 "enabled and locally ready",
+			enabled:              true,
+			probe:                &fakeDirectoryProbe{},
+			authorizationStatus:  StatusOK,
+			authorizationMessage: "Google directory authorization is locally ready; live lookup is unexercised",
+		},
+		{
+			name:                 "enabled and invalid token",
+			enabled:              true,
+			probe:                &fakeDirectoryProbe{err: errors.New("private invalid token detail")},
+			authorizationStatus:  StatusWarning,
+			authorizationMessage: "Google directory authorization is unavailable or invalid",
+		},
+		{
+			name:                 "enabled and forbidden",
+			enabled:              true,
+			probe:                &fakeDirectoryProbe{err: errors.New("private forbidden provider detail")},
+			authorizationStatus:  StatusWarning,
+			authorizationMessage: "Google directory authorization is unavailable or invalid",
+		},
+		{
+			name:                 "enabled and unavailable",
+			enabled:              true,
+			probe:                &fakeDirectoryProbe{err: errors.New("private unavailable provider detail")},
+			authorizationStatus:  StatusWarning,
+			authorizationMessage: "Google directory authorization is unavailable or invalid",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			report := (Service{
+				Database:         &fakeDatabase{migrationsCurrent: true},
+				Google:           healthyGoogle(),
+				DirectoryEnabled: testCase.enabled,
+				Directory:        testCase.probe,
+				Invocation: modelpolicy.Invocation{
+					Provider: modelpolicy.ProviderOpenAI,
+					DataMode: modelpolicy.DataModePersonal,
+				},
+				Model: &fakeModelProbe{},
+			}).Check(context.Background())
+
+			configurationMessage := "Google directory enrichment is disabled"
+			if testCase.enabled {
+				configurationMessage = "Google directory enrichment is enabled"
+			}
+			assertCheck(t, report, CheckDirectoryConfiguration, StatusOK, configurationMessage)
+			authorization := assertCheck(
+				t,
+				report,
+				CheckDirectoryAuthorization,
+				testCase.authorizationStatus,
+				testCase.authorizationMessage,
+			)
+			if strings.Contains(authorization.Message, "private") ||
+				strings.Contains(authorization.Remediation, "private") {
+				t.Fatalf("directory authorization check disclosed provider detail: %#v", authorization)
+			}
+			if !report.Healthy() {
+				t.Fatal("Report.Healthy() = false, want optional directory warnings to remain healthy")
+			}
+			wantCalls := 0
+			if testCase.enabled && testCase.probe != nil {
+				wantCalls = 1
+			}
+			if testCase.probe != nil && testCase.probe.calls != wantCalls {
+				t.Fatalf("directory probe calls = %d, want %d", testCase.probe.calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestDoctorDirectoryCancellationIsCanonical(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	probe := &fakeDirectoryProbe{check: func(context.Context) error {
+		cancel()
+		return errors.New("private cancellation detail")
+	}}
+	model := &fakeModelProbe{}
+
+	report := (Service{
+		Database:         &fakeDatabase{migrationsCurrent: true},
+		Google:           healthyGoogle(),
+		DirectoryEnabled: true,
+		Directory:        probe,
+		Invocation: modelpolicy.Invocation{
+			Provider: modelpolicy.ProviderOpenAI,
+			DataMode: modelpolicy.DataModePersonal,
+		},
+		Model: model,
+	}).Check(ctx)
+
+	if report.Err != context.Canceled || !errors.Is(report.Err, context.Canceled) {
+		t.Fatalf("Report.Err = %v, want canonical context.Canceled", report.Err)
+	}
+	assertCheck(t, report, CheckDirectoryAuthorization, StatusFailed, "check canceled")
+	if probe.calls != 1 || model.credentialsCalls != 0 || model.modelCalls != 0 {
+		t.Fatalf("calls = directory:%d model:%d/%d, want 1/0/0", probe.calls, model.credentialsCalls, model.modelCalls)
+	}
+}
+
 func TestDoctorRestrictedDisclosurePrecedesGoogleAndDisabledPermitsReads(t *testing.T) {
 	calls := []string{}
 	disclosure := &fakeDisclosureProbe{logging: func(context.Context) (InvocationLoggingState, error) {
@@ -40,18 +156,25 @@ func TestDoctorRestrictedDisclosurePrecedesGoogleAndDisabledPermitsReads(t *test
 		calls = append(calls, "google.authorization")
 		return nil
 	}
+	directory := &fakeDirectoryProbe{check: func(context.Context) error {
+		calls = append(calls, "directory.authorization")
+		return nil
+	}}
 	model := &fakeModelProbe{}
 
 	report := (Service{
-		Database:   &fakeDatabase{migrationsCurrent: true},
-		Google:     google,
-		Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
-		Model:      model,
-		Disclosure: disclosure,
+		Database:         &fakeDatabase{migrationsCurrent: true},
+		Google:           google,
+		DirectoryEnabled: true,
+		Directory:        directory,
+		Invocation:       modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
+		Model:            model,
+		Disclosure:       disclosure,
 	}).Check(context.Background())
 
-	if len(calls) != 2 || calls[0] != "disclosure" || calls[1] != "google.authorization" {
-		t.Fatalf("boundary calls = %v, want disclosure before Google authorization", calls)
+	wantCalls := []string{"disclosure", "google.authorization", "directory.authorization"}
+	if strings.Join(calls, ",") != strings.Join(wantCalls, ",") {
+		t.Fatalf("boundary calls = %v, want disclosure before Drive and directory authorization %v", calls, wantCalls)
 	}
 	if disclosure.calls != 1 || google.authorizationCalls != 1 || google.folderCalls != 1 || google.representativeCalls != 1 || google.getCalls != 1 {
 		t.Fatalf("calls = disclosure:%d authorization:%d folder:%d representative:%d get:%d, want 1/1/1/1/1", disclosure.calls, google.authorizationCalls, google.folderCalls, google.representativeCalls, google.getCalls)
@@ -76,17 +199,23 @@ func TestDoctorRestrictedDisclosureFailureSkipsAllGoogleReads(t *testing.T) {
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			google := healthyGoogle()
+			directory := &fakeDirectoryProbe{}
 			model := &fakeModelProbe{}
 			report := (Service{
-				Database:   &fakeDatabase{migrationsCurrent: true},
-				Google:     google,
-				Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
-				Model:      model,
-				Disclosure: testCase.probe,
+				Database:         &fakeDatabase{migrationsCurrent: true},
+				Google:           google,
+				DirectoryEnabled: true,
+				Directory:        directory,
+				Invocation:       modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
+				Model:            model,
+				Disclosure:       testCase.probe,
 			}).Check(context.Background())
 
 			if google.authorizationCalls != 0 || google.folderCalls != 0 || google.representativeCalls != 0 || google.getCalls != 0 {
 				t.Fatalf("Google calls = authorization:%d folder:%d representative:%d get:%d, want all zero", google.authorizationCalls, google.folderCalls, google.representativeCalls, google.getCalls)
+			}
+			if directory.calls != 0 {
+				t.Fatalf("directory calls = %d, want 0", directory.calls)
 			}
 			for _, name := range []CheckName{CheckGoogleAuthorization, CheckGoogleFolder, CheckGoogleTabs} {
 				check := assertCheck(t, report, name, StatusFailed, "not checked because restricted model disclosure safety is not confirmed")
@@ -94,6 +223,8 @@ func TestDoctorRestrictedDisclosureFailureSkipsAllGoogleReads(t *testing.T) {
 					t.Fatalf("Google skipped check leaked or is unbounded: %#v", check)
 				}
 			}
+			assertCheck(t, report, CheckDirectoryConfiguration, StatusOK, "Google directory enrichment is enabled")
+			assertCheck(t, report, CheckDirectoryAuthorization, StatusWarning, "not checked because restricted model disclosure safety is not confirmed")
 			assertCheck(t, report, CheckModelDisclosure, StatusFailed, "restricted data mode selected; model disclosure safety is not confirmed")
 			if model.credentialsCalls != 1 || model.modelCalls != 1 || model.invokeCalls != 0 {
 				t.Fatalf("model calls = credentials:%d metadata:%d runtime:%d, want 1/1/0", model.credentialsCalls, model.modelCalls, model.invokeCalls)
@@ -109,22 +240,25 @@ func TestDoctorRestrictedDisclosureCancellationStopsBeforeGoogleAndModel(t *test
 		return InvocationLoggingDisabled, nil
 	}}
 	google := healthyGoogle()
+	directory := &fakeDirectoryProbe{}
 	model := &fakeModelProbe{}
 
 	report := (Service{
-		Database:   &fakeDatabase{migrationsCurrent: true},
-		Google:     google,
-		Invocation: modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
-		Model:      model,
-		Disclosure: disclosure,
+		Database:         &fakeDatabase{migrationsCurrent: true},
+		Google:           google,
+		DirectoryEnabled: true,
+		Directory:        directory,
+		Invocation:       modelpolicy.Invocation{Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModeRestricted, Region: "us-east-1"},
+		Model:            model,
+		Disclosure:       disclosure,
 	}).Check(ctx)
 
 	if report.Err != context.Canceled || !errors.Is(report.Err, context.Canceled) {
 		t.Fatalf("Report.Err = %v, want canonical context.Canceled", report.Err)
 	}
 	assertCheck(t, report, CheckModelDisclosure, StatusFailed, "check canceled")
-	if google.authorizationCalls != 0 || google.folderCalls != 0 || google.representativeCalls != 0 || google.getCalls != 0 || model.credentialsCalls != 0 || model.modelCalls != 0 || model.invokeCalls != 0 {
-		t.Fatalf("calls after cancellation = Google:%d/%d/%d/%d model:%d/%d/%d, want all zero", google.authorizationCalls, google.folderCalls, google.representativeCalls, google.getCalls, model.credentialsCalls, model.modelCalls, model.invokeCalls)
+	if google.authorizationCalls != 0 || google.folderCalls != 0 || google.representativeCalls != 0 || google.getCalls != 0 || directory.calls != 0 || model.credentialsCalls != 0 || model.modelCalls != 0 || model.invokeCalls != 0 {
+		t.Fatalf("calls after cancellation = Google:%d/%d/%d/%d directory:%d model:%d/%d/%d, want all zero", google.authorizationCalls, google.folderCalls, google.representativeCalls, google.getCalls, directory.calls, model.credentialsCalls, model.modelCalls, model.invokeCalls)
 	}
 }
 
@@ -205,6 +339,20 @@ type fakeModelProbe struct {
 	credentialsCalls int
 	modelCalls       int
 	invokeCalls      int
+}
+
+type fakeDirectoryProbe struct {
+	check func(context.Context) error
+	err   error
+	calls int
+}
+
+func (fake *fakeDirectoryProbe) CheckAuthorization(ctx context.Context) error {
+	fake.calls++
+	if fake.check != nil {
+		return fake.check(ctx)
+	}
+	return fake.err
 }
 
 func (fake *fakeModelProbe) CheckCredentials(context.Context) error {

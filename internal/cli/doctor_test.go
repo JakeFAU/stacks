@@ -21,6 +21,7 @@ func TestDoctorRendersReportAndFailsOnlyForFailedChecks(t *testing.T) {
 			report: doctor.Report{Checks: []doctor.Check{
 				{Name: doctor.CheckDatabaseConnectivity, Status: doctor.StatusOK, Message: "PostgreSQL is reachable"},
 				{Name: doctor.CheckGoogleTabs, Status: doctor.StatusWarning, Message: "synthetic warning"},
+				{Name: doctor.CheckDirectoryAuthorization, Status: doctor.StatusWarning, Message: "not checked because disabled"},
 			}},
 		},
 		{

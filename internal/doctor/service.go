@@ -16,14 +16,16 @@ import (
 type CheckName string
 
 const (
-	CheckDatabaseConnectivity CheckName = "database.connectivity"
-	CheckDatabaseMigrations   CheckName = "database.migrations"
-	CheckGoogleAuthorization  CheckName = "google.authorization"
-	CheckGoogleFolder         CheckName = "google.folder"
-	CheckGoogleTabs           CheckName = "google.tabs"
-	CheckModelCredentials     CheckName = "model.credentials"
-	CheckModelAvailability    CheckName = "model.availability"
-	CheckModelDisclosure      CheckName = "model.disclosure"
+	CheckDatabaseConnectivity   CheckName = "database.connectivity"
+	CheckDatabaseMigrations     CheckName = "database.migrations"
+	CheckGoogleAuthorization    CheckName = "google.authorization"
+	CheckGoogleFolder           CheckName = "google.folder"
+	CheckGoogleTabs             CheckName = "google.tabs"
+	CheckDirectoryConfiguration CheckName = "directory.configuration"
+	CheckDirectoryAuthorization CheckName = "directory.authorization"
+	CheckModelCredentials       CheckName = "model.credentials"
+	CheckModelAvailability      CheckName = "model.availability"
+	CheckModelDisclosure        CheckName = "model.disclosure"
 )
 
 // Status is the bounded outcome vocabulary rendered by the doctor command.
@@ -99,6 +101,12 @@ type DisclosureProbe interface {
 	InvocationLogging(context.Context) (InvocationLoggingState, error)
 }
 
+// DirectoryProbe exposes only local directory OAuth readiness. It must not
+// enumerate profiles or perform a directory search.
+type DirectoryProbe interface {
+	CheckAuthorization(context.Context) error
+}
+
 // AWS is retained as the existing combined Bedrock control-plane probe
 // contract until Task 9 updates the composition root.
 type AWS interface {
@@ -109,12 +117,14 @@ type AWS interface {
 // Service coordinates the read-only checks. It never authenticates, invokes a
 // model, applies migrations, synchronizes documents, or changes cloud config.
 type Service struct {
-	Database   Database
-	Google     Google
-	Invocation modelpolicy.Invocation
-	Model      ModelProbe
-	Disclosure DisclosureProbe
-	AWS        AWS
+	Database         Database
+	Google           Google
+	DirectoryEnabled bool
+	Directory        DirectoryProbe
+	Invocation       modelpolicy.Invocation
+	Model            ModelProbe
+	Disclosure       DisclosureProbe
+	AWS              AWS
 }
 
 // Check performs a fixed number of dependency calls and returns only bounded
@@ -213,6 +223,44 @@ func (service Service) Check(ctx context.Context) Report {
 		}
 	}
 
+	report.Checks = append(report.Checks, directoryConfigurationCheck(service.DirectoryEnabled))
+	if !service.DirectoryEnabled {
+		report.Checks = append(report.Checks, warning(
+			CheckDirectoryAuthorization,
+			"not checked because disabled",
+			"enable STACKS_GOOGLE_DIRECTORY_ENABLED to inspect directory authorization",
+		))
+	} else if !sourceAccessAllowed {
+		report.Checks = append(report.Checks, warning(
+			CheckDirectoryAuthorization,
+			"not checked because restricted model disclosure safety is not confirmed",
+			"confirm Bedrock invocation logging is disabled before directory authorization inspection",
+		))
+	} else if service.Directory == nil {
+		report.Checks = append(report.Checks, warning(
+			CheckDirectoryAuthorization,
+			"Google directory authorization check is not configured",
+			"configure the Google directory OAuth client and token paths",
+		))
+	} else {
+		err := service.Directory.CheckAuthorization(ctx)
+		if stop(&report, ctx, CheckDirectoryAuthorization, err) {
+			return report
+		}
+		if err != nil {
+			report.Checks = append(report.Checks, warning(
+				CheckDirectoryAuthorization,
+				"Google directory authorization is unavailable or invalid",
+				"run `stacks auth google-directory`",
+			))
+		} else {
+			report.Checks = append(report.Checks, ok(
+				CheckDirectoryAuthorization,
+				"Google directory authorization is locally ready; live lookup is unexercised",
+			))
+		}
+	}
+
 	if model == nil {
 		report.Checks = appendModelUnavailable(report.Checks, invocation.Provider, fmt.Sprintf("%s model check is not configured", providerName(invocation.Provider)))
 	} else {
@@ -242,6 +290,13 @@ func (service Service) Check(ctx context.Context) Report {
 	}
 	report.Checks = append(report.Checks, restrictedDisclosureCheck(disclosureState, disclosureErr))
 	return report
+}
+
+func directoryConfigurationCheck(enabled bool) Check {
+	if enabled {
+		return ok(CheckDirectoryConfiguration, "Google directory enrichment is enabled")
+	}
+	return ok(CheckDirectoryConfiguration, "Google directory enrichment is disabled")
 }
 
 func classifyTabs(tabs []source.Tab) Check {
@@ -351,4 +406,8 @@ func ok(name CheckName, message string) Check {
 
 func failed(name CheckName, message, remediation string) Check {
 	return Check{Name: name, Status: StatusFailed, Message: message, Remediation: remediation}
+}
+
+func warning(name CheckName, message, remediation string) Check {
+	return Check{Name: name, Status: StatusWarning, Message: message, Remediation: remediation}
 }

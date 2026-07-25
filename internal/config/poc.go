@@ -154,8 +154,13 @@ func (settings PoCSettings) Validate(command Command) error {
 		return settings.validateDoctor(command)
 	case CommandSync:
 		return settings.validateCorpusAndModel(command)
-	case CommandEntities, CommandReview:
+	case CommandEntities:
 		return settings.validateRequired(command, DatabaseURLEnvironmentVariable)
+	case CommandReview:
+		if err := settings.validateRequired(command, DatabaseURLEnvironmentVariable); err != nil {
+			return err
+		}
+		return settings.validateGoogleDirectory(command)
 	case CommandAnalyze:
 		if err := settings.validateRequired(command,
 			DatabaseURLEnvironmentVariable,

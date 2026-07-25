@@ -152,7 +152,7 @@ func TestGoogleDirectoryEnabledValidationRejectsInvalidSettings(t *testing.T) {
 			settings := validPoCSettings()
 			settings.Directory = validGoogleDirectorySettings()
 			testCase.invalidate(&settings.Directory)
-			for _, command := range []Command{CommandSync, CommandDoctor} {
+			for _, command := range []Command{CommandSync, CommandDoctor, CommandReview} {
 				if err := settings.Validate(command); err == nil {
 					t.Fatalf("Validate(%s) error = nil, want directory setting rejection", command)
 				}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -12,19 +13,25 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/smithy-go"
 	"go.opentelemetry.io/otel/metric/noop"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"stacks/internal/analysis"
 	"stacks/internal/cli"
 	"stacks/internal/config"
+	"stacks/internal/directory"
 	"stacks/internal/doctor"
+	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
+	"stacks/internal/knowledge"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
 	"stacks/internal/source"
+	"stacks/internal/storage"
 )
 
 func TestAWSLoadOptionsUseDefaultCredentialChainWhenProfileIsAbsent(t *testing.T) {
@@ -88,8 +95,15 @@ func TestFailedRestrictedGateConstructsNoSourceStorageOrModel(t *testing.T) {
 	for _, command := range []config.Command{config.CommandSync, config.CommandAnalyze} {
 		t.Run(string(command), func(t *testing.T) {
 			settings := validCommandPoCSettings(command, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
+			if command == config.CommandSync {
+				enableRuntimeDirectory(&settings)
+			}
 			calls := []string{}
 			runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingEnabled)
+			runtime.newDirectoryLookup = func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+				calls = append(calls, "directory")
+				return &recordingRuntimeDirectoryLookup{}, nil
+			}
 			commands, err := pocCommandProviderWithRuntime(
 				context.Background(), config.Settings{PoC: settings}, io.Discard, io.Discard,
 				tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
@@ -105,6 +119,81 @@ func TestFailedRestrictedGateConstructsNoSourceStorageOrModel(t *testing.T) {
 				t.Fatalf("calls = %v, want only disclosure inspection", calls)
 			}
 		})
+	}
+}
+
+func TestCanceledRestrictedSyncGateConstructsNoDriveDirectoryStorageOrModel(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
+	enableRuntimeDirectory(&settings)
+	calls := []string{}
+	runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingDisabled)
+	runtime.newDoctorProviderProbe = func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error) {
+		return nil, cancelingDisclosureProbe{calls: &calls}, nil
+	}
+	runtime.newDirectoryLookup = func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+		calls = append(calls, "directory")
+		return &recordingRuntimeDirectoryLookup{}, nil
+	}
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(),
+		config.Settings{PoC: settings},
+		io.Discard,
+		io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		nil,
+		runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = commands[string(config.CommandSync)].Run(ctx, nil)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("sync error = %v, want context.Canceled", err)
+	}
+	if strings.Join(calls, ",") != "logging" {
+		t.Fatalf("calls = %v, want only disclosure inspection", calls)
+	}
+}
+
+func TestFailedRestrictedReviewGateConstructsNoDirectoryOrStorage(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandReview, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
+	enableRuntimeDirectory(&settings)
+	calls := []string{}
+	runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingEnabled)
+	runtime.newDirectoryLookup = func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+		calls = append(calls, "directory")
+		return &recordingRuntimeDirectoryLookup{}, nil
+	}
+	runtime.openReviewRepositories = func(context.Context, string) (*storage.EntityRepository, directory.Repository, func(), error) {
+		calls = append(calls, "postgres")
+		return nil, nil, nil, nil
+	}
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(),
+		config.Settings{PoC: settings},
+		io.Discard,
+		io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		nil,
+		runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+
+	err = commands[string(config.CommandReview)].Run(context.Background(), []string{"list"})
+
+	if !errors.Is(err, doctor.ErrDisclosureNotConfirmed) {
+		t.Fatalf("review error = %v, want disclosure rejection", err)
+	}
+	if strings.Join(calls, ",") != "logging" {
+		t.Fatalf("calls = %v, want only disclosure inspection", calls)
 	}
 }
 
@@ -212,6 +301,335 @@ func TestAuthCommandRejectsInvalidTargetBeforeConstructingAuthorizers(t *testing
 	}
 }
 
+func TestDisabledSyncAndReviewDoNotConstructDirectoryBoundaries(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal)
+	var directoryLookupCalls, directoryProbeCalls int
+	var syncRepositoryCalls, reviewRepositoryCalls int
+	var closes int
+	runtime := pocCommandRuntime{
+		newDoctorDirectory: func(config.GoogleDirectorySettings) doctor.DirectoryProbe {
+			directoryProbeCalls++
+			return &readyDirectoryProbe{}
+		},
+		newDirectoryLookup: func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+			directoryLookupCalls++
+			return &recordingRuntimeDirectoryLookup{}, nil
+		},
+		newSource: func(context.Context, config.PoCSettings) (source.Source, error) {
+			return emptyRuntimeSource{}, nil
+		},
+		openSyncRepositories: func(context.Context, string) (ingest.Repository, directory.Repository, func(), error) {
+			syncRepositoryCalls++
+			return noOpRuntimeIngestionRepository{}, noOpRuntimeDirectoryRepository{}, func() { closes++ }, nil
+		},
+		openReviewRepositories: func(context.Context, string) (*storage.EntityRepository, directory.Repository, func(), error) {
+			reviewRepositoryCalls++
+			return nil, noOpRuntimeDirectoryRepository{}, func() { closes++ }, nil
+		},
+		newModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error) {
+			return noOpRuntimeModel{}, nil
+		},
+	}
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(),
+		config.Settings{PoC: settings},
+		io.Discard,
+		io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		nil,
+		runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err != nil {
+		t.Fatalf("disabled sync error = %v", err)
+	}
+	if err := commands[string(config.CommandReview)].Run(context.Background(), []string{"list"}); err == nil {
+		t.Fatal("review list error = nil, want nil repository sentinel")
+	}
+
+	if directoryLookupCalls != 0 || directoryProbeCalls != 0 {
+		t.Fatalf("directory constructors = lookup:%d probe:%d, want 0/0", directoryLookupCalls, directoryProbeCalls)
+	}
+	if syncRepositoryCalls != 1 || reviewRepositoryCalls != 1 || closes != 2 {
+		t.Fatalf("repositories/closes = sync:%d review:%d closes:%d, want 1/1/2", syncRepositoryCalls, reviewRepositoryCalls, closes)
+	}
+}
+
+func TestEnabledSyncConstructsOneDirectoryBoundaryAndOneSharedRepositoryOwner(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal)
+	enableRuntimeDirectory(&settings)
+	var calls []string
+	lookup := &recordingRuntimeDirectoryLookup{}
+	runtime := pocCommandRuntime{
+		newDirectoryLookup: func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+			calls = append(calls, "directory")
+			return lookup, nil
+		},
+		newSource: func(context.Context, config.PoCSettings) (source.Source, error) {
+			calls = append(calls, "drive")
+			return emptyRuntimeSource{}, nil
+		},
+		openSyncRepositories: func(context.Context, string) (ingest.Repository, directory.Repository, func(), error) {
+			calls = append(calls, "postgres")
+			return noOpRuntimeIngestionRepository{}, noOpRuntimeDirectoryRepository{}, func() {
+				calls = append(calls, "close")
+			}, nil
+		},
+		newModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error) {
+			calls = append(calls, "model")
+			return noOpRuntimeModel{}, nil
+		},
+	}
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(),
+		config.Settings{PoC: settings},
+		io.Discard,
+		io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		nil,
+		runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+
+	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err != nil {
+		t.Fatalf("enabled sync error = %v", err)
+	}
+	want := []string{"drive", "directory", "postgres", "model", "close"}
+	if strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+	if lookup.calls != 0 {
+		t.Fatalf("directory searches = %d, want no bulk search for an empty workset", lookup.calls)
+	}
+}
+
+func TestRestrictedSyncConstructsDirectoryOnlyAfterDisclosureGate(t *testing.T) {
+	settings := validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
+	enableRuntimeDirectory(&settings)
+	calls := []string{}
+	runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingDisabled)
+	runtime.newDirectoryLookup = func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+		calls = append(calls, "directory")
+		return nil, errors.New("synthetic bounded directory construction failure")
+	}
+
+	commands, err := pocCommandProviderWithRuntime(
+		context.Background(),
+		config.Settings{PoC: settings},
+		io.Discard,
+		io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		nil,
+		runtime,
+	)
+	if err != nil {
+		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+	}
+	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err == nil {
+		t.Fatal("sync error = nil, want directory construction failure")
+	}
+	want := []string{"logging", "google", "directory"}
+	if strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want disclosure before Drive and directory construction %v", calls, want)
+	}
+}
+
+func TestDoctorConstructsOptionalProbeOnlyWhenEnabledAndNeverConstructsRuntimeOrSearch(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			settings := validCommandPoCSettings(config.CommandDoctor, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal)
+			if enabled {
+				enableRuntimeDirectory(&settings)
+			}
+			var probeConstructions, modelRuntimeConstructions, lookupConstructions int
+			probe := &readyDirectoryProbe{}
+			runtime := pocCommandRuntime{
+				newDoctorDatabase: func(string) doctorDatabase { return readyDoctorDatabase{} },
+				newDoctorGoogle:   func(config.PoCSettings) doctor.Google { return readyDoctorGoogle{} },
+				newDoctorDirectory: func(config.GoogleDirectorySettings) doctor.DirectoryProbe {
+					probeConstructions++
+					return probe
+				},
+				newDoctorProviderProbe: func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error) {
+					return readyDoctorModelProbe{}, nil, nil
+				},
+				newDirectoryLookup: func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+					lookupConstructions++
+					return &recordingRuntimeDirectoryLookup{}, nil
+				},
+				newModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error) {
+					modelRuntimeConstructions++
+					return noOpRuntimeModel{}, nil
+				},
+			}
+			commands, err := pocCommandProviderWithRuntime(
+				context.Background(),
+				config.Settings{PoC: settings},
+				io.Discard,
+				io.Discard,
+				tracenoop.NewTracerProvider().Tracer("synthetic"),
+				nil,
+				nil,
+				runtime,
+			)
+			if err != nil {
+				t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+			}
+
+			if err := commands[string(config.CommandDoctor)].Run(context.Background(), nil); err != nil {
+				t.Fatalf("doctor error = %v", err)
+			}
+			wantProbeConstructions := 0
+			wantProbeChecks := 0
+			if enabled {
+				wantProbeConstructions = 1
+				wantProbeChecks = 1
+			}
+			if probeConstructions != wantProbeConstructions ||
+				probe.calls != wantProbeChecks ||
+				modelRuntimeConstructions != 0 ||
+				lookupConstructions != 0 {
+				t.Fatalf(
+					"doctor constructions/checks = probe:%d/%d model:%d lookup:%d, want %d/%d/0/0",
+					probeConstructions,
+					probe.calls,
+					modelRuntimeConstructions,
+					lookupConstructions,
+					wantProbeConstructions,
+					wantProbeChecks,
+				)
+			}
+		})
+	}
+}
+
+func TestComposedDirectoryServiceTelemetryContainsOnlyBoundedFields(t *testing.T) {
+	const (
+		sentinelName    = "Private Name Marker 9b41"
+		sentinelEmail   = "private.marker@corp.example"
+		sentinelSubject = "people/private-subject-9b41"
+		sentinelToken   = "private-token-9b41"
+		sentinelQuery   = "private query marker 9b41"
+	)
+	settings := config.GoogleDirectorySettings{
+		Enabled:      true,
+		EmailDomains: []string{"corp.example"},
+		Freshness:    24 * time.Hour,
+		RetryAfter:   time.Minute,
+		MaxAttempts:  1,
+	}
+	repository := &runtimeDirectoryRepository{
+		work: directory.Workset{Mentions: []directory.PendingMention{{
+			MentionID:      "private-mention-9b41",
+			ProposalID:     "private-proposal-9b41",
+			Surface:        sentinelQuery,
+			NormalizedName: sentinelName,
+			ProposedEmail:  sentinelEmail,
+			EmailQuote:     sentinelEmail,
+		}}},
+	}
+	lookup := &recordingRuntimeDirectoryLookup{
+		result: directory.LookupResult{Profiles: []entity.DirectoryProfile{{
+			Provider:    "google_people",
+			SubjectID:   sentinelSubject,
+			Source:      entity.DirectorySourceDomainProfile,
+			DisplayName: sentinelName,
+			Emails:      []entity.DirectoryEmail{{Value: sentinelEmail, Primary: true}},
+		}}},
+		err: errors.New(sentinelToken),
+	}
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	decisions := &runtimeDirectoryDecisions{}
+	service, err := newDirectoryService(
+		settings,
+		lookup,
+		repository,
+		provider.Tracer("runtime-directory-test"),
+		decisions,
+		func() time.Time { return time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC) },
+	)
+	if err != nil {
+		t.Fatalf("newDirectoryService() error = %v", err)
+	}
+
+	if _, err := service.Enrich(context.Background(), "private-derivation-9b41"); err != nil {
+		t.Fatalf("Enrich() error = %v", err)
+	}
+	if len(decisions.observations) != 1 {
+		t.Fatalf("decision count = %d, want 1", len(decisions.observations))
+	}
+	observation := decisions.observations[0]
+	if observation.Name != "directory_lookup" ||
+		observation.Outcome != string(entity.DirectoryUnavailable) ||
+		observation.InputSize != 1 ||
+		observation.OutputSize != 0 {
+		t.Fatalf("decision = %#v, want bounded directory outcome/counts", observation)
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "stacks.directory.enrich" {
+		t.Fatalf("spans = %#v, want one bounded directory span", spans)
+	}
+	telemetry := fmt.Sprintf("%#v %#v", decisions.observations, spans)
+	for _, privateMarker := range []string{
+		sentinelName,
+		sentinelEmail,
+		sentinelSubject,
+		sentinelToken,
+		sentinelQuery,
+	} {
+		if strings.Contains(telemetry, privateMarker) {
+			t.Fatalf("telemetry contains private marker %q", privateMarker)
+		}
+	}
+}
+
+func TestComposedDirectoryServiceIsTheSharedEnrichmentAndReviewerBoundary(t *testing.T) {
+	settings := config.GoogleDirectorySettings{
+		Enabled:      true,
+		EmailDomains: []string{"corp.example"},
+		Freshness:    24 * time.Hour,
+		RetryAfter:   time.Minute,
+		MaxAttempts:  1,
+	}
+	directoryService, err := newDirectoryService(
+		settings,
+		&recordingRuntimeDirectoryLookup{},
+		noOpRuntimeDirectoryRepository{},
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		time.Now,
+	)
+	if err != nil {
+		t.Fatalf("newDirectoryService() error = %v", err)
+	}
+	ingestionService := newIngestionService(
+		validCommandPoCSettings(config.CommandSync, modelpolicy.ProviderOpenAI, modelpolicy.DataModePersonal),
+		emptyRuntimeSource{},
+		noOpRuntimeModel{},
+		noOpRuntimeIngestionRepository{},
+		directoryService,
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		time.Now,
+	)
+	var reviewerVerifier cli.ReviewerEmailVerifier = directoryService
+
+	if ingestionService.IdentityEnricher != directoryService {
+		t.Fatal("ingestion did not receive the composed directory service instance")
+	}
+	if reviewerVerifier != directoryService {
+		t.Fatal("review did not receive the composed directory service instance")
+	}
+}
+
 func TestPaddedDirectProviderSettingsRejectBeforeAnyBoundary(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -283,9 +701,177 @@ type recordingDisclosureProbe struct {
 	state doctor.InvocationLoggingState
 }
 
+type cancelingDisclosureProbe struct {
+	calls *[]string
+}
+
+func (probe cancelingDisclosureProbe) InvocationLogging(context.Context) (doctor.InvocationLoggingState, error) {
+	*probe.calls = append(*probe.calls, "logging")
+	return doctor.InvocationLoggingUnknown, context.Canceled
+}
+
 func (probe recordingDisclosureProbe) InvocationLogging(context.Context) (doctor.InvocationLoggingState, error) {
 	*probe.calls = append(*probe.calls, "logging")
 	return probe.state, nil
+}
+
+type readyDirectoryProbe struct {
+	calls int
+}
+
+func (probe *readyDirectoryProbe) CheckAuthorization(context.Context) error {
+	probe.calls++
+	return nil
+}
+
+type readyDoctorDatabase struct{}
+
+func (readyDoctorDatabase) Ping(context.Context) error { return nil }
+
+func (readyDoctorDatabase) MigrationsCurrent(context.Context) (bool, error) { return true, nil }
+
+func (readyDoctorDatabase) Close() {}
+
+type readyDoctorGoogle struct{}
+
+func (readyDoctorGoogle) CheckAuthorization(context.Context) error { return nil }
+
+func (readyDoctorGoogle) CheckFolder(context.Context) error { return nil }
+
+func (readyDoctorGoogle) GetRepresentative(context.Context) (source.Document, bool, error) {
+	return source.Document{ID: "synthetic-document"}, true, nil
+}
+
+func (readyDoctorGoogle) GetDocument(context.Context, string) (source.Document, error) {
+	return source.Document{Tabs: []source.Tab{{Role: source.TabRoleTranscript}}}, nil
+}
+
+type readyDoctorModelProbe struct{}
+
+func (readyDoctorModelProbe) CheckCredentials(context.Context) error { return nil }
+
+func (readyDoctorModelProbe) CheckModel(context.Context) error { return nil }
+
+type emptyRuntimeSource struct{}
+
+func (emptyRuntimeSource) List(context.Context, string) ([]source.Document, error) { return nil, nil }
+
+func (emptyRuntimeSource) Get(context.Context, string) (source.Document, error) {
+	return source.Document{}, errors.New("unexpected source get")
+}
+
+type noOpRuntimeModel struct{}
+
+func (noOpRuntimeModel) Generate(context.Context, extract.Request) (extract.Response, error) {
+	return extract.Response{}, nil
+}
+
+type noOpRuntimeIngestionRepository struct{}
+
+func (noOpRuntimeIngestionRepository) PrepareVersion(
+	context.Context,
+	knowledge.DocumentVersion,
+	ingest.DerivationIdentity,
+	modelpolicy.DataMode,
+	time.Duration,
+) (ingest.VersionState, error) {
+	return ingest.VersionState{}, nil
+}
+
+func (noOpRuntimeIngestionRepository) CompleteVersion(context.Context, ingest.Completion) error {
+	return nil
+}
+
+func (noOpRuntimeIngestionRepository) RecordFailure(
+	context.Context,
+	string,
+	string,
+	ingest.VersionStatus,
+	ingest.FailureCode,
+) error {
+	return nil
+}
+
+func (noOpRuntimeIngestionRepository) EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error) {
+	return nil, nil
+}
+
+type noOpRuntimeDirectoryRepository struct{}
+
+func (noOpRuntimeDirectoryRepository) LoadWork(
+	context.Context,
+	string,
+	time.Time,
+	time.Duration,
+	time.Duration,
+) (directory.Workset, error) {
+	return directory.Workset{}, nil
+}
+
+func (noOpRuntimeDirectoryRepository) LoadIdentityState(context.Context) (directory.IdentityState, error) {
+	return directory.IdentityState{}, nil
+}
+
+func (noOpRuntimeDirectoryRepository) Persist(
+	context.Context,
+	directory.PersistInput,
+) (directory.PersistResult, error) {
+	return directory.PersistResult{}, nil
+}
+
+type recordingRuntimeDirectoryLookup struct {
+	result  directory.LookupResult
+	err     error
+	calls   int
+	queries []entity.DirectoryQuery
+}
+
+func (lookup *recordingRuntimeDirectoryLookup) Search(
+	_ context.Context,
+	query entity.DirectoryQuery,
+) (directory.LookupResult, error) {
+	lookup.calls++
+	lookup.queries = append(lookup.queries, query)
+	return lookup.result, lookup.err
+}
+
+type runtimeDirectoryRepository struct {
+	work      directory.Workset
+	persisted []directory.PersistInput
+}
+
+func (repository *runtimeDirectoryRepository) LoadWork(
+	context.Context,
+	string,
+	time.Time,
+	time.Duration,
+	time.Duration,
+) (directory.Workset, error) {
+	return repository.work, nil
+}
+
+func (repository *runtimeDirectoryRepository) LoadIdentityState(context.Context) (directory.IdentityState, error) {
+	return directory.IdentityState{}, nil
+}
+
+func (repository *runtimeDirectoryRepository) Persist(
+	_ context.Context,
+	input directory.PersistInput,
+) (directory.PersistResult, error) {
+	repository.persisted = append(repository.persisted, input)
+	return directory.PersistResult{}, nil
+}
+
+type runtimeDirectoryDecisions struct {
+	observations []observability.DecisionObservation
+}
+
+func (decisions *runtimeDirectoryDecisions) Record(
+	_ context.Context,
+	observation observability.DecisionObservation,
+) error {
+	decisions.observations = append(decisions.observations, observation)
+	return nil
 }
 
 func boundaryOrderRuntime(calls *[]string, state doctor.InvocationLoggingState) pocCommandRuntime {
@@ -297,9 +883,9 @@ func boundaryOrderRuntime(calls *[]string, state doctor.InvocationLoggingState) 
 			*calls = append(*calls, "google")
 			return nil, nil
 		},
-		openIngestionRepository: func(context.Context, string) (ingest.Repository, func(), error) {
+		openSyncRepositories: func(context.Context, string) (ingest.Repository, directory.Repository, func(), error) {
 			*calls = append(*calls, "postgres")
-			return nil, func() { *calls = append(*calls, "close") }, nil
+			return nil, nil, func() { *calls = append(*calls, "close") }, nil
 		},
 		openAnalysisRepository: func(context.Context, string) (analysis.Repository, func(), error) {
 			*calls = append(*calls, "postgres")
@@ -309,6 +895,18 @@ func boundaryOrderRuntime(calls *[]string, state doctor.InvocationLoggingState) 
 			*calls = append(*calls, "model")
 			return nil, errStopAfterModelConstruction
 		},
+	}
+}
+
+func enableRuntimeDirectory(settings *config.PoCSettings) {
+	settings.Directory = config.GoogleDirectorySettings{
+		Enabled:         true,
+		OAuthClientFile: "/synthetic/directory-client.json",
+		OAuthTokenFile:  "/synthetic/directory-token.json",
+		EmailDomains:    []string{"corp.example"},
+		Freshness:       24 * time.Hour,
+		RetryAfter:      time.Minute,
+		MaxAttempts:     1,
 	}
 }
 
@@ -424,7 +1022,7 @@ func TestCommandServicesReceiveSelectedInvocationPolicy(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			settings := config.PoCSettings{Model: config.ModelSettings{Provider: test.provider, DataMode: test.dataMode, AWSRegion: test.region}}
 			t.Run("sync", func(t *testing.T) {
-				ingestion := newIngestionService(settings, nil, nil, nil, nil, nil, nil)
+				ingestion := newIngestionService(settings, nil, nil, nil, nil, nil, nil, nil)
 				if ingestion.Provider != test.provider || ingestion.DataMode != test.dataMode || ingestion.Region != test.region {
 					t.Fatalf("ingestion invocation = %q/%q/%q, want %q/%q/%q", ingestion.Provider, ingestion.DataMode, ingestion.Region, test.provider, test.dataMode, test.region)
 				}

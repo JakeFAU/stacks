@@ -20,6 +20,7 @@ import (
 	"stacks/internal/app"
 	"stacks/internal/cli"
 	"stacks/internal/config"
+	"stacks/internal/directory"
 	"stacks/internal/doctor"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
@@ -37,6 +38,7 @@ const (
 	observabilityShutdownTimeout      = 10 * time.Second
 	awsAccessDeniedErrorCode          = "AccessDenied"
 	awsAccessDeniedExceptionErrorCode = "AccessDeniedException"
+	googleDirectoryMaximumResults     = 25
 )
 
 func main() {
@@ -113,15 +115,18 @@ type doctorDatabase interface {
 }
 
 type pocCommandRuntime struct {
-	newDriveAuthorizer      func(string, string, io.Writer) cli.GoogleAuthorizer
-	newDirectoryAuthorizer  func(string, string, io.Writer) cli.GoogleAuthorizer
-	newDoctorDatabase       func(string) doctorDatabase
-	newDoctorGoogle         func(config.PoCSettings) doctor.Google
-	newDoctorProviderProbe  func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
-	newSource               func(context.Context, config.PoCSettings) (source.Source, error)
-	openIngestionRepository func(context.Context, string) (ingest.Repository, func(), error)
-	openAnalysisRepository  func(context.Context, string) (analysis.Repository, func(), error)
-	newModel                func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error)
+	newDriveAuthorizer     func(string, string, io.Writer) cli.GoogleAuthorizer
+	newDirectoryAuthorizer func(string, string, io.Writer) cli.GoogleAuthorizer
+	newDoctorDatabase      func(string) doctorDatabase
+	newDoctorGoogle        func(config.PoCSettings) doctor.Google
+	newDoctorDirectory     func(config.GoogleDirectorySettings) doctor.DirectoryProbe
+	newDoctorProviderProbe func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
+	newSource              func(context.Context, config.PoCSettings) (source.Source, error)
+	newDirectoryLookup     func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error)
+	openSyncRepositories   func(context.Context, string) (ingest.Repository, directory.Repository, func(), error)
+	openReviewRepositories func(context.Context, string) (*storage.EntityRepository, directory.Repository, func(), error)
+	openAnalysisRepository func(context.Context, string) (analysis.Repository, func(), error)
+	newModel               func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error)
 }
 
 func defaultPoCCommandRuntime() pocCommandRuntime {
@@ -141,6 +146,9 @@ func defaultPoCCommandRuntime() pocCommandRuntime {
 				drive.NewTabClassifier(settings.TranscriptTitles, settings.NotesTitles),
 			)
 		},
+		newDoctorDirectory: func(settings config.GoogleDirectorySettings) doctor.DirectoryProbe {
+			return googledirectory.NewProbe(settings.OAuthClientFile, settings.OAuthTokenFile)
+		},
 		newDoctorProviderProbe: newDoctorProviderProbe,
 		newSource: func(ctx context.Context, settings config.PoCSettings) (source.Source, error) {
 			httpClient, err := drive.NewAuthorizedHTTPClient(ctx, settings.GoogleOAuthClientFile, settings.GoogleOAuthTokenFile)
@@ -149,12 +157,30 @@ func defaultPoCCommandRuntime() pocCommandRuntime {
 			}
 			return drive.NewClient(ctx, httpClient, drive.NewTabClassifier(settings.TranscriptTitles, settings.NotesTitles))
 		},
-		openIngestionRepository: func(ctx context.Context, databaseURL string) (ingest.Repository, func(), error) {
+		newDirectoryLookup: func(ctx context.Context, settings config.GoogleDirectorySettings) (directory.Lookup, error) {
+			httpClient, err := googledirectory.NewAuthorizedHTTPClient(
+				ctx,
+				settings.OAuthClientFile,
+				settings.OAuthTokenFile,
+			)
+			if err != nil {
+				return nil, err
+			}
+			return googledirectory.NewClient(ctx, httpClient, googleDirectoryMaximumResults)
+		},
+		openSyncRepositories: func(ctx context.Context, databaseURL string) (ingest.Repository, directory.Repository, func(), error) {
 			pool, err := storage.Open(ctx, databaseURL)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
-			return storage.NewIngestionRepository(pool), pool.Close, nil
+			return storage.NewIngestionRepository(pool), storage.NewDirectoryRepository(pool), pool.Close, nil
+		},
+		openReviewRepositories: func(ctx context.Context, databaseURL string) (*storage.EntityRepository, directory.Repository, func(), error) {
+			pool, err := storage.Open(ctx, databaseURL)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			return storage.NewEntityRepository(pool), storage.NewDirectoryRepository(pool), pool.Close, nil
 		},
 		openAnalysisRepository: func(ctx context.Context, databaseURL string) (analysis.Repository, func(), error) {
 			pool, err := storage.Open(ctx, databaseURL)
@@ -210,7 +236,10 @@ func pocCommandProviderWithRuntime(
 			if err := settings.PoC.Validate(config.CommandDoctor); err != nil {
 				return err
 			}
-			if runtime.newDoctorDatabase == nil || runtime.newDoctorGoogle == nil || runtime.newDoctorProviderProbe == nil {
+			if runtime.newDoctorDatabase == nil ||
+				runtime.newDoctorGoogle == nil ||
+				runtime.newDoctorProviderProbe == nil ||
+				(settings.PoC.Directory.Enabled && runtime.newDoctorDirectory == nil) {
 				return errors.New("doctor command dependencies are not configured")
 			}
 			database := runtime.newDoctorDatabase(settings.PoC.DatabaseURL)
@@ -219,9 +248,14 @@ func pocCommandProviderWithRuntime(
 			if err != nil {
 				return err
 			}
+			var directoryProbe doctor.DirectoryProbe
+			if settings.PoC.Directory.Enabled {
+				directoryProbe = runtime.newDoctorDirectory(settings.PoC.Directory)
+			}
 			return (cli.DoctorCommand{
 				Service: doctor.Service{
 					Database: database, Google: runtime.newDoctorGoogle(settings.PoC),
+					DirectoryEnabled: settings.PoC.Directory.Enabled, Directory: directoryProbe,
 					Invocation: modelInvocation(settings.PoC.Model), Model: model, Disclosure: disclosure,
 				},
 				Output: stdout,
@@ -234,19 +268,43 @@ func pocCommandProviderWithRuntime(
 			if err := requireRestrictedDisclosure(ctx, settings.PoC.Model, runtime); err != nil {
 				return err
 			}
-			if runtime.newSource == nil || runtime.openIngestionRepository == nil || runtime.newModel == nil {
+			if runtime.newSource == nil ||
+				runtime.openSyncRepositories == nil ||
+				runtime.newModel == nil ||
+				(settings.PoC.Directory.Enabled && runtime.newDirectoryLookup == nil) {
 				return errors.New("sync command dependencies are not configured")
 			}
 			sourceBoundary, err := runtime.newSource(ctx, settings.PoC)
 			if err != nil {
 				return err
 			}
-			repository, closeRepository, err := runtime.openIngestionRepository(ctx, settings.PoC.DatabaseURL)
+			var directoryLookup directory.Lookup
+			if settings.PoC.Directory.Enabled {
+				directoryLookup, err = runtime.newDirectoryLookup(ctx, settings.PoC.Directory)
+				if err != nil {
+					return err
+				}
+			}
+			repository, directoryRepository, closeRepository, err := runtime.openSyncRepositories(ctx, settings.PoC.DatabaseURL)
 			if err != nil {
 				return err
 			}
 			if closeRepository != nil {
 				defer closeRepository()
+			}
+			var directoryService *directory.Service
+			if settings.PoC.Directory.Enabled {
+				directoryService, err = newDirectoryService(
+					settings.PoC.Directory,
+					directoryLookup,
+					directoryRepository,
+					tracer,
+					decisions,
+					time.Now,
+				)
+				if err != nil {
+					return err
+				}
 			}
 			model, err := runtime.newModel(ctx, settings.PoC.Model, invocations, tracer)
 			if err != nil {
@@ -254,7 +312,7 @@ func pocCommandProviderWithRuntime(
 			}
 			service := newIngestionService(
 				settings.PoC, sourceBoundary, model, repository,
-				tracer, decisions, time.Now,
+				directoryService, tracer, decisions, time.Now,
 			)
 			return (cli.SyncCommand{Service: service, Output: stdout}).Run(ctx, args)
 		}),
@@ -274,12 +332,50 @@ func pocCommandProviderWithRuntime(
 			if err := settings.PoC.Validate(config.CommandReview); err != nil {
 				return err
 			}
-			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
+			if settings.PoC.Directory.Enabled &&
+				settings.PoC.Model.DataMode == modelpolicy.DataModeRestricted {
+				if err := requireRestrictedDisclosure(ctx, settings.PoC.Model, runtime); err != nil {
+					return err
+				}
+			}
+			if runtime.openReviewRepositories == nil ||
+				(settings.PoC.Directory.Enabled && runtime.newDirectoryLookup == nil) {
+				return errors.New("review command dependencies are not configured")
+			}
+			var directoryLookup directory.Lookup
+			var err error
+			if settings.PoC.Directory.Enabled {
+				directoryLookup, err = runtime.newDirectoryLookup(ctx, settings.PoC.Directory)
+				if err != nil {
+					return err
+				}
+			}
+			entityRepository, directoryRepository, closeRepositories, err := runtime.openReviewRepositories(
+				ctx,
+				settings.PoC.DatabaseURL,
+			)
 			if err != nil {
 				return err
 			}
-			defer pool.Close()
-			store := cli.NewStorageReviewStore(storage.NewEntityRepository(pool))
+			if closeRepositories != nil {
+				defer closeRepositories()
+			}
+			var verifier cli.ReviewerEmailVerifier
+			if settings.PoC.Directory.Enabled {
+				directoryService, err := newDirectoryService(
+					settings.PoC.Directory,
+					directoryLookup,
+					directoryRepository,
+					tracer,
+					decisions,
+					time.Now,
+				)
+				if err != nil {
+					return err
+				}
+				verifier = directoryService
+			}
+			store := cli.NewStorageReviewStore(entityRepository, verifier)
 			return (cli.ReviewCommand{Service: &cli.ReviewService{Store: store}, Output: stdout}).Run(ctx, args)
 		}),
 		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, args []string) error {
@@ -342,6 +438,7 @@ func newIngestionService(
 	sourceBoundary source.Source,
 	model extract.Model,
 	repository ingest.Repository,
+	identityEnricher ingest.IdentityEnricher,
 	tracer trace.Tracer,
 	decisions ingest.DecisionRecorder,
 	now func() time.Time,
@@ -354,7 +451,45 @@ func newIngestionService(
 		MaxTokens:      settings.Model.MaxOutputTokens,
 		LeaseDuration:  settings.IngestionLeaseDuration,
 		AttemptTimeout: settings.IngestionAttemptTimeout,
-		Tracer:         tracer, Decisions: decisions, Now: now,
+		Tracer:         tracer, Decisions: decisions, IdentityEnricher: identityEnricher, Now: now,
+	}
+}
+
+func newDirectoryService(
+	settings config.GoogleDirectorySettings,
+	lookup directory.Lookup,
+	repository directory.Repository,
+	tracer trace.Tracer,
+	decisions directory.DecisionRecorder,
+	now func() time.Time,
+) (*directory.Service, error) {
+	policy, err := entity.NewDirectoryPolicy(settings.EmailDomains)
+	if err != nil {
+		return nil, errors.New("construct directory service: approved-domain policy is invalid")
+	}
+	return &directory.Service{
+		Lookup:      lookup,
+		Repository:  repository,
+		Policy:      policy,
+		Enabled:     settings.Enabled,
+		Freshness:   settings.Freshness,
+		RetryAfter:  settings.RetryAfter,
+		MaxAttempts: settings.MaxAttempts,
+		Tracer:      tracer,
+		Decisions:   decisions,
+		Now:         now,
+		Wait:        waitForDirectoryRetry,
+	}, nil
+}
+
+func waitForDirectoryRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
