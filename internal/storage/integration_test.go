@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	knowledge "github.com/JakeFAU/stacks/core/evidence"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -23,7 +24,6 @@ import (
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
-	"stacks/internal/knowledge"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 )
@@ -2070,23 +2070,23 @@ func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(
 		ProviderRevision:   "",
 		ModifiedAt:         time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
 		RecordedAt:         time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
-		Tabs: []source.Tab{{
+		Sections: testEvidenceSections(t, []source.Tab{{
 			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
 			Role: source.TabRoleTranscript, Text: transcript,
-		}},
+		}}),
 	})
 	if err != nil {
 		t.Fatalf("new unassociated identity version: %v", err)
 	}
 	alexSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "tab-synthetic", StartOffset: 0,
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0,
 		EndOffset: len(alexEvidence), Quote: alexEvidence,
 	})
 	if err != nil {
 		t.Fatalf("new Alex evidence span: %v", err)
 	}
 	bobSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "tab-synthetic", StartOffset: len(alexEvidence) + 1,
+		Document: version, SectionID: "tab-synthetic", StartOffset: len(alexEvidence) + 1,
 		EndOffset: len(transcript), Quote: bobEvidence,
 	})
 	if err != nil {
@@ -2269,7 +2269,7 @@ func TestPre00005LegacyRowsRemainAuditableButNotCurrentlyAdmissible(t *testing.T
 		t.Fatalf("put legacy source version: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "tab-synthetic", StartOffset: 0,
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0,
 		EndOffset: len("Synthetic"), Quote: "Synthetic",
 	})
 	if err != nil {
@@ -2748,9 +2748,9 @@ func TestSnapshotCoherenceAdmissionMigrationQuarantinesHybridRowsAndSafeResyncUs
 	if err != nil || summary.Completed != 1 || model.calls != 1 {
 		t.Fatalf("safe post-upgrade Sync() = (%#v, %v), model calls=%d, want one new completed derivation", summary, err, model.calls)
 	}
-	if repository.preparedVersion.Title() != "Weekly" || repository.preparedVersion.SourceMeetingTime() != nil {
+	if repository.preparedVersion.Title() != "Weekly" || repository.preparedVersion.SourceTime() != nil {
 		t.Fatalf("safe resync version title/time = %q/%v, want fetched undated snapshot",
-			repository.preparedVersion.Title(), repository.preparedVersion.SourceMeetingTime())
+			repository.preparedVersion.Title(), repository.preparedVersion.SourceTime())
 	}
 	if repository.versionID == unsafe.versionID {
 		t.Fatal("safe resync reused the hybrid source version")
@@ -3568,10 +3568,10 @@ func seedPost00007HybridRows(t *testing.T, pool *pgxpool.Pool, quotedSchema stri
 		return sum[:]
 	}
 	versionDigest := version.Digest()
-	tab := version.Tabs()[0]
-	tabDigest := sha256.Sum256([]byte(tab.Text))
+	section := version.Sections()[0]
+	sectionDigest := sha256.Sum256([]byte(section.Text()))
 	schemaDigest := sha256.Sum256(extract.ExtractionJSONSchema())
-	meetingTime := version.SourceMeetingTime()
+	meetingTime := version.SourceTime()
 
 	statements := []struct {
 		operation string
@@ -3580,8 +3580,8 @@ func seedPost00007HybridRows(t *testing.T, pool *pgxpool.Pool, quotedSchema stri
 	}{
 		{"source", "INSERT INTO " + quotedSchema + `.source_documents (id, provider, provider_document_id, title, locator, recorded_at) VALUES ($1, $2, $3, $4, $5, $6)`, []any{sourceID, version.Provider(), version.ProviderDocumentID(), version.Title(), version.Locator(), recordedAt}},
 		{"hybrid version", "INSERT INTO " + quotedSchema + `.document_versions (id, source_document_id, digest, content_digest_v2, title, locator, provider_version, provider_revision, provider_modified_at, source_meeting_time, recorded_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10)`, []any{rows.versionID, sourceID, versionDigest[:], version.Title(), version.Locator(), version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt(), meetingTime, recordedAt}},
-		{"tab", "INSERT INTO " + quotedSchema + `.document_tabs (id, document_version_id, provider_tab_id, title, title_path, display_order, role, content, content_digest) VALUES ($1, $2, $3, $4, $5, 0, 'transcript', $6, $7)`, []any{tabID, rows.versionID, tab.ID, tab.Title, tab.Path, tab.Text, tabDigest[:]}},
-		{"span", "INSERT INTO " + quotedSchema + `.evidence_spans (id, document_tab_id, start_offset, end_offset, quote) VALUES ($1, $2, 0, $3, $4)`, []any{spanID, tabID, len(tab.Text), tab.Text}},
+		{"tab", "INSERT INTO " + quotedSchema + `.document_tabs (id, document_version_id, provider_tab_id, title, title_path, display_order, role, content, content_digest) VALUES ($1, $2, $3, $4, $5, 0, 'transcript', $6, $7)`, []any{tabID, rows.versionID, section.ID(), section.Title(), section.Path(), section.Text(), sectionDigest[:]}},
+		{"span", "INSERT INTO " + quotedSchema + `.evidence_spans (id, document_tab_id, start_offset, end_offset, quote) VALUES ($1, $2, 0, $3, $4)`, []any{spanID, tabID, len(section.Text()), section.Text()}},
 		{"entity", "INSERT INTO " + quotedSchema + `.entities (id, kind, display_name, recorded_at) VALUES ($1, 'person', 'Synthetic Person', $2)`, []any{entityID, recordedAt}},
 		{"v4 run", "INSERT INTO " + quotedSchema + `.extraction_runs (id, document_version_id, derivation_digest, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, processing_status, completed_by_owner, recorded_at, completed_at, currently_admissible) VALUES ($1, $2, $3, 'synthetic-model', 'us-east-1', 256, 'extract-v2', $4, 'complete', $5, $6, $6, true)`, []any{rows.extractionRunID, rows.versionID, digest("snapshot-merge-v4"), schemaDigest[:], ownerID, recordedAt}},
 		{"mention", "INSERT INTO " + quotedSchema + `.mentions (id, evidence_span_id, extraction_run_id, surface, normalized_name, role, recorded_at, currently_admissible) VALUES ($1, $2, $3, 'Synthetic', 'synthetic', 'speaker', $4, true)`, []any{rows.mentionID, spanID, rows.extractionRunID, recordedAt}},
@@ -3662,12 +3662,12 @@ func (repository *snapshotCoherenceRepository) PrepareVersion(ctx context.Contex
 		return ingest.VersionState{}, err
 	}
 	versionDigest := version.Digest()
-	if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.document_versions (id, source_document_id, digest, content_digest_v2, title, locator, provider_version, provider_revision, provider_modified_at, source_meeting_time, recorded_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10)`, repository.versionID, sourceID, versionDigest[:], version.Title(), version.Locator(), version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt(), version.SourceMeetingTime(), version.RecordedAt()); err != nil {
+	if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.document_versions (id, source_document_id, digest, content_digest_v2, title, locator, provider_version, provider_revision, provider_modified_at, source_meeting_time, recorded_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10)`, repository.versionID, sourceID, versionDigest[:], version.Title(), version.Locator(), version.ProviderVersion(), version.ProviderRevision(), version.ModifiedAt(), version.SourceTime(), version.RecordedAt()); err != nil {
 		return ingest.VersionState{}, err
 	}
-	for _, tab := range version.Tabs() {
-		tabDigest := sha256.Sum256([]byte(tab.Text))
-		if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.document_tabs (document_version_id, provider_tab_id, title, parent_provider_tab_id, title_path, display_order, role, content, content_digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, repository.versionID, tab.ID, tab.Title, tab.ParentID, tab.Path, tab.Order, string(tab.Role), tab.Text, tabDigest[:]); err != nil {
+	for _, section := range version.Sections() {
+		sectionDigest := sha256.Sum256([]byte(section.Text()))
+		if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.document_tabs (document_version_id, provider_tab_id, title, parent_provider_tab_id, title_path, display_order, role, content, content_digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, repository.versionID, section.ID(), section.Title(), section.ParentID(), section.Path(), section.Order(), section.Role(), section.Text(), sectionDigest[:]); err != nil {
 			return ingest.VersionState{}, err
 		}
 	}
@@ -3721,8 +3721,8 @@ func snapshotCoherenceVersion(t *testing.T, document source.Document) knowledge.
 	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
 		Provider: document.Provider, ProviderDocumentID: document.ID, Title: document.Title,
 		Locator: document.Locator, ProviderVersion: document.Version, ProviderRevision: document.Revision,
-		ModifiedAt: document.ModifiedAt, SourceMeetingTime: document.MeetingTime,
-		RecordedAt: time.Date(2026, time.July, 22, 1, 0, 0, 0, time.UTC), Tabs: document.Tabs,
+		ModifiedAt: document.ModifiedAt, SourceTime: document.MeetingTime,
+		RecordedAt: time.Date(2026, time.July, 22, 1, 0, 0, 0, time.UTC), Sections: testEvidenceSections(t, document.Tabs),
 	})
 	if err != nil {
 		t.Fatalf("build snapshot-coherence version: %v", err)
@@ -3966,10 +3966,10 @@ func TestPutDocumentVersionReusesRevisionInclusiveLegacyDigestAcrossUpgrade(t *t
 			ProviderVersion: "synthetic-version-1", ProviderRevision: revision,
 			ModifiedAt: time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
 			RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
-			Tabs: []source.Tab{{
+			Sections: testEvidenceSections(t, []source.Tab{{
 				ID: "tab-synthetic", Title: "Synthetic Transcript", Path: []string{"Synthetic Transcript"},
 				Order: 0, Role: source.TabRoleTranscript, Text: "Synthetic compatibility text.",
-			}},
+			}}),
 		})
 		if err != nil {
 			t.Fatalf("new compatibility document version: %v", err)
@@ -3993,17 +3993,17 @@ func TestPutDocumentVersionReusesRevisionInclusiveLegacyDigestAcrossUpgrade(t *t
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		legacyVersionID, sourceID, legacyDigest[:], legacyVersion.Title(), legacyVersion.Locator(),
 		legacyVersion.ProviderVersion(), legacyVersion.ProviderRevision(), legacyVersion.ModifiedAt(),
-		legacyVersion.SourceMeetingTime(), legacyVersion.RecordedAt()); err != nil {
+		legacyVersion.SourceTime(), legacyVersion.RecordedAt()); err != nil {
 		t.Fatalf("seed legacy document version: %v", err)
 	}
-	for _, tab := range legacyVersion.Tabs() {
-		contentDigest := sha256.Sum256([]byte(tab.Text))
+	for _, section := range legacyVersion.Sections() {
+		contentDigest := sha256.Sum256([]byte(section.Text()))
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO stacks.document_tabs
 				(document_version_id, provider_tab_id, title, parent_provider_tab_id, title_path,
 				 display_order, role, content, content_digest)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, legacyVersionID, tab.ID, tab.Title,
-			tab.ParentID, tab.Path, tab.Order, string(tab.Role), tab.Text, contentDigest[:]); err != nil {
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, legacyVersionID, section.ID(), section.Title(),
+			section.ParentID(), section.Path(), section.Order(), section.Role(), section.Text(), contentDigest[:]); err != nil {
 			t.Fatalf("seed legacy document tab: %v", err)
 		}
 	}
@@ -4539,16 +4539,16 @@ func completeVersionedPairSignal(
 		ProviderRevision:   providerRevision,
 		ModifiedAt:         recordedAt,
 		RecordedAt:         recordedAt,
-		Tabs: []source.Tab{{
+		Sections: testEvidenceSections(t, []source.Tab{{
 			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
 			Role: source.TabRoleTranscript, Text: transcript,
-		}},
+		}}),
 	})
 	if err != nil {
 		t.Fatalf("new current-version document: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "tab-synthetic",
+		Document: version, SectionID: "tab-synthetic",
 		StartOffset: 0, EndOffset: len(transcript), Quote: transcript,
 	})
 	if err != nil {
@@ -4788,7 +4788,7 @@ func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Ti
 		t.Fatalf("put pair-analysis document: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
 	})
 	if err != nil {
 		t.Fatalf("new pair-analysis evidence span: %v", err)
@@ -4963,7 +4963,7 @@ func TestPutEvidenceSpanRejectsImmutableQuoteConflict(t *testing.T) {
 		t.Fatalf("put evidence document version: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
 	})
 	if err != nil {
 		t.Fatalf("new evidence span: %v", err)
@@ -4989,7 +4989,7 @@ func TestCompleteSignalRejectsNotesOnlyEvidence(t *testing.T) {
 		t.Fatalf("put notes document version: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
 	})
 	if err != nil {
 		t.Fatalf("new notes evidence span: %v", err)
@@ -5135,16 +5135,16 @@ func createDirectoryPendingMentionFixtureWithSurfaceEmail(
 		ProviderVersion:    "synthetic-version-1",
 		ModifiedAt:         time.Date(2026, time.July, 24, 10, 0, 0, 0, time.UTC),
 		RecordedAt:         time.Date(2026, time.July, 24, 11, 0, 0, 0, time.UTC),
-		Tabs: []source.Tab{{
+		Sections: testEvidenceSections(t, []source.Tab{{
 			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
 			Role: source.TabRoleTranscript, Text: quote,
-		}},
+		}}),
 	})
 	if err != nil {
 		t.Fatalf("new synthetic directory document: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "tab-synthetic", StartOffset: 0,
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0,
 		EndOffset: len(quote), Quote: quote,
 	})
 	if err != nil {
@@ -5257,10 +5257,10 @@ func advanceDirectoryMentionSourceVersion(t *testing.T, pool *pgxpool.Pool, ment
 		ProviderVersion:    "synthetic-version-2",
 		ModifiedAt:         time.Date(2026, time.July, 24, 15, 0, 0, 0, time.UTC),
 		RecordedAt:         time.Date(2026, time.July, 24, 16, 0, 0, 0, time.UTC),
-		Tabs: []source.Tab{{
+		Sections: testEvidenceSections(t, []source.Tab{{
 			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
 			Role: source.TabRoleTranscript, Text: "Synthetic later directory content.",
-		}},
+		}}),
 	})
 	if err != nil {
 		t.Fatalf("new synthetic later directory version: %v", err)
@@ -5512,7 +5512,7 @@ func createSyntheticMentionAndSpan(t *testing.T, pool *pgxpool.Pool) (string, st
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document:    version,
-		TabID:       "tab-synthetic",
+		SectionID:   "tab-synthetic",
 		StartOffset: 0,
 		EndOffset:   len("Synthetic"),
 		Quote:       "Synthetic",
@@ -5578,16 +5578,32 @@ func testDocumentVersionWithRole(t *testing.T, providerDocumentID string, role s
 		ProviderRevision:   "synthetic-revision-1",
 		ModifiedAt:         time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
 		RecordedAt:         time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
-		Tabs: []source.Tab{{
+		Sections: testEvidenceSections(t, []source.Tab{{
 			ID:    "tab-synthetic",
 			Title: "Synthetic Transcript",
 			Order: 0,
 			Role:  role,
 			Text:  "Synthetic meeting text.",
-		}},
+		}}),
 	})
 	if err != nil {
 		t.Fatalf("new synthetic document version: %v", err)
 	}
 	return version
+}
+
+func testEvidenceSections(t *testing.T, tabs []source.Tab) []knowledge.Section {
+	t.Helper()
+	sections := make([]knowledge.Section, len(tabs))
+	for index, tab := range tabs {
+		section, err := knowledge.NewSection(knowledge.SectionInput{
+			ID: tab.ID, Title: tab.Title, ParentID: tab.ParentID, Path: tab.Path,
+			Order: tab.Order, Role: string(tab.Role), Text: tab.Text,
+		})
+		if err != nil {
+			t.Fatalf("new test evidence section: %v", err)
+		}
+		sections[index] = section
+	}
+	return sections
 }

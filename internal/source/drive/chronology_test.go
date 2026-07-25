@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/evidence"
 	"stacks/internal/analysis"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
-	"stacks/internal/knowledge"
 	"stacks/internal/modelpolicy"
 )
 
@@ -211,7 +211,7 @@ type chronologyRepository struct {
 
 func (repository *chronologyRepository) PrepareVersion(
 	_ context.Context,
-	version knowledge.DocumentVersion,
+	version evidence.DocumentVersion,
 	derivation ingest.DerivationIdentity,
 	_ modelpolicy.DataMode,
 	leaseDuration time.Duration,

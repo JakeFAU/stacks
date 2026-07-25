@@ -1,4 +1,5 @@
-package knowledge
+// Package evidence defines provider-neutral immutable source evidence.
+package evidence
 
 import (
 	"crypto/sha256"
@@ -25,9 +26,7 @@ type SourceReference struct {
 type ContentDigest [sha256.Size]byte
 
 // DigestContent computes the digest used to identify source content.
-func DigestContent(content []byte) ContentDigest {
-	return sha256.Sum256(content)
-}
+func DigestContent(content []byte) ContentDigest { return sha256.Sum256(content) }
 
 // ParseContentDigest parses a hexadecimal SHA-256 digest.
 func ParseContentDigest(value string) (ContentDigest, error) {
@@ -35,16 +34,13 @@ func ParseContentDigest(value string) (ContentDigest, error) {
 	if err != nil || len(decoded) != sha256.Size {
 		return ContentDigest{}, fmt.Errorf("content digest must be a hexadecimal SHA-256 value")
 	}
-
 	var digest ContentDigest
 	copy(digest[:], decoded)
 	return digest, nil
 }
 
 // String returns the lowercase hexadecimal digest.
-func (digest ContentDigest) String() string {
-	return hex.EncodeToString(digest[:])
-}
+func (digest ContentDigest) String() string { return hex.EncodeToString(digest[:]) }
 
 // EvidenceInput contains the values needed to construct immutable evidence.
 type EvidenceInput struct {
@@ -55,8 +51,7 @@ type EvidenceInput struct {
 }
 
 // Evidence identifies an immutable version of source content and when Stacks
-// first recorded it. Its fields are private so callers cannot mutate it after
-// validation.
+// first recorded it.
 type Evidence struct {
 	id         EvidenceID
 	source     SourceReference
@@ -82,37 +77,20 @@ func NewEvidence(input EvidenceInput) (Evidence, error) {
 	if input.Digest == (ContentDigest{}) {
 		return Evidence{}, fmt.Errorf("evidence content digest is required")
 	}
-
 	source := input.Source
-	source.Provider = strings.TrimSpace(source.Provider)
-	source.DocumentID = strings.TrimSpace(source.DocumentID)
-	source.Version = strings.TrimSpace(source.Version)
-	source.Locator = strings.TrimSpace(source.Locator)
-
-	return Evidence{
-		id:         id,
-		source:     source,
-		digest:     input.Digest,
-		recordedAt: input.RecordedAt.UTC(),
-	}, nil
+	source.Provider, source.DocumentID = strings.TrimSpace(source.Provider), strings.TrimSpace(source.DocumentID)
+	source.Version, source.Locator = strings.TrimSpace(source.Version), strings.TrimSpace(source.Locator)
+	return Evidence{id: id, source: source, digest: input.Digest, recordedAt: input.RecordedAt.UTC()}, nil
 }
 
 // ID returns the stable evidence identifier.
-func (evidence Evidence) ID() EvidenceID {
-	return evidence.id
-}
+func (value Evidence) ID() EvidenceID { return value.id }
 
 // Source returns the evidence source reference.
-func (evidence Evidence) Source() SourceReference {
-	return evidence.source
-}
+func (value Evidence) Source() SourceReference { return value.source }
 
 // Digest returns the immutable content digest.
-func (evidence Evidence) Digest() ContentDigest {
-	return evidence.digest
-}
+func (value Evidence) Digest() ContentDigest { return value.digest }
 
 // RecordedAt returns when Stacks first recorded the evidence.
-func (evidence Evidence) RecordedAt() time.Time {
-	return evidence.recordedAt
-}
+func (value Evidence) RecordedAt() time.Time { return value.recordedAt }

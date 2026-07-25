@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
+	knowledge "github.com/JakeFAU/stacks/core/evidence"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"stacks/internal/knowledge"
 	"stacks/internal/modelpolicy"
 )
 
@@ -318,7 +318,7 @@ func createLegacyObservationFixture(t *testing.T, pool *pgxpool.Pool) legacyObse
 		t.Fatalf("put legacy compatibility document version: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, TabID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
 	})
 	if err != nil {
 		t.Fatalf("create legacy compatibility evidence span: %v", err)

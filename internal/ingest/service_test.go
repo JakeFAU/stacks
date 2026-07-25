@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/evidence"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -20,7 +21,6 @@ import (
 	"stacks/internal/directory"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
-	"stacks/internal/knowledge"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/observability"
 	"stacks/internal/source"
@@ -939,7 +939,7 @@ func TestSyncDoesNotCombineFetchedTitleWithListedTitleMeetingTime(t *testing.T) 
 	if got := repository.lastPreparedVersion.Title(); got != "Weekly" {
 		t.Fatalf("persisted title = %q, want fetched title", got)
 	}
-	if got := repository.lastPreparedVersion.SourceMeetingTime(); got != nil {
+	if got := repository.lastPreparedVersion.SourceTime(); got != nil {
 		t.Fatalf("persisted meeting time = %v, want unknown for fetched undated title", got)
 	}
 	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart != nil {
@@ -971,7 +971,7 @@ func TestSyncInheritsListedTitleAndMeetingTimeWhenFetchedTitleIsAbsent(t *testin
 	if got := repository.lastPreparedVersion.Title(); got != listed.Title {
 		t.Fatalf("persisted title = %q, want listed fallback %q", got, listed.Title)
 	}
-	if got := repository.lastPreparedVersion.SourceMeetingTime(); got == nil || !got.Equal(listedMeetingTime) {
+	if got := repository.lastPreparedVersion.SourceTime(); got == nil || !got.Equal(listedMeetingTime) {
 		t.Fatalf("persisted meeting time = %v, want listed fallback %v", got, listedMeetingTime)
 	}
 	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart == nil ||
@@ -1387,13 +1387,17 @@ func syntheticDocument(id, transcript string) source.Document {
 	}
 }
 
-func documentVersion(t *testing.T, document source.Document) knowledge.DocumentVersion {
+func documentVersion(t *testing.T, document source.Document) evidence.DocumentVersion {
 	t.Helper()
-	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+	sections, err := evidenceSections(document.Tabs)
+	if err != nil {
+		t.Fatalf("evidenceSections() error = %v", err)
+	}
+	version, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
 		Provider: document.Provider, ProviderDocumentID: document.ID, Title: document.Title,
 		Locator: document.Locator, ProviderVersion: document.Version, ProviderRevision: document.Revision,
-		ModifiedAt: document.ModifiedAt, SourceMeetingTime: document.MeetingTime,
-		RecordedAt: recordedAt, Tabs: document.Tabs,
+		ModifiedAt: document.ModifiedAt, SourceTime: document.MeetingTime,
+		RecordedAt: recordedAt, Sections: sections,
 	})
 	if err != nil {
 		t.Fatalf("NewDocumentVersion() error = %v", err)
@@ -1575,7 +1579,7 @@ type memoryRepository struct {
 	versions              map[string]VersionState
 	completions           map[string]Completion
 	snapshots             []entity.EntitySnapshot
-	lastPreparedVersion   knowledge.DocumentVersion
+	lastPreparedVersion   evidence.DocumentVersion
 	lastCompletion        Completion
 	completionCalls       int
 	failCompletionOnce    bool
@@ -1596,7 +1600,7 @@ func newMemoryRepository() *memoryRepository {
 	return &memoryRepository{versions: make(map[string]VersionState), completions: make(map[string]Completion)}
 }
 
-func (repository *memoryRepository) PrepareVersion(_ context.Context, version knowledge.DocumentVersion, derivation DerivationIdentity, _ modelpolicy.DataMode, leaseDuration time.Duration) (VersionState, error) {
+func (repository *memoryRepository) PrepareVersion(_ context.Context, version evidence.DocumentVersion, derivation DerivationIdentity, _ modelpolicy.DataMode, leaseDuration time.Duration) (VersionState, error) {
 	if repository.calls != nil {
 		*repository.calls = append(*repository.calls, "prepare")
 	}
@@ -1854,15 +1858,15 @@ func requireCitationVerifiedReview(
 	}
 }
 
-func versionKey(version knowledge.DocumentVersion) string {
+func versionKey(version evidence.DocumentVersion) string {
 	return version.Provider() + "/" + version.ProviderDocumentID() + "/" + version.Digest().String()
 }
 
-func derivationKey(version knowledge.DocumentVersion, identity DerivationIdentity) string {
+func derivationKey(version evidence.DocumentVersion, identity DerivationIdentity) string {
 	return versionKey(version) + "/" + fmt.Sprintf("%x", identity.Digest)
 }
 
-func testDerivationIdentity(t *testing.T, version knowledge.DocumentVersion) DerivationIdentity {
+func testDerivationIdentity(t *testing.T, version evidence.DocumentVersion) DerivationIdentity {
 	t.Helper()
 	identity := DerivationIdentity{
 		Provider: modelpolicy.ProviderBedrock,
@@ -1913,12 +1917,16 @@ func TestComputeDerivationDigestChangesWithMaterialExtractionConfiguration(t *te
 }
 
 func TestComputeDerivationDigestPreservesBedrockV5Bytes(t *testing.T) {
-	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+	sections, err := evidenceSections([]source.Tab{{ID: "transcript-tab", Title: "Transcript", Path: []string{"Transcript"}, Role: source.TabRoleTranscript, Text: "Synthetic transcript."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
 		Provider: "drive", ProviderDocumentID: "document-compat", Title: "Synthetic Meeting",
 		Locator: "https://example.invalid/document", ProviderVersion: "version-1", ProviderRevision: "revision-1",
 		ModifiedAt: time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
 		RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
-		Tabs:       []source.Tab{{ID: "transcript-tab", Title: "Transcript", Path: []string{"Transcript"}, Role: source.TabRoleTranscript, Text: "Synthetic transcript."}},
+		Sections:   sections,
 	})
 	if err != nil {
 		t.Fatal(err)

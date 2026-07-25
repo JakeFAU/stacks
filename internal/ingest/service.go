@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -22,7 +23,6 @@ import (
 	"stacks/internal/directory"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
-	"stacks/internal/knowledge"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/observability"
 	"stacks/internal/source"
@@ -107,7 +107,7 @@ type DerivationIdentity struct {
 // EvidenceRecord maps a model-local citation key to validated exact evidence.
 type EvidenceRecord struct {
 	Key  string
-	Span knowledge.EvidenceSpan
+	Span evidence.EvidenceSpan
 }
 
 // MentionRecord is one source-grounded person mention and its deterministic
@@ -173,7 +173,7 @@ type Completion struct {
 
 // Repository owns durable processing state and the atomic completion boundary.
 type Repository interface {
-	PrepareVersion(context.Context, knowledge.DocumentVersion, DerivationIdentity, modelpolicy.DataMode, time.Duration) (VersionState, error)
+	PrepareVersion(context.Context, evidence.DocumentVersion, DerivationIdentity, modelpolicy.DataMode, time.Duration) (VersionState, error)
 	CompleteVersion(context.Context, Completion) error
 	RecordFailure(context.Context, string, string, VersionStatus, FailureCode) error
 	EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error)
@@ -316,11 +316,15 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if err != nil {
 		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
 	}
-	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+	sections, err := evidenceSections(document.Tabs)
+	if err != nil {
+		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
+	}
+	version, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
 		Provider: document.Provider, ProviderDocumentID: document.ID, Title: document.Title,
 		Locator: document.Locator, ProviderVersion: document.Version, ProviderRevision: document.Revision,
-		ModifiedAt: document.ModifiedAt, SourceMeetingTime: document.MeetingTime,
-		RecordedAt: service.now(), Tabs: document.Tabs,
+		ModifiedAt: document.ModifiedAt, SourceTime: document.MeetingTime,
+		RecordedAt: service.now(), Sections: sections,
 	})
 	if err != nil {
 		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
@@ -441,7 +445,7 @@ func (service *Service) enrich(ctx context.Context, result Result) (Result, erro
 }
 
 func (service *Service) completion(
-	version knowledge.DocumentVersion,
+	version evidence.DocumentVersion,
 	state VersionState,
 	response extract.Response,
 	output extract.ExtractionOutput,
@@ -452,8 +456,8 @@ func (service *Service) completion(
 		DataMode: service.DataMode,
 	}
 	for _, citation := range output.Citations {
-		span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-			Document: version, TabID: citation.TabID, StartOffset: citation.StartOffset,
+		span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
+			Document: version, SectionID: citation.TabID, StartOffset: citation.StartOffset,
 			EndOffset: citation.EndOffset, Quote: citation.Quote,
 		})
 		if err != nil {
@@ -555,6 +559,26 @@ func extractionRequest(tabs []source.Tab, sourceMeetingTime *time.Time, promptVe
 	}, nil
 }
 
+func evidenceSections(tabs []source.Tab) ([]evidence.Section, error) {
+	sections := make([]evidence.Section, len(tabs))
+	for index, tab := range tabs {
+		switch tab.Role {
+		case source.TabRoleOther, source.TabRoleTranscript, source.TabRoleGeminiNotes:
+		default:
+			return nil, fmt.Errorf("document tab %d: role is invalid", index)
+		}
+		section, err := evidence.NewSection(evidence.SectionInput{
+			ID: tab.ID, Title: tab.Title, ParentID: tab.ParentID, Path: tab.Path,
+			Order: tab.Order, Role: string(tab.Role), Text: tab.Text,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("document tab %d: %w", index, err)
+		}
+		sections[index] = section
+	}
+	return sections, nil
+}
+
 func mergeSourceDocument(listed, fetched source.Document) (source.Document, error) {
 	if strings.TrimSpace(listed.ID) == "" || strings.TrimSpace(fetched.ID) == "" || listed.ID != fetched.ID {
 		return source.Document{}, fmt.Errorf("source document identity is inconsistent")
@@ -651,7 +675,7 @@ func stableDerivationID(derivationDigest [sha256.Size]byte, kind, sourceID strin
 
 // ComputeDerivationDigest identifies one immutable source version processed by
 // one exact extraction configuration. It excludes attempt/lease state.
-func ComputeDerivationDigest(version knowledge.DocumentVersion, identity DerivationIdentity) ([sha256.Size]byte, error) {
+func ComputeDerivationDigest(version evidence.DocumentVersion, identity DerivationIdentity) ([sha256.Size]byte, error) {
 	if err := (modelpolicy.Invocation{
 		Provider: identity.Provider,
 		DataMode: modelpolicy.DataModePersonal,
