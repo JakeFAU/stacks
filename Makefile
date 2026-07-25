@@ -2,7 +2,7 @@ STATICCHECK_VERSION := 2026.1
 GOOSE_VERSION := v3.27.1
 ENV_FILE ?= .env
 
-.PHONY: analyze auth-google build db-down db-migrate db-status db-up doctor entities fmt obs-config obs-down obs-up review run staticcheck sync test test-integration
+.PHONY: analyze auth-google auth-google-directory build db-down db-migrate db-status db-up doctor entities fmt obs-config obs-down obs-up review run staticcheck sync test test-integration
 
 analyze:
 	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the PoC" >&2; exit 1)
@@ -11,6 +11,10 @@ analyze:
 auth-google:
 	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure Google OAuth paths" >&2; exit 1)
 	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks auth google
+
+auth-google-directory:
+	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure Google directory OAuth paths" >&2; exit 1)
+	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks auth google-directory
 
 build:
 	go build -o bin/stacks ./cmd/stacks

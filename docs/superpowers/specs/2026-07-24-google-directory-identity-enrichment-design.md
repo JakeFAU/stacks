@@ -4,6 +4,12 @@
 **Status:** Approved for implementation planning
 **Scope:** Optional, on-demand Google Workspace directory identity enrichment for unresolved people in the manager-confidence workflow
 
+**Acceptance boundary:** This status intentionally remains approved rather than
+implemented because Task 10 does not have approval to perform a live Google
+directory person lookup. Optional personal/work lookup acceptance, company IT
+OAuth approval and directory visibility, organization-chart availability,
+Bedrock quota, and company-IP model acceptance remain unvalidated.
+
 ## Context
 
 Stacks currently resolves people from source-grounded mentions, accepted email

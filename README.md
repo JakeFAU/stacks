@@ -16,6 +16,8 @@ counterevidence, uncertainty, gaps, and citations visible.
 - Docker with Compose
 - a Google installed-application OAuth client with read-only Drive and Docs
   access
+- for optional directory enrichment, a separate Google installed-application
+  OAuth client with read-only Workspace directory access
 - one explicitly selected model provider: an OpenAI API key, an Anthropic API
   key, or AWS credentials available through the default credential chain or an
   optional shared profile
@@ -64,6 +66,13 @@ implemented.
 | `STACKS_GOOGLE_FOLDER_ID` | no default | One direct-child Drive folder boundary |
 | `STACKS_GOOGLE_OAUTH_CLIENT_FILE` | no default | External installed-app OAuth client JSON path |
 | `STACKS_GOOGLE_OAUTH_TOKEN_FILE` | no default | External owner-only OAuth token JSON path |
+| `STACKS_GOOGLE_DIRECTORY_ENABLED` | `false` | Enable optional on-demand Google Workspace directory identity enrichment |
+| `STACKS_GOOGLE_DIRECTORY_OAUTH_CLIENT_FILE` | no default | External directory-only installed-app OAuth client JSON path |
+| `STACKS_GOOGLE_DIRECTORY_OAUTH_TOKEN_FILE` | no default | External owner-only directory OAuth token JSON path |
+| `STACKS_GOOGLE_DIRECTORY_EMAIL_DOMAINS` | no default | Comma-separated approved work-email domains for directory lookup and automatic exact-email authority |
+| `STACKS_GOOGLE_DIRECTORY_FRESHNESS` | `24h` | Reuse window for conclusive directory results |
+| `STACKS_GOOGLE_DIRECTORY_RETRY_AFTER` | `15m` | Retry-after window for transient directory outcomes |
+| `STACKS_GOOGLE_DIRECTORY_MAX_ATTEMPTS` | `3` | Bounded directory lookup attempts, from `1` to `3` |
 | `STACKS_TRANSCRIPT_TITLES` | no default | Comma-separated exact transcript titles after case/whitespace normalization |
 | `STACKS_NOTES_TITLES` | no default | Comma-separated exact Gemini-notes titles after normalization |
 | `STACKS_DATA_MODE` | no default | Explicit disclosure mode: `personal` or `restricted` |
@@ -88,6 +97,82 @@ by Compose and migrations, so they intentionally have no example values.
 used by repository integration tests. `STACKS_TEST_MIGRATION_DATABASE_URL` is
 the schema-capable admin-role input used only by isolated forward-migration
 upgrade tests. Both are used only by the integration-test target.
+
+## Optional Google Workspace directory identity enrichment
+
+Stacks can enrich unresolved people with on-demand calls to the Google People
+API `people.searchDirectoryPeople` method. Directory access uses exactly the
+`https://www.googleapis.com/auth/directory.readonly` scope. It has a separate
+installed-application OAuth client and owner-only token file from Drive/Docs;
+authorizing directory access never changes or broadens the Drive token. Stacks
+does not implement service-account impersonation or domain-wide delegation.
+
+The People API request reads only `metadata`, `names`, and `emailAddresses`.
+Stacks stores the provider-scoped person identifier and directory source type,
+display name, primary and alternate normalized work emails, available source
+observation time, and Stacks' recorded time. It deliberately does not request
+organization, title, department, manager or reporting-line, membership, phone,
+postal address, photo, biography, or birthday fields.
+
+Directory enrichment is disabled by default. When enabled, both external OAuth
+paths and at least one approved domain in
+`STACKS_GOOGLE_DIRECTORY_EMAIL_DOMAINS` are required. A lookup occurs only for
+a source-grounded person mention that remains unresolved after accepted aliases
+are checked. There is no startup enumeration, background crawl, bulk directory
+synchronization, or organization-chart import.
+
+Only a unique exact approved-domain work-email match from a Google domain
+profile can earn automatic authority, and only when the email is
+deterministically source-bound or explicitly supplied by the reviewer. A
+citation-verified model proposal, a name-only result, ambiguity, a conflict, or
+any non-profile result remains review-only. Provider ordering and confidence
+never establish identity. An accepted reviewer link and the aliases explicitly
+authorized by that decision remain effective for later exact resolution until
+an append-only correction supersedes the decision.
+
+Directory data is additive and optional. Disabled, denied, revoked, throttled,
+or unavailable directory access leaves source preservation, ingestion, and
+analysis usable; unresolved mentions can be retried later. To disable lookup,
+set `STACKS_GOOGLE_DIRECTORY_ENABLED=false`. IT can revoke the separate
+directory token or OAuth grant without revoking or rewriting Drive access.
+
+Doctor reports directory readiness independently:
+
+- disabled is an expected configuration state; authorization is not checked;
+- locally ready means the separate OAuth material and requested scope are
+  usable, but no live person lookup has been exercised;
+- missing, invalid, denied, or unavailable directory authorization is a
+  warning/degraded optional state and does not make required dependencies
+  unhealthy.
+
+The directory doctor probe may refresh its OAuth token in memory, but it never
+calls `searchDirectoryPeople`, persists a profile, or invokes a model. Directory
+profile snapshots, lookup attempts and matches, accepted provider links,
+decisions, and corrections are kept as provenance-bearing local PostgreSQL
+audit records. Ordinary logs, metrics, traces, errors, and sync output exclude
+names, emails, provider person identifiers, profile payloads, OAuth material,
+and lookup query values; they contain only bounded outcomes, counts, timing, and
+policy metadata.
+
+Future employment, title, team, manager, and organization relationships remain
+separate provenance-bearing temporal observations. They are not inferred from
+or stored as timeless directory identity facts.
+
+Configure the separate client/token paths and approved domains, then authorize
+and check readiness before the first bounded sync:
+
+```sh
+make auth-google-directory
+make doctor
+make sync
+make review ARGS="list"
+make review ARGS="show <proposal-id>"
+make review ARGS="accept-directory <proposal-id> <directory-profile-id>"
+```
+
+The directory-backed `review list` and `review show` output is private local
+operator output and may contain bounded identity evidence needed for a
+decision. Do not copy it into logs, commits, tickets, or shared reports.
 
 ## Model provider operation
 
