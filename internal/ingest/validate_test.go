@@ -4,11 +4,14 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
 	"stacks/internal/entity"
 	"stacks/internal/modelpolicy"
 )
+
+var validationRecordedAt = time.Date(2026, time.July, 25, 12, 0, 0, 123456000, time.UTC)
 
 func TestValidateForPersistenceRequiresNewRunDataMode(t *testing.T) {
 	completion := Completion{VersionID: "version-1"}
@@ -29,7 +32,7 @@ func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentit
 	evidence := persistenceEvidence(t)
 	baseObservation := ObservationRecord{
 		ID: "11111111-1111-1111-1111-111111111111", Predicate: interactionPredicate,
-		EvidenceKeys: []string{"citation-1"},
+		EvidenceKeys: []string{"citation-1"}, RecordedAt: validationRecordedAt,
 	}
 	baseSignal := SignalRecord{
 		ID: "22222222-2222-2222-2222-222222222222", ObservationID: baseObservation.ID,
@@ -66,7 +69,7 @@ func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentit
 				VersionID: "version-1", DataMode: modelpolicy.DataModePersonal, Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 				Observations: []ObservationRecord{
 					baseObservation,
-					{ID: "33333333-3333-3333-3333-333333333333", Predicate: interactionPredicate, EvidenceKeys: []string{"citation-1"}},
+					{ID: "33333333-3333-3333-3333-333333333333", Predicate: interactionPredicate, EvidenceKeys: []string{"citation-1"}, RecordedAt: validationRecordedAt},
 				},
 			},
 		},
@@ -149,7 +152,7 @@ func TestValidateForPersistenceRejectsUnknownObservationMentionReferences(t *tes
 		Observations: []ObservationRecord{{
 			ID: "11111111-1111-1111-1111-111111111111", Predicate: interactionPredicate,
 			SubjectMentionKey: "mention-unknown", ObjectMentionKey: "mention-employee",
-			EvidenceKeys: []string{"citation-1"},
+			EvidenceKeys: []string{"citation-1"}, RecordedAt: validationRecordedAt,
 		}},
 	}
 
@@ -158,12 +161,28 @@ func TestValidateForPersistenceRejectsUnknownObservationMentionReferences(t *tes
 	}
 }
 
+func TestValidateForPersistenceRejectsZeroObservationRecordedAt(t *testing.T) {
+	evidence := persistenceEvidence(t)
+	completion := Completion{
+		VersionID: "version-1", DataMode: modelpolicy.DataModePersonal,
+		Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+		Observations: []ObservationRecord{{
+			ID: "11111111-1111-1111-1111-111111111111", Predicate: interactionPredicate,
+			EvidenceKeys: []string{"citation-1"},
+		}},
+	}
+
+	if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
+		t.Fatalf("ValidateForPersistence() error = %v, want zero recorded time rejection", err)
+	}
+}
+
 func TestValidateForPersistenceRejectsWhitespacePaddedLocalIdentifiersAndReferences(t *testing.T) {
 	newCompletion := func() Completion {
 		evidence := persistenceEvidence(t)
 		observation := ObservationRecord{
 			ID: "11111111-1111-1111-1111-111111111111", Predicate: interactionPredicate,
-			EvidenceKeys: []string{"citation-1"},
+			EvidenceKeys: []string{"citation-1"}, RecordedAt: validationRecordedAt,
 		}
 		return Completion{
 			VersionID:    "version-1",

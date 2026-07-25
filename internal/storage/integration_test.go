@@ -2056,6 +2056,91 @@ func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	}
 }
 
+func TestPrepareVersionReturnsPersistedRecordedAtForEveryState(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewIngestionRepository(pool)
+	ctx := context.Background()
+	version := testDocumentVersion(t, testIdentifier("document-recorded-at-states"))
+	derivation := testExtractionDerivation(t, version)
+
+	first, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare initial extraction run: %v", err)
+	}
+	var storedRecordedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT recorded_at FROM stacks.extraction_runs WHERE id = $1`, first.DerivationID).Scan(&storedRecordedAt); err != nil {
+		t.Fatalf("load stored extraction recorded time: %v", err)
+	}
+	storedRecordedAt = storedRecordedAt.UTC()
+	assertPersistedRecordedAt := func(name string, state ingest.VersionState) {
+		t.Helper()
+		if !state.RecordedAt.Equal(storedRecordedAt) ||
+			state.RecordedAt.Location() != time.UTC ||
+			!state.RecordedAt.Equal(state.RecordedAt.Truncate(time.Microsecond)) {
+			t.Fatalf("%s RecordedAt = %v, want persisted UTC microsecond %v", name, state.RecordedAt, storedRecordedAt)
+		}
+	}
+	assertPersistedRecordedAt("initial pending", first)
+
+	busy, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare busy extraction run: %v", err)
+	}
+	if busy.Status != ingest.VersionStatusBusy {
+		t.Fatalf("busy state = %#v, want busy", busy)
+	}
+	assertPersistedRecordedAt("busy", busy)
+
+	if err := repository.RecordFailure(ctx, first.DerivationID, first.LeaseOwner, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
+		t.Fatalf("record incomplete extraction run: %v", err)
+	}
+	resumed, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare resumed extraction run: %v", err)
+	}
+	if resumed.Status != ingest.VersionStatusPending {
+		t.Fatalf("resumed state = %#v, want pending", resumed)
+	}
+	assertPersistedRecordedAt("resumed", resumed)
+
+	if err := repository.CompleteVersion(ctx, ingest.Completion{
+		VersionID: resumed.ID, DerivationID: resumed.DerivationID, LeaseOwner: resumed.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}); err != nil {
+		t.Fatalf("complete resumed extraction run: %v", err)
+	}
+	complete, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare completed extraction run: %v", err)
+	}
+	if complete.Status != ingest.VersionStatusComplete {
+		t.Fatalf("complete state = %#v, want complete", complete)
+	}
+	assertPersistedRecordedAt("complete", complete)
+}
+
+func TestPrepareVersionTruncatesRecordedAtOnceToPostgresPrecision(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewIngestionRepository(pool)
+	ctx := context.Background()
+	version := testDocumentVersion(t, testIdentifier("document-recorded-at-precision"))
+
+	state, err := repository.PrepareVersion(ctx, version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare extraction run: %v", err)
+	}
+	var storedRecordedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT recorded_at FROM stacks.extraction_runs WHERE id = $1`, state.DerivationID).Scan(&storedRecordedAt); err != nil {
+		t.Fatalf("load stored extraction recorded time: %v", err)
+	}
+	storedRecordedAt = storedRecordedAt.UTC()
+	if !state.RecordedAt.Equal(storedRecordedAt) ||
+		state.RecordedAt.Location() != time.UTC ||
+		!state.RecordedAt.Equal(state.RecordedAt.Truncate(time.Microsecond)) {
+		t.Fatalf("RecordedAt = %v, want persisted UTC microsecond %v", state.RecordedAt, storedRecordedAt)
+	}
+}
+
 func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
@@ -3675,12 +3760,13 @@ func (repository *snapshotCoherenceRepository) PrepareVersion(ctx context.Contex
 		}
 	}
 	leaseExpiresAt := time.Now().UTC().Add(leaseDuration)
-	if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.extraction_runs (id, document_version_id, derivation_digest, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at, currently_admissible) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)`, repository.derivationID, repository.versionID, derivation.Digest[:], derivation.ModelID, derivation.Region, derivation.MaxTokens, derivation.PromptVersion, derivation.SchemaDigest[:], repository.leaseOwner, leaseExpiresAt, time.Now().UTC()); err != nil {
+	recordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 123456000, time.UTC)
+	if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.extraction_runs (id, document_version_id, derivation_digest, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at, currently_admissible) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)`, repository.derivationID, repository.versionID, derivation.Digest[:], derivation.ModelID, derivation.Region, derivation.MaxTokens, derivation.PromptVersion, derivation.SchemaDigest[:], repository.leaseOwner, leaseExpiresAt, recordedAt); err != nil {
 		return ingest.VersionState{}, err
 	}
 	return ingest.VersionState{
 		ID: repository.versionID, DerivationID: repository.derivationID, DerivationDigest: derivation.Digest,
-		LeaseOwner: repository.leaseOwner, LeaseExpiresAt: leaseExpiresAt, Status: ingest.VersionStatusPending,
+		RecordedAt: recordedAt, LeaseOwner: repository.leaseOwner, LeaseExpiresAt: leaseExpiresAt, Status: ingest.VersionStatusPending,
 	}, nil
 }
 
@@ -4589,7 +4675,7 @@ func completeVersionedPairSignal(
 		Observations: []ingest.ObservationRecord{{
 			ID: observationID, SubjectEntityID: managerID, ObjectEntityID: employeeID,
 			SubjectMentionKey: "manager", ObjectMentionKey: "employee",
-			Predicate: "interaction_signal", ValidStart: &validTime, EvidenceKeys: []string{"evidence"},
+			Predicate: "interaction_signal", ValidStart: &validTime, EvidenceKeys: []string{"evidence"}, RecordedAt: state.RecordedAt,
 		}},
 		Signals: []ingest.SignalRecord{{
 			ID: uuid.NewString(), ObservationID: observationID,

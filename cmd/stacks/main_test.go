@@ -990,7 +990,7 @@ func (noOpRuntimeIngestionRepository) PrepareVersion(
 	modelpolicy.DataMode,
 	time.Duration,
 ) (ingest.VersionState, error) {
-	return ingest.VersionState{}, nil
+	return ingest.VersionState{RecordedAt: time.Date(2026, time.July, 25, 12, 0, 0, 123456000, time.UTC)}, nil
 }
 
 func (noOpRuntimeIngestionRepository) CompleteVersion(context.Context, ingest.Completion) error {

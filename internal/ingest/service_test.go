@@ -188,7 +188,7 @@ func TestSyncSkipsExtractionForUnchangedVersion(t *testing.T) {
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
 		ID: "version-unchanged", DerivationID: "derivation-unchanged",
-		DerivationDigest: derivation.Digest, Status: VersionStatusComplete,
+		DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusComplete,
 	}
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
 	service := testService(document, repository, model)
@@ -256,7 +256,7 @@ func TestSyncEnrichesCompleteDerivationWithoutModelInvocation(t *testing.T) {
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
 		ID: "version-directory-complete", DerivationID: "derivation-directory-complete",
-		DerivationDigest: derivation.Digest, Status: VersionStatusComplete,
+		DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusComplete,
 	}
 	model := &recordingModel{
 		responses: []extract.Response{validEmptyResponse(t)},
@@ -305,7 +305,7 @@ func TestSyncNeverEnrichesFailedCompletionOrBusyDerivation(t *testing.T) {
 				derivation := testDerivationIdentity(t, version)
 				repository.versions[derivationKey(version, derivation)] = VersionState{
 					ID: "version-directory-busy", DerivationID: "derivation-directory-busy",
-					DerivationDigest: derivation.Digest, Status: VersionStatusPending,
+					DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusPending,
 					LeaseOwner: "other-worker",
 				}
 			},
@@ -591,7 +591,7 @@ func TestSyncReturnsBusyWithoutInvokingModelForActiveDerivationLease(t *testing.
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
 		ID: "version-busy", DerivationID: "derivation-busy", DerivationDigest: derivation.Digest,
-		Status: VersionStatusPending, LeaseOwner: "other-worker",
+		RecordedAt: recordedAt, Status: VersionStatusPending, LeaseOwner: "other-worker",
 	}
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
 	service := testService(document, repository, model)
@@ -1337,7 +1337,7 @@ func TestCompletionReplacesRawSignalRationaleWithDeterministicExplanation(t *tes
 
 	completion, err := service.completion(version, VersionState{
 		ID: "version-id", DerivationID: "derivation-id",
-		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")),
+		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), RecordedAt: recordedAt,
 	}, extract.Response{
 		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
 	}, output, nil)
@@ -1347,6 +1347,56 @@ func TestCompletionReplacesRawSignalRationaleWithDeterministicExplanation(t *tes
 	if len(completion.Signals) != 1 || completion.Signals[0].Rationale == unsafeRationale ||
 		!strings.Contains(completion.Signals[0].Rationale, "future responsibility") {
 		t.Fatalf("stored signal rationale = %#v, want deterministic category/direction explanation", completion.Signals)
+	}
+}
+
+func TestCompletionCarriesRetryStableRecordedAt(t *testing.T) {
+	const transcript = "Leader assigns follow-up."
+	runRecordedAt := time.Date(2026, time.July, 25, 15, 4, 3, 123456000, time.UTC)
+	version := documentVersion(t, syntheticDocument("document-recorded-at", transcript))
+	service := &Service{
+		Resolver: entity.Resolver{},
+		Now: func() time.Time {
+			return time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+		},
+	}
+	output := extract.ExtractionOutput{
+		Citations: []extract.Citation{{
+			ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+			EndOffset: len(transcript), Quote: transcript,
+		}},
+		People: []extract.PersonMention{
+			{ID: "mention-leader", Surface: "Leader", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-report", Surface: "follow-up", Role: extract.MentionRoleReference, CitationIDs: []string{"citation-1"}},
+		},
+		Statements: []extract.AttributedStatement{{
+			ID: "statement-1", SpeakerMentionID: "mention-leader", SubjectMentionID: "mention-report",
+			Predicate: "assigned", ObjectText: "follow-up", CitationIDs: []string{"citation-1"},
+		}},
+		Signals: []extract.InteractionSignal{{
+			ID: "signal-1", SubjectMentionID: "mention-leader", ObjectMentionID: "mention-report",
+			StatementIDs: []string{"statement-1"}, Category: extract.SignalCategoryFutureResponsibility,
+			Direction: extract.SignalDirectionStrengthening, Rationale: "Synthetic rationale", Confidence: 0.8,
+			SupportingCitationIDs: []string{"citation-1"},
+		}},
+	}
+
+	completion, err := service.completion(version, VersionState{
+		ID: "version-id", DerivationID: "derivation-id",
+		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), RecordedAt: runRecordedAt,
+	}, extract.Response{
+		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+	}, output, nil)
+	if err != nil {
+		t.Fatalf("completion() error = %v", err)
+	}
+	if len(completion.Observations) == 0 {
+		t.Fatal("completion observations = none, want recorded interaction")
+	}
+	for _, observation := range completion.Observations {
+		if !observation.RecordedAt.Equal(runRecordedAt) || observation.RecordedAt.Location() != time.UTC {
+			t.Fatalf("observation RecordedAt = %v, want retry-stable extraction time %v", observation.RecordedAt, runRecordedAt)
+		}
 	}
 }
 
@@ -1619,7 +1669,7 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version ev
 		state = VersionState{
 			ID:               "version-" + version.Digest().String()[:12],
 			DerivationID:     "derivation-" + fmt.Sprintf("%x", derivation.Digest[:6]),
-			DerivationDigest: derivation.Digest, Status: VersionStatusPending,
+			DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusPending,
 			LeaseOwner: fmt.Sprintf("owner-%d", repository.prepareClaims), LeaseExpiresAt: leaseExpiresAt,
 		}
 		repository.lastLeaseExpiresAt = leaseExpiresAt

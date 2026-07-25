@@ -142,7 +142,7 @@ func validateObservationIdentities(records []ObservationRecord, evidence map[str
 	byID := make(map[string][sha256.Size]byte, len(records))
 	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
 	for _, record := range records {
-		if !canonicalLocalIdentifier(record.ID) {
+		if !canonicalLocalIdentifier(record.ID) || record.RecordedAt.IsZero() {
 			return nil, ErrPersistenceReference
 		}
 		if _, exists := byID[record.ID]; exists {

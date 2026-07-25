@@ -85,6 +85,7 @@ type VersionState struct {
 	ID               string
 	DerivationID     string
 	DerivationDigest [sha256.Size]byte
+	RecordedAt       time.Time
 	LeaseOwner       string
 	LeaseExpiresAt   time.Time
 	Status           VersionStatus
@@ -138,6 +139,7 @@ type ObservationRecord struct {
 	ValidStart        *time.Time
 	EvidenceKeys      []string
 	Confidence        *float64
+	RecordedAt        time.Time
 }
 
 // SignalEvidenceRecord associates one citation with its bounded signal role.
@@ -500,7 +502,7 @@ func (service *Service) completion(
 			ID: observationID, SubjectEntityID: subject, ObjectEntityID: object,
 			SubjectMentionKey: signal.SubjectMentionID, ObjectMentionKey: signal.ObjectMentionID,
 			Predicate: interactionPredicate, ValidStart: validStart,
-			EvidenceKeys: evidenceKeys, Confidence: &confidence,
+			EvidenceKeys: evidenceKeys, Confidence: &confidence, RecordedAt: state.RecordedAt,
 		})
 		signalEvidence := make([]SignalEvidenceRecord, 0, len(signal.SupportingCitationIDs)+len(signal.ContradictingCitationIDs))
 		for _, key := range signal.SupportingCitationIDs {

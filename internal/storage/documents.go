@@ -314,9 +314,13 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 	if err != nil {
 		return ingest.VersionState{}, err
 	}
-	claimedAt := time.Now().UTC()
+	claimedAt := time.Now().UTC().Truncate(legacyPostgresTimestampPrecision)
 	leaseExpiresAt := claimedAt.Add(leaseDuration)
-	state := ingest.VersionState{ID: stored.ID, DerivationDigest: derivation.Digest}
+	state := ingest.VersionState{
+		ID:               stored.ID,
+		DerivationDigest: derivation.Digest,
+		RecordedAt:       claimedAt,
+	}
 	storedAdmissible := true
 	storedRegion := nullableModelRegion(derivation.Provider, derivation.Region)
 	err = transaction.QueryRow(ctx, `
@@ -337,18 +341,19 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 		var failureCode *string
 		var activeOwner *string
 		var activeUntil *time.Time
+		var persistedRecordedAt time.Time
 		var storedProvider, storedDataMode, storedModelID, storedPromptVersion string
 		var storedBedrockRegion *string
 		var storedMaxTokens int
 		var storedSchemaDigest []byte
 		if err := transaction.QueryRow(ctx, `
-			SELECT id, processing_status, retry_count, failure_code, lease_owner, lease_expires_at,
+			SELECT id, processing_status, retry_count, failure_code, lease_owner, lease_expires_at, recorded_at,
 			       model_provider, data_mode, model_id, bedrock_region, max_output_tokens, prompt_version,
 			       schema_digest, currently_admissible
 			FROM stacks.extraction_runs
 			WHERE document_version_id = $1 AND derivation_digest = $2
 			FOR UPDATE`, stored.ID, derivation.Digest[:]).Scan(
-			&state.DerivationID, &status, &state.RetryCount, &failureCode, &activeOwner, &activeUntil,
+			&state.DerivationID, &status, &state.RetryCount, &failureCode, &activeOwner, &activeUntil, &persistedRecordedAt,
 			&storedProvider, &storedDataMode, &storedModelID, &storedBedrockRegion, &storedMaxTokens,
 			&storedPromptVersion, &storedSchemaDigest, &storedAdmissible,
 		); err != nil {
@@ -360,6 +365,7 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 			string(storedSchemaDigest) != string(derivation.SchemaDigest[:]) {
 			return ingest.VersionState{}, fmt.Errorf("load ingestion derivation state: immutable configuration conflicts")
 		}
+		state.RecordedAt = persistedRecordedAt.UTC()
 		state.Status = ingest.VersionStatus(status)
 		if failureCode != nil {
 			state.FailureCode = ingest.FailureCode(*failureCode)
