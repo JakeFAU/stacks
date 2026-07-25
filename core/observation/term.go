@@ -1,4 +1,7 @@
-// Package observation defines immutable, evidence-backed propositions.
+// Package observation defines immutable temporal propositions with provenance.
+// Ordinary observations require evidence; explicit legacy compatibility
+// observations may be uncited and remain unresolved during temporal
+// aggregation.
 package observation
 
 import (

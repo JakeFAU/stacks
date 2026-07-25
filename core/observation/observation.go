@@ -85,8 +85,11 @@ type ObservationInput struct {
 	LegacyUncited bool
 }
 
-// Observation is an immutable, evidence-backed proposition. ValidTime says
-// when it applied in the source world; RecordedAt says when it was recorded.
+// Observation is an immutable temporal proposition. Ordinary observations are
+// evidence-backed. Explicit legacy compatibility values may be uncited; they
+// retain observation and provenance metadata and remain unresolved during
+// temporal aggregation. ValidTime says when a proposition applied in the
+// source world; RecordedAt says when it was recorded.
 type Observation struct {
 	id            ObservationID
 	statement     Statement
