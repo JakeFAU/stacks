@@ -215,6 +215,7 @@ func TestSyncEnrichesNewDerivationAfterDurableCompletionReleasesLease(t *testing
 	}
 	enricher := &recordingIdentityEnricher{
 		repository: repository,
+		model:      model,
 		calls:      &calls,
 		summaries:  []directory.Summary{{Attempted: 1, Matched: 1}},
 	}
@@ -234,6 +235,9 @@ func TestSyncEnrichesNewDerivationAfterDurableCompletionReleasesLease(t *testing
 	}
 	if enricher.ownedLease {
 		t.Fatal("Enrich() observed an extraction lease owner after durable completion")
+	}
+	if !enricher.modelContextCanceled {
+		t.Fatal("Enrich() observed the model attempt context before cancellation")
 	}
 	if len(summary.Results) != 1 ||
 		summary.Results[0].Outcome != OutcomeCompleted ||
@@ -396,6 +400,57 @@ func TestSyncDirectoryCancellationPreservesCompletedResultAndCanonicalError(t *t
 				summary.Completed != 1 ||
 				summary.Directory.Attempted != 1 {
 				t.Fatalf("summary = %#v, want completed result preserved through cancellation", summary)
+			}
+		})
+	}
+}
+
+func TestSyncDirectoryCancellationDiscardsEarlierAggregateErrorAfterPreservingResults(t *testing.T) {
+	for _, cancellation := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cancellation.Error(), func(t *testing.T) {
+			malformed := extract.Response{
+				Output:        json.RawMessage(`{"unexpected":true}`),
+				ModelID:       "synthetic-model",
+				PromptVersion: extract.ExtractionPromptVersion,
+			}
+			repository := newMemoryRepository()
+			repository.failureRecordErr = errors.New("synthetic persistence failure")
+			enricher := &recordingIdentityEnricher{
+				repository: repository,
+				summaries:  []directory.Summary{{Attempted: 1}},
+				errs:       []error{cancellation},
+			}
+			service := testServiceWithSource(&memorySource{
+				listed: []source.Document{
+					{Provider: "drive", ID: "document-persistence-failure"},
+					{Provider: "drive", ID: "document-directory-cancellation"},
+				},
+				fetched: map[string]source.Document{
+					"document-persistence-failure":    syntheticDocument("document-persistence-failure", "First synthetic source."),
+					"document-directory-cancellation": syntheticDocument("document-directory-cancellation", "Second synthetic source."),
+				},
+			}, repository, &recordingModel{responses: []extract.Response{
+				malformed,
+				validEmptyResponse(t),
+			}})
+			service.IdentityEnricher = enricher
+
+			summary, err := service.Sync(context.Background())
+			if err != cancellation || !errors.Is(err, cancellation) {
+				t.Fatalf("Sync() error = %#v, want direct canonical %v", err, cancellation)
+			}
+			if errors.Is(err, ErrFailurePersistence) {
+				t.Fatalf("Sync() error = %v, want earlier aggregate error discarded", err)
+			}
+			if len(summary.Results) != 2 ||
+				summary.Results[0].Outcome != OutcomeIncomplete ||
+				summary.Results[0].FailureCode != FailureStorage ||
+				summary.Results[1].Outcome != OutcomeCompleted ||
+				summary.Results[1].Directory.Attempted != 1 ||
+				summary.Incomplete != 1 ||
+				summary.Completed != 1 ||
+				summary.Directory.Attempted != 1 {
+				t.Fatalf("summary = %#v, want prior failure and current durable completion preserved", summary)
 			}
 		})
 	}
@@ -1473,6 +1528,7 @@ type recordingModel struct {
 	responses []extract.Response
 	errs      []error
 	requests  []extract.Request
+	contexts  []context.Context
 	calls     int
 	callsLog  *[]string
 }
@@ -1498,10 +1554,11 @@ func (recorder *recordingDecisionRecorder) Record(_ context.Context, observation
 	return nil
 }
 
-func (model *recordingModel) Generate(_ context.Context, request extract.Request) (extract.Response, error) {
+func (model *recordingModel) Generate(ctx context.Context, request extract.Request) (extract.Response, error) {
 	if model.callsLog != nil {
 		*model.callsLog = append(*model.callsLog, "model")
 	}
+	model.contexts = append(model.contexts, ctx)
 	model.requests = append(model.requests, request)
 	index := model.calls
 	model.calls++
@@ -1641,12 +1698,14 @@ func (repository *memoryRepository) EntitySnapshots(context.Context) ([]entity.E
 }
 
 type recordingIdentityEnricher struct {
-	repository *memoryRepository
-	calls      *[]string
-	summaries  []directory.Summary
-	errs       []error
-	callsCount int
-	ownedLease bool
+	repository           *memoryRepository
+	model                *recordingModel
+	calls                *[]string
+	summaries            []directory.Summary
+	errs                 []error
+	callsCount           int
+	ownedLease           bool
+	modelContextCanceled bool
 }
 
 func (enricher *recordingIdentityEnricher) Enrich(_ context.Context, derivationID string) (directory.Summary, error) {
@@ -1660,6 +1719,14 @@ func (enricher *recordingIdentityEnricher) Enrich(_ context.Context, derivationI
 			if state.DerivationID == derivationID && state.LeaseOwner != "" {
 				enricher.ownedLease = true
 			}
+		}
+	}
+	if enricher.model != nil && len(enricher.model.contexts) != 0 {
+		modelContext := enricher.model.contexts[len(enricher.model.contexts)-1]
+		select {
+		case <-modelContext.Done():
+			enricher.modelContextCanceled = true
+		default:
 		}
 	}
 	var summary directory.Summary

@@ -286,7 +286,7 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 				summary.add(result)
 				service.recordDecision(ctx, result.Outcome, service.now().Sub(started))
 			}
-			return summary, errors.Join(aggregateErr, cancellationErr)
+			return summary, cancellationErr
 		}
 		if authErr := boundedGlobalAuthentication(documentErr); authErr != nil {
 			return summary, errors.Join(aggregateErr, authErr)
