@@ -304,10 +304,12 @@ make analyze
 required set of applied migrations; Google OAuth material, configured-folder
 access, and one representative all-tabs classification; selected-provider
 credentials; non-invoking model metadata; and restricted Bedrock invocation
-logging. It never runs OAuth, applies migrations, syncs or persists graph data,
-extracts content, invokes a model, changes configuration, or enables/disables
-logging. Missing or expired Google authorization directs the operator to
-`stacks auth google`.
+logging. Its readiness checks may load existing OAuth material and refresh an
+existing token in memory, but it never starts interactive authorization,
+performs a directory person search, applies migrations, syncs or persists graph
+data, extracts content, invokes a model, changes configuration, or
+enables/disables logging. Missing or expired Google authorization directs the
+operator to `stacks auth google`.
 
 Migration 9 grants the application role only the schema usage and table read
 access needed to inspect Goose migration status. It does not grant schema
