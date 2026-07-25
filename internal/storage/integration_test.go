@@ -2453,6 +2453,85 @@ func TestCompleteVersionExactRetryToleratesAdditionalSharedEvidence(t *testing.T
 	}
 }
 
+func TestCompleteVersionExactRetryForOrderedMultiSectionVersionIsReadOnly(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	version := testMultiSectionIngestionVersion(t, "ordered-multi-section", 0, 1)
+	repository := NewIngestionRepository(pool)
+	state, err := repository.PrepareVersion(
+		ctx,
+		version,
+		testExtractionDerivation(t, version),
+		modelpolicy.DataModePersonal,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare ordered multi-section version: %v", err)
+	}
+	fixture := canonicalIngestionFixture{
+		pool: pool, repository: repository, state: state, version: version,
+	}
+	completion := ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}
+	if err := repository.CompleteVersion(ctx, completion); err != nil {
+		t.Fatalf("complete ordered multi-section version: %v", err)
+	}
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	if err := repository.CompleteVersion(ctx, completion); err != nil {
+		t.Fatalf("retry ordered multi-section version: %v", err)
+	}
+
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("ordered multi-section retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestPrepareVersionRejectsNonCanonicalSectionOrderBeforeWrites(t *testing.T) {
+	testCases := []struct {
+		name   string
+		orders []int
+	}{
+		{name: "unsorted", orders: []int{1, 0}},
+		{name: "duplicate order", orders: []int{0, 0}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIntegrationDatabase(t)
+			ctx := context.Background()
+			version := testMultiSectionIngestionVersion(
+				t,
+				"invalid-section-order-"+testCase.name,
+				testCase.orders...,
+			)
+
+			_, err := NewIngestionRepository(pool).PrepareVersion(
+				ctx,
+				version,
+				testExtractionDerivation(t, version),
+				modelpolicy.DataModePersonal,
+				5*time.Minute,
+			)
+			const wantError = "prepare ingestion version: document sections must have strictly increasing display order"
+			if err == nil || err.Error() != wantError {
+				t.Fatalf("non-canonical section order error = %v, want bounded %q", err, wantError)
+			}
+			if got := countRows(t, pool, `
+				SELECT count(*)
+				FROM stacks.source_documents
+				WHERE provider = $1 AND provider_document_id = $2`,
+				version.Provider(), version.ProviderDocumentID(),
+			); got != 0 {
+				t.Fatalf("non-canonical section order persisted source rows = %d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestCompleteVersionCompletedOwnerPrecedesVersionMismatch(t *testing.T) {
 	testCases := []struct {
 		name        string
@@ -2559,6 +2638,20 @@ func TestCompleteVersionRejectsCompletedEvidenceContentCorruption(t *testing.T) 
 					fixture.state.ID, corruptDigest[:],
 				); err != nil {
 					t.Fatalf("corrupt stored canonical version digest: %v", err)
+				}
+			},
+		},
+		{
+			name: "canonical stable content digest",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture) {
+				corruptDigest := sha256.Sum256([]byte("synthetic-corrupt-stable-content-digest"))
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.document_versions
+					SET content_digest_v2 = $2
+					WHERE id = $1`,
+					fixture.state.ID, corruptDigest[:],
+				); err != nil {
+					t.Fatalf("corrupt stored canonical stable content digest: %v", err)
 				}
 			},
 		},
@@ -7199,6 +7292,39 @@ func testIngestionDocumentVersion(
 	})
 	if err != nil {
 		t.Fatalf("new synthetic ingestion document version: %v", err)
+	}
+	return version
+}
+
+func testMultiSectionIngestionVersion(t *testing.T, label string, orders ...int) knowledge.DocumentVersion {
+	t.Helper()
+	if len(orders) != 2 {
+		t.Fatalf("multi-section test orders = %v, want exactly two", orders)
+	}
+	recordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 0, time.UTC)
+	providerDocumentID := testIdentifier("multi-section-" + label)
+	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider:           "synthetic-drive",
+		ProviderDocumentID: providerDocumentID,
+		Title:              "Synthetic multi-section meeting",
+		Locator:            "https://docs.example.invalid/document/" + providerDocumentID,
+		ProviderVersion:    "synthetic-version-1",
+		ProviderRevision:   "synthetic-version-1-revision",
+		ModifiedAt:         recordedAt,
+		RecordedAt:         recordedAt,
+		Sections: testEvidenceSections(t, []source.Tab{
+			{
+				ID: "tab-synthetic-a", Title: "Synthetic Transcript A", Order: orders[0],
+				Role: source.TabRoleTranscript, Text: "Synthetic first section.",
+			},
+			{
+				ID: "tab-synthetic-b", Title: "Synthetic Transcript B", Order: orders[1],
+				Role: source.TabRoleTranscript, Text: "Synthetic second section.",
+			},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("new multi-section ingestion version: %v", err)
 	}
 	return version
 }

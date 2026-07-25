@@ -73,6 +73,9 @@ func (repository *DocumentRepository) InTransaction(ctx context.Context, work fu
 // PutDocumentVersion stores a version and its ordered tabs. Repeating the same
 // provider document and digest returns its existing stable ID with created false.
 func (repository *DocumentRepository) PutDocumentVersion(ctx context.Context, version evidence.DocumentVersion) (StoredDocumentVersion, bool, error) {
+	if err := validateDocumentSectionOrder(version); err != nil {
+		return StoredDocumentVersion{}, false, fmt.Errorf("put document version: %w", err)
+	}
 	if repository.pool != nil {
 		var stored StoredDocumentVersion
 		var created bool
@@ -87,6 +90,16 @@ func (repository *DocumentRepository) PutDocumentVersion(ctx context.Context, ve
 		return stored, created, nil
 	}
 	return repository.putDocumentVersion(ctx, version)
+}
+
+func validateDocumentSectionOrder(version evidence.DocumentVersion) error {
+	sections := version.Sections()
+	for index := 1; index < len(sections); index++ {
+		if sections[index-1].Order() >= sections[index].Order() {
+			return fmt.Errorf("document sections must have strictly increasing display order")
+		}
+	}
+	return nil
 }
 
 func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, version evidence.DocumentVersion) (StoredDocumentVersion, bool, error) {
@@ -292,6 +305,9 @@ func NewIngestionRepository(pool *pgxpool.Pool) *IngestionRepository {
 func (repository *IngestionRepository) PrepareVersion(ctx context.Context, version evidence.DocumentVersion, derivation ingest.DerivationIdentity, dataMode modelpolicy.DataMode, leaseDuration time.Duration) (ingest.VersionState, error) {
 	if repository == nil || repository.pool == nil {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: repository is not configured")
+	}
+	if err := validateDocumentSectionOrder(version); err != nil {
+		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: %w", err)
 	}
 	if err := (modelpolicy.Invocation{Provider: derivation.Provider, DataMode: dataMode, Region: derivation.Region}).Validate(); err != nil {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: model policy is invalid")
