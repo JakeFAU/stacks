@@ -284,7 +284,7 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 		if cancellationErr := boundedCancellation(ctx, documentErr); cancellationErr != nil {
 			if result.Outcome == OutcomeCompleted || result.Outcome == OutcomeUnchanged {
 				summary.add(result)
-				service.recordDecision(ctx, result.Outcome, service.now().Sub(started))
+				service.recordDecision(ctx, result, service.now().Sub(started))
 			}
 			return summary, cancellationErr
 		}
@@ -292,7 +292,7 @@ func (service *Service) Sync(ctx context.Context) (summary Summary, resultErr er
 			return summary, errors.Join(aggregateErr, authErr)
 		}
 		summary.add(result)
-		service.recordDecision(ctx, result.Outcome, service.now().Sub(started))
+		service.recordDecision(ctx, result, service.now().Sub(started))
 		if documentErr != nil {
 			aggregateErr = ErrFailurePersistence
 		}
@@ -825,12 +825,12 @@ func (service *Service) now() time.Time {
 	return service.Now().UTC()
 }
 
-func (service *Service) recordDecision(ctx context.Context, outcome Outcome, duration time.Duration) {
+func (service *Service) recordDecision(ctx context.Context, result Result, duration time.Duration) {
 	if service.Decisions == nil {
 		return
 	}
 	_ = service.Decisions.Record(ctx, observability.DecisionObservation{
-		Name: ingestionDecisionName, Outcome: string(outcome), Duration: duration,
+		Name: ingestionDecisionName, Outcome: string(result.Outcome), Reason: string(result.FailureCode), Duration: duration,
 		InputSize: 1, OutputSize: 1,
 	})
 }
