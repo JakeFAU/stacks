@@ -317,7 +317,7 @@ func (transaction *Transaction) AppendResolutionDecision(
 		return nil
 	}
 	if decision.Authority() == identity.AuthorityAutomatic {
-		if err := transaction.validateAutomaticResolutionAuthority(ctx, decision); err != nil {
+		if err := transaction.validateAutomaticResolutionAuthority(ctx, decision, aliases); err != nil {
 			return err
 		}
 	}
@@ -393,6 +393,7 @@ func (transaction *Transaction) AppendResolutionDecision(
 func (transaction *Transaction) validateAutomaticResolutionAuthority(
 	ctx context.Context,
 	decision identity.ResolutionDecision,
+	aliases []identity.AliasAssertion,
 ) error {
 	if decision.Outcome() != identity.DecisionAccepted || decision.SupersedesID() != "" {
 		return fmt.Errorf(
@@ -400,23 +401,61 @@ func (transaction *Transaction) validateAutomaticResolutionAuthority(
 			ErrConflict,
 		)
 	}
+	if len(aliases) != 1 {
+		return fmt.Errorf(
+			"append resolution decision: automatic authority requires one source-grounded email alias: %w",
+			ErrConflict,
+		)
+	}
 	var exactCandidates, matchingEntityCandidates int
+	var proposedEmail string
+	var proposedEmailIsGrounded bool
 	if err := transaction.transaction.QueryRow(ctx, `
 		SELECT
-			count(*),
-			count(*) FILTER (WHERE entity_id = $2)
-		FROM stacks_core.resolution_candidates
-		WHERE proposal_id = $1
-		  AND reason_code = $3`,
+			(
+				SELECT count(*)
+				FROM stacks_core.resolution_candidates AS candidate
+				WHERE candidate.proposal_id = proposal.id
+				  AND candidate.reason_code = $3
+			),
+			(
+				SELECT count(*)
+				FROM stacks_core.resolution_candidates AS candidate
+				WHERE candidate.proposal_id = proposal.id
+				  AND candidate.reason_code = $3
+				  AND candidate.entity_id = $2
+			),
+			mention.proposed_email,
+			mention.proposed_email_evidence_id IS NOT NULL
+		FROM stacks_core.resolution_proposals AS proposal
+		JOIN stacks_core.mentions AS mention
+		  ON mention.id = proposal.mention_id
+		WHERE proposal.id = $1`,
 		decision.ProposalID(),
 		decision.EntityID(),
 		uniqueExactWorkEmailReasonCode,
-	).Scan(&exactCandidates, &matchingEntityCandidates); err != nil {
+	).Scan(
+		&exactCandidates,
+		&matchingEntityCandidates,
+		&proposedEmail,
+		&proposedEmailIsGrounded,
+	); err != nil {
 		return wrapIdentityError(ctx, "validate automatic resolution authority", err)
 	}
 	if exactCandidates != 1 || matchingEntityCandidates != 1 {
 		return fmt.Errorf(
 			"append resolution decision: automatic authority requires one unique exact work-email candidate: %w",
+			ErrConflict,
+		)
+	}
+	aliasEmail := aliases[0].Alias().Value
+	normalizedProposedEmail := identity.NormalizeEmail(proposedEmail)
+	if aliasEmail != identity.NormalizeEmail(aliasEmail) ||
+		!proposedEmailIsGrounded ||
+		!identity.ValidEmail(normalizedProposedEmail) ||
+		aliasEmail != normalizedProposedEmail {
+		return fmt.Errorf(
+			"append resolution decision: automatic authority email alias is not source-grounded: %w",
 			ErrConflict,
 		)
 	}

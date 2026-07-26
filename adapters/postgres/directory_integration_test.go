@@ -251,6 +251,48 @@ func TestCanonicalDirectoryReviewerAcceptanceProjectsOnlySelectedProfile(t *test
 			second.SubjectID,
 		)
 	}
+
+	laterMention := seedCanonicalDirectoryMention(
+		t,
+		fixture,
+		"alternative-profile-later",
+		first.Emails[0].Value,
+	)
+	later := canonicalDirectoryPersistInput()
+	later.Mention = laterMention
+	later.Query.Email = laterMention.ProposedEmail
+	later.Lookup.Profiles[0] = first
+	later.Lookup.Profiles[0].ObservedAt = canonicalDirectoryRecordedAt.Add(2 * time.Hour)
+	later.Evaluation.AcceptedEmail = laterMention.ProposedEmail
+	later.Evaluation.Profile = &later.Lookup.Profiles[0]
+	later.RecordedAt = canonicalDirectoryRecordedAt.Add(2 * time.Hour)
+	laterResult, err := store.Persist(fixture.ctx, later)
+	if err != nil {
+		t.Fatalf("persist later unselected provider subject: %v", err)
+	}
+	var alternativeEntityID string
+	if err := fixture.admin.QueryRow(fixture.ctx, `
+		SELECT link.entity_id
+		FROM stacks_directory.entity_links AS link
+		JOIN stacks_directory.profiles AS profile
+		  ON profile.id = link.profile_id
+		WHERE link.proposal_id = $1
+		  AND profile.provider_subject_id = $2`,
+		mention.ProposalID,
+		first.SubjectID,
+	).Scan(&alternativeEntityID); err != nil {
+		t.Fatalf("load alternative directory candidate entity: %v", err)
+	}
+	if !laterResult.AutoResolved ||
+		laterResult.EntityID != alternativeEntityID ||
+		laterResult.EntityID == selectedEntityID {
+		t.Fatalf(
+			"later unselected provider result = %#v, want authority %q distinct from selected %q",
+			laterResult,
+			alternativeEntityID,
+			selectedEntityID,
+		)
+	}
 }
 
 func TestCanonicalDirectoryProviderConflictDowngradesToReview(t *testing.T) {

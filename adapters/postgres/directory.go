@@ -1227,6 +1227,7 @@ func loadDirectoryProviderOwners(
 		  ON profile.id = link.profile_id
 		JOIN stacks_core.resolution_decisions AS current
 		  ON current.proposal_id = link.proposal_id
+		 AND current.entity_id = link.entity_id
 		WHERE profile.provider = $1
 		  AND profile.provider_subject_id = $2
 		  AND current.outcome = 'accepted'

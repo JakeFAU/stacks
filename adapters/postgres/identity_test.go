@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -181,7 +182,7 @@ func TestUniqueExactWorkEmailCanCreateAutomaticAuthority(t *testing.T) {
 		"mention:email-authority/automatic",
 		fixture.evidence[1],
 		"Unrelated Surface",
-		"",
+		" PERSON@Synthetic.Example ",
 	)
 	secondProposal := canonicalProposal(
 		t,
@@ -221,8 +222,20 @@ func TestUniqueExactWorkEmailCanCreateAutomaticAuthority(t *testing.T) {
 		"",
 		identityRecordedAt.Add(5*time.Minute),
 	)
+	automaticAlias := canonicalAliasAssertion(
+		t,
+		"alias:email-authority/automatic",
+		automatic.ID(),
+		entity.ID(),
+		identity.Alias{Type: identity.AliasTypeEmail, Value: "person@synthetic.example"},
+		identityRecordedAt.Add(5*time.Minute),
+	)
 	if err := fixture.database.InTransaction(fixture.ctx, func(transaction *postgres.Transaction) error {
-		return transaction.AppendResolutionDecision(fixture.ctx, automatic, nil)
+		return transaction.AppendResolutionDecision(
+			fixture.ctx,
+			automatic,
+			[]identity.AliasAssertion{automaticAlias},
+		)
 	}); err != nil {
 		t.Fatalf("append automatic exact-email authority: %v", err)
 	}
@@ -232,6 +245,121 @@ func TestUniqueExactWorkEmailCanCreateAutomaticAuthority(t *testing.T) {
 	}
 	if effective.ID() != automatic.ID() || effective.Authority() != identity.AuthorityAutomatic {
 		t.Fatalf("effective automatic decision = %#v, want %q", effective, automatic.ID())
+	}
+}
+
+func TestIdentityAutomaticEmailAuthorityRequiresSourceGroundedCanonicalAlias(t *testing.T) {
+	tests := []struct {
+		name                 string
+		aliasValues          []string
+		wrongCandidateEntity bool
+	}{
+		{name: "unrelated valid email", aliasValues: []string{"unrelated@synthetic.example"}},
+		{name: "noncanonical alias", aliasValues: []string{" SOURCE.BOUND@Synthetic.Example "}},
+		{name: "absent alias"},
+		{
+			name:        "multiple aliases",
+			aliasValues: []string{"source.bound@synthetic.example", "other@synthetic.example"},
+		},
+		{
+			name:                 "candidate names another entity",
+			aliasValues:          []string{"source.bound@synthetic.example"},
+			wrongCandidateEntity: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newIdentityRepositoryFixture(t)
+			decisionEntity := canonicalEntity(t, "entity:automatic-alias/decision", "Decision Entity")
+			mention := canonicalMention(
+				t,
+				"mention:automatic-alias",
+				fixture.evidence[0],
+				"Synthetic Person",
+				" Source.Bound@Synthetic.Example ",
+			)
+			proposal := canonicalProposal(
+				t,
+				"proposal:automatic-alias",
+				mention.ID(),
+				fixture.evidence[0],
+			)
+			candidateEntity := decisionEntity
+			if test.wrongCandidateEntity {
+				candidateEntity = canonicalEntity(
+					t,
+					"entity:automatic-alias/candidate",
+					"Candidate Entity",
+				)
+			}
+			persistIdentityReview(t, fixture, decisionEntity, mention, proposal)
+			candidate := canonicalCandidate(
+				t,
+				"candidate:automatic-alias",
+				proposal.ID(),
+				candidateEntity.ID(),
+				1,
+				"unique_exact_work_email",
+				identity.CandidateSource{Kind: "directory", Reference: "profile:opaque/automatic-alias"},
+			)
+			if err := fixture.database.InTransaction(
+				fixture.ctx,
+				func(transaction *postgres.Transaction) error {
+					if candidateEntity.ID() != decisionEntity.ID() {
+						if _, err := transaction.PutEntity(fixture.ctx, candidateEntity); err != nil {
+							return err
+						}
+					}
+					_, err := transaction.PutResolutionCandidate(fixture.ctx, candidate)
+					return err
+				},
+			); err != nil {
+				t.Fatalf("persist automatic candidate: %v", err)
+			}
+			decision := canonicalResolutionDecision(
+				t,
+				"decision:automatic-alias",
+				proposal.ID(),
+				identity.DecisionAccepted,
+				decisionEntity.ID(),
+				identity.AuthorityAutomatic,
+				"",
+				identityRecordedAt.Add(4*time.Minute),
+			)
+			aliases := make([]identity.AliasAssertion, len(test.aliasValues))
+			for index, value := range test.aliasValues {
+				aliases[index] = canonicalAliasAssertion(
+					t,
+					identity.AliasAssertionID(fmt.Sprintf("alias:automatic-alias/%d", index)),
+					decision.ID(),
+					decisionEntity.ID(),
+					identity.Alias{Type: identity.AliasTypeEmail, Value: value},
+					identityRecordedAt.Add(4*time.Minute),
+				)
+			}
+			err := fixture.database.InTransaction(
+				fixture.ctx,
+				func(transaction *postgres.Transaction) error {
+					return transaction.AppendResolutionDecision(fixture.ctx, decision, aliases)
+				},
+			)
+			if !errors.Is(err, postgres.ErrConflict) {
+				t.Fatalf("AppendResolutionDecision() error = %v, want ErrConflict", err)
+			}
+			var decisions, assertions int
+			if err := fixture.admin.QueryRow(fixture.ctx, `
+				SELECT
+					(SELECT count(*) FROM stacks_core.resolution_decisions WHERE proposal_id = $1),
+					(SELECT count(*) FROM stacks_core.entity_alias_assertions WHERE decision_id = $2)`,
+				proposal.ID(),
+				decision.ID(),
+			).Scan(&decisions, &assertions); err != nil {
+				t.Fatalf("count rejected automatic authority rows: %v", err)
+			}
+			if decisions != 0 || assertions != 0 {
+				t.Fatalf("automatic decision/alias rows = %d/%d, want 0/0", decisions, assertions)
+			}
+		})
 	}
 }
 
