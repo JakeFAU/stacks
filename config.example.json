@@ -1,0 +1,57 @@
+{
+  "http": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "read_header_timeout_seconds": 5
+  },
+  "log": {
+    "level": "info"
+  },
+  "telemetry": {
+    "enabled": false,
+    "endpoint": "127.0.0.1:4317",
+    "insecure": true,
+    "metric_export_interval": "10s",
+    "service_name": "stacks",
+    "trace_sample_ratio": 1
+  },
+  "database": {
+    "scopes": ["core"],
+    "application_role": "stacks_app"
+  },
+  "google": {
+    "folder_id": "replace-with-folder-id",
+    "oauth_client_file": "/absolute/path/outside-repository/google-oauth-client.json",
+    "oauth_token_file": "/absolute/path/outside-repository/stacks-google-token.json",
+    "transcript_titles": ["Transcript"],
+    "notes_titles": ["Notes"]
+  },
+  "directory": {
+    "enabled": false,
+    "oauth_client_file": "/absolute/path/outside-repository/directory-client.json",
+    "oauth_token_file": "/absolute/path/outside-repository/directory-token.json",
+    "email_domains": ["corp.example"],
+    "freshness": "24h",
+    "retry_after": "15m",
+    "max_attempts": 3
+  },
+  "model": {
+    "data_mode": "personal",
+    "provider": "openai",
+    "id": "replace-with-explicit-model-id",
+    "max_output_tokens": 2048,
+    "max_attempts": 1,
+    "aws_profile": "",
+    "aws_region": ""
+  },
+  "ingestion": {
+    "lease_duration": "5m",
+    "attempt_timeout": "4m"
+  },
+  "extraction": {
+    "prompt_version": "extract-v2"
+  },
+  "analysis": {
+    "prompt_version": "analyze-v1"
+  }
+}
