@@ -10,6 +10,7 @@ import (
 
 // LookupResult contains the bounded outcome of one directory lookup.
 type LookupResult struct {
+	Provider   string
 	Outcome    entity.DirectoryOutcome
 	Profiles   []entity.DirectoryProfile
 	RetryAfter time.Duration

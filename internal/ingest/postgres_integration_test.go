@@ -379,6 +379,7 @@ func TestCanonicalCompletedRetryPreservesAdditiveIdentityAndDirectoryState(t *te
 			EmailEvidence: postgres.DirectoryEmailEvidenceNone,
 		},
 		Lookup: postgres.DirectoryLookupResult{
+			Provider: "google_people",
 			Outcome:  postgres.DirectoryOutcomeReview,
 			Profiles: []postgres.DirectoryProfile{profile},
 		},

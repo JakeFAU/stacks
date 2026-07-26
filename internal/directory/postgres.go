@@ -124,6 +124,7 @@ func (repository *PostgresRepository) Persist(
 			EmailEvidence: string(input.Query.EmailEvidence),
 		},
 		Lookup: postgres.DirectoryLookupResult{
+			Provider:   input.Lookup.Provider,
 			Outcome:    string(input.Lookup.Outcome),
 			Profiles:   postgresDirectoryProfiles(input.Lookup.Profiles),
 			RetryAfter: input.Lookup.RetryAfter,

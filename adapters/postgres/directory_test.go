@@ -119,6 +119,21 @@ func TestCanonicalDirectoryRejectsRawNonCanonicalTimesBeforeSQL(t *testing.T) {
 	}
 }
 
+func TestCanonicalDirectoryRejectsInvalidLookupProviderBeforeSQL(t *testing.T) {
+	for _, provider := range []string{" \t", strings.Repeat("p", 129)} {
+		input := canonicalDirectoryPersistInput()
+		input.Lookup.Provider = provider
+
+		_, err := (postgres.DirectoryStore{}).Persist(context.Background(), input)
+		if err == nil || !strings.Contains(err.Error(), "lookup provider") {
+			t.Fatalf("Persist() error = %v, want bounded lookup-provider rejection", err)
+		}
+		if strings.Contains(err.Error(), "not configured") {
+			t.Fatalf("Persist() reached database validation before provider rejection: %v", err)
+		}
+	}
+}
+
 func TestCanonicalDirectoryLoadWorkRejectsRawNonCanonicalNowBeforeSQL(t *testing.T) {
 	nonUTC := time.Date(
 		2026,
@@ -207,6 +222,7 @@ func canonicalDirectoryPersistInput() postgres.DirectoryPersistInput {
 			EmailEvidence: postgres.DirectoryEmailEvidenceSourceBound,
 		},
 		Lookup: postgres.DirectoryLookupResult{
+			Provider: "google_people",
 			Outcome:  postgres.DirectoryOutcomeMatched,
 			Profiles: []postgres.DirectoryProfile{profile},
 		},

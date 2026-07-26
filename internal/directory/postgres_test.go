@@ -106,6 +106,7 @@ func TestDirectoryPostgresMapsRepositoryContract(t *testing.T) {
 			EmailEvidence: entity.EmailEvidenceSourceBound,
 		},
 		Lookup: LookupResult{
+			Provider: "google_people",
 			Outcome:  entity.DirectoryMatched,
 			Profiles: []entity.DirectoryProfile{rootProfile},
 		},
@@ -130,6 +131,7 @@ func TestDirectoryPostgresMapsRepositoryContract(t *testing.T) {
 	if fake.persistInput.Mention.ProposalID != input.Mention.ProposalID ||
 		fake.persistInput.Query.Kind != string(input.Query.Kind) ||
 		fake.persistInput.Query.EmailEvidence != string(input.Query.EmailEvidence) ||
+		fake.persistInput.Lookup.Provider != input.Lookup.Provider ||
 		fake.persistInput.Lookup.Outcome != string(input.Lookup.Outcome) ||
 		len(fake.persistInput.Lookup.Profiles) != 1 ||
 		fake.persistInput.Lookup.Profiles[0].ObservedAt != rootProfile.ObservedAt ||

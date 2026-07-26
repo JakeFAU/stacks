@@ -1295,8 +1295,15 @@ func validateDecisionAliases(
 	if decision.Outcome() == identity.DecisionRejected && len(aliases) != 0 {
 		return fmt.Errorf("rejected decisions cannot assert aliases: %w", ErrConflict)
 	}
-	if decision.Authority() == identity.AuthorityAutomatic && len(aliases) != 0 {
-		return fmt.Errorf("automatic decisions cannot teach aliases: %w", ErrConflict)
+	if decision.Authority() == identity.AuthorityAutomatic {
+		if len(aliases) > 1 {
+			return fmt.Errorf("automatic decisions can assert at most one exact email: %w", ErrConflict)
+		}
+		for _, assertion := range aliases {
+			if assertion.Alias().Type != identity.AliasTypeEmail {
+				return fmt.Errorf("automatic decisions cannot assert name aliases: %w", ErrConflict)
+			}
+		}
 	}
 	seen := make(map[identity.AliasAssertionID]struct{}, len(aliases))
 	for _, assertion := range aliases {

@@ -27,6 +27,7 @@ type canonicalDirectoryFixture struct {
 
 func TestCanonicalDirectoryExactEmailCreatesAutomaticAuthority(t *testing.T) {
 	fixture := newCanonicalDirectoryFixture(t)
+	store := postgres.DirectoryStore{Database: fixture.database}
 	mention := seedCanonicalDirectoryMention(
 		t,
 		fixture,
@@ -40,7 +41,7 @@ func TestCanonicalDirectoryExactEmailCreatesAutomaticAuthority(t *testing.T) {
 	input.Evaluation.AcceptedEmail = mention.ProposedEmail
 	input.Evaluation.Profile = &input.Lookup.Profiles[0]
 
-	result, err := (postgres.DirectoryStore{Database: fixture.database}).Persist(
+	result, err := store.Persist(
 		fixture.ctx,
 		input,
 	)
@@ -74,6 +75,45 @@ func TestCanonicalDirectoryExactEmailCreatesAutomaticAuthority(t *testing.T) {
 		proposal.Candidates[0].Source().Kind != "directory" ||
 		proposal.Candidates[0].Source().Reference == "" {
 		t.Fatalf("directory candidate provenance = %#v, want one exact-email opaque source", proposal.Candidates)
+	}
+
+	state, err := store.LoadIdentityState(fixture.ctx)
+	if err != nil {
+		t.Fatalf("LoadIdentityState() error = %v", err)
+	}
+	resolution := (identity.Resolver{}).Resolve(identity.Mention{
+		Name:  mention.NormalizedName,
+		Email: mention.ProposedEmail,
+	}, state.Snapshots)
+	if !resolution.AutoResolved || resolution.EntityID != result.EntityID {
+		t.Fatalf(
+			"accepted exact-email resolution = %#v, want automatic entity %q",
+			resolution,
+			result.EntityID,
+		)
+	}
+
+	laterMention := seedCanonicalDirectoryMention(
+		t,
+		fixture,
+		"exact-email-later",
+		mention.ProposedEmail,
+	)
+	later := input
+	later.Mention = laterMention
+	later.Evaluation.EntityID = resolution.EntityID
+	later.Evaluation.CreatePerson = false
+	later.RecordedAt = canonicalDirectoryRecordedAt.Add(time.Hour)
+	laterResult, err := store.Persist(fixture.ctx, later)
+	if err != nil {
+		t.Fatalf("persist later exact-email proposal: %v", err)
+	}
+	if !laterResult.AutoResolved || laterResult.EntityID != result.EntityID {
+		t.Fatalf(
+			"later exact-email result = %#v, want existing automatic entity %q",
+			laterResult,
+			result.EntityID,
+		)
 	}
 }
 
@@ -126,6 +166,90 @@ func TestCanonicalDirectoryNameOnlyCreatesReviewCandidate(t *testing.T) {
 		proposal.Candidates[0].ReasonCode() != "directory_name_review" ||
 		proposal.Candidates[0].Source().Kind != "directory" {
 		t.Fatalf("name-only candidates = %#v, want one directory review candidate", proposal.Candidates)
+	}
+}
+
+func TestCanonicalDirectoryReviewerAcceptanceProjectsOnlySelectedProfile(t *testing.T) {
+	fixture := newCanonicalDirectoryFixture(t)
+	mention := seedCanonicalDirectoryMention(
+		t,
+		fixture,
+		"selected-profile",
+		"selected.profile@example.test",
+	)
+	input := canonicalDirectoryPersistInput()
+	input.Mention = mention
+	input.Query = postgres.DirectoryQuery{
+		Kind:          postgres.DirectoryQueryName,
+		Name:          mention.NormalizedName,
+		EmailEvidence: postgres.DirectoryEmailEvidenceNone,
+	}
+	first := input.Lookup.Profiles[0]
+	first.SubjectID = "people/alternative-profile"
+	first.Emails[0].Value = "alternative.profile@example.test"
+	second := first
+	second.SubjectID = "people/selected-profile"
+	second.Emails = []postgres.DirectoryEmail{{
+		Value: "selected.profile@example.test", Primary: true,
+	}}
+	input.Lookup.Outcome = postgres.DirectoryOutcomeReview
+	input.Lookup.Profiles = []postgres.DirectoryProfile{first, second}
+	input.Evaluation = postgres.DirectoryEvaluation{
+		Outcome:    postgres.DirectoryOutcomeReview,
+		Candidates: append([]postgres.DirectoryProfile(nil), input.Lookup.Profiles...),
+	}
+	store := postgres.DirectoryStore{Database: fixture.database}
+	if _, err := store.Persist(fixture.ctx, input); err != nil {
+		t.Fatalf("persist multiple review candidates: %v", err)
+	}
+
+	var selectedEntityID string
+	if err := fixture.admin.QueryRow(fixture.ctx, `
+		SELECT link.entity_id
+		FROM stacks_directory.entity_links AS link
+		JOIN stacks_directory.profiles AS profile
+		  ON profile.id = link.profile_id
+		WHERE link.proposal_id = $1
+		  AND profile.provider_subject_id = $2`,
+		mention.ProposalID,
+		second.SubjectID,
+	).Scan(&selectedEntityID); err != nil {
+		t.Fatalf("load selected directory candidate entity: %v", err)
+	}
+	decision, err := identity.NewResolutionDecision(identity.ResolutionDecisionInput{
+		ID:         "decision:selected-profile",
+		ProposalID: identity.ProposalID(mention.ProposalID),
+		Outcome:    identity.DecisionAccepted,
+		EntityID:   identity.EntityID(selectedEntityID),
+		Authority:  identity.AuthorityReviewer,
+		ReasonCode: "reviewer_selected_directory_profile",
+		RecordedAt: canonicalDirectoryRecordedAt.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("NewResolutionDecision() error = %v", err)
+	}
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *postgres.Transaction) error {
+			return transaction.AppendResolutionDecision(fixture.ctx, decision, nil)
+		},
+	); err != nil {
+		t.Fatalf("append reviewer directory decision: %v", err)
+	}
+
+	state, err := store.LoadIdentityState(fixture.ctx)
+	if err != nil {
+		t.Fatalf("LoadIdentityState() error = %v", err)
+	}
+	if len(state.Links) != 1 ||
+		state.Links[0].Provider != second.Provider ||
+		state.Links[0].SubjectID != second.SubjectID ||
+		state.Links[0].EntityID != selectedEntityID {
+		t.Fatalf(
+			"effective directory links = %#v, want only selected profile %q",
+			state.Links,
+			second.SubjectID,
+		)
 	}
 }
 
@@ -241,6 +365,182 @@ func TestCanonicalDirectoryRetryAndChangedSnapshotsAreIdempotent(t *testing.T) {
 	assertCanonicalDirectoryCounts(t, fixture, mention, 2, 2, 2, 1)
 }
 
+func TestCanonicalDirectoryReviewRetryAfterFreshnessPreservesCandidate(t *testing.T) {
+	fixture := newCanonicalDirectoryFixture(t)
+	mention := seedCanonicalDirectoryMention(
+		t,
+		fixture,
+		"review-retry",
+		"review.retry@example.test",
+	)
+	input := canonicalDirectoryPersistInput()
+	input.Mention = mention
+	input.Query = postgres.DirectoryQuery{
+		Kind:          postgres.DirectoryQueryName,
+		Name:          mention.NormalizedName,
+		EmailEvidence: postgres.DirectoryEmailEvidenceNone,
+	}
+	input.Lookup.Outcome = postgres.DirectoryOutcomeReview
+	input.Lookup.Profiles[0].SubjectID = "people/review-retry"
+	input.Lookup.Profiles[0].Emails[0].Value = mention.ProposedEmail
+	input.Evaluation = postgres.DirectoryEvaluation{
+		Outcome:    postgres.DirectoryOutcomeReview,
+		Candidates: append([]postgres.DirectoryProfile(nil), input.Lookup.Profiles...),
+	}
+	store := postgres.DirectoryStore{Database: fixture.database}
+	if _, err := store.Persist(fixture.ctx, input); err != nil {
+		t.Fatalf("first review Persist() error = %v", err)
+	}
+
+	repeated := input
+	repeated.AttemptCount = 2
+	repeated.RecordedAt = canonicalDirectoryRecordedAt.Add(2 * time.Hour)
+	if _, err := store.Persist(fixture.ctx, repeated); err != nil {
+		t.Fatalf("review Persist() after freshness error = %v", err)
+	}
+
+	var candidates, attempts int
+	if err := fixture.admin.QueryRow(fixture.ctx, `
+		SELECT
+			(
+				SELECT count(*)
+				FROM stacks_core.resolution_candidates
+				WHERE proposal_id = $1
+			),
+			(
+				SELECT count(*)
+				FROM stacks_directory.lookup_attempts
+				WHERE proposal_id = $1
+			)`,
+		mention.ProposalID,
+	).Scan(&candidates, &attempts); err != nil {
+		t.Fatalf("count review retry state: %v", err)
+	}
+	if candidates != 1 || attempts != 2 {
+		t.Fatalf(
+			"review retry candidates/attempts = %d/%d, want 1/2",
+			candidates,
+			attempts,
+		)
+	}
+}
+
+func TestCanonicalDirectoryLookupProviderIsPartOfAttemptIdentity(t *testing.T) {
+	fixture := newCanonicalDirectoryFixture(t)
+	mention := seedCanonicalDirectoryMention(
+		t,
+		fixture,
+		"lookup-provider",
+		"lookup.provider@example.test",
+	)
+	input := postgres.DirectoryPersistInput{
+		Mention: mention,
+		Query: postgres.DirectoryQuery{
+			Kind:          postgres.DirectoryQueryName,
+			Name:          mention.NormalizedName,
+			EmailEvidence: postgres.DirectoryEmailEvidenceNone,
+		},
+		Lookup: postgres.DirectoryLookupResult{
+			Provider: "google_people",
+			Outcome:  postgres.DirectoryOutcomeNoMatch,
+		},
+		AttemptCount: 1,
+		RecordedAt:   canonicalDirectoryRecordedAt,
+	}
+	store := postgres.DirectoryStore{Database: fixture.database}
+	if _, err := store.Persist(fixture.ctx, input); err != nil {
+		t.Fatalf("persist Google People no-match: %v", err)
+	}
+	other := input
+	other.Lookup.Provider = "synthetic_people"
+	if _, err := store.Persist(fixture.ctx, other); err != nil {
+		t.Fatalf("persist distinct-provider no-match: %v", err)
+	}
+
+	var attempts, providers int
+	if err := fixture.admin.QueryRow(fixture.ctx, `
+		SELECT count(*), count(DISTINCT provider)
+		FROM stacks_directory.lookup_attempts
+		WHERE proposal_id = $1`,
+		mention.ProposalID,
+	).Scan(&attempts, &providers); err != nil {
+		t.Fatalf("count lookup provider provenance: %v", err)
+	}
+	if attempts != 2 || providers != 2 {
+		t.Fatalf(
+			"lookup attempts/providers = %d/%d, want 2/2",
+			attempts,
+			providers,
+		)
+	}
+}
+
+func TestCanonicalDirectoryRejectsAutomaticAuthorityFromAmbiguousExactProfiles(t *testing.T) {
+	fixture := newCanonicalDirectoryFixture(t)
+	mention := seedCanonicalDirectoryMention(
+		t,
+		fixture,
+		"ambiguous-exact",
+		"ambiguous.exact@example.test",
+	)
+	input := canonicalDirectoryPersistInput()
+	input.Mention = mention
+	input.Query.Email = mention.ProposedEmail
+	first := input.Lookup.Profiles[0]
+	first.SubjectID = "people/ambiguous-first"
+	first.Emails[0].Value = mention.ProposedEmail
+	second := first
+	second.SubjectID = "people/ambiguous-second"
+	input.Lookup.Profiles = []postgres.DirectoryProfile{first, second}
+	input.Evaluation.AcceptedEmail = mention.ProposedEmail
+	input.Evaluation.Profile = &input.Lookup.Profiles[0]
+
+	_, persistErr := (postgres.DirectoryStore{Database: fixture.database}).Persist(
+		fixture.ctx,
+		input,
+	)
+	if persistErr == nil {
+		t.Error("Persist() error = nil, want ambiguous exact-email rejection")
+	}
+
+	var directoryRows, authorityRows int
+	if err := fixture.admin.QueryRow(fixture.ctx, `
+		SELECT
+			(
+				SELECT count(*)
+				FROM stacks_directory.profiles
+			) + (
+				SELECT count(*)
+				FROM stacks_directory.snapshots
+			) + (
+				SELECT count(*)
+				FROM stacks_directory.lookup_attempts
+			) + (
+				SELECT count(*)
+				FROM stacks_directory.entity_links
+			),
+			(
+				SELECT count(*)
+				FROM stacks_core.resolution_candidates
+				WHERE proposal_id = $1
+			) + (
+				SELECT count(*)
+				FROM stacks_core.resolution_decisions
+				WHERE proposal_id = $1
+			)`,
+		mention.ProposalID,
+	).Scan(&directoryRows, &authorityRows); err != nil {
+		t.Fatalf("count ambiguous automatic state: %v", err)
+	}
+	if directoryRows != 0 || authorityRows != 0 {
+		t.Fatalf(
+			"ambiguous directory/authority rows = %d/%d, want 0/0",
+			directoryRows,
+			authorityRows,
+		)
+	}
+}
+
 func TestCanonicalDirectoryBoundedFailurePreservesReviewerAuthority(t *testing.T) {
 	fixture := newCanonicalDirectoryFixture(t)
 	mention := seedCanonicalDirectoryMention(
@@ -311,7 +611,8 @@ func TestCanonicalDirectoryBoundedFailurePreservesReviewerAuthority(t *testing.T
 			EmailEvidence: postgres.DirectoryEmailEvidenceSourceBound,
 		},
 		Lookup: postgres.DirectoryLookupResult{
-			Outcome: postgres.DirectoryOutcomeNoMatch,
+			Provider: "google_people",
+			Outcome:  postgres.DirectoryOutcomeNoMatch,
 		},
 		AttemptCount: 2,
 		RecordedAt:   canonicalDirectoryRecordedAt.Add(2 * time.Hour),
@@ -345,7 +646,8 @@ func TestCanonicalDirectoryBoundedFailurePreservesReviewerAuthority(t *testing.T
 			EmailEvidence: postgres.DirectoryEmailEvidenceSourceBound,
 		},
 		Lookup: postgres.DirectoryLookupResult{
-			Outcome: postgres.DirectoryOutcomeUnavailable,
+			Provider: "google_people",
+			Outcome:  postgres.DirectoryOutcomeUnavailable,
 		},
 		AttemptCount: 3,
 		RecordedAt:   canonicalDirectoryRecordedAt.Add(3 * time.Hour),
@@ -369,12 +671,32 @@ func TestCanonicalDirectoryBoundedFailurePreservesReviewerAuthority(t *testing.T
 		automatic.EntityID == string(reviewerEntity.ID()) {
 		t.Fatalf("effective decision after directory failure = %#v, want reviewer correction", effective)
 	}
+	var boundedProviderAttempts int
+	if err := fixture.admin.QueryRow(fixture.ctx, `
+		SELECT count(*)
+		FROM stacks_directory.lookup_attempts
+		WHERE proposal_id = $1
+		  AND outcome IN ('no_match', 'unavailable')
+		  AND provider = 'google_people'`,
+		mention.ProposalID,
+	).Scan(&boundedProviderAttempts); err != nil {
+		t.Fatalf("count bounded provider attempts: %v", err)
+	}
+	if boundedProviderAttempts != 2 {
+		t.Fatalf(
+			"bounded Google People attempts = %d, want no-match and unavailable provenance",
+			boundedProviderAttempts,
+		)
+	}
 	state, err := store.LoadIdentityState(fixture.ctx)
 	if err != nil {
 		t.Fatalf("LoadIdentityState() error = %v", err)
 	}
-	if len(state.Links) != 1 || state.Links[0].EntityID != string(reviewerEntity.ID()) {
-		t.Fatalf("effective directory links = %#v, want reviewer entity", state.Links)
+	if len(state.Links) != 0 {
+		t.Fatalf(
+			"effective directory links = %#v, want no provider subject for unrelated reviewer entity",
+			state.Links,
+		)
 	}
 }
 
@@ -424,18 +746,19 @@ func TestDirectoryStoreConcurrentExactEmailCreatesOneAuthority(t *testing.T) {
 	if errs[0] != nil || errs[1] != nil {
 		t.Fatalf("concurrent Persist() errors = %v/%v", errs[0], errs[1])
 	}
-	if results[0].AutoResolved == results[1].AutoResolved {
-		t.Fatalf("concurrent results = %#v/%#v, want exactly one automatic authority", results[0], results[1])
+	if !results[0].AutoResolved ||
+		!results[1].AutoResolved ||
+		results[0].EntityID == "" ||
+		results[0].EntityID != results[1].EntityID {
+		t.Fatalf(
+			"concurrent results = %#v/%#v, want the same automatic authority",
+			results[0],
+			results[1],
+		)
 	}
 	authorityID := results[0].EntityID
-	if authorityID == "" {
-		authorityID = results[1].EntityID
-	}
-	if authorityID == "" {
-		t.Fatalf("concurrent results = %#v/%#v, want one nonblank authority", results[0], results[1])
-	}
 
-	var entities, decisions, providerOwners int
+	var entities, decisions, aliases, providerOwners int
 	if err := fixture.admin.QueryRow(fixture.ctx, `
 		SELECT
 			(
@@ -450,14 +773,24 @@ func TestDirectoryStoreConcurrentExactEmailCreatesOneAuthority(t *testing.T) {
 				  AND decision.authority = 'automatic'
 			),
 			(
+				SELECT count(*)
+				FROM stacks_core.entity_alias_assertions AS assertion
+				JOIN stacks_core.resolution_decisions AS decision
+				  ON decision.id = assertion.decision_id
+				WHERE decision.proposal_id IN ($2, $3)
+				  AND assertion.alias_type = 'email'
+				  AND assertion.alias_value = $4
+				  AND assertion.entity_id = $1
+			),
+			(
 				SELECT count(DISTINCT current.entity_id)
 				FROM stacks_directory.entity_links AS link
 				JOIN stacks_directory.profiles AS profile
 				  ON profile.id = link.profile_id
 				JOIN stacks_core.resolution_decisions AS current
 				  ON current.proposal_id = link.proposal_id
-				WHERE profile.provider = $4
-				  AND profile.provider_subject_id = $5
+				WHERE profile.provider = $5
+				  AND profile.provider_subject_id = $6
 				  AND current.outcome = 'accepted'
 				  AND NOT EXISTS (
 					SELECT 1
@@ -468,16 +801,18 @@ func TestDirectoryStoreConcurrentExactEmailCreatesOneAuthority(t *testing.T) {
 		authorityID,
 		firstMention.ProposalID,
 		secondMention.ProposalID,
+		firstMention.ProposedEmail,
 		profile.Provider,
 		profile.SubjectID,
-	).Scan(&entities, &decisions, &providerOwners); err != nil {
+	).Scan(&entities, &decisions, &aliases, &providerOwners); err != nil {
 		t.Fatalf("count concurrent authority: %v", err)
 	}
-	if entities != 1 || decisions != 1 || providerOwners != 1 {
+	if entities != 1 || decisions != 2 || aliases != 2 || providerOwners != 1 {
 		t.Fatalf(
-			"concurrent entities/automatic decisions/provider owners = %d/%d/%d, want 1/1/1",
+			"concurrent entities/automatic decisions/email aliases/provider owners = %d/%d/%d/%d, want 1/2/2/1",
 			entities,
 			decisions,
+			aliases,
 			providerOwners,
 		)
 	}
@@ -586,7 +921,10 @@ func TestCanonicalDirectoryWorkHonorsFreshnessAndRetryWindows(t *testing.T) {
 			Name:          mention.NormalizedName,
 			EmailEvidence: postgres.DirectoryEmailEvidenceNone,
 		},
-		Lookup:       postgres.DirectoryLookupResult{Outcome: postgres.DirectoryOutcomeUnavailable},
+		Lookup: postgres.DirectoryLookupResult{
+			Provider: "google_people",
+			Outcome:  postgres.DirectoryOutcomeUnavailable,
+		},
 		AttemptCount: 1,
 		RecordedAt:   canonicalDirectoryRecordedAt,
 		RetryAfter:   &retryAt,

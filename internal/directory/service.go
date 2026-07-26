@@ -225,7 +225,10 @@ func (service *Service) VerifyReviewerEmail(ctx context.Context, email string) (
 		Email:         entity.NormalizeEmail(email),
 		EmailEvidence: entity.EmailEvidenceReviewerSupplied,
 	}
-	verification := ReviewerVerification{Query: query}
+	verification := ReviewerVerification{
+		Query:  query,
+		Lookup: LookupResult{Provider: reviewerDirectoryProvider},
+	}
 	if err := ctx.Err(); err != nil {
 		return ReviewerVerification{}, err
 	}
@@ -272,7 +275,10 @@ func (service *Service) VerifyReviewerEmail(ctx context.Context, email string) (
 		return ReviewerVerification{}, cancellationErr
 	}
 	if err != nil {
-		verification.Lookup = LookupResult{Outcome: entity.DirectoryUnavailable}
+		verification.Lookup = LookupResult{
+			Provider: reviewerDirectoryProvider,
+			Outcome:  entity.DirectoryUnavailable,
+		}
 	}
 	if verification.Lookup.Outcome == "" {
 		verification.Evaluation = service.Policy.Evaluate(
@@ -358,7 +364,10 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 		started := timepoint.Normalize(service.Now())
 		summary.Attempted++
 
-		lookup := LookupResult{Outcome: entity.DirectoryNotConfigured}
+		lookup := LookupResult{
+			Provider: reviewerDirectoryProvider,
+			Outcome:  entity.DirectoryNotConfigured,
+		}
 		attemptCount := 0
 		var lookupErr error
 		if service.Lookup != nil {
@@ -449,14 +458,23 @@ func (service *Service) search(ctx context.Context, query entity.DirectoryQuery)
 	var result LookupResult
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt - 1, err
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt - 1, err
 		}
 		untrusted, err := service.Lookup.Search(ctx, query)
 		if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, cancellationErr
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt, cancellationErr
 		}
 		if err != nil {
-			result = LookupResult{Outcome: entity.DirectoryUnavailable}
+			result = LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}
 		} else {
 			result = normalizeLookupResult(untrusted)
 		}
@@ -467,14 +485,23 @@ func (service *Service) search(ctx context.Context, query entity.DirectoryQuery)
 			return result, attempt, nil
 		}
 		if err := ctx.Err(); err != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, err
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt, err
 		}
 		waitErr := service.Wait(ctx, service.retryDelay(result))
 		if cancellationErr := directoryCancellation(ctx, waitErr); cancellationErr != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, cancellationErr
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt, cancellationErr
 		}
 		if waitErr != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, nil
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt, nil
 		}
 	}
 	return result, maxAttempts, nil
@@ -485,12 +512,19 @@ func retryableDirectoryOutcome(outcome entity.DirectoryOutcome) bool {
 }
 
 func normalizeLookupResult(result LookupResult) LookupResult {
+	result.Provider = strings.TrimSpace(result.Provider)
+	if result.Provider == "" {
+		result.Provider = reviewerDirectoryProvider
+	}
 	if result.Outcome == "" {
 		result.RetryAfter = 0
 		return result
 	}
 	if !boundedDirectoryOutcome(result.Outcome) {
-		return LookupResult{Outcome: entity.DirectoryInvalidResponse}
+		return LookupResult{
+			Provider: result.Provider,
+			Outcome:  entity.DirectoryInvalidResponse,
+		}
 	}
 	result.Profiles = nil
 	if !retryableDirectoryOutcome(result.Outcome) {

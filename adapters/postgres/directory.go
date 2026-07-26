@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/timepoint"
@@ -45,16 +46,19 @@ const (
 	directoryPolicyVersion       = "directory-identity-v1"
 	directoryProfileDigest       = "stacks.directory-profile.v2.canonical"
 	directoryQueryDigest         = "stacks.directory-query.v2.canonical"
-	directoryAttemptDigest       = "stacks.directory-attempt.v2.canonical"
+	directoryAttemptDigest       = "stacks.directory-attempt.v3.lookup-provider"
 	directoryEntityIDVersion     = "stacks.directory-entity.v1"
 	directoryCandidateIDVersion  = "stacks.directory-candidate.v1"
 	directoryDecisionIDVersion   = "stacks.directory-decision.v1"
+	directoryAliasIDVersion      = "stacks.directory-alias-assertion.v1"
 	directoryLinkIDVersion       = "stacks.directory-link.v1"
 	directoryAuthorityNamespace  = "github.com/JakeFAU/stacks/postgres-directory-authority/v1"
 	directoryCandidateSourceKind = "directory"
 	directoryExactEmailReason    = "unique_exact_work_email"
 	directoryEmailReviewReason   = "directory_exact_email_review"
 	directoryNameReviewReason    = "directory_name_review"
+
+	directoryLookupProviderMaximumRunes = 128
 )
 
 // DirectoryPendingMention is private source-grounded work without provider
@@ -125,6 +129,7 @@ type DirectoryProfile struct {
 
 // DirectoryLookupResult is one bounded provider outcome.
 type DirectoryLookupResult struct {
+	Provider   string
 	Outcome    string
 	Profiles   []DirectoryProfile
 	RetryAfter time.Duration
@@ -344,6 +349,7 @@ func (store DirectoryStore) LoadIdentityState(
 		  ON profile.id = link.profile_id
 		JOIN stacks_core.resolution_decisions AS current
 		  ON current.proposal_id = link.proposal_id
+		 AND current.entity_id = link.entity_id
 		WHERE current.outcome = 'accepted'
 		  AND NOT EXISTS (
 			SELECT 1
@@ -692,7 +698,7 @@ func persistDirectoryAttempt(
 		attemptID,
 		input.Mention.MentionID,
 		input.Mention.ProposalID,
-		directoryCandidateSourceKind,
+		normalizeDirectoryProvider(input.Lookup.Provider),
 		input.Query.Kind,
 		input.Query.EmailEvidence,
 		queryDigest[:],
@@ -707,15 +713,15 @@ func persistDirectoryAttempt(
 		return "", fmt.Errorf("insert directory lookup attempt: %w", err)
 	}
 	var (
-		storedMention, storedProposal, storedOutcome string
-		storedRecordedAt                             time.Time
-		storedRetryAfter                             *time.Time
-		storedSnapshots                              []string
-		storedDigest                                 []byte
+		storedMention, storedProposal, storedProvider, storedOutcome string
+		storedRecordedAt                                             time.Time
+		storedRetryAfter                                             *time.Time
+		storedSnapshots                                              []string
+		storedDigest                                                 []byte
 	)
 	if err := transaction.QueryRow(ctx, `
 		SELECT
-			mention_id, proposal_id, outcome, recorded_at, retry_after,
+			mention_id, proposal_id, provider, outcome, recorded_at, retry_after,
 			snapshot_ids, digest
 		FROM stacks_directory.lookup_attempts
 		WHERE id = $1`,
@@ -723,6 +729,7 @@ func persistDirectoryAttempt(
 	).Scan(
 		&storedMention,
 		&storedProposal,
+		&storedProvider,
 		&storedOutcome,
 		&storedRecordedAt,
 		&storedRetryAfter,
@@ -733,6 +740,7 @@ func persistDirectoryAttempt(
 	}
 	if storedMention != input.Mention.MentionID ||
 		storedProposal != input.Mention.ProposalID ||
+		storedProvider != normalizeDirectoryProvider(input.Lookup.Provider) ||
 		storedOutcome != input.Lookup.Outcome ||
 		!storedRecordedAt.Equal(input.RecordedAt) ||
 		!sameDirectoryTimePointer(storedRetryAfter, input.RetryAfter) ||
@@ -799,6 +807,17 @@ func persistAutomaticDirectoryAuthority(
 				EntityID:     string(current.EntityID()),
 			}, nil
 		}
+		if err := persistDirectoryReviewCandidates(
+			ctx,
+			transaction,
+			input,
+			attemptID,
+			profiles,
+			[]DirectoryProfile{profile.profile},
+		); err != nil {
+			return DirectoryPersistResult{}, err
+		}
+		return DirectoryPersistResult{}, nil
 	}
 
 	email := normalizeDirectoryEmail(input.Evaluation.AcceptedEmail)
@@ -872,7 +891,28 @@ func persistAutomaticDirectoryAuthority(
 	if err != nil {
 		return DirectoryPersistResult{}, fmt.Errorf("construct directory decision: %w", err)
 	}
-	if err := transaction.AppendResolutionDecision(ctx, decision, nil); err != nil {
+	alias, err := identity.NewAliasAssertion(identity.AliasAssertionInput{
+		ID: identity.AliasAssertionID(directoryOpaqueID(
+			directoryAliasIDVersion,
+			string(decision.ID()),
+			email,
+		)),
+		DecisionID: decision.ID(),
+		EntityID:   identity.EntityID(entityID),
+		Alias: identity.Alias{
+			Type:  identity.AliasTypeEmail,
+			Value: email,
+		},
+		RecordedAt: input.RecordedAt,
+	})
+	if err != nil {
+		return DirectoryPersistResult{}, fmt.Errorf("construct directory email alias: %w", err)
+	}
+	if err := transaction.AppendResolutionDecision(
+		ctx,
+		decision,
+		[]identity.AliasAssertion{alias},
+	); err != nil {
 		return DirectoryPersistResult{}, err
 	}
 	if err := persistDirectoryEntityLink(
@@ -1006,24 +1046,35 @@ func ensureDirectoryCandidate(
 		snapshotID,
 		reason,
 	))
-	var rank int
-	err := transaction.QueryRow(ctx, `
-		SELECT candidate_rank
-		FROM stacks_core.resolution_candidates
-		WHERE id = $1`,
-		candidateID,
-	).Scan(&rank)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if err := transaction.QueryRow(ctx, `
-			SELECT COALESCE(max(candidate_rank), 0) + 1
-			FROM stacks_core.resolution_candidates
-			WHERE proposal_id = $1`,
-			proposalID,
-		).Scan(&rank); err != nil {
-			return identity.ResolutionCandidate{}, fmt.Errorf("load directory candidate rank: %w", err)
+	source := identity.CandidateSource{
+		Kind:      directoryCandidateSourceKind,
+		Reference: snapshotID,
+	}
+	stored, err := loadResolutionCandidateValue(ctx, transaction.transaction, candidateID)
+	if err == nil {
+		if stored.ProposalID() != identity.ProposalID(proposalID) ||
+			stored.EntityID() != identity.EntityID(entityID) ||
+			stored.Confidence() != 0 ||
+			stored.ReasonCode() != reason ||
+			stored.Source() != source {
+			return identity.ResolutionCandidate{}, fmt.Errorf(
+				"stored directory candidate conflicts: %w",
+				ErrConflict,
+			)
 		}
-	} else if err != nil {
+		return stored, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return identity.ResolutionCandidate{}, fmt.Errorf("load directory candidate: %w", err)
+	}
+	var rank int
+	if err := transaction.QueryRow(ctx, `
+		SELECT COALESCE(max(candidate_rank), 0) + 1
+		FROM stacks_core.resolution_candidates
+		WHERE proposal_id = $1`,
+		proposalID,
+	).Scan(&rank); err != nil {
+		return identity.ResolutionCandidate{}, fmt.Errorf("load directory candidate rank: %w", err)
 	}
 	candidate, err := identity.NewResolutionCandidate(identity.ResolutionCandidateInput{
 		ID:         candidateID,
@@ -1032,10 +1083,7 @@ func ensureDirectoryCandidate(
 		Rank:       rank,
 		Confidence: 0,
 		ReasonCode: reason,
-		Source: identity.CandidateSource{
-			Kind:      directoryCandidateSourceKind,
-			Reference: snapshotID,
-		},
+		Source:     source,
 		RecordedAt: recordedAt,
 	})
 	if err != nil {
@@ -1253,6 +1301,9 @@ func validateDirectoryPersistInput(input DirectoryPersistInput) error {
 		input.AttemptCount < 0 {
 		return fmt.Errorf("persist directory lookup: bounded outcome or attempt count is invalid")
 	}
+	if !validDirectoryLookupProvider(input.Lookup.Provider) {
+		return fmt.Errorf("persist directory lookup: lookup provider is invalid")
+	}
 	if input.RecordedAt.IsZero() || !timepoint.IsCanonical(input.RecordedAt) {
 		return fmt.Errorf("persist directory lookup: recorded time is not canonical")
 	}
@@ -1291,7 +1342,11 @@ func validateDirectoryPersistInput(input DirectoryPersistInput) error {
 				canonicalDirectoryProfile(*input.Evaluation.Profile),
 				normalizeDirectoryEmail(input.Query.Email),
 			) ||
-			!directoryProfileInSet(*input.Evaluation.Profile, input.Lookup.Profiles) {
+			!directoryProfileInSet(*input.Evaluation.Profile, input.Lookup.Profiles) ||
+			countEligibleDirectoryExactProfiles(
+				input.Lookup.Profiles,
+				normalizeDirectoryEmail(input.Evaluation.AcceptedEmail),
+			) != 1 {
 			return fmt.Errorf("persist directory lookup: automatic evaluation is invalid")
 		}
 	}
@@ -1395,6 +1450,7 @@ func digestDirectoryAttempt(
 	fields := []string{
 		input.Mention.MentionID,
 		input.Mention.ProposalID,
+		normalizeDirectoryProvider(input.Lookup.Provider),
 		fmt.Sprintf("%x", queryDigest),
 		directoryPolicyVersion,
 		input.Lookup.Outcome,
@@ -1526,6 +1582,33 @@ func normalizeDirectoryEmail(value string) string {
 func validDirectoryEmail(value string) bool {
 	at := strings.LastIndex(value, "@")
 	return at > 0 && at < len(value)-1 && !strings.ContainsAny(value, " \t\r\n")
+}
+
+func normalizeDirectoryProvider(value string) string {
+	return strings.TrimSpace(value)
+}
+
+func validDirectoryLookupProvider(value string) bool {
+	normalized := normalizeDirectoryProvider(value)
+	return normalized != "" &&
+		utf8.ValidString(normalized) &&
+		utf8.RuneCountInString(normalized) <= directoryLookupProviderMaximumRunes
+}
+
+func countEligibleDirectoryExactProfiles(
+	profiles []DirectoryProfile,
+	email string,
+) int {
+	matches := make(map[[sha256.Size]byte]struct{})
+	for _, raw := range profiles {
+		profile := canonicalDirectoryProfile(raw)
+		if profile.Source != DirectorySourceDomainProfile ||
+			!directoryProfileHasEmail(profile, email) {
+			continue
+		}
+		matches[digestDirectoryProfile(profile)] = struct{}{}
+	}
+	return len(matches)
 }
 
 func directoryTimeString(value time.Time) string {
