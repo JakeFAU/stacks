@@ -4,6 +4,13 @@
 **Status:** Approved design
 **Scope:** Plan B
 
+> **Plan C update:** The repository has no supported installation base. The
+> approved
+> [Canonical PostgreSQL Reset Design](2026-07-25-canonical-postgres-reset-design.md)
+> replaces the legacy-adoption roadmap below with a deliberate local database
+> reset and fresh canonical baselines. This document remains the record of Plan
+> B's temporary compatibility contract.
+
 ## Purpose and roadmap
 
 Plan B makes `core/observation.Observation` the active observation contract at
@@ -20,9 +27,9 @@ This is an intentionally bounded compatibility step:
   reject characterized corrupt pairings with bounded compatibility errors.
   Encode only the explicitly representable canonical subset. Preserve the
   signal tables as a vertical extension.
-- **Plan C:** perform the full scoped-migration cutover: embedded baselines,
-  independent migration ledgers, atomic legacy adoption, migration
-  fingerprints, and complete canonical PostgreSQL storage.
+- **Plan C:** reset the disposable development database into fresh embedded
+  core and optional directory baselines, independent migration ledgers,
+  migration fingerprints, and complete canonical PostgreSQL storage.
 - **Plan D:** expose deterministic temporal reading through a
   production-facing, read-only, cited query boundary.
 

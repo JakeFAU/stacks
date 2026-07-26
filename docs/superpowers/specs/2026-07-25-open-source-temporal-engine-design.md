@@ -1,11 +1,19 @@
 # Open-Source Temporal Evidence Engine
 
 **Date:** 2026-07-25
-**Status:** Approved for implementation planning
+**Status:** Approved architecture, amended by Plan C
 **Scope:** Establish an enforceable open-source core for versioned evidence,
 identity authority, temporal observations, and deterministic longitudinal
 interpretation while retaining the existing Stacks application and
 manager-confidence workflow as downstream consumers.
+
+> **Plan C update:** The repository has no supported installation base and its
+> local database is intentionally disposable. The approved
+> [Canonical PostgreSQL Reset Design](2026-07-25-canonical-postgres-reset-design.md)
+> supersedes this document's legacy-adoption, manager-confidence migration,
+> and permanent-example assumptions. Plan C uses fresh core and optional
+> directory baselines; manager confidence is a temporary query use case, not an
+> installation scope.
 
 ## Product thesis
 
@@ -70,11 +78,11 @@ The objective is therefore boundary extraction and integration, not a rewrite.
 - Keep identity proposals separate from authoritative reviewer decisions.
 - Keep source, model, directory, storage, and operator behavior behind explicit
   consumer-owned contracts.
-- Preserve existing database history and local data using forward-only,
-  compatibility-tested migrations.
-- Retain manager-confidence as an optional example vertical until at least one
-  additional synthetic example proves that the core is not secretly coupled to
-  it.
+- Establish fresh canonical database history through the approved destructive
+  early-development reset, then use forward-only, compatibility-tested
+  migrations.
+- Retain manager-confidence temporarily as a query acceptance case until the
+  generic query boundary replaces it.
 - Prepare the repository for a legally and operationally responsible
   open-source release.
 
@@ -89,7 +97,7 @@ The objective is therefore boundary extraction and integration, not a rewrite.
 - Inventing a universal ontology or unrestricted property-value system.
 - Adding a web interface.
 - Adding natural-language temporal query planning or uncited narration.
-- Rewriting or renumbering already-applied migrations.
+- Providing an in-place upgrade from the retired PoC migration chain.
 - Invoking live model providers, reading private source contents, deploying,
   enabling cloud logging, or changing external repository settings as part of
   the boundary extraction.
@@ -133,16 +141,10 @@ stacks/
       go.mod
     openai/
       go.mod
-  examples/
-    managerconfidence/
-      go.mod
-      migrations/postgres/
   app/
     go.mod
     cmd/stacks/
     internal/
-  db/
-    migrations/                 # immutable legacy 00001-00012 history
   go.work
 ```
 
@@ -150,8 +152,8 @@ The exact filesystem move will be incremental. Each commit must leave the
 repository buildable and tested. The final dependency direction is:
 
 ```text
-app and examples -> adapters -> core
-app and examples ------------> core
+app -> adapters -> core
+app ------------> core
 
 core -> Go standard library and reviewed foundational dependencies
 model adapters -> adapters/model
@@ -163,10 +165,11 @@ core -X-> deployment disclosure policy
 ```
 
 The core module path will be
-`github.com/JakeFAU/stacks/core`. Each adapter family, the
-manager-confidence example, and the application own separate modules under the
-same repository namespace. This keeps a PostgreSQL consumer from inheriting
-AWS or Google dependencies and lets adapters evolve independently.
+`github.com/JakeFAU/stacks/core`. Each adapter family and the application own
+separate modules under the same repository namespace. This keeps a PostgreSQL
+consumer from inheriting AWS or Google dependencies and lets adapters evolve
+independently. Manager confidence remains temporary application-level query
+policy, not a module or installation boundary.
 
 The core is standard-library-first, not artificially standard-library-only.
 The existing `golang.org/x/text/unicode/norm` dependency remains permitted
@@ -212,7 +215,7 @@ Owns immutable source material and exact support:
 The current tab-aware implementation remains supported. A tab becomes one kind
 of ordered content section rather than a Google-specific or meeting-specific
 core concept. Source adapters may preserve native section structure and roles
-as metadata. A manager-confidence vertical may interpret a section as a
+as metadata. A manager-confidence query use case may interpret a section as a
 transcript; the core does not.
 
 `SourceMeetingTime` becomes a generic explicit source-time observation. Drive
@@ -237,70 +240,36 @@ Owns immutable, evidence-backed propositions:
   metadata rather than truth.
 
 A term is a closed tagged value, not `any` or arbitrary JSON. It represents
-only the forms already earned by the implementation: absent for lossless
-legacy or unary observations, exact text, a source-grounded mention reference,
-or a canonical entity reference that may retain the grounding mention
-reference. Keeping both entity and mention is required because the current
-writer deliberately persists both after resolution. Numeric, boolean,
-time-valued, composite, or provider-specific objects may be added only after a
-real use case establishes their invariants.
+only the forms already earned by the implementation: absent for unary
+observations, exact text, a source-grounded mention reference, or a canonical
+entity reference that may retain the grounding mention reference. Keeping both
+entity and mention preserves the evidence grounding after resolution. Numeric,
+boolean, time-valued, composite, or provider-specific objects may be added only
+after a real use case establishes their invariants.
 
 The public epistemic vocabulary includes every status already accepted by the
 database: observed, inferred, hypothesized, structurally validated,
 empirically validated, and rejected. Confidence never promotes one status to
 another. New normalized confidence uses an explicit unit-interval scale.
-Existing finite values without a declared scale remain representable as
-scale-unspecified legacy scores; generic logic must not compare or calibrate
-them as probabilities.
+Every stored confidence value declares a current meaningful scale; generic
+logic must not compare values from incompatible scales or calibrate them as
+probabilities.
 
 The core constructor validates all required invariants and returns an immutable
 value. Persistence adapters consume and return this canonical type rather than
 parallel observation DTOs.
 
-### Observation compatibility contract
+### Observation persistence contract
 
-The canonical cutover must be lossless for every row shape accepted by the
-current schema and produced by current writers.
+The clean canonical baseline stores the public observation contract directly.
+It has no compatibility carrier, manager-specific evidence table,
+`LegacyUncited`, `LegacyUnversioned`, or `unspecified_legacy` confidence state.
 
-Before changing storage, characterization tests record:
-
-- permitted combinations of subject entity, object entity, subject mention,
-  object mention, and absent terms;
-- all six durable epistemic states;
-- no valid-time bounds, start-only bounds, equal bounds, and bounded ranges;
-- existing derivation strings, extraction-run provenance, confidence, and
-  digest behavior;
-- observation evidence plus manager-confidence supporting and contradicting
-  evidence roles;
-- signal category, direction, rationale, model, and prompt data stored in the
-  vertical extension tables.
-
-The compatibility mapping is:
-
-- entity and mention columns become tagged canonical terms without resolving
-  or rewriting identity; an entity-plus-mention pair remains one entity term
-  with its grounding mention;
-- existing observation evidence is supporting evidence;
-- `signal_evidence.role` supplies supporting and contradicting roles for the
-  associated vertical observation;
-- manager-confidence category, direction, and rationale remain vertical
-  extension data keyed by canonical observation ID;
-- the stored `recorded_at` value remains the historical recorded time for
-  legacy rows, even though the old writer selected it internally;
-- new writes must provide recorded time through the canonical constructor;
-- no bounds map to unknown source time;
-- equal start and end bounds map to an instant at that time;
-- start-only and increasing bounded legacy meanings are mapped only after
-  characterization proves the existing writer semantics;
-- no legacy row is relabeled as an uncertainty window without explicit stored
-  evidence of that meaning;
-- every finite legacy confidence value is preserved with an unspecified scale,
-  while new unit-interval confidence is validated between zero and one.
-
-If an existing row cannot be mapped deterministically, adoption fails with a
-bounded schema/data compatibility error. It is not silently coerced, dropped,
-or reinterpreted. Round-trip integration tests cover every accepted legacy
-shape before the old DTOs are removed.
+PostgreSQL round-trip tests cover every tagged term, epistemic status, temporal
+kind and open-bound shape, evidence role, derivation field, and supported
+confidence scale. The versioned canonical digest covers the complete semantic
+payload. The exact relational contract is defined by the
+[Canonical PostgreSQL Reset Design](2026-07-25-canonical-postgres-reset-design.md).
 
 ### `identity`
 
@@ -401,7 +370,7 @@ The generic adapter contract contains:
 Adapters must not contain a registry of application prompt versions. They
 validate only transport-level requirements and provider capabilities. Prompts,
 schemas, deterministic output validation, and conversion to observations live
-with the application or example that owns their meaning.
+with the application use case that owns their meaning.
 
 Private input, prompts containing private content, model output, credentials,
 and raw provider errors must not enter ordinary logs, metrics, traces, or error
@@ -416,7 +385,8 @@ token handling.
 
 Google Drive implements a provider-neutral versioned source boundary. Its
 tab-aware extraction behavior remains an adapter capability, while transcript
-selection and meeting chronology move to the manager-confidence example.
+selection and meeting chronology remain temporary manager-confidence query
+policy until the generic query boundary replaces them.
 
 Google Workspace Directory implements an optional identity-evidence boundary.
 Its data may add candidates. Disabled, denied, throttled, or unavailable
@@ -452,120 +422,34 @@ are translated at their owning boundary.
 
 ## Migration transition
 
-Existing migrations through `00012` are immutable historical artifacts. They
-must not be renamed, reordered, edited, or replayed under different checksums.
+Plan C deliberately resets the disposable development database. It does not
+adopt or upgrade migrations `00001` through `00012`.
 
-Migration ownership cuts over once, after legacy version `00012`:
+The PostgreSQL adapter embeds a fresh canonical core baseline and owns
+`stacks_migrations.core_version`. The optional directory adapter embeds its
+own baseline and owns `stacks_migrations.directory_version`. There is no
+manager-confidence migration scope.
 
-- `public.goose_db_version` remains the immutable ledger for legacy
-  `00001`-`00012`;
-- no migration after the cutover is added to the legacy sequence;
-- the PostgreSQL adapter embeds version-matched core migrations and owns a
-  dedicated core ledger;
-- the manager-confidence example embeds its extension migrations and owns a
-  dedicated vertical ledger;
-- the directory adapter embeds its PostgreSQL extension migrations and owns a
-  dedicated directory ledger;
-- each ledger has an independent namespace and version sequence, so applying
-  version `1` in one scope cannot satisfy version `1` in another.
+The full migration, fingerprint, reset, doctor, safety, and verification
+contract is defined by the
+[Canonical PostgreSQL Reset Design](2026-07-25-canonical-postgres-reset-design.md).
+After that baseline is established, applied migrations are immutable and later
+schema changes are forward-only.
 
-The concrete ledger names are:
+## Manager-confidence transitional use case
 
-```text
-public.goose_db_version
-stacks_migrations.core_version
-stacks_migrations.managerconfidence_version
-stacks_migrations.directory_version
-```
+Manager confidence is one question that can be asked of the temporal graph,
+not a permanent example module, database vertical, or installation choice.
 
-`stacks_migrations` is admin-owned. The application receives only the read
-access required for migration readiness checks. Doctor reports legacy
-pre-adoption state and each installed scoped migration set independently.
+During Plan C, its existing command may remain as specialized application query
+policy over canonical storage. It has no private tables, migrations, or storage
+DTOs. Plan D introduces the generic cited temporal query interface. Once that
+interface provides equivalent behavior, the specialized command and remaining
+manager-specific application code are removed.
 
-### Existing Stacks databases
-
-Every existing database first upgrades through the complete legacy
-`00001`-`00012` chain. Adoption then runs as one admin transaction:
-
-1. acquire a transaction-scoped PostgreSQL advisory lock dedicated to migration
-   adoption;
-2. verify that the legacy ledger has exactly the required applied versions and
-   no failed or unexpected post-cutover version;
-3. fingerprint the required generic, manager-confidence, and directory tables,
-   columns, types, nullability, constraints, indexes, functions, and triggers;
-4. reject partial, drifted, or unsupported schemas before writing any scoped
-   state;
-5. create the scoped ledgers;
-6. insert the exact scoped baseline versions and schema fingerprints;
-7. record the permanent migration mode and cutover ownership;
-8. commit the lock, inspection, and adoption records atomically.
-
-If the transaction fails, no scoped ledger may remain partially adopted.
-Repeating adoption against the same verified schema is idempotent. Repeating it
-against different fingerprints fails visibly.
-
-After adoption, all new generic changes belong only to the core ledger. New
-manager-confidence and directory changes belong only to their owning ledgers.
-No logical schema change is authored in both the legacy and scoped histories.
-
-### New installations
-
-A new core installation runs only the embedded PostgreSQL core baseline. It
-contains generic document, evidence, identity, observation, and migration
-objects, with no manager-confidence, directory, OAuth, or model-provider
-tables.
-
-A new application installation composes the core baseline with explicitly
-selected extension migrations. The migration coordinator orders scopes and
-reports which are installed. It does not infer an extension from unrelated
-configuration or silently create every available table.
-
-### Compatibility matrix
-
-Integration fixtures cover every legacy applied boundary `00001` through
-`00012`. Each fixture must upgrade to `00012`, adopt scoped ownership, and reach
-the same generic schema fingerprint. The matrix also covers:
-
-1. an empty legacy database reaching `00012` and adopting successfully;
-2. an empty scoped core database containing no vertical or provider tables;
-3. a full scoped application installation;
-4. repeated adoption;
-5. interrupted adoption rollback;
-6. partial legacy application;
-7. missing or unexpected schema objects;
-8. modified constraints or indexes;
-9. concurrent adoption attempts;
-10. independent core, manager-confidence, and directory status reporting.
-
-The embedded migration packages expose their migration files and manifest
-version to consumers, ensuring the SQL travels with the exact Go adapter or
-example version that owns it.
-
-No migration drops legacy data. Removal of unused vertical tables, if ever
-wanted, requires a separate explicit destructive decision and is outside this
-design.
-
-## Manager-confidence example
-
-The existing workflow moves downstream without losing behavior:
-
-- transcript selection and strict leading `[YYYY-MM-DD]` chronology;
-- manager and employee pairing;
-- interaction-signal vocabulary;
-- admission quarantine and counterevidence rules;
-- bounded conclusion language;
-- analysis prompts and schemas;
-- directory-enrichment policy;
-- CLI commands specific to pair analysis;
-- vertical storage and migrations.
-
-The example consumes public core types and adapter contracts. The core never
-imports it.
-
-Existing manager-confidence tests move with the vertical and continue to prove
-its current behavior. The example remains useful as a substantial reference
-implementation rather than a toy, but the top-level product documentation does
-not present it as the engine itself.
+The synthetic manager-confidence workflow continues to test chronology,
+identity, supporting and contradicting evidence, admission, and bounded
+conclusions until the generic interface replaces it.
 
 ## Second synthetic proof
 
@@ -645,7 +529,7 @@ Before announcing or tagging a release:
   because it includes an explicit patent grant;
 - add `SECURITY.md`, `CONTRIBUTING.md`, and a concise code of conduct;
 - rewrite the README around the temporal evidence engine;
-- clearly label manager-confidence as an optional example;
+- describe manager confidence only as a temporary query acceptance case;
 - document the disclosure boundary for every provider adapter;
 - add synthetic quick-start data;
 - run a history-wide secret scan with a pinned tool;
@@ -667,7 +551,7 @@ The detailed execution plan will split this design into independently reviewed
 tasks. The intended dependency order is:
 
 1. Lock characterization tests around current public-worthy invariants and
-   dependency direction, including all legacy observation row shapes.
+   dependency direction.
 2. Establish the workspace and core module with provider-neutral evidence,
    observation, identity, and temporal packages.
 3. Introduce one canonical observation path and make PostgreSQL preserve the
@@ -677,10 +561,10 @@ tasks. The intended dependency order is:
 5. Separate generic model transport from application prompt contracts.
 6. Split PostgreSQL, Drive, directory, Anthropic, Bedrock, and OpenAI adapter
    families into independently owned modules.
-7. Move manager-confidence policy and commands downstream into its own example
-   module.
-8. Add embedded scoped migrations, atomic adoption, and the complete
-   `00001`-`00012` compatibility matrix.
+7. Keep manager-confidence policy temporarily in the application as a client
+   of canonical contracts.
+8. Add the fresh embedded core and optional directory migrations, explicit
+   local reset, independent ledgers, and schema fingerprints defined by Plan C.
 9. Add the second synthetic longitudinal proof.
 10. Promote core orchestration publicly only if that proof establishes the
     interface.
@@ -715,18 +599,19 @@ make test-integration
 
 It must additionally prove:
 
-- the core module has no imports from adapters, applications, examples, Zap,
+- the core module has no imports from adapters, applications, Zap,
   OpenTelemetry, SQL drivers, or provider SDKs;
 - the core module builds and tests outside the workspace;
 - the repository Make targets explicitly cover every module rather than
   relying on root `./...` patterns that skip nested modules;
-- legacy migration upgrades and scoped clean installs both pass;
+- core-only and core-plus-directory clean installs both pass;
 - retry and resume remain idempotent;
 - extraction leases and admission quarantine remain intact;
-- stable digest compatibility remains intact;
+- versioned canonical digest behavior remains stable;
 - identity authority and alias lifecycle remain append-only and deterministic;
 - temporal extent kind and recorded time round-trip through PostgreSQL;
-- manager-confidence behavior remains unchanged as a downstream example;
+- the temporary manager-confidence query uses only canonical persistence and
+  retains its synthetic acceptance behavior;
 - the synthetic commitment example produces cited, time-aware results with
   preserved counterevidence.
 
@@ -758,10 +643,10 @@ them.
 
 ### Migration divergence
 
-**Risk:** legacy and scoped schemas drift.
+**Risk:** embedded migrations, expected fingerprints, and runtime codecs drift.
 
-**Control:** compare generic schema invariants in integration tests and require
-one canonical SQL definition or generated snapshot source where practical.
+**Control:** ship one embedded, checksummed SQL history per scope and compare
+its clean live schema with the expected fingerprint in integration tests.
 
 ### Core contaminated by adapters
 
@@ -770,13 +655,13 @@ one canonical SQL definition or generated snapshot source where practical.
 **Control:** separate modules, import-boundary tests, and independent module
 builds.
 
-### Vertical behavior silently changes
+### Query-use-case behavior silently changes
 
-**Risk:** moving manager-confidence downstream weakens its admission,
-counterevidence, privacy, or retry guarantees.
+**Risk:** translating manager confidence onto canonical storage weakens its
+admission, counterevidence, privacy, or retry guarantees.
 
 **Control:** retain existing behavioral and PostgreSQL tests, then run an
-independent vertical regression review.
+independent use-case regression review.
 
 ### Open-source release exposes sensitive history
 
@@ -796,9 +681,10 @@ The boundary extraction is complete when:
 - PostgreSQL round-trips the full canonical temporal contract;
 - the working Stacks application uses the public core rather than a duplicate
   internal model;
-- manager-confidence is downstream and its existing behavior still passes;
+- the temporary manager-confidence command uses canonical contracts and its
+  synthetic acceptance behavior still passes;
 - one unrelated synthetic example demonstrates longitudinal cited reasoning;
-- existing databases upgrade forward without data loss;
+- the documented destructive local reset creates the fresh canonical baseline;
 - clean core databases do not contain vertical or provider schemas;
 - repository verification, race tests, Staticcheck, build, migration tests,
   PostgreSQL integration, and independent reviews pass;
