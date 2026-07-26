@@ -4,11 +4,22 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/observation"
 	"stacks/internal/entity"
 	"stacks/internal/modelpolicy"
 )
+
+var validationRecordedAt = time.Date(2026, time.July, 25, 12, 0, 0, 123456000, time.UTC)
+var validationSourceConfidence = func() observation.Confidence {
+	value, err := observation.NewUnitIntervalConfidence(0.8)
+	if err != nil {
+		panic(err)
+	}
+	return value
+}()
 
 func TestValidateForPersistenceRequiresNewRunDataMode(t *testing.T) {
 	completion := Completion{VersionID: "version-1"}
@@ -27,18 +38,6 @@ func TestValidateForPersistenceRequiresNewRunDataMode(t *testing.T) {
 
 func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentity(t *testing.T) {
 	evidence := persistenceEvidence(t)
-	baseObservation := ObservationRecord{
-		ID: "11111111-1111-1111-1111-111111111111", Predicate: interactionPredicate,
-		EvidenceKeys: []string{"citation-1"},
-	}
-	baseSignal := SignalRecord{
-		ID: "22222222-2222-2222-2222-222222222222", ObservationID: baseObservation.ID,
-		Category: "future_responsibility", Direction: "strengthening",
-		ExtractionModelID: "synthetic-model", PromptVersion: "extract-v1",
-		Rationale: "Synthetic rationale", Confidence: 0.8,
-		Evidence: []SignalEvidenceRecord{{EvidenceKey: "citation-1", Role: "supporting"}},
-	}
-
 	cases := []struct {
 		name       string
 		completion Completion
@@ -57,27 +56,6 @@ func TestValidateForPersistenceRejectsDistinctModelRecordsWithSameDurableIdentit
 				Mentions: []MentionRecord{
 					{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic", NormalizedName: "synthetic", Role: "speaker", Resolution: entity.Resolution{AutoResolved: true, EntityID: "entity-1"}},
 					{Key: "mention-2", EvidenceKey: "citation-1", Surface: "Synthetic", NormalizedName: "synthetic", Role: "speaker", Resolution: entity.Resolution{AutoResolved: true, EntityID: "entity-1"}},
-				},
-			},
-		},
-		{
-			name: "observation semantic identities",
-			completion: Completion{
-				VersionID: "version-1", DataMode: modelpolicy.DataModePersonal, Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
-				Observations: []ObservationRecord{
-					baseObservation,
-					{ID: "33333333-3333-3333-3333-333333333333", Predicate: interactionPredicate, EvidenceKeys: []string{"citation-1"}},
-				},
-			},
-		},
-		{
-			name: "signal semantic identities and evidence sets",
-			completion: Completion{
-				VersionID: "version-1", DataMode: modelpolicy.DataModePersonal, Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
-				Observations: []ObservationRecord{baseObservation},
-				Signals: []SignalRecord{
-					baseSignal,
-					{ID: "44444444-4444-4444-4444-444444444444", ObservationID: baseObservation.ID, Category: baseSignal.Category, Direction: baseSignal.Direction, ExtractionModelID: baseSignal.ExtractionModelID, PromptVersion: baseSignal.PromptVersion, Rationale: baseSignal.Rationale, Confidence: baseSignal.Confidence, Evidence: baseSignal.Evidence},
 				},
 			},
 		},
@@ -146,10 +124,11 @@ func TestValidateForPersistenceRejectsUnknownObservationMentionReferences(t *tes
 			{Key: "mention-manager", EvidenceKey: "citation-1", Surface: "Synthetic Manager", Role: "speaker"},
 			{Key: "mention-employee", EvidenceKey: "citation-1", Surface: "Synthetic Employee", Role: "reference"},
 		},
-		Observations: []ObservationRecord{{
-			ID: "11111111-1111-1111-1111-111111111111", Predicate: interactionPredicate,
+		Observations: []ObservationDraft{{
+			ID: "11111111-1111-1111-1111-111111111111", Predicate: observation.Predicate(interactionPredicate),
+			ValidTime: observation.UnknownTime(), SourceConfidence: validationSourceConfidence,
 			SubjectMentionKey: "mention-unknown", ObjectMentionKey: "mention-employee",
-			EvidenceKeys: []string{"citation-1"},
+			EvidenceKeys: []string{"citation-1"}, RecordedAt: validationRecordedAt,
 		}},
 	}
 
@@ -158,21 +137,136 @@ func TestValidateForPersistenceRejectsUnknownObservationMentionReferences(t *tes
 	}
 }
 
+func TestValidateForPersistenceRejectsZeroObservationRecordedAt(t *testing.T) {
+	evidence := persistenceEvidence(t)
+	completion := Completion{
+		VersionID: "version-1", DataMode: modelpolicy.DataModePersonal,
+		Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+		Observations: []ObservationDraft{{
+			ID: "11111111-1111-1111-1111-111111111111", Predicate: observation.Predicate(interactionPredicate),
+			ValidTime: observation.UnknownTime(), SourceConfidence: validationSourceConfidence,
+			EvidenceKeys: []string{"citation-1"},
+		}},
+	}
+
+	if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
+		t.Fatalf("ValidateForPersistence() error = %v, want zero recorded time rejection", err)
+	}
+}
+
+func TestValidateForPersistenceRejectsInvalidSourceConfidence(t *testing.T) {
+	evidence := persistenceEvidence(t)
+	legacyConfidence, err := observation.NewLegacyConfidence(0.5)
+	if err != nil {
+		t.Fatalf("NewLegacyConfidence() error = %v", err)
+	}
+	for _, testCase := range []struct {
+		name       string
+		confidence observation.Confidence
+	}{
+		{name: "zero_value", confidence: observation.Confidence{}},
+		{name: "legacy_scale", confidence: legacyConfidence},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			completion := Completion{
+				VersionID: "version-1", DataMode: modelpolicy.DataModePersonal,
+				Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+				Observations: []ObservationDraft{{
+					ID:        "11111111-1111-1111-1111-111111111111",
+					Predicate: observation.Predicate(interactionPredicate),
+					ValidTime: observation.UnknownTime(), EvidenceKeys: []string{"citation-1"},
+					SourceConfidence: testCase.confidence, RecordedAt: validationRecordedAt,
+				}},
+			}
+			if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
+				t.Fatalf("ValidateForPersistence() error = %v, want invalid source confidence rejection", err)
+			}
+		})
+	}
+}
+
+func TestValidateForPersistenceUsesReferencesNotObservationSemanticHash(t *testing.T) {
+	evidence := persistenceEvidence(t)
+	sourceConfidence, err := observation.NewUnitIntervalConfidence(0.5)
+	if err != nil {
+		t.Fatalf("NewUnitIntervalConfidence() error = %v", err)
+	}
+	newDraft := func(id observation.ObservationID) ObservationDraft {
+		return ObservationDraft{
+			ID: id, Predicate: observation.Predicate(interactionPredicate),
+			ValidTime: observation.UnknownTime(), EvidenceKeys: []string{"citation-1"},
+			SourceConfidence: sourceConfidence, RecordedAt: validationRecordedAt,
+		}
+	}
+	base := Completion{
+		VersionID: "version-1", DataMode: modelpolicy.DataModePersonal,
+		Evidence: []EvidenceRecord{{Key: "citation-1", Span: evidence}},
+	}
+
+	t.Run("duplicate stable ID", func(t *testing.T) {
+		completion := base
+		completion.Observations = []ObservationDraft{
+			newDraft("11111111-1111-1111-1111-111111111111"),
+			newDraft("11111111-1111-1111-1111-111111111111"),
+		}
+		if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceCollision) {
+			t.Fatalf("ValidateForPersistence() error = %v, want duplicate stable ID rejection", err)
+		}
+	})
+
+	t.Run("unknown evidence", func(t *testing.T) {
+		completion := base
+		draft := newDraft("11111111-1111-1111-1111-111111111111")
+		draft.EvidenceKeys = []string{"citation-unknown"}
+		completion.Observations = []ObservationDraft{draft}
+		if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
+			t.Fatalf("ValidateForPersistence() error = %v, want unknown evidence rejection", err)
+		}
+	})
+
+	t.Run("unknown mention", func(t *testing.T) {
+		completion := base
+		completion.Mentions = []MentionRecord{
+			{Key: "mention-subject", EvidenceKey: "citation-1", Surface: "Synthetic", Role: "speaker"},
+			{Key: "mention-object", EvidenceKey: "citation-1", Surface: "evidence", Role: "reference"},
+		}
+		draft := newDraft("11111111-1111-1111-1111-111111111111")
+		draft.SubjectMentionKey = "mention-unknown"
+		draft.ObjectMentionKey = "mention-object"
+		completion.Observations = []ObservationDraft{draft}
+		if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
+			t.Fatalf("ValidateForPersistence() error = %v, want unknown mention rejection", err)
+		}
+	})
+
+	t.Run("equal unresolved semantics with different stable IDs", func(t *testing.T) {
+		completion := base
+		completion.Observations = []ObservationDraft{
+			newDraft("11111111-1111-1111-1111-111111111111"),
+			newDraft("22222222-2222-2222-2222-222222222222"),
+		}
+		if err := ValidateForPersistence(completion); err != nil {
+			t.Fatalf("ValidateForPersistence() error = %v, want reference-valid drafts", err)
+		}
+	})
+}
+
 func TestValidateForPersistenceRejectsWhitespacePaddedLocalIdentifiersAndReferences(t *testing.T) {
 	newCompletion := func() Completion {
 		evidence := persistenceEvidence(t)
-		observation := ObservationRecord{
-			ID: "11111111-1111-1111-1111-111111111111", Predicate: interactionPredicate,
-			EvidenceKeys: []string{"citation-1"},
+		observationDraft := ObservationDraft{
+			ID: "11111111-1111-1111-1111-111111111111", Predicate: observation.Predicate(interactionPredicate),
+			ValidTime: observation.UnknownTime(), EvidenceKeys: []string{"citation-1"},
+			SourceConfidence: validationSourceConfidence, RecordedAt: validationRecordedAt,
 		}
 		return Completion{
 			VersionID:    "version-1",
 			DataMode:     modelpolicy.DataModePersonal,
 			Evidence:     []EvidenceRecord{{Key: "citation-1", Span: evidence}},
 			Mentions:     []MentionRecord{{Key: "mention-1", EvidenceKey: "citation-1", Surface: "Synthetic Person", Role: "speaker"}},
-			Observations: []ObservationRecord{observation},
+			Observations: []ObservationDraft{observationDraft},
 			Signals: []SignalRecord{{
-				ID: "22222222-2222-2222-2222-222222222222", ObservationID: observation.ID,
+				ID: "22222222-2222-2222-2222-222222222222", ObservationID: string(observationDraft.ID),
 				Category: "future_responsibility", Direction: "strengthening",
 				ExtractionModelID: "synthetic-model", PromptVersion: "extract-v1",
 				Rationale: "Synthetic rationale", Confidence: 0.8,

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -72,6 +73,9 @@ func (repository *DocumentRepository) InTransaction(ctx context.Context, work fu
 // PutDocumentVersion stores a version and its ordered tabs. Repeating the same
 // provider document and digest returns its existing stable ID with created false.
 func (repository *DocumentRepository) PutDocumentVersion(ctx context.Context, version evidence.DocumentVersion) (StoredDocumentVersion, bool, error) {
+	if err := validateDocumentSectionOrder(version); err != nil {
+		return StoredDocumentVersion{}, false, fmt.Errorf("put document version: %w", err)
+	}
 	if repository.pool != nil {
 		var stored StoredDocumentVersion
 		var created bool
@@ -86,6 +90,16 @@ func (repository *DocumentRepository) PutDocumentVersion(ctx context.Context, ve
 		return stored, created, nil
 	}
 	return repository.putDocumentVersion(ctx, version)
+}
+
+func validateDocumentSectionOrder(version evidence.DocumentVersion) error {
+	sections := version.Sections()
+	for index := 1; index < len(sections); index++ {
+		if sections[index-1].Order() >= sections[index].Order() {
+			return fmt.Errorf("document sections must have strictly increasing display order")
+		}
+	}
+	return nil
 }
 
 func (repository *DocumentRepository) putDocumentVersion(ctx context.Context, version evidence.DocumentVersion) (StoredDocumentVersion, bool, error) {
@@ -292,6 +306,9 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 	if repository == nil || repository.pool == nil {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: repository is not configured")
 	}
+	if err := validateDocumentSectionOrder(version); err != nil {
+		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: %w", err)
+	}
 	if err := (modelpolicy.Invocation{Provider: derivation.Provider, DataMode: dataMode, Region: derivation.Region}).Validate(); err != nil {
 		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: model policy is invalid")
 	}
@@ -314,9 +331,13 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 	if err != nil {
 		return ingest.VersionState{}, err
 	}
-	claimedAt := time.Now().UTC()
+	claimedAt := time.Now().UTC().Truncate(legacyPostgresTimestampPrecision)
 	leaseExpiresAt := claimedAt.Add(leaseDuration)
-	state := ingest.VersionState{ID: stored.ID, DerivationDigest: derivation.Digest}
+	state := ingest.VersionState{
+		ID:               stored.ID,
+		DerivationDigest: derivation.Digest,
+		RecordedAt:       claimedAt,
+	}
 	storedAdmissible := true
 	storedRegion := nullableModelRegion(derivation.Provider, derivation.Region)
 	err = transaction.QueryRow(ctx, `
@@ -337,18 +358,19 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 		var failureCode *string
 		var activeOwner *string
 		var activeUntil *time.Time
+		var persistedRecordedAt time.Time
 		var storedProvider, storedDataMode, storedModelID, storedPromptVersion string
 		var storedBedrockRegion *string
 		var storedMaxTokens int
 		var storedSchemaDigest []byte
 		if err := transaction.QueryRow(ctx, `
-			SELECT id, processing_status, retry_count, failure_code, lease_owner, lease_expires_at,
+			SELECT id, processing_status, retry_count, failure_code, lease_owner, lease_expires_at, recorded_at,
 			       model_provider, data_mode, model_id, bedrock_region, max_output_tokens, prompt_version,
 			       schema_digest, currently_admissible
 			FROM stacks.extraction_runs
 			WHERE document_version_id = $1 AND derivation_digest = $2
 			FOR UPDATE`, stored.ID, derivation.Digest[:]).Scan(
-			&state.DerivationID, &status, &state.RetryCount, &failureCode, &activeOwner, &activeUntil,
+			&state.DerivationID, &status, &state.RetryCount, &failureCode, &activeOwner, &activeUntil, &persistedRecordedAt,
 			&storedProvider, &storedDataMode, &storedModelID, &storedBedrockRegion, &storedMaxTokens,
 			&storedPromptVersion, &storedSchemaDigest, &storedAdmissible,
 		); err != nil {
@@ -360,6 +382,7 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 			string(storedSchemaDigest) != string(derivation.SchemaDigest[:]) {
 			return ingest.VersionState{}, fmt.Errorf("load ingestion derivation state: immutable configuration conflicts")
 		}
+		state.RecordedAt = persistedRecordedAt.UTC()
 		state.Status = ingest.VersionStatus(status)
 		if failureCode != nil {
 			state.FailureCode = ingest.FailureCode(*failureCode)
@@ -453,32 +476,53 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	}
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 
-	var storedVersionID, status, storedDataMode string
+	var storedVersionID, status, storedDataMode, storedModelID, storedPromptVersion string
+	var storedRecordedAt time.Time
 	var storedAdmissible bool
 	var activeOwner, completedByOwner *string
 	var activeUntil *time.Time
 	if err := transaction.QueryRow(ctx, `
-		SELECT document_version_id, processing_status, data_mode, lease_owner, lease_expires_at,
-		       completed_by_owner, currently_admissible
+		SELECT document_version_id, processing_status, data_mode, model_id, prompt_version, recorded_at,
+		       lease_owner, lease_expires_at, completed_by_owner, currently_admissible
 		FROM stacks.extraction_runs WHERE id = $1 FOR UPDATE`, completion.DerivationID).Scan(
-		&storedVersionID, &status, &storedDataMode, &activeOwner, &activeUntil, &completedByOwner,
-		&storedAdmissible,
+		&storedVersionID, &status, &storedDataMode, &storedModelID, &storedPromptVersion, &storedRecordedAt,
+		&activeOwner, &activeUntil, &completedByOwner, &storedAdmissible,
 	); err != nil {
 		return fmt.Errorf("lock ingestion derivation: %w", err)
+	}
+	run := owningExtractionRun{
+		ID:            completion.DerivationID,
+		ModelID:       storedModelID,
+		PromptVersion: storedPromptVersion,
+		RecordedAt:    storedRecordedAt,
+	}
+	if status == string(ingest.VersionStatusComplete) {
+		if completedByOwner == nil || *completedByOwner != completion.LeaseOwner {
+			return newCompletionBoundaryError(
+				ErrObservationConflict,
+				reasonCompletionOwnerMismatch,
+				completion.DerivationID,
+			)
+		}
+		if storedVersionID != completion.VersionID {
+			return newCompletionBoundaryError(
+				ErrObservationConflict,
+				reasonCompletionWriteSetMismatch,
+				completion.DerivationID,
+			)
+		}
+		if err := compareCompletedWriteSet(ctx, transaction, completion, run); err != nil {
+			return err
+		}
+		return transaction.Commit(ctx)
 	}
 	if storedVersionID != completion.VersionID {
 		return fmt.Errorf("complete ingestion version: derivation source version conflicts")
 	}
-	if status == string(ingest.VersionStatusComplete) {
-		if completedByOwner == nil || *completedByOwner != completion.LeaseOwner {
-			return fmt.Errorf("complete ingestion version: completion lease is not owned")
-		}
-		if storedAdmissible {
-			if err := setCurrentDocumentVersion(ctx, transaction, completion.VersionID); err != nil {
-				return err
-			}
-		}
-		return transaction.Commit(ctx)
+	if !storedAdmissible {
+		return newCompletionBoundaryError(
+			ErrObservationCompatibility, reasonOwningRunNotAdmissible, completion.DerivationID,
+		)
 	}
 	if storedDataMode != string(completion.DataMode) {
 		return fmt.Errorf("complete ingestion version: active data mode conflicts")
@@ -486,7 +530,9 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if activeOwner == nil || activeUntil == nil || *activeOwner != completion.LeaseOwner || !activeUntil.After(time.Now().UTC()) {
 		return fmt.Errorf("complete ingestion version: active lease is not owned")
 	}
-
+	if err := validateIngestionRecordedAt(completion.Observations, storedRecordedAt); err != nil {
+		return err
+	}
 	evidenceIDs, err := persistIngestionEvidence(ctx, transaction, completion.Evidence)
 	if err != nil {
 		return err
@@ -495,7 +541,7 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	if err != nil {
 		return err
 	}
-	if err := persistIngestionGraph(ctx, transaction, completion.DerivationID, completion.Observations, completion.Signals, evidenceIDs, mentionIDs); err != nil {
+	if err := persistIngestionGraph(ctx, transaction, run, completion.Observations, completion.Signals, evidenceIDs, mentionIDs); err != nil {
 		return err
 	}
 	result, err := transaction.Exec(ctx, `
@@ -517,6 +563,17 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	}
 	if err := transaction.Commit(ctx); err != nil {
 		return fmt.Errorf("commit ingestion version %q: %w", completion.VersionID, err)
+	}
+	return nil
+}
+
+func validateIngestionRecordedAt(observations []ingest.ObservationDraft, recordedAt time.Time) error {
+	for _, draft := range observations {
+		if !draft.RecordedAt.Equal(recordedAt) {
+			return newObservationBoundaryError(
+				ErrObservationConflict, reasonRecordedAtOwnerMismatch, string(draft.ID),
+			)
+		}
 	}
 	return nil
 }
@@ -646,83 +703,220 @@ func persistIngestionMentions(ctx context.Context, transaction pgx.Tx, derivatio
 	return mentionIDs, nil
 }
 
-func persistIngestionGraph(ctx context.Context, transaction pgx.Tx, derivationID string, observations []ingest.ObservationRecord, signals []ingest.SignalRecord, evidenceIDs, mentionIDs map[string]string) error {
-	for _, record := range observations {
-		resolvedEvidence, err := resolveEvidenceKeys(record.EvidenceKeys, evidenceIDs)
-		if err != nil {
-			return err
-		}
-		input := ObservationInput{
-			ID: record.ID, SubjectEntityID: record.SubjectEntityID, ObjectEntityID: record.ObjectEntityID,
-			ExtractionRunID:  derivationID,
-			SubjectMentionID: mentionIDs[record.SubjectMentionKey], ObjectMentionID: mentionIDs[record.ObjectMentionKey],
-			Predicate: record.Predicate, ValidStart: record.ValidStart,
-			Derivation: "model_extraction", EpistemicStatus: "inferred", Confidence: record.Confidence,
-		}
-		canonicalInput, canonicalEvidence, err := canonicalizeObservationIdentity(input, resolvedEvidence)
-		if err != nil {
-			return err
-		}
-		if err := validateObservationInput(canonicalInput); err != nil {
-			return err
-		}
-		digest, err := ComputeObservationDigest(canonicalInput, canonicalEvidence)
-		if err != nil {
-			return err
-		}
-		observation, err := putObservation(ctx, transaction, canonicalInput, digest[:])
-		if err != nil {
-			return err
-		}
-		for _, evidenceID := range canonicalEvidence {
-			if _, err := transaction.Exec(ctx, `
-				INSERT INTO stacks.observation_evidence (observation_id, evidence_span_id)
-				VALUES ($1, $2) ON CONFLICT DO NOTHING`, observation.ID, evidenceID); err != nil {
-				return fmt.Errorf("persist ingestion observation evidence: %w", err)
-			}
-		}
+func persistIngestionGraph(
+	ctx context.Context,
+	transaction pgx.Tx,
+	run owningExtractionRun,
+	observations []ingest.ObservationDraft,
+	signals []ingest.SignalRecord,
+	evidenceIDs, mentionIDs map[string]string,
+) error {
+	staged, err := stageCanonicalIngestionWrites(run, observations, signals, evidenceIDs, mentionIDs)
+	if err != nil {
+		return err
 	}
-	for _, record := range signals {
-		evidence := make([]SignalEvidenceInput, 0, len(record.Evidence))
-		for _, link := range record.Evidence {
-			evidenceID, exists := evidenceIDs[link.EvidenceKey]
-			if !exists {
-				return fmt.Errorf("persist ingestion signal: evidence reference is unknown")
-			}
-			evidence = append(evidence, SignalEvidenceInput{EvidenceSpanID: evidenceID, Role: link.Role})
-		}
-		input := SignalInput{
-			ID: record.ID, ObservationID: record.ObservationID, Category: record.Category,
-			Direction: record.Direction, ExtractionModelID: record.ExtractionModelID,
-			PromptVersion: record.PromptVersion, Rationale: record.Rationale, Confidence: record.Confidence,
-		}
-		canonicalInput, canonicalEvidence, err := canonicalizeSignalIdentity(input, evidence)
-		if err != nil {
+	for _, write := range staged {
+		if _, _, err := putLegacyObservation(ctx, transaction, write); err != nil {
 			return err
-		}
-		if err := validateSignalInput(canonicalInput); err != nil {
-			return err
-		}
-		digest, err := ComputeSignalDigest(canonicalInput, canonicalEvidence)
-		if err != nil {
-			return err
-		}
-		signal, err := putSignal(ctx, transaction, canonicalInput, digest[:])
-		if err != nil {
-			return err
-		}
-		for _, link := range canonicalEvidence {
-			if !validSignalEvidenceRole(link.Role) {
-				return fmt.Errorf("persist ingestion signal: evidence role is invalid")
-			}
-			if _, err := transaction.Exec(ctx, `
-				INSERT INTO stacks.signal_evidence (signal_id, evidence_span_id, role)
-				VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, signal.ID, link.EvidenceSpanID, link.Role); err != nil {
-				return fmt.Errorf("persist ingestion signal evidence: %w", err)
-			}
 		}
 	}
 	return nil
+}
+
+func stageCanonicalIngestionWrites(
+	run owningExtractionRun,
+	observations []ingest.ObservationDraft,
+	signals []ingest.SignalRecord,
+	evidenceIDs, mentionIDs map[string]string,
+) ([]legacyObservationWrite, error) {
+	observationIDs := make(map[string]struct{}, len(observations))
+	for _, draft := range observations {
+		identifier, err := canonicalUUID(string(draft.ID))
+		if err != nil {
+			return nil, newLegacyUUIDPreflightError(draft.ID)
+		}
+		if _, exists := observationIDs[identifier]; exists {
+			return nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, identifier)
+		}
+		observationIDs[identifier] = struct{}{}
+	}
+
+	signalsByObservation := make(map[string]*ingest.SignalRecord, len(signals))
+	for index := range signals {
+		signal := &signals[index]
+		observationID, err := canonicalUUID(signal.ObservationID)
+		if err != nil {
+			return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, "")
+		}
+		if _, exists := observationIDs[observationID]; !exists {
+			return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, observationID)
+		}
+		if _, exists := signalsByObservation[observationID]; exists {
+			return nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, observationID)
+		}
+		signalsByObservation[observationID] = signal
+	}
+
+	staged := make([]legacyObservationWrite, 0, len(observations))
+	seenObservationIDs := make(map[string]struct{}, len(observations))
+	seenDigests := make(map[[sha256.Size]byte]string, len(observations))
+	seenSignalIDs := make(map[string]struct{}, len(signals))
+	for _, draft := range observations {
+		observationID, _ := canonicalUUID(string(draft.ID))
+		signal := signalsByObservation[observationID]
+		if signal == nil {
+			return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, observationID)
+		}
+		value, compatibility, signalState, err := buildCanonicalIngestionObservation(
+			draft, signal, run, evidenceIDs, mentionIDs,
+		)
+		if err != nil {
+			return nil, err
+		}
+		write, err := encodeLegacyObservation(value, compatibility, &run, signalState)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seenObservationIDs[write.Row.ID]; exists {
+			return nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, write.Row.ID)
+		}
+		seenObservationIDs[write.Row.ID] = struct{}{}
+		if priorID, exists := seenDigests[write.Row.Digest]; exists && priorID != write.Row.ID {
+			return nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, write.Row.ID)
+		}
+		seenDigests[write.Row.Digest] = write.Row.ID
+		if write.Signal == nil {
+			return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, write.Row.ID)
+		}
+		if _, exists := seenSignalIDs[write.Signal.Input.ID]; exists {
+			return nil, newObservationBoundaryError(ErrObservationConflict, reasonCompletionWriteSetMismatch, write.Row.ID)
+		}
+		seenSignalIDs[write.Signal.Input.ID] = struct{}{}
+		staged = append(staged, write)
+	}
+	if len(seenSignalIDs) != len(signals) {
+		return nil, newCompletionBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, run.ID)
+	}
+	return staged, nil
+}
+
+func buildCanonicalIngestionObservation(
+	draft ingest.ObservationDraft,
+	signal *ingest.SignalRecord,
+	run owningExtractionRun,
+	evidenceIDs map[string]string,
+	mentionIDs map[string]string,
+) (observation.Observation, legacyObservationCompatibility, *legacySignalState, error) {
+	if !draft.RecordedAt.Equal(run.RecordedAt) {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil,
+			newObservationBoundaryError(ErrObservationConflict, reasonRecordedAtOwnerMismatch, string(draft.ID))
+	}
+	subjectMentionID, err := resolveMentionKey(draft.SubjectMentionKey, mentionIDs)
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	objectMentionID, err := resolveMentionKey(draft.ObjectMentionKey, mentionIDs)
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	subject, err := ingestionTerm(draft.SubjectEntityID, subjectMentionID)
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	object, err := ingestionTerm(draft.ObjectEntityID, objectMentionID)
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	resolvedOrigin, err := resolveEvidenceKeys(draft.EvidenceKeys, evidenceIDs)
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	origin := make([]evidence.EvidenceID, len(resolvedOrigin))
+	for index, evidenceID := range resolvedOrigin {
+		origin[index] = evidence.EvidenceID(evidenceID)
+	}
+	origin, err = normalizeLegacyOrigin(origin)
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	signalState, err := buildCanonicalIngestionSignal(draft.ID, signal, evidenceIDs)
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	links, err := canonicalEvidenceLinks(origin, signalState)
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	legacyConfidence, err := observation.NewLegacyConfidence(draft.SourceConfidence.Value())
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	value, err := observation.NewObservation(observation.ObservationInput{
+		ID:         draft.ID,
+		Statement:  observation.Statement{Subject: subject, Predicate: draft.Predicate, Object: object},
+		ValidTime:  draft.ValidTime,
+		RecordedAt: run.RecordedAt,
+		Evidence:   links,
+		Derivation: observation.Derivation{
+			Method:        "model_extraction",
+			Version:       run.PromptVersion,
+			RunID:         run.ID,
+			Model:         run.ModelID,
+			PromptVersion: run.PromptVersion,
+		},
+		Status:     observation.StatusInferred,
+		Confidence: &legacyConfidence,
+	})
+	if err != nil {
+		return observation.Observation{}, legacyObservationCompatibility{}, nil, err
+	}
+	return value, legacyObservationCompatibility{observationEvidenceOrigin: origin}, signalState, nil
+}
+
+func ingestionTerm(entityID, mentionID string) (observation.Term, error) {
+	switch {
+	case entityID != "":
+		return observation.NewEntityTerm(entityID, mentionID)
+	case mentionID != "":
+		return observation.NewMentionTerm(mentionID)
+	default:
+		return observation.AbsentTerm(), nil
+	}
+}
+
+func resolveMentionKey(key string, mentionIDs map[string]string) (string, error) {
+	if key == "" {
+		return "", nil
+	}
+	identifier, exists := mentionIDs[key]
+	if !exists {
+		return "", newCompletionBoundaryError(ErrObservationCompatibility, reasonEvidenceOwnershipMismatch, "")
+	}
+	return identifier, nil
+}
+
+func buildCanonicalIngestionSignal(
+	observationID observation.ObservationID,
+	record *ingest.SignalRecord,
+	evidenceIDs map[string]string,
+) (*legacySignalState, error) {
+	if record == nil {
+		return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonCompletionOwnerMismatch, string(observationID))
+	}
+	links := make([]SignalEvidenceInput, 0, len(record.Evidence))
+	for _, link := range record.Evidence {
+		evidenceID, exists := evidenceIDs[link.EvidenceKey]
+		if !exists {
+			return nil, newObservationBoundaryError(ErrObservationCompatibility, reasonEvidenceOwnershipMismatch, string(observationID))
+		}
+		links = append(links, SignalEvidenceInput{EvidenceSpanID: evidenceID, Role: link.Role})
+	}
+	input := SignalInput{
+		ID: record.ID, ObservationID: record.ObservationID, Category: record.Category,
+		Direction: record.Direction, ExtractionModelID: record.ExtractionModelID,
+		PromptVersion: record.PromptVersion, Rationale: record.Rationale, Confidence: record.Confidence,
+	}
+	return canonicalSignalState(observationID, &input, links)
 }
 
 func resolveEvidenceKeys(keys []string, evidenceIDs map[string]string) ([]string, error) {

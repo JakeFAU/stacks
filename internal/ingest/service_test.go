@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/observation"
 	"go.opentelemetry.io/otel/codes"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -189,7 +190,7 @@ func TestSyncSkipsExtractionForUnchangedVersion(t *testing.T) {
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
 		ID: "version-unchanged", DerivationID: "derivation-unchanged",
-		DerivationDigest: derivation.Digest, Status: VersionStatusComplete,
+		DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusComplete,
 	}
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
 	service := testService(document, repository, model)
@@ -257,7 +258,7 @@ func TestSyncEnrichesCompleteDerivationWithoutModelInvocation(t *testing.T) {
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
 		ID: "version-directory-complete", DerivationID: "derivation-directory-complete",
-		DerivationDigest: derivation.Digest, Status: VersionStatusComplete,
+		DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusComplete,
 	}
 	model := &recordingModel{
 		responses: []extract.Response{validEmptyResponse(t)},
@@ -306,7 +307,7 @@ func TestSyncNeverEnrichesFailedCompletionOrBusyDerivation(t *testing.T) {
 				derivation := testDerivationIdentity(t, version)
 				repository.versions[derivationKey(version, derivation)] = VersionState{
 					ID: "version-directory-busy", DerivationID: "derivation-directory-busy",
-					DerivationDigest: derivation.Digest, Status: VersionStatusPending,
+					DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusPending,
 					LeaseOwner: "other-worker",
 				}
 			},
@@ -592,7 +593,7 @@ func TestSyncReturnsBusyWithoutInvokingModelForActiveDerivationLease(t *testing.
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
 		ID: "version-busy", DerivationID: "derivation-busy", DerivationDigest: derivation.Digest,
-		Status: VersionStatusPending, LeaseOwner: "other-worker",
+		RecordedAt: recordedAt, Status: VersionStatusPending, LeaseOwner: "other-worker",
 	}
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
 	service := testService(document, repository, model)
@@ -911,7 +912,8 @@ func TestSyncPreservesUnknownMeetingTime(t *testing.T) {
 	if err != nil || summary.Completed != 1 {
 		t.Fatalf("Sync() = (%#v, %v), want one completed", summary, err)
 	}
-	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart != nil {
+	if len(repository.lastCompletion.Observations) != 1 ||
+		repository.lastCompletion.Observations[0].ValidTime.Kind() != observation.TemporalUnknown {
 		t.Fatalf("observation valid time = %#v, want unknown", repository.lastCompletion.Observations)
 	}
 }
@@ -943,7 +945,8 @@ func TestSyncDoesNotCombineFetchedTitleWithListedTitleMeetingTime(t *testing.T) 
 	if got := repository.lastPreparedVersion.SourceTime(); got != nil {
 		t.Fatalf("persisted meeting time = %v, want unknown for fetched undated title", got)
 	}
-	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart != nil {
+	if len(repository.lastCompletion.Observations) != 1 ||
+		repository.lastCompletion.Observations[0].ValidTime.Kind() != observation.TemporalUnknown {
 		t.Fatalf("observation valid time = %#v, want stale listed date excluded from chronology", repository.lastCompletion.Observations)
 	}
 }
@@ -975,8 +978,11 @@ func TestSyncInheritsListedTitleAndMeetingTimeWhenFetchedTitleIsAbsent(t *testin
 	if got := repository.lastPreparedVersion.SourceTime(); got == nil || !got.Equal(listedMeetingTime) {
 		t.Fatalf("persisted meeting time = %v, want listed fallback %v", got, listedMeetingTime)
 	}
-	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart == nil ||
-		!repository.lastCompletion.Observations[0].ValidStart.Equal(listedMeetingTime) {
+	if len(repository.lastCompletion.Observations) != 1 {
+		t.Fatalf("observations = %#v, want one coherent listed title time", repository.lastCompletion.Observations)
+	}
+	start, hasStart, _, hasEnd := repository.lastCompletion.Observations[0].ValidTime.Bounds()
+	if !hasStart || hasEnd || !start.Equal(listedMeetingTime) {
 		t.Fatalf("observation valid time = %#v, want coherent listed title time", repository.lastCompletion.Observations)
 	}
 }
@@ -995,7 +1001,8 @@ func TestSyncCannotManufactureChronologyFromDeadlineCitation(t *testing.T) {
 	if err != nil || summary.Completed != 1 {
 		t.Fatalf("Sync() = (%#v, %v), want one completed extraction", summary, err)
 	}
-	if len(repository.lastCompletion.Observations) != 1 || repository.lastCompletion.Observations[0].ValidStart != nil {
+	if len(repository.lastCompletion.Observations) != 1 ||
+		repository.lastCompletion.Observations[0].ValidTime.Kind() != observation.TemporalUnknown {
 		t.Fatalf("observation valid time = %#v, want deadline citation unable to manufacture chronology", repository.lastCompletion.Observations)
 	}
 }
@@ -1151,7 +1158,6 @@ func TestSyncClassifiesPersistenceIdentityCollisionAsInvalidOutput(t *testing.T)
 		response   extract.Response
 	}{
 		{name: "mention proposal", transcript: "Synthetic duplicate mention.", response: duplicateMentionResponse(t)},
-		{name: "observation and signal", transcript: "Synthetic duplicate signal.", response: duplicateSignalResponse(t)},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -1212,43 +1218,6 @@ func TestSyncClassifiesPaddedModelLocalIDAsInvalidOutputBeforeStorage(t *testing
 	if repository.completionCalls != 0 {
 		t.Fatalf("completion calls = %d, want padded IDs rejected before storage", repository.completionCalls)
 	}
-}
-
-func duplicateSignalResponse(t *testing.T) extract.Response {
-	t.Helper()
-	const transcript = "Synthetic duplicate signal."
-	output, err := json.Marshal(extract.ExtractionOutput{
-		Citations: []extract.Citation{{ID: "citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript}},
-		People: []extract.PersonMention{
-			{ID: "mention-1", Surface: "Synthetic", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
-			{ID: "mention-2", Surface: "signal", Role: extract.MentionRoleReference, CitationIDs: []string{"citation-1"}},
-		},
-		Statements: []extract.AttributedStatement{{
-			ID: "statement-1", SpeakerMentionID: "mention-1", SubjectMentionID: "mention-2",
-			Predicate: "assigned", ObjectText: "follow-up", CitationIDs: []string{"citation-1"},
-		}},
-		Signals: []extract.InteractionSignal{
-			{
-				ID: "signal-1", SubjectMentionID: "mention-1", ObjectMentionID: "mention-2", StatementIDs: []string{"statement-1"},
-				Category: extract.SignalCategoryFutureResponsibility, Direction: extract.SignalDirectionStrengthening,
-				Rationale: "Synthetic rationale one", Confidence: 0.8, SupportingCitationIDs: []string{"citation-1"}, ContradictingCitationIDs: []string{},
-			},
-			{
-				ID: "signal-2", SubjectMentionID: "mention-1", ObjectMentionID: "mention-2", StatementIDs: []string{"statement-1"},
-				Category: extract.SignalCategorySupportAdvocacy, Direction: extract.SignalDirectionStrengthening,
-				Rationale: "Synthetic rationale two", Confidence: 0.8, SupportingCitationIDs: []string{"citation-1"}, ContradictingCitationIDs: []string{},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("marshal duplicate signal extraction: %v", err)
-	}
-	if _, err := extract.DecodeAndValidateExtraction(extract.SubmittedText{Tabs: []extract.SubmittedTab{{
-		ID: "transcript-tab", Role: extract.TabRoleTranscript, Text: transcript,
-	}}}, output); err != nil {
-		t.Fatalf("duplicate signal fixture must remain schema-valid: %v", err)
-	}
-	return extract.Response{Output: output, ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion, Outcome: "success"}
 }
 
 func TestSyncSubmitsTranscriptAndNotesAsSeparatelyLabeledTabs(t *testing.T) {
@@ -1383,7 +1352,7 @@ func TestCompletionReplacesRawSignalRationaleWithDeterministicExplanation(t *tes
 
 	completion, err := service.completion(version, VersionState{
 		ID: "version-id", DerivationID: "derivation-id",
-		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")),
+		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), RecordedAt: recordedAt,
 	}, extract.Response{
 		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
 	}, output, nil)
@@ -1393,6 +1362,67 @@ func TestCompletionReplacesRawSignalRationaleWithDeterministicExplanation(t *tes
 	if len(completion.Signals) != 1 || completion.Signals[0].Rationale == unsafeRationale ||
 		!strings.Contains(completion.Signals[0].Rationale, "future responsibility") {
 		t.Fatalf("stored signal rationale = %#v, want deterministic category/direction explanation", completion.Signals)
+	}
+}
+
+func TestCompletionBuildsCanonicalCompatibleObservationDraft(t *testing.T) {
+	const transcript = "Leader assigns follow-up."
+	meetingDate := time.Date(2026, time.July, 25, 0, 0, 0, 0, time.UTC)
+	runRecordedAt := time.Date(2026, time.July, 25, 15, 4, 3, 123456000, time.UTC)
+	version := documentVersion(t, syntheticDocument("document-recorded-at", transcript))
+	service := &Service{
+		Resolver: entity.Resolver{},
+		Now: func() time.Time {
+			return time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+		},
+	}
+	output := extract.ExtractionOutput{
+		MeetingDate: "2026-07-25",
+		Citations: []extract.Citation{{
+			ID: "citation-1", TabID: "transcript-tab", StartOffset: 0,
+			EndOffset: len(transcript), Quote: transcript,
+		}},
+		People: []extract.PersonMention{
+			{ID: "mention-leader", Surface: "Leader", Role: extract.MentionRoleSpeaker, CitationIDs: []string{"citation-1"}},
+			{ID: "mention-report", Surface: "follow-up", Role: extract.MentionRoleReference, CitationIDs: []string{"citation-1"}},
+		},
+		Statements: []extract.AttributedStatement{{
+			ID: "statement-1", SpeakerMentionID: "mention-leader", SubjectMentionID: "mention-report",
+			Predicate: "assigned", ObjectText: "follow-up", ValidDate: "2026-07-25", CitationIDs: []string{"citation-1"},
+		}},
+		Signals: []extract.InteractionSignal{{
+			ID: "signal-1", SubjectMentionID: "mention-leader", ObjectMentionID: "mention-report",
+			StatementIDs: []string{"statement-1"}, Category: extract.SignalCategoryFutureResponsibility,
+			Direction: extract.SignalDirectionStrengthening, Rationale: "Synthetic rationale", Confidence: 0.8,
+			SupportingCitationIDs: []string{"citation-1"},
+		}},
+	}
+
+	completion, err := service.completion(version, VersionState{
+		ID: "version-id", DerivationID: "derivation-id",
+		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), RecordedAt: runRecordedAt,
+	}, extract.Response{
+		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+	}, output, nil)
+	if err != nil {
+		t.Fatalf("completion() error = %v", err)
+	}
+	if len(completion.Observations) == 0 {
+		t.Fatal("completion observations = none, want recorded interaction")
+	}
+	draft := completion.Observations[0]
+	if draft.Predicate != observation.Predicate(interactionPredicate) {
+		t.Fatalf("draft predicate = %q, want %q", draft.Predicate, interactionPredicate)
+	}
+	start, hasStart, _, hasEnd := draft.ValidTime.Bounds()
+	if !hasStart || hasEnd || !start.Equal(meetingDate) {
+		t.Fatalf("draft valid time = %#v, want Since(%v)", draft.ValidTime, meetingDate)
+	}
+	if !draft.RecordedAt.Equal(runRecordedAt) || draft.RecordedAt.Location() != time.UTC {
+		t.Fatalf("draft RecordedAt = %v, want retry-stable extraction time %v", draft.RecordedAt, runRecordedAt)
+	}
+	if draft.SourceConfidence.Scale() != observation.ConfidenceUnitInterval || draft.SourceConfidence.Value() != 0.8 {
+		t.Fatalf("draft source confidence = %#v, want unit_interval 0.8", draft.SourceConfidence)
 	}
 }
 
@@ -1665,7 +1695,7 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version ev
 		state = VersionState{
 			ID:               "version-" + version.Digest().String()[:12],
 			DerivationID:     "derivation-" + fmt.Sprintf("%x", derivation.Digest[:6]),
-			DerivationDigest: derivation.Digest, Status: VersionStatusPending,
+			DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusPending,
 			LeaseOwner: fmt.Sprintf("owner-%d", repository.prepareClaims), LeaseExpiresAt: leaseExpiresAt,
 		}
 		repository.lastLeaseExpiresAt = leaseExpiresAt

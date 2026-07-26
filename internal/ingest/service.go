@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -85,6 +86,7 @@ type VersionState struct {
 	ID               string
 	DerivationID     string
 	DerivationDigest [sha256.Size]byte
+	RecordedAt       time.Time
 	LeaseOwner       string
 	LeaseExpiresAt   time.Time
 	Status           VersionStatus
@@ -126,18 +128,19 @@ type MentionRecord struct {
 	Resolution     entity.Resolution
 }
 
-// ObservationRecord is one inferred interaction observation. Empty entity IDs
+// ObservationDraft is one inferred interaction observation. Empty entity IDs
 // preserve unresolved identity rather than promoting a guess to graph truth.
-type ObservationRecord struct {
-	ID                string
+type ObservationDraft struct {
+	ID                observation.ObservationID
 	SubjectEntityID   string
 	ObjectEntityID    string
 	SubjectMentionKey string
 	ObjectMentionKey  string
-	Predicate         string
-	ValidStart        *time.Time
+	Predicate         observation.Predicate
+	ValidTime         observation.TemporalExtent
+	RecordedAt        time.Time
 	EvidenceKeys      []string
-	Confidence        *float64
+	SourceConfidence  observation.Confidence
 }
 
 // SignalEvidenceRecord associates one citation with its bounded signal role.
@@ -167,7 +170,7 @@ type Completion struct {
 	DataMode     modelpolicy.DataMode
 	Evidence     []EvidenceRecord
 	Mentions     []MentionRecord
-	Observations []ObservationRecord
+	Observations []ObservationDraft
 	Signals      []SignalRecord
 }
 
@@ -486,6 +489,17 @@ func (service *Service) completion(
 	if err != nil {
 		return Completion{}, err
 	}
+	validTime := observation.UnknownTime()
+	if validStart != nil {
+		validTime, err = observation.Since(*validStart)
+		if err != nil {
+			return Completion{}, err
+		}
+	}
+	predicate, err := observation.NewPredicate(interactionPredicate)
+	if err != nil {
+		return Completion{}, err
+	}
 	statements := make(map[string]extract.AttributedStatement, len(output.Statements))
 	for _, statement := range output.Statements {
 		statements[statement.ID] = statement
@@ -495,12 +509,15 @@ func (service *Service) completion(
 		subject := resolvedEntityID(resolutions[signal.SubjectMentionID])
 		object := resolvedEntityID(resolutions[signal.ObjectMentionID])
 		evidenceKeys := signalEvidenceKeys(signal, statements)
-		confidence := signal.Confidence
-		completion.Observations = append(completion.Observations, ObservationRecord{
-			ID: observationID, SubjectEntityID: subject, ObjectEntityID: object,
+		sourceConfidence, err := observation.NewUnitIntervalConfidence(signal.Confidence)
+		if err != nil {
+			return Completion{}, err
+		}
+		completion.Observations = append(completion.Observations, ObservationDraft{
+			ID: observation.ObservationID(observationID), SubjectEntityID: subject, ObjectEntityID: object,
 			SubjectMentionKey: signal.SubjectMentionID, ObjectMentionKey: signal.ObjectMentionID,
-			Predicate: interactionPredicate, ValidStart: validStart,
-			EvidenceKeys: evidenceKeys, Confidence: &confidence,
+			Predicate: predicate, ValidTime: validTime,
+			EvidenceKeys: evidenceKeys, SourceConfidence: sourceConfidence, RecordedAt: state.RecordedAt,
 		})
 		signalEvidence := make([]SignalEvidenceRecord, 0, len(signal.SupportingCitationIDs)+len(signal.ContradictingCitationIDs))
 		for _, key := range signal.SupportingCitationIDs {
@@ -510,7 +527,7 @@ func (service *Service) completion(
 			signalEvidence = append(signalEvidence, SignalEvidenceRecord{EvidenceKey: key, Role: "contradicting"})
 		}
 		completion.Signals = append(completion.Signals, SignalRecord{
-			ID: stableDerivationID(state.DerivationDigest, "signal", signal.ID), ObservationID: observationID,
+			ID: stableDerivationID(state.DerivationDigest, "signal", signal.ID), ObservationID: string(observationID),
 			Category: signal.Category, Direction: signal.Direction,
 			ExtractionModelID: response.ModelID, PromptVersion: response.PromptVersion,
 			Rationale:  analysis.ExplainSignal(analysis.Category(signal.Category), analysis.Direction(signal.Direction)),

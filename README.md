@@ -26,6 +26,12 @@ manager-confidence workflow remain downstream in the application during the
 next extraction phases. The public core is experimental and has no independent
 release yet.
 
+The application PostgreSQL boundary consumes canonical `core/observation`
+values through a compatibility codec for the frozen legacy schema. That codec
+does not make the legacy schema complete canonical storage: unsupported terms,
+time windows, and explicit generic confidence scales remain deferred to the
+scoped-migration phase.
+
 ## Requirements
 
 - Go 1.26 or newer

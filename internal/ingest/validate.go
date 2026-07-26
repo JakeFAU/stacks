@@ -4,10 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"math"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
+
+	"github.com/JakeFAU/stacks/core/observation"
 
 	"stacks/internal/entity"
 	"stacks/internal/extract"
@@ -40,11 +41,11 @@ func ValidateForPersistence(completion Completion) error {
 	if err != nil {
 		return err
 	}
-	observationIdentities, err := validateObservationIdentities(completion.Observations, evidenceIdentities, mentionKeys)
+	observationIDs, err := validateObservationReferences(completion.Observations, evidenceIdentities, mentionKeys)
 	if err != nil {
 		return err
 	}
-	return validateSignalIdentities(completion.Signals, observationIdentities, evidenceIdentities)
+	return validateSignalIdentities(completion.Signals, observationIDs, evidenceIdentities)
 }
 
 func validateEvidenceIdentities(records []EvidenceRecord) (map[string][sha256.Size]byte, error) {
@@ -138,60 +139,37 @@ func validateMentionIdentities(records []MentionRecord, evidence map[string][sha
 	return seenKeys, nil
 }
 
-func validateObservationIdentities(records []ObservationRecord, evidence map[string][sha256.Size]byte, mentions map[string]struct{}) (map[string][sha256.Size]byte, error) {
-	byID := make(map[string][sha256.Size]byte, len(records))
-	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
+func validateObservationReferences(records []ObservationDraft, evidence map[string][sha256.Size]byte, mentions map[string]struct{}) (map[string]struct{}, error) {
+	byID := make(map[string]struct{}, len(records))
 	for _, record := range records {
-		if !canonicalLocalIdentifier(record.ID) {
+		identifier := string(record.ID)
+		if !canonicalLocalIdentifier(identifier) || record.RecordedAt.IsZero() || !validSourceConfidence(record.SourceConfidence) {
 			return nil, ErrPersistenceReference
 		}
-		if _, exists := byID[record.ID]; exists {
+		if _, exists := byID[identifier]; exists {
 			return nil, ErrPersistenceCollision
 		}
-		if record.SubjectMentionKey != "" || record.ObjectMentionKey != "" {
-			_, subjectExists := mentions[record.SubjectMentionKey]
-			_, objectExists := mentions[record.ObjectMentionKey]
-			if !canonicalLocalIdentifier(record.SubjectMentionKey) || !canonicalLocalIdentifier(record.ObjectMentionKey) || !subjectExists || !objectExists {
+		for _, mentionKey := range []string{record.SubjectMentionKey, record.ObjectMentionKey} {
+			if mentionKey == "" {
+				continue
+			}
+			if _, exists := mentions[mentionKey]; !canonicalLocalIdentifier(mentionKey) || !exists {
 				return nil, ErrPersistenceReference
 			}
 		}
-		evidenceSet, err := canonicalEvidenceSet(record.EvidenceKeys, evidence)
-		if err != nil {
+		if _, err := canonicalEvidenceSet(record.EvidenceKeys, evidence); err != nil {
 			return nil, err
 		}
-		identity := digestIdentity(struct {
-			Subject        string
-			Object         string
-			SubjectMention string
-			ObjectMention  string
-			Predicate      string
-			ValidStart     string
-			Confidence     string
-			Evidence       [][sha256.Size]byte
-			Derivation     string
-			Epistemic      string
-		}{
-			Subject: record.SubjectEntityID, Object: record.ObjectEntityID,
-			SubjectMention: record.SubjectMentionKey, ObjectMention: record.ObjectMentionKey,
-			Predicate: record.Predicate, ValidStart: optionalTime(record.ValidStart),
-			Confidence: optionalConfidence(record.Confidence), Evidence: evidenceSet,
-			Derivation: "model_extraction", Epistemic: "inferred",
-		})
-		if _, exists := seenDurable[identity]; exists {
-			return nil, ErrPersistenceCollision
-		}
-		byID[record.ID] = identity
-		seenDurable[identity] = struct{}{}
+		byID[identifier] = struct{}{}
 	}
 	return byID, nil
 }
 
-func validateSignalIdentities(records []SignalRecord, observations map[string][sha256.Size]byte, evidence map[string][sha256.Size]byte) error {
+func validateSignalIdentities(records []SignalRecord, observations map[string]struct{}, evidence map[string][sha256.Size]byte) error {
 	seenIDs := make(map[string]struct{}, len(records))
 	seenObservations := make(map[string]struct{}, len(records))
-	seenDurable := make(map[[sha256.Size]byte]struct{}, len(records))
 	for _, record := range records {
-		observationIdentity, exists := observations[record.ObservationID]
+		_, exists := observations[record.ObservationID]
 		if !canonicalLocalIdentifier(record.ID) || !canonicalLocalIdentifier(record.ObservationID) || !exists {
 			return ErrPersistenceReference
 		}
@@ -203,31 +181,18 @@ func validateSignalIdentities(records []SignalRecord, observations map[string][s
 		}
 		seenIDs[record.ID] = struct{}{}
 		seenObservations[record.ObservationID] = struct{}{}
-		evidenceSet, err := canonicalSignalEvidenceSet(record.Evidence, evidence)
-		if err != nil {
+		if _, err := canonicalSignalEvidenceSet(record.Evidence, evidence); err != nil {
 			return err
 		}
-		identity := digestIdentity(struct {
-			Observation [sha256.Size]byte
-			Category    string
-			Direction   string
-			Model       string
-			Prompt      string
-			Rationale   string
-			Confidence  string
-			Evidence    []signalEvidenceIdentity
-		}{
-			Observation: observationIdentity, Category: record.Category,
-			Direction: record.Direction, Model: record.ExtractionModelID,
-			Prompt: record.PromptVersion, Rationale: record.Rationale,
-			Confidence: strconv.FormatFloat(record.Confidence, 'g', -1, 64), Evidence: evidenceSet,
-		})
-		if _, exists := seenDurable[identity]; exists {
-			return ErrPersistenceCollision
-		}
-		seenDurable[identity] = struct{}{}
 	}
 	return nil
+}
+
+func validSourceConfidence(value observation.Confidence) bool {
+	score := value.Value()
+	return value.Scale() == observation.ConfidenceUnitInterval &&
+		!math.IsNaN(score) && !math.IsInf(score, 0) &&
+		score >= 0 && score <= 1
 }
 
 type signalEvidenceIdentity struct {
@@ -290,18 +255,4 @@ func digestIdentity(value any) [sha256.Size]byte {
 		panic("ingestion identity contains an unsupported value")
 	}
 	return sha256.Sum256(encoded)
-}
-
-func optionalTime(value *time.Time) string {
-	if value == nil {
-		return ""
-	}
-	return value.UTC().Format(time.RFC3339Nano)
-}
-
-func optionalConfidence(value *float64) string {
-	if value == nil {
-		return ""
-	}
-	return strconv.FormatFloat(*value, 'g', -1, 64)
 }

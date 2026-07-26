@@ -9,14 +9,17 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	knowledge "github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	analysisdomain "stacks/internal/analysis"
@@ -2053,6 +2056,970 @@ func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	}
 }
 
+func TestPrepareVersionReturnsPersistedRecordedAtForEveryState(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewIngestionRepository(pool)
+	ctx := context.Background()
+	version := testDocumentVersion(t, testIdentifier("document-recorded-at-states"))
+	derivation := testExtractionDerivation(t, version)
+
+	first, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare initial extraction run: %v", err)
+	}
+	var storedRecordedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT recorded_at FROM stacks.extraction_runs WHERE id = $1`, first.DerivationID).Scan(&storedRecordedAt); err != nil {
+		t.Fatalf("load stored extraction recorded time: %v", err)
+	}
+	storedRecordedAt = storedRecordedAt.UTC()
+	assertPersistedRecordedAt := func(name string, state ingest.VersionState) {
+		t.Helper()
+		if !state.RecordedAt.Equal(storedRecordedAt) ||
+			state.RecordedAt.Location() != time.UTC ||
+			!state.RecordedAt.Equal(state.RecordedAt.Truncate(time.Microsecond)) {
+			t.Fatalf("%s RecordedAt = %v, want persisted UTC microsecond %v", name, state.RecordedAt, storedRecordedAt)
+		}
+	}
+	assertPersistedRecordedAt("initial pending", first)
+
+	busy, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare busy extraction run: %v", err)
+	}
+	if busy.Status != ingest.VersionStatusBusy {
+		t.Fatalf("busy state = %#v, want busy", busy)
+	}
+	assertPersistedRecordedAt("busy", busy)
+
+	if err := repository.RecordFailure(ctx, first.DerivationID, first.LeaseOwner, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
+		t.Fatalf("record incomplete extraction run: %v", err)
+	}
+	resumed, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare resumed extraction run: %v", err)
+	}
+	if resumed.Status != ingest.VersionStatusPending {
+		t.Fatalf("resumed state = %#v, want pending", resumed)
+	}
+	assertPersistedRecordedAt("resumed", resumed)
+
+	if err := repository.CompleteVersion(ctx, ingest.Completion{
+		VersionID: resumed.ID, DerivationID: resumed.DerivationID, LeaseOwner: resumed.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}); err != nil {
+		t.Fatalf("complete resumed extraction run: %v", err)
+	}
+	complete, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare completed extraction run: %v", err)
+	}
+	if complete.Status != ingest.VersionStatusComplete {
+		t.Fatalf("complete state = %#v, want complete", complete)
+	}
+	assertPersistedRecordedAt("complete", complete)
+}
+
+func TestPrepareVersionTruncatesRecordedAtOnceToPostgresPrecision(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	repository := NewIngestionRepository(pool)
+	ctx := context.Background()
+	version := testDocumentVersion(t, testIdentifier("document-recorded-at-precision"))
+
+	state, err := repository.PrepareVersion(ctx, version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare extraction run: %v", err)
+	}
+	var storedRecordedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT recorded_at FROM stacks.extraction_runs WHERE id = $1`, state.DerivationID).Scan(&storedRecordedAt); err != nil {
+		t.Fatalf("load stored extraction recorded time: %v", err)
+	}
+	storedRecordedAt = storedRecordedAt.UTC()
+	if !state.RecordedAt.Equal(storedRecordedAt) ||
+		state.RecordedAt.Location() != time.UTC ||
+		!state.RecordedAt.Equal(state.RecordedAt.Truncate(time.Microsecond)) {
+		t.Fatalf("RecordedAt = %v, want persisted UTC microsecond %v", state.RecordedAt, storedRecordedAt)
+	}
+}
+
+func TestIngestionPersistsCanonicalObservationWithLegacyConfidenceDowngrade(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCanonicalIngestionFixture(t, pool, "confidence")
+	if fixture.draft.SourceConfidence.Scale() != observation.ConfidenceUnitInterval ||
+		fixture.draft.SourceConfidence.Value() != fixture.signal.Confidence {
+		t.Fatalf("application source confidence = %#v, signal = %v; want bounded matching fixture",
+			fixture.draft.SourceConfidence, fixture.signal.Confidence)
+	}
+
+	fixture.complete(t)
+	loaded, err := loadLegacyObservation(context.Background(), pool, string(fixture.draft.ID))
+	if err != nil {
+		t.Fatalf("load canonical ingestion observation: %v", err)
+	}
+	confidence, ok := loaded.Observation.Confidence()
+	if !ok || confidence.Scale() != observation.ConfidenceUnspecifiedLegacy ||
+		confidence.Value() != fixture.draft.SourceConfidence.Value() {
+		t.Fatalf("canonical confidence = %#v/%t, want unspecified_legacy %v",
+			confidence, ok, fixture.draft.SourceConfidence.Value())
+	}
+	if loaded.Signal == nil || loaded.Signal.Input.Confidence != fixture.signal.Confidence {
+		t.Fatalf("stored signal = %#v, want vertical confidence %v", loaded.Signal, fixture.signal.Confidence)
+	}
+}
+
+func TestIngestionPreservesObservationOriginAndSignalRoles(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	label := testIdentifier("canonical-origin")
+	quotes := map[string]string{
+		"statement":     "Synthetic Manager assigned Synthetic Employee in " + label + ".",
+		"supporting":    "Synthetic supporting evidence for " + label + ".",
+		"contradicting": "Synthetic contradicting evidence for " + label + ".",
+		"shared":        "Synthetic shared evidence for " + label + ".",
+	}
+	transcript := strings.Join([]string{
+		quotes["statement"], quotes["supporting"], quotes["contradicting"], quotes["shared"],
+	}, " ")
+	version := testIngestionDocumentVersion(t, label, "synthetic-version-1", transcript)
+	state, evidenceRecords := prepareIngestionEvidence(t, pool, version, []struct {
+		key   string
+		quote string
+	}{
+		{key: "statement", quote: quotes["statement"]},
+		{key: "supporting", quote: quotes["supporting"]},
+		{key: "contradicting", quote: quotes["contradicting"]},
+		{key: "shared", quote: quotes["shared"]},
+	})
+	predicate, err := observation.NewPredicate("interaction_signal")
+	if err != nil {
+		t.Fatalf("new canonical ingestion predicate: %v", err)
+	}
+	sourceConfidence, err := observation.NewUnitIntervalConfidence(0.8)
+	if err != nil {
+		t.Fatalf("new canonical ingestion confidence: %v", err)
+	}
+	observationID := observation.ObservationID(uuid.NewString())
+	signalID := uuid.NewString()
+	completion := ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal, Evidence: evidenceRecords,
+		Mentions: []ingest.MentionRecord{
+			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
+			{Key: "employee", EvidenceKey: "statement", Surface: "Synthetic Employee", NormalizedName: "synthetic employee", Role: "reference"},
+		},
+		Observations: []ingest.ObservationDraft{{
+			ID: observationID, SubjectMentionKey: "manager", ObjectMentionKey: "employee",
+			Predicate: predicate, ValidTime: observation.UnknownTime(), RecordedAt: state.RecordedAt,
+			EvidenceKeys:     []string{"statement", "supporting", "contradicting", "shared"},
+			SourceConfidence: sourceConfidence,
+		}},
+		Signals: []ingest.SignalRecord{{
+			ID: signalID, ObservationID: string(observationID),
+			Category: "delegation_autonomy", Direction: "mixed",
+			ExtractionModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+			Rationale: "Synthetic source-grounded signal.", Confidence: 0.8,
+			Evidence: []ingest.SignalEvidenceRecord{
+				{EvidenceKey: "supporting", Role: "supporting"},
+				{EvidenceKey: "shared", Role: "supporting"},
+				{EvidenceKey: "contradicting", Role: "contradicting"},
+				{EvidenceKey: "shared", Role: "contradicting"},
+			},
+		}},
+	}
+	if err := NewIngestionRepository(pool).CompleteVersion(ctx, completion); err != nil {
+		t.Fatalf("complete origin-preserving ingestion: %v", err)
+	}
+
+	evidenceIDs := make(map[string]string, len(quotes))
+	for key, quote := range quotes {
+		evidenceIDs[key] = ingestionEvidenceID(t, pool, state.DerivationID, quote)
+	}
+	loaded, err := loadLegacyObservation(ctx, pool, string(observationID))
+	if err != nil {
+		t.Fatalf("load origin-preserving observation: %v", err)
+	}
+	wantOrigin := []knowledge.EvidenceID{
+		knowledge.EvidenceID(evidenceIDs["statement"]),
+		knowledge.EvidenceID(evidenceIDs["supporting"]),
+		knowledge.EvidenceID(evidenceIDs["contradicting"]),
+		knowledge.EvidenceID(evidenceIDs["shared"]),
+	}
+	sort.Slice(wantOrigin, func(left, right int) bool { return wantOrigin[left] < wantOrigin[right] })
+	if !sameEvidenceIDs(loaded.Compatibility.observationEvidenceOrigin, wantOrigin) {
+		t.Fatalf("private observation origin = %#v, want distinct statement/support/contradiction union %#v",
+			loaded.Compatibility.observationEvidenceOrigin, wantOrigin)
+	}
+	wantLinks := []observation.EvidenceLink{
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["statement"]), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["supporting"]), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["contradicting"]), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["shared"]), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["contradicting"]), Role: observation.EvidenceContradicting},
+		{EvidenceID: knowledge.EvidenceID(evidenceIDs["shared"]), Role: observation.EvidenceContradicting},
+	}
+	if !sameEvidenceLinks(loaded.Observation.EvidenceLinks(), wantLinks) {
+		t.Fatalf("canonical evidence links = %#v, want exact-pair union %#v", loaded.Observation.EvidenceLinks(), wantLinks)
+	}
+	wantSignalEvidence := []SignalEvidenceInput{
+		{EvidenceSpanID: evidenceIDs["supporting"], Role: "supporting"},
+		{EvidenceSpanID: evidenceIDs["shared"], Role: "supporting"},
+		{EvidenceSpanID: evidenceIDs["contradicting"], Role: "contradicting"},
+		{EvidenceSpanID: evidenceIDs["shared"], Role: "contradicting"},
+	}
+	if loaded.Signal == nil || !sameSignalEvidence(loaded.Signal.Evidence, wantSignalEvidence) {
+		t.Fatalf("signal evidence = %#v, want exact supporting/contradicting pairs %#v", loaded.Signal, wantSignalEvidence)
+	}
+	row, _, signal, err := scanLegacyObservationState(ctx, pool, string(observationID))
+	if err != nil {
+		t.Fatalf("scan persisted v1 observation: %v", err)
+	}
+	wantDigest, err := computeObservationDigestV1(legacyObservationWrite{Row: row, Origin: wantOrigin, Signal: signal})
+	if err != nil {
+		t.Fatalf("compute origin-based v1 digest: %v", err)
+	}
+	if row.Digest != wantDigest {
+		t.Fatalf("stored v1 digest = %x, want private-origin digest %x", row.Digest, wantDigest)
+	}
+}
+
+func TestIngestionUsesOwningRunDerivationAndRecordedAt(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCanonicalIngestionFixture(t, pool, "owning-run")
+	fixture.complete(t)
+
+	loaded, err := loadLegacyObservation(context.Background(), pool, string(fixture.draft.ID))
+	if err != nil {
+		t.Fatalf("load owning-run ingestion observation: %v", err)
+	}
+	derivation := loaded.Observation.Derivation()
+	if derivation.Method != "model_extraction" ||
+		derivation.Version != fixture.derivation.PromptVersion ||
+		derivation.RunID != fixture.state.DerivationID ||
+		derivation.Model != fixture.derivation.ModelID ||
+		derivation.PromptVersion != fixture.derivation.PromptVersion {
+		t.Fatalf("canonical derivation = %#v, want exact owning extraction run", derivation)
+	}
+	if !loaded.Observation.RecordedAt().Equal(fixture.state.RecordedAt) {
+		t.Fatalf("canonical RecordedAt = %v, want owning run time %v",
+			loaded.Observation.RecordedAt(), fixture.state.RecordedAt)
+	}
+}
+
+func TestIngestionRejectsInadmissibleActiveRunWithoutMutation(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	fixture := newCanonicalIngestionFixture(t, pool, "inactive-owning-run")
+	if _, err := pool.Exec(ctx, `
+		UPDATE stacks.extraction_runs
+		SET currently_admissible = false
+		WHERE id = $1`, fixture.state.DerivationID); err != nil {
+		t.Fatalf("mark synthetic owning run inadmissible: %v", err)
+	}
+	before := snapshotCanonicalIngestionCompletion(t, fixture)
+
+	err := fixture.repository.CompleteVersion(ctx, fixture.completion())
+	if !errors.Is(err, ErrObservationCompatibility) {
+		t.Fatalf("complete with inadmissible owning run error = %v, want ErrObservationCompatibility", err)
+	}
+	wantError := fmt.Sprintf(
+		"observation boundary run %q: %s", fixture.state.DerivationID, reasonOwningRunNotAdmissible,
+	)
+	if err.Error() != wantError {
+		t.Fatalf("inadmissible owning run error = %q, want fixed privacy-safe %q", err, wantError)
+	}
+
+	after := snapshotCanonicalIngestionCompletion(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("inadmissible completion mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestIngestionCompletedRetryRejectsRecordedAtMismatchWithoutMutation(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	fixture := newCanonicalIngestionFixture(t, pool, "completed-recorded-at-mismatch")
+	fixture.complete(t)
+	before := snapshotCanonicalIngestionCompletion(t, fixture)
+	retry := fixture.completion()
+	retry.Observations[0].RecordedAt = fixture.state.RecordedAt.Add(time.Microsecond)
+
+	err := fixture.repository.CompleteVersion(ctx, retry)
+	if !errors.Is(err, ErrObservationConflict) {
+		t.Fatalf("completed retry with changed recorded time error = %v, want ErrObservationConflict", err)
+	}
+	wantError := fmt.Sprintf(
+		"observation boundary run %q: %s", fixture.state.DerivationID, reasonCompletionWriteSetMismatch,
+	)
+	if err.Error() != wantError {
+		t.Fatalf("completed retry recorded-time error = %q, want fixed privacy-safe %q", err, wantError)
+	}
+
+	after := snapshotCanonicalIngestionCompletion(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("rejected completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionExactCompletedRetryIsReadOnly(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCompletedRetryFixture(t, pool, "exact-read-only")
+	fixture.complete(t)
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	if err := fixture.repository.CompleteVersion(context.Background(), fixture.completion()); err != nil {
+		t.Fatalf("retry exact completed write-set: %v", err)
+	}
+
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("exact completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionExactRetryToleratesAdditiveIdentityEnrichment(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	fixture := newCompletedRetryFixture(t, pool, "additive-identity")
+	fixture.complete(t)
+
+	mentionID, proposalID, automaticDecisionID := completedRetryResolutionState(t, fixture)
+	additiveEntityID := uuid.NewString()
+	entities := NewEntityRepository(pool)
+	if _, err := entities.CreateEntity(ctx, EntityInput{
+		ID: additiveEntityID, Kind: "person", DisplayName: "Synthetic Directory Enrichment",
+	}); err != nil {
+		t.Fatalf("create additive directory entity: %v", err)
+	}
+	persistDirectoryNameCandidateForReview(
+		t,
+		pool,
+		directory.PendingMention{
+			MentionID:      mentionID,
+			ProposalID:     proposalID,
+			Surface:        fixture.mentions[0].Surface,
+			NormalizedName: fixture.mentions[0].NormalizedName,
+			NameQuote:      fixture.evidence[0].Span.Text(),
+		},
+		syntheticDirectoryProfile(
+			"completed-retry",
+			"directory-enrichment@synthetic.example",
+			time.Date(2026, time.July, 25, 12, 0, 0, 0, time.UTC),
+		),
+	)
+	if _, err := entities.CorrectReviewDecision(ctx, automaticDecisionID, ResolutionDecisionInput{
+		ProposalID: proposalID, Outcome: ResolutionOutcomeAccepted, EntityID: additiveEntityID,
+	}); err != nil {
+		t.Fatalf("append synthetic reviewer correction: %v", err)
+	}
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	if err := fixture.repository.CompleteVersion(ctx, fixture.completion()); err != nil {
+		t.Fatalf("retry completed write-set after additive identity enrichment: %v", err)
+	}
+
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("enriched completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionExactRetryToleratesAdditionalSharedEvidence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	fixture := newCompletedRetryFixture(t, pool, "additional-shared-evidence")
+	fixture.complete(t)
+
+	transcript := fixture.version.Sections()[0].Text()
+	start := strings.Index(transcript, "assigned")
+	end := start + len("assigned")
+	sharedSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: fixture.version, SectionID: "tab-synthetic",
+		StartOffset: start, EndOffset: end, Quote: transcript[start:end],
+	})
+	if err != nil {
+		t.Fatalf("new additional shared evidence: %v", err)
+	}
+	if _, err := NewDocumentRepository(pool).PutEvidenceSpan(ctx, sharedSpan); err != nil {
+		t.Fatalf("append additional shared evidence: %v", err)
+	}
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	if err := fixture.repository.CompleteVersion(ctx, fixture.completion()); err != nil {
+		t.Fatalf("retry completed write-set with additional shared evidence: %v", err)
+	}
+
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("shared-evidence completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionExactRetryForOrderedMultiSectionVersionIsReadOnly(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	version := testMultiSectionIngestionVersion(t, "ordered-multi-section", 0, 1)
+	repository := NewIngestionRepository(pool)
+	state, err := repository.PrepareVersion(
+		ctx,
+		version,
+		testExtractionDerivation(t, version),
+		modelpolicy.DataModePersonal,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare ordered multi-section version: %v", err)
+	}
+	fixture := canonicalIngestionFixture{
+		pool: pool, repository: repository, state: state, version: version,
+	}
+	completion := ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}
+	if err := repository.CompleteVersion(ctx, completion); err != nil {
+		t.Fatalf("complete ordered multi-section version: %v", err)
+	}
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	if err := repository.CompleteVersion(ctx, completion); err != nil {
+		t.Fatalf("retry ordered multi-section version: %v", err)
+	}
+
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("ordered multi-section retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestPrepareVersionRejectsNonCanonicalSectionOrderBeforeWrites(t *testing.T) {
+	testCases := []struct {
+		name   string
+		orders []int
+	}{
+		{name: "unsorted", orders: []int{1, 0}},
+		{name: "duplicate order", orders: []int{0, 0}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIntegrationDatabase(t)
+			ctx := context.Background()
+			version := testMultiSectionIngestionVersion(
+				t,
+				"invalid-section-order-"+testCase.name,
+				testCase.orders...,
+			)
+
+			_, err := NewIngestionRepository(pool).PrepareVersion(
+				ctx,
+				version,
+				testExtractionDerivation(t, version),
+				modelpolicy.DataModePersonal,
+				5*time.Minute,
+			)
+			const wantError = "prepare ingestion version: document sections must have strictly increasing display order"
+			if err == nil || err.Error() != wantError {
+				t.Fatalf("non-canonical section order error = %v, want bounded %q", err, wantError)
+			}
+			if got := countRows(t, pool, `
+				SELECT count(*)
+				FROM stacks.source_documents
+				WHERE provider = $1 AND provider_document_id = $2`,
+				version.Provider(), version.ProviderDocumentID(),
+			); got != 0 {
+				t.Fatalf("non-canonical section order persisted source rows = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestCompleteVersionCompletedOwnerPrecedesVersionMismatch(t *testing.T) {
+	testCases := []struct {
+		name        string
+		changeOwner bool
+		wantReason  string
+	}{
+		{name: "different owner", changeOwner: true, wantReason: reasonCompletionOwnerMismatch},
+		{name: "same owner", wantReason: reasonCompletionWriteSetMismatch},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIntegrationDatabase(t)
+			fixture := newCompletedRetryFixture(t, pool, "owner-version-"+testCase.name)
+			fixture.complete(t)
+			completion := fixture.completion()
+			completion.VersionID = uuid.NewString()
+			if testCase.changeOwner {
+				completion.LeaseOwner = uuid.NewString()
+			}
+			before := snapshotCompletedRetryWriteSet(t, fixture)
+
+			err := fixture.repository.CompleteVersion(context.Background(), completion)
+			if !errors.Is(err, ErrObservationConflict) {
+				t.Fatalf("completed owner/version mismatch error = %v, want ErrObservationConflict", err)
+			}
+			wantError := fmt.Sprintf(
+				"observation boundary run %q: %s",
+				fixture.state.DerivationID,
+				testCase.wantReason,
+			)
+			if err.Error() != wantError {
+				t.Fatalf("completed owner/version mismatch error = %q, want %q", err, wantError)
+			}
+			after := snapshotCompletedRetryWriteSet(t, fixture)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("completed owner/version rejection mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+			}
+		})
+	}
+}
+
+func TestCompleteVersionActiveVersionMismatchBehaviorUnchanged(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCanonicalIngestionFixture(t, pool, "active-version-mismatch")
+	completion := fixture.completion()
+	completion.VersionID = uuid.NewString()
+	before := snapshotCanonicalIngestionCompletion(t, fixture)
+
+	err := fixture.repository.CompleteVersion(context.Background(), completion)
+	if errors.Is(err, ErrObservationConflict) {
+		t.Fatalf("active version mismatch error = %v, unexpectedly became completed conflict", err)
+	}
+	const wantError = "complete ingestion version: derivation source version conflicts"
+	if err == nil || err.Error() != wantError {
+		t.Fatalf("active version mismatch error = %v, want %q", err, wantError)
+	}
+	after := snapshotCanonicalIngestionCompletion(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("active version rejection mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestCompleteVersionRejectsCompletedEvidenceContentCorruption(t *testing.T) {
+	testCases := []struct {
+		name    string
+		arrange func(*testing.T, canonicalIngestionFixture)
+	}{
+		{
+			name: "tab content",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture) {
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.document_tabs
+					SET content = content || ' Synthetic corruption.'
+					WHERE document_version_id = $1`,
+					fixture.state.ID,
+				); err != nil {
+					t.Fatalf("corrupt stored tab content: %v", err)
+				}
+			},
+		},
+		{
+			name: "tab content digest",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture) {
+				corruptDigest := sha256.Sum256([]byte("synthetic-corrupt-tab-digest"))
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.document_tabs
+					SET content_digest = $2
+					WHERE document_version_id = $1`,
+					fixture.state.ID, corruptDigest[:],
+				); err != nil {
+					t.Fatalf("corrupt stored tab content digest: %v", err)
+				}
+			},
+		},
+		{
+			name: "canonical version digest",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture) {
+				corruptDigest := sha256.Sum256([]byte("synthetic-corrupt-version-digest"))
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.document_versions
+					SET digest = $2
+					WHERE id = $1`,
+					fixture.state.ID, corruptDigest[:],
+				); err != nil {
+					t.Fatalf("corrupt stored canonical version digest: %v", err)
+				}
+			},
+		},
+		{
+			name: "canonical stable content digest",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture) {
+				corruptDigest := sha256.Sum256([]byte("synthetic-corrupt-stable-content-digest"))
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.document_versions
+					SET content_digest_v2 = $2
+					WHERE id = $1`,
+					fixture.state.ID, corruptDigest[:],
+				); err != nil {
+					t.Fatalf("corrupt stored canonical stable content digest: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIntegrationDatabase(t)
+			fixture := newCompletedRetryFixture(t, pool, "content-corruption-"+testCase.name)
+			fixture.complete(t)
+			testCase.arrange(t, fixture)
+			before := snapshotCompletedRetryWriteSet(t, fixture)
+
+			err := fixture.repository.CompleteVersion(context.Background(), fixture.completion())
+			if !errors.Is(err, ErrObservationConflict) {
+				t.Fatalf("completed content corruption error = %v, want ErrObservationConflict", err)
+			}
+			wantError := fmt.Sprintf(
+				"observation boundary run %q: %s",
+				fixture.state.DerivationID,
+				reasonCompletionWriteSetMismatch,
+			)
+			if err.Error() != wantError {
+				t.Fatalf("completed content corruption error = %q, want privacy-safe %q", err, wantError)
+			}
+			after := snapshotCompletedRetryWriteSet(t, fixture)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("content-corruption rejection mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+			}
+		})
+	}
+}
+
+func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
+	testCases := []struct {
+		name    string
+		arrange func(*testing.T, canonicalIngestionFixture, *ingest.Completion)
+	}{
+		{
+			name: "evidence span identity",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				first := completion.Evidence[0].Span
+				completion.Evidence[0].Span = completion.Evidence[1].Span
+				completion.Evidence[1].Span = first
+				completion.Mentions[0].EvidenceKey = "manager-name"
+			},
+		},
+		{
+			name: "evidence immutable quote or offsets",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, completion *ingest.Completion) {
+				transcript := fixture.evidence[0].Span.Text()
+				changed, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+					Document: fixture.version, SectionID: fixture.evidence[0].Span.SectionID(),
+					StartOffset: 0, EndOffset: len(transcript) - 1, Quote: transcript[:len(transcript)-1],
+				})
+				if err != nil {
+					t.Fatalf("new changed synthetic evidence: %v", err)
+				}
+				completion.Evidence[0].Span = changed
+			},
+		},
+		{
+			name: "mention identity key",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Mentions[0].Role = "reference"
+			},
+		},
+		{
+			name: "mention evidence binding",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Mentions[0].EvidenceKey = "manager-name"
+				completion.Observations[0].EvidenceKeys = []string{"statement", "manager-name"}
+			},
+		},
+		{
+			name: "completion owned resolution payload",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Mentions[0].Resolution.Candidates[0].Reason = "changed_synthetic_candidate"
+			},
+		},
+		{
+			name: "observation statement time or confidence",
+			arrange: func(t *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				predicate, err := observation.NewPredicate("support_signal")
+				if err != nil {
+					t.Fatalf("new changed synthetic predicate: %v", err)
+				}
+				completion.Observations[0].Predicate = predicate
+			},
+		},
+		{
+			name: "observation origin",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Observations[0].EvidenceKeys = []string{"employee-name"}
+			},
+		},
+		{
+			name: "signal payload",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Signals[0].Category = "support_advocacy"
+			},
+		},
+		{
+			name: "signal evidence role or identity",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.Signals[0].Evidence[0].Role = "contradicting"
+			},
+		},
+		{
+			name: "data mode",
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+				completion.DataMode = modelpolicy.DataModeRestricted
+			},
+		},
+		{
+			name: "stored extraction run admissibility",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *ingest.Completion) {
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.extraction_runs
+					SET currently_admissible = false
+					WHERE id = $1`, fixture.state.DerivationID); err != nil {
+					t.Fatalf("mutate stored run admissibility: %v", err)
+				}
+			},
+		},
+		{
+			name: "stored current version association",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *ingest.Completion) {
+				if _, err := fixture.pool.Exec(context.Background(), `
+					UPDATE stacks.source_documents AS source
+					SET current_document_version_id = NULL
+					FROM stacks.document_versions AS version
+					WHERE version.id = $1 AND source.id = version.source_document_id`,
+					fixture.state.ID,
+				); err != nil {
+					t.Fatalf("mutate stored current version association: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIntegrationDatabase(t)
+			fixture := newCompletedRetryFixture(t, pool, testIdentifier(testCase.name))
+			fixture.complete(t)
+			completion := fixture.completion()
+			testCase.arrange(t, fixture, &completion)
+			before := snapshotCompletedRetryWriteSet(t, fixture)
+
+			err := fixture.repository.CompleteVersion(context.Background(), completion)
+			if !errors.Is(err, ErrObservationConflict) {
+				t.Fatalf("completed write-set mismatch error = %v, want ErrObservationConflict", err)
+			}
+			wantError := fmt.Sprintf(
+				"observation boundary run %q: %s",
+				fixture.state.DerivationID,
+				reasonCompletionWriteSetMismatch,
+			)
+			if err.Error() != wantError {
+				t.Fatalf("completed write-set mismatch error = %q, want privacy-safe %q", err, wantError)
+			}
+			after := snapshotCompletedRetryWriteSet(t, fixture)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("rejected completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+			}
+		})
+	}
+}
+
+func TestCompleteVersionRejectsCompletedRetryFromDifferentOwner(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	fixture := newCompletedRetryFixture(t, pool, "different-owner")
+	fixture.complete(t)
+	completion := fixture.completion()
+	completion.LeaseOwner = uuid.NewString()
+	before := snapshotCompletedRetryWriteSet(t, fixture)
+
+	err := fixture.repository.CompleteVersion(context.Background(), completion)
+	if !errors.Is(err, ErrObservationConflict) {
+		t.Fatalf("different-owner completed retry error = %v, want ErrObservationConflict", err)
+	}
+	wantError := fmt.Sprintf(
+		"observation boundary run %q: %s",
+		fixture.state.DerivationID,
+		reasonCompletionOwnerMismatch,
+	)
+	if err.Error() != wantError {
+		t.Fatalf("different-owner completed retry error = %q, want privacy-safe %q", err, wantError)
+	}
+	after := snapshotCompletedRetryWriteSet(t, fixture)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("different-owner completed retry mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+	}
+}
+
+func TestIngestionCompletionValidationPrecedence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	testCases := []struct {
+		name      string
+		label     string
+		arrange   func(*testing.T, canonicalIngestionFixture, *ingest.Completion)
+		wantKind  error
+		wantError func(canonicalIngestionFixture) string
+	}{
+		{
+			name:  "completed wrong owner precedes recorded-time mismatch",
+			label: "precedence-completed-owner",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, completion *ingest.Completion) {
+				t.Helper()
+				fixture.complete(t)
+				completion.LeaseOwner = uuid.NewString()
+			},
+			wantKind: ErrObservationConflict,
+			wantError: func(fixture canonicalIngestionFixture) string {
+				return fmt.Sprintf(
+					"observation boundary run %q: %s",
+					fixture.state.DerivationID,
+					reasonCompletionOwnerMismatch,
+				)
+			},
+		},
+		{
+			name:  "inadmissible active run precedes recorded-time mismatch",
+			label: "precedence-active-admissibility",
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *ingest.Completion) {
+				t.Helper()
+				if _, err := fixture.pool.Exec(ctx, `
+					UPDATE stacks.extraction_runs
+					SET currently_admissible = false
+					WHERE id = $1`, fixture.state.DerivationID); err != nil {
+					t.Fatalf("mark precedence owning run inadmissible: %v", err)
+				}
+			},
+			wantKind: ErrObservationCompatibility,
+			wantError: func(fixture canonicalIngestionFixture) string {
+				return fmt.Sprintf(
+					"observation boundary run %q: %s",
+					fixture.state.DerivationID,
+					reasonOwningRunNotAdmissible,
+				)
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newCanonicalIngestionFixture(t, pool, testCase.label)
+			completion := fixture.completion()
+			testCase.arrange(t, fixture, &completion)
+			completion.Observations[0].RecordedAt = fixture.state.RecordedAt.Add(time.Microsecond)
+			before := snapshotCanonicalIngestionCompletion(t, fixture)
+
+			err := fixture.repository.CompleteVersion(ctx, completion)
+			if err == nil {
+				t.Fatal("completion with competing validation failures succeeded")
+			}
+			if testCase.wantKind != nil && !errors.Is(err, testCase.wantKind) {
+				t.Fatalf("validation precedence error = %v, want %v", err, testCase.wantKind)
+			}
+			if want := testCase.wantError(fixture); err.Error() != want {
+				t.Fatalf("validation precedence error = %q, want authoritative %q", err, want)
+			}
+
+			after := snapshotCanonicalIngestionCompletion(t, fixture)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("rejected precedence completion mutated durable state:\nbefore = %#v\nafter  = %#v", before, after)
+			}
+		})
+	}
+}
+
+func TestIngestionCanonicalConstructionFailureRollsBackWholeCompletion(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	providerDocumentID := testIdentifier("canonical-rollback")
+	firstVersion := testIngestionDocumentVersion(t, providerDocumentID, "synthetic-version-1", "Synthetic prior completed version.")
+	repository := NewIngestionRepository(pool)
+	first, err := repository.PrepareVersion(ctx, firstVersion, testExtractionDerivation(t, firstVersion), modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare prior completed version: %v", err)
+	}
+	if err := repository.CompleteVersion(ctx, ingest.Completion{
+		VersionID: first.ID, DerivationID: first.DerivationID, LeaseOwner: first.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}); err != nil {
+		t.Fatalf("complete prior version: %v", err)
+	}
+
+	transcript := "Synthetic Manager assigned Synthetic Employee."
+	failingVersion := testIngestionDocumentVersion(t, providerDocumentID, "synthetic-version-2", transcript)
+	state, evidenceRecords := prepareIngestionEvidence(t, pool, failingVersion, []struct {
+		key   string
+		quote string
+	}{{key: "statement", quote: transcript}})
+	sourceConfidence, err := observation.NewUnitIntervalConfidence(0.8)
+	if err != nil {
+		t.Fatalf("new rollback confidence: %v", err)
+	}
+	observationID := observation.ObservationID(uuid.NewString())
+	signalID := uuid.NewString()
+	err = repository.CompleteVersion(ctx, ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal, Evidence: evidenceRecords,
+		Mentions: []ingest.MentionRecord{
+			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
+			{Key: "employee", EvidenceKey: "statement", Surface: "Synthetic Employee", NormalizedName: "synthetic employee", Role: "reference"},
+		},
+		Observations: []ingest.ObservationDraft{{
+			ID: observationID, SubjectMentionKey: "manager", ObjectMentionKey: "employee",
+			Predicate: "", ValidTime: observation.UnknownTime(), RecordedAt: state.RecordedAt,
+			EvidenceKeys: []string{"statement"}, SourceConfidence: sourceConfidence,
+		}},
+		Signals: []ingest.SignalRecord{{
+			ID: signalID, ObservationID: string(observationID),
+			Category: "delegation_autonomy", Direction: "strengthening",
+			ExtractionModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+			Rationale: "Synthetic rollback signal.", Confidence: 0.8,
+			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "statement", Role: "supporting"}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("invalid canonical ingestion completion succeeded")
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{name: "evidence", query: `
+			SELECT count(*)
+			FROM stacks.evidence_spans AS evidence
+			JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
+			WHERE tab.document_version_id = $1`, args: []any{state.ID}},
+		{name: "mention", query: `SELECT count(*) FROM stacks.mentions WHERE extraction_run_id = $1`, args: []any{state.DerivationID}},
+		{name: "proposal", query: `
+			SELECT count(*)
+			FROM stacks.resolution_proposals AS proposal
+			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+			WHERE mention.extraction_run_id = $1`, args: []any{state.DerivationID}},
+		{name: "observation", query: `SELECT count(*) FROM stacks.observations WHERE id = $1`, args: []any{string(observationID)}},
+		{name: "signal", query: `SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, args: []any{signalID}},
+	} {
+		if got := countRows(t, pool, testCase.query, testCase.args...); got != 0 {
+			t.Fatalf("failed canonical completion left %s rows = %d, want 0", testCase.name, got)
+		}
+	}
+	var status, currentVersionID string
+	if err := pool.QueryRow(ctx, `SELECT processing_status FROM stacks.extraction_runs WHERE id = $1`, state.DerivationID).Scan(&status); err != nil {
+		t.Fatalf("load failed completion status: %v", err)
+	}
+	if status != string(ingest.VersionStatusPending) {
+		t.Fatalf("failed completion status = %q, want pending", status)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT current_document_version_id::text
+		FROM stacks.source_documents
+		WHERE provider = $1 AND provider_document_id = $2`,
+		failingVersion.Provider(), failingVersion.ProviderDocumentID()).Scan(&currentVersionID); err != nil {
+		t.Fatalf("load current document pointer after rollback: %v", err)
+	}
+	if currentVersionID != first.ID {
+		t.Fatalf("current document pointer = %q, want prior completed version %q", currentVersionID, first.ID)
+	}
+}
+
 func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
@@ -3672,12 +4639,13 @@ func (repository *snapshotCoherenceRepository) PrepareVersion(ctx context.Contex
 		}
 	}
 	leaseExpiresAt := time.Now().UTC().Add(leaseDuration)
-	if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.extraction_runs (id, document_version_id, derivation_digest, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at, currently_admissible) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)`, repository.derivationID, repository.versionID, derivation.Digest[:], derivation.ModelID, derivation.Region, derivation.MaxTokens, derivation.PromptVersion, derivation.SchemaDigest[:], repository.leaseOwner, leaseExpiresAt, time.Now().UTC()); err != nil {
+	recordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 123456000, time.UTC)
+	if _, err := repository.pool.Exec(ctx, "INSERT INTO "+repository.quotedSchema+`.extraction_runs (id, document_version_id, derivation_digest, model_id, bedrock_region, max_output_tokens, prompt_version, schema_digest, lease_owner, lease_expires_at, recorded_at, currently_admissible) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)`, repository.derivationID, repository.versionID, derivation.Digest[:], derivation.ModelID, derivation.Region, derivation.MaxTokens, derivation.PromptVersion, derivation.SchemaDigest[:], repository.leaseOwner, leaseExpiresAt, recordedAt); err != nil {
 		return ingest.VersionState{}, err
 	}
 	return ingest.VersionState{
 		ID: repository.versionID, DerivationID: repository.derivationID, DerivationDigest: derivation.Digest,
-		LeaseOwner: repository.leaseOwner, LeaseExpiresAt: leaseExpiresAt, Status: ingest.VersionStatusPending,
+		RecordedAt: recordedAt, LeaseOwner: repository.leaseOwner, LeaseExpiresAt: leaseExpiresAt, Status: ingest.VersionStatusPending,
 	}, nil
 }
 
@@ -4566,6 +5534,14 @@ func completeVersionedPairSignal(
 		t.Fatalf("prepare current-version extraction: %v", err)
 	}
 	validTime := time.Date(2026, time.July, 24, 0, 0, 0, 0, time.UTC)
+	canonicalValidTime, err := observation.Since(validTime)
+	if err != nil {
+		t.Fatalf("construct current-version valid time: %v", err)
+	}
+	sourceConfidence, err := observation.NewUnitIntervalConfidence(0.9)
+	if err != nil {
+		t.Fatalf("construct current-version source confidence: %v", err)
+	}
 	observationID := uuid.NewString()
 	if err := ingestion.CompleteVersion(ctx, ingest.Completion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
@@ -4583,10 +5559,11 @@ func completeVersionedPairSignal(
 				Resolution: entity.Resolution{EntityID: employeeID, AutoResolved: true},
 			},
 		},
-		Observations: []ingest.ObservationRecord{{
-			ID: observationID, SubjectEntityID: managerID, ObjectEntityID: employeeID,
+		Observations: []ingest.ObservationDraft{{
+			ID: observation.ObservationID(observationID), SubjectEntityID: managerID, ObjectEntityID: employeeID,
 			SubjectMentionKey: "manager", ObjectMentionKey: "employee",
-			Predicate: "interaction_signal", ValidStart: &validTime, EvidenceKeys: []string{"evidence"},
+			Predicate: observation.Predicate("interaction_signal"), ValidTime: canonicalValidTime,
+			EvidenceKeys: []string{"evidence"}, SourceConfidence: sourceConfidence, RecordedAt: state.RecordedAt,
 		}},
 		Signals: []ingest.SignalRecord{{
 			ID: uuid.NewString(), ObservationID: observationID,
@@ -4814,19 +5791,34 @@ func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Ti
 	if err != nil {
 		t.Fatalf("create employee proposal: %v", err)
 	}
+	ingestion := NewIngestionRepository(pool)
+	derivation := testExtractionDerivation(t, version)
+	state, err := ingestion.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("prepare pair-analysis extraction run: %v", err)
+	}
+	run := owningExtractionRun{
+		ID: state.DerivationID, ModelID: derivation.ModelID,
+		PromptVersion: derivation.PromptVersion, RecordedAt: state.RecordedAt,
+	}
 	graph := NewGraphRepository(pool)
-	observation, err := graph.CompleteObservation(ctx, ObservationInput{
-		ID: uuid.NewString(), SubjectMentionID: managerMention.ID, ObjectMentionID: employeeMention.ID,
-		Predicate: "interaction_signal", ValidStart: &validTime, Derivation: "model_extraction", EpistemicStatus: "inferred",
-	}, []string{storedSpan.ID})
+	canonicalObservation := testCanonicalObservation(t, run, uuid.NewString(), "", managerMention.ID, "", employeeMention.ID,
+		"interaction_signal", testCanonicalInstant(t, validTime), storedSpan.ID)
+	observation, _, err := graph.CompleteObservation(ctx, canonicalObservation, []knowledge.EvidenceID{knowledge.EvidenceID(storedSpan.ID)}, &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(canonicalObservation.ID()), Category: "delegation_autonomy", Direction: direction,
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Rationale: "Synthetic observable pair rationale.", Confidence: 0.5,
+	}, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}})
 	if err != nil {
 		t.Fatalf("complete pair observation: %v", err)
 	}
-	if _, err := graph.CompleteSignal(ctx, SignalInput{
-		ID: uuid.NewString(), ObservationID: observation.ID, Category: "delegation_autonomy", Direction: direction,
-		ExtractionModelID: "synthetic-model", PromptVersion: "extract-v1", Rationale: "Synthetic observable pair rationale.", Confidence: 0.5,
-	}, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}}); err != nil {
-		t.Fatalf("complete pair signal: %v", err)
+	if observation.ID() != canonicalObservation.ID() {
+		t.Fatalf("complete pair observation ID = %q, want %q", observation.ID(), canonicalObservation.ID())
+	}
+	if err := ingestion.CompleteVersion(ctx, ingest.Completion{
+		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal,
+	}); err != nil {
+		t.Fatalf("complete pair-analysis extraction run: %v", err)
 	}
 	return managerProposal.ID, employeeProposal.ID
 }
@@ -4904,55 +5896,439 @@ func TestStorageRetriesDoNotDuplicateGraphRecords(t *testing.T) {
 		t.Fatalf("repeated candidate ID = %q, want %q", secondCandidate.ID, firstCandidate.ID)
 	}
 
-	observationInput := ObservationInput{
-		ID:              uuid.NewString(),
-		SubjectEntityID: entity.ID,
-		Predicate:       "interacted_with",
-		Derivation:      "synthetic",
-		EpistemicStatus: "inferred",
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-graph-retry")))
+	observationInput := testCanonicalObservation(t, run, uuid.NewString(), entity.ID, "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	signalInput := SignalInput{
+		ID:                uuid.NewString(),
+		ObservationID:     string(observationInput.ID()),
+		Category:          "delegation_autonomy",
+		Direction:         "strengthening",
+		ExtractionModelID: run.ModelID,
+		PromptVersion:     run.PromptVersion,
+		Confidence:        0.8,
 	}
-	firstObservation, err := graph.CompleteObservation(ctx, observationInput, []string{spanID})
+	firstObservation, firstSignal, err := graph.CompleteObservation(ctx, observationInput, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, &signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
 	if err != nil {
 		t.Fatalf("complete observation: %v", err)
 	}
-	secondObservation, err := graph.CompleteObservation(ctx, observationInput, []string{spanID})
+	secondObservation, secondSignal, err := graph.CompleteObservation(ctx, observationInput, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, &signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
 	if err != nil {
 		t.Fatalf("complete repeated observation: %v", err)
 	}
-	if secondObservation.ID != firstObservation.ID {
-		t.Fatalf("repeated observation ID = %q, want %q", secondObservation.ID, firstObservation.ID)
+	if secondObservation.ID() != firstObservation.ID() {
+		t.Fatalf("repeated observation ID = %q, want %q", secondObservation.ID(), firstObservation.ID())
 	}
-
-	signalInput := SignalInput{
-		ID:                uuid.NewString(),
-		ObservationID:     firstObservation.ID,
-		Category:          "delegation_autonomy",
-		Direction:         "strengthening",
-		ExtractionModelID: "synthetic-model",
-		PromptVersion:     "synthetic-v1",
-		Confidence:        0.8,
-	}
-	firstSignal, err := graph.CompleteSignal(ctx, signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
-	if err != nil {
-		t.Fatalf("complete signal: %v", err)
-	}
-	secondSignal, err := graph.CompleteSignal(ctx, signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
-	if err != nil {
-		t.Fatalf("complete repeated signal: %v", err)
-	}
-	if secondSignal.ID != firstSignal.ID {
+	if firstSignal == nil || secondSignal == nil || secondSignal.ID != firstSignal.ID {
 		t.Fatalf("repeated signal ID = %q, want %q", secondSignal.ID, firstSignal.ID)
 	}
 	changedObservation := observationInput
-	changedObservation.Predicate = "different_interaction"
-	if _, err := graph.CompleteObservation(ctx, changedObservation, []string{spanID}); err == nil {
+	changedObservation = testCanonicalObservation(t, run, string(observationInput.ID()), entity.ID, "", "", "", "different_interaction", observation.UnknownTime(), spanID)
+	if _, _, err := graph.CompleteObservation(ctx, changedObservation, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, &signalInput, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}}); err == nil {
 		t.Fatal("changed observation payload with existing ID succeeded")
 	}
 	changedSignal := signalInput
 	changedSignal.Direction = "weakening"
-	if _, err := graph.CompleteSignal(ctx, changedSignal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}}); err == nil {
+	if _, _, err := graph.CompleteObservation(ctx, observationInput, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, &changedSignal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}}); err == nil {
 		t.Fatal("changed signal payload with existing ID succeeded")
 	}
+}
+
+func TestCompleteObservationAcceptsExactCanonicalRetry(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, spanID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-canonical-retry")))
+	value := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	signal := &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(value.ID()), Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Rationale: "Synthetic retry rationale.", Confidence: 0.8,
+	}
+	first, firstSignal, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, signal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
+	if err != nil {
+		t.Fatalf("complete canonical observation: %v", err)
+	}
+	second, secondSignal, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, signal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
+	if err != nil {
+		t.Fatalf("retry canonical observation: %v", err)
+	}
+	if second.ID() != first.ID() || firstSignal == nil || secondSignal == nil || secondSignal.ID != firstSignal.ID {
+		t.Fatalf("canonical retry = %#v/%#v, want identical completion", second, secondSignal)
+	}
+}
+
+func TestCompleteObservationCanonicalizesUUIDBoundFieldsForRetry(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	entities := NewEntityRepository(pool)
+
+	subjectEntity, err := entities.CreateEntity(ctx, EntityInput{
+		ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Uppercase Subject",
+	})
+	if err != nil {
+		t.Fatalf("create subject entity: %v", err)
+	}
+	objectEntity, err := entities.CreateEntity(ctx, EntityInput{
+		ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Uppercase Object",
+	})
+	if err != nil {
+		t.Fatalf("create object entity: %v", err)
+	}
+	subjectMentionID, originID := createSyntheticMentionAndSpan(t, pool)
+	objectMentionID, signalOnlyID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-uppercase-uuid-retry")))
+	uppercaseRun := run
+	uppercaseRun.ID = strings.ToUpper(run.ID)
+	observationID := strings.ToUpper(uuid.NewString())
+	value := testCanonicalObservation(
+		t,
+		uppercaseRun,
+		observationID,
+		strings.ToUpper(subjectEntity.ID),
+		strings.ToUpper(subjectMentionID),
+		strings.ToUpper(objectEntity.ID),
+		strings.ToUpper(objectMentionID),
+		"interacted_with",
+		observation.UnknownTime(),
+		strings.ToUpper(originID),
+		strings.ToUpper(signalOnlyID),
+	)
+	signalID := strings.ToUpper(uuid.NewString())
+	signal := &SignalInput{
+		ID: signalID, ObservationID: observationID, Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Rationale: "Synthetic uppercase UUID retry.", Confidence: 0.8,
+	}
+	origin := []knowledge.EvidenceID{knowledge.EvidenceID(strings.ToUpper(originID))}
+	signalEvidence := []SignalEvidenceInput{{EvidenceSpanID: strings.ToUpper(signalOnlyID), Role: "supporting"}}
+
+	first, firstSignal, err := graph.CompleteObservation(ctx, value, origin, signal, signalEvidence)
+	if err != nil {
+		t.Fatalf("complete uppercase UUID observation: %v", err)
+	}
+	second, secondSignal, err := graph.CompleteObservation(ctx, value, origin, signal, signalEvidence)
+	if err != nil {
+		t.Fatalf("retry uppercase UUID observation: %v", err)
+	}
+	if first.ID() != second.ID() || firstSignal == nil || secondSignal == nil || firstSignal.ID != secondSignal.ID {
+		t.Fatalf("uppercase UUID retry = %#v/%#v, want identical completion", second, secondSignal)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.observations WHERE id = $1`, observationID); got != 1 {
+		t.Fatalf("observation rows = %d, want 1", got)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, observationID); got != 1 {
+		t.Fatalf("observation evidence rows = %d, want 1", got)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, signalID); got != 1 {
+		t.Fatalf("signal rows = %d, want 1", got)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, signalID); got != 1 {
+		t.Fatalf("signal evidence rows = %d, want 1", got)
+	}
+}
+
+func TestCompleteObservationRejectsInadmissibleOwningRunWithoutGraphWrites(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, spanID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-inadmissible-owning-run")))
+	if _, err := pool.Exec(ctx, `UPDATE stacks.extraction_runs SET currently_admissible = false WHERE id = $1`, run.ID); err != nil {
+		t.Fatalf("mark synthetic run inadmissible: %v", err)
+	}
+	value := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	signal := &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(value.ID()), Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+	}
+	_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, signal, []SignalEvidenceInput{{EvidenceSpanID: spanID, Role: "supporting"}})
+	if !errors.Is(err, ErrObservationCompatibility) || strings.Contains(err.Error(), "synthetic") {
+		t.Fatalf("inadmissible run error = %v", err)
+	}
+	for _, testCase := range []struct {
+		name  string
+		query string
+		id    string
+	}{
+		{name: "observation", query: `SELECT count(*) FROM stacks.observations WHERE id = $1`, id: string(value.ID())},
+		{name: "observation_evidence", query: `SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, id: string(value.ID())},
+		{name: "signal", query: `SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, id: signal.ID},
+		{name: "signal_evidence", query: `SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, id: signal.ID},
+	} {
+		if got := countRows(t, pool, testCase.query, testCase.id); got != 0 {
+			t.Fatalf("%s writes = %d, want 0", testCase.name, got)
+		}
+	}
+}
+
+func TestCompleteObservationRejectsEveryDigestExcludedDifference(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-canonical-differences")))
+	_, originID := createSyntheticMentionAndSpan(t, pool)
+	_, signalOnlyID := createSyntheticMentionAndSpan(t, pool)
+	_, extraSignalID := createSyntheticMentionAndSpan(t, pool)
+
+	for _, testCase := range []struct {
+		name     string
+		complete func(t *testing.T, id, signalID string) error
+		want     error
+	}{
+		{
+			name: "private_origin",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(signalOnlyID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+				}, []SignalEvidenceInput{{EvidenceSpanID: originID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+		{
+			name: "signal_only_evidence",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID, extraSignalID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+				}, []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}, {EvidenceSpanID: extraSignalID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+		{
+			name: "signal_role",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+				}, []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+		{
+			name: "generic_confidence",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservationWithConfidence(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), 0.7, originID, signalOnlyID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+				}, []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+		{
+			name: "vertical_signal_confidence",
+			complete: func(t *testing.T, id, signalID string) error {
+				value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+				_, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, &SignalInput{
+					ID: signalID, ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.6,
+				}, []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}})
+				return err
+			},
+			want: ErrObservationConflict,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			id := uuid.NewString()
+			value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+			roles := []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}}
+			if testCase.name == "signal_role" {
+				value = testCanonicalObservationWithLinks(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), []observation.EvidenceLink{
+					{EvidenceID: knowledge.EvidenceID(originID), Role: observation.EvidenceSupporting},
+					{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting},
+					{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceContradicting},
+				}, nil)
+				roles = append(roles, SignalEvidenceInput{EvidenceSpanID: signalOnlyID, Role: "contradicting"})
+			}
+			signal := &SignalInput{ID: uuid.NewString(), ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8}
+			if _, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, signal, roles); err != nil {
+				t.Fatalf("seed canonical completion: %v", err)
+			}
+			err := testCase.complete(t, id, signal.ID)
+			if !errors.Is(err, testCase.want) {
+				t.Fatalf("difference error = %v, want %v", err, testCase.want)
+			}
+		})
+	}
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(t *testing.T, id string)
+		want   error
+	}{
+		{name: "recorded_at", mutate: func(t *testing.T, id string) {
+			if _, err := pool.Exec(ctx, `UPDATE stacks.observations SET recorded_at = recorded_at + interval '1 microsecond' WHERE id = $1`, id); err != nil {
+				t.Fatalf("mutate stored recorded_at: %v", err)
+			}
+		}, want: ErrObservationConflict},
+		{name: "stored_digest", mutate: func(t *testing.T, id string) {
+			digest := sha256.Sum256([]byte("stored-digest-" + id))
+			if _, err := pool.Exec(ctx, `UPDATE stacks.observations SET digest = $2 WHERE id = $1`, id, digest[:]); err != nil {
+				t.Fatalf("mutate stored digest: %v", err)
+			}
+		}, want: ErrObservationCompatibility},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			id := uuid.NewString()
+			value := testCanonicalObservation(t, run, id, "", "", "", "", testRetryPredicate(id), observation.UnknownTime(), originID, signalOnlyID)
+			signal := &SignalInput{ID: uuid.NewString(), ObservationID: id, Category: "delegation_autonomy", Direction: "strengthening", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8}
+			roles := []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}}
+			if _, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, signal, roles); err != nil {
+				t.Fatalf("seed canonical completion: %v", err)
+			}
+			testCase.mutate(t, id)
+			if _, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(originID)}, signal, roles); !errors.Is(err, testCase.want) {
+				t.Fatalf("stored difference error = %v, want %v", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestCompleteObservationRejectsDifferentIDWithSameDigest(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, spanID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-canonical-digest-conflict")))
+	first := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	if _, _, err := graph.CompleteObservation(ctx, first, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, nil, nil); err != nil {
+		t.Fatalf("complete first observation: %v", err)
+	}
+	second := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	_, _, err := graph.CompleteObservation(ctx, second, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, nil, nil)
+	var databaseError *pgconn.PgError
+	if !errors.Is(err, ErrObservationConflict) || !errors.As(err, &databaseError) || strings.Contains(err.Error(), databaseError.Message) {
+		t.Fatalf("same-digest error = %v, want ErrObservationConflict", err)
+	}
+}
+
+func TestCompleteObservationRejectsUnrepresentableCanonicalValueBeforeSQL(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, spanID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-unrepresentable-canonical")))
+	run.RecordedAt = run.RecordedAt.Add(time.Nanosecond)
+	value := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), spanID)
+	if _, _, err := graph.CompleteObservation(ctx, value, []knowledge.EvidenceID{knowledge.EvidenceID(spanID)}, nil, nil); !errors.Is(err, ErrObservationNotRepresentable) {
+		t.Fatalf("unrepresentable completion error = %v, want ErrObservationNotRepresentable", err)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.observations WHERE id = $1`, string(value.ID())); got != 0 {
+		t.Fatalf("unrepresentable observation rows = %d, want 0", got)
+	}
+}
+
+func TestCompleteObservationPreservesOriginRelativeSignalEvidence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, observationOnlyID := createSyntheticMentionAndSpan(t, pool)
+	_, signalOnlyID := createSyntheticMentionAndSpan(t, pool)
+	_, bothID := createSyntheticMentionAndSpan(t, pool)
+	_, contradictingOriginID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-origin-relative-signal")))
+	value := testCanonicalObservationWithLinks(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), []observation.EvidenceLink{
+		{EvidenceID: knowledge.EvidenceID(observationOnlyID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(bothID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(contradictingOriginID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(contradictingOriginID), Role: observation.EvidenceContradicting},
+	}, nil)
+	signal := &SignalInput{ID: uuid.NewString(), ObservationID: string(value.ID()), Category: "delegation_autonomy", Direction: "mixed", ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8}
+	if _, _, err := graph.CompleteObservation(ctx, value,
+		[]knowledge.EvidenceID{knowledge.EvidenceID(observationOnlyID), knowledge.EvidenceID(bothID), knowledge.EvidenceID(contradictingOriginID)}, signal,
+		[]SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}, {EvidenceSpanID: bothID, Role: "supporting"}, {EvidenceSpanID: contradictingOriginID, Role: "contradicting"}},
+	); err != nil {
+		t.Fatalf("complete origin-relative signal evidence: %v", err)
+	}
+	loaded, err := loadLegacyObservation(ctx, pool, string(value.ID()))
+	if err != nil {
+		t.Fatalf("load completed observation: %v", err)
+	}
+	wantPairs := []observation.EvidenceLink{
+		{EvidenceID: knowledge.EvidenceID(observationOnlyID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(bothID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(contradictingOriginID), Role: observation.EvidenceSupporting},
+		{EvidenceID: knowledge.EvidenceID(contradictingOriginID), Role: observation.EvidenceContradicting},
+	}
+	if !sameEvidenceLinks(loaded.Observation.EvidenceLinks(), wantPairs) {
+		t.Fatalf("canonical evidence = %#v, want %#v", loaded.Observation.EvidenceLinks(), wantPairs)
+	}
+	wantOrigin := []knowledge.EvidenceID{knowledge.EvidenceID(observationOnlyID), knowledge.EvidenceID(bothID), knowledge.EvidenceID(contradictingOriginID)}
+	sort.Slice(wantOrigin, func(left, right int) bool { return wantOrigin[left] < wantOrigin[right] })
+	if !sameEvidenceIDs(loaded.Compatibility.observationEvidenceOrigin, wantOrigin) {
+		t.Fatalf("private origin = %#v, want %#v", loaded.Compatibility.observationEvidenceOrigin, wantOrigin)
+	}
+	wantRoles := []SignalEvidenceInput{{EvidenceSpanID: bothID, Role: "supporting"}, {EvidenceSpanID: contradictingOriginID, Role: "contradicting"}, {EvidenceSpanID: signalOnlyID, Role: "supporting"}}
+	if loaded.Signal == nil || !sameSignalEvidence(loaded.Signal.Evidence, wantRoles) {
+		t.Fatalf("signal evidence = %#v, want %#v", loaded.Signal, wantRoles)
+	}
+}
+
+func TestCompleteObservationPreservesExplicitEmptyOriginForSignalOnlyEvidence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, signalOnlyID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-explicit-empty-origin")))
+	value := testCanonicalObservationWithLinks(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), []observation.EvidenceLink{
+		{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting},
+	}, nil)
+	signal := &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(value.ID()), Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+	}
+	signalEvidence := []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}}
+	origin := []knowledge.EvidenceID{}
+
+	if _, _, err := graph.CompleteObservation(ctx, value, origin, signal, signalEvidence); err != nil {
+		t.Fatalf("complete signal-only observation: %v", err)
+	}
+	if _, _, err := graph.CompleteObservation(ctx, value, origin, signal, signalEvidence); err != nil {
+		t.Fatalf("retry signal-only observation: %v", err)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, string(value.ID())); got != 0 {
+		t.Fatalf("observation evidence rows = %d, want 0", got)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, signal.ID); got != 1 {
+		t.Fatalf("signal evidence rows = %d, want 1", got)
+	}
+	loaded, err := loadLegacyObservation(ctx, pool, string(value.ID()))
+	if err != nil {
+		t.Fatalf("load signal-only observation: %v", err)
+	}
+	if loaded.Compatibility.observationEvidenceOrigin == nil || len(loaded.Compatibility.observationEvidenceOrigin) != 0 {
+		t.Fatalf("private origin = %#v, want explicit empty set", loaded.Compatibility.observationEvidenceOrigin)
+	}
+	wantLinks := []observation.EvidenceLink{{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting}}
+	if !sameEvidenceLinks(loaded.Observation.EvidenceLinks(), wantLinks) {
+		t.Fatalf("canonical evidence = %#v, want signal-only link %#v", loaded.Observation.EvidenceLinks(), wantLinks)
+	}
+}
+
+func sameSignalEvidence(left, right []SignalEvidenceInput) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[SignalEvidenceInput]int, len(left))
+	for _, value := range left {
+		counts[value]++
+	}
+	for _, value := range right {
+		if counts[value] == 0 {
+			return false
+		}
+		counts[value]--
+	}
+	return true
+}
+
+func testRetryPredicate(id string) string {
+	return "interacted_with_" + id
 }
 
 func TestPutEvidenceSpanRejectsImmutableQuoteConflict(t *testing.T) {
@@ -4980,7 +6356,7 @@ func TestPutEvidenceSpanRejectsImmutableQuoteConflict(t *testing.T) {
 	}
 }
 
-func TestCompleteSignalRejectsNotesOnlyEvidence(t *testing.T) {
+func TestCompleteObservationRejectsNotesOnlySignalEvidence(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
 	version := testDocumentVersionWithRole(t, testIdentifier("document-notes-signal"), source.TabRoleGeminiNotes)
@@ -4999,18 +6375,29 @@ func TestCompleteSignalRejectsNotesOnlyEvidence(t *testing.T) {
 		t.Fatalf("put notes evidence span: %v", err)
 	}
 	graph := NewGraphRepository(pool)
-	observation, err := graph.CompleteObservation(ctx, ObservationInput{
-		ID: uuid.NewString(), Predicate: "interacted_with", Derivation: "synthetic", EpistemicStatus: "inferred",
-	}, []string{storedSpan.ID})
-	if err != nil {
-		t.Fatalf("complete notes observation: %v", err)
+	run := testOwningExtractionRun(t, pool, version)
+	canonicalObservation := testCanonicalObservation(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), storedSpan.ID)
+	signal := &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(canonicalObservation.ID()), Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
 	}
-	_, err = graph.CompleteSignal(ctx, SignalInput{
-		ID: uuid.NewString(), ObservationID: observation.ID, Category: "delegation_autonomy", Direction: "strengthening",
-		ExtractionModelID: "synthetic-model", PromptVersion: "synthetic-v1", Confidence: 0.8,
-	}, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}})
+	_, _, err = graph.CompleteObservation(ctx, canonicalObservation, []knowledge.EvidenceID{knowledge.EvidenceID(storedSpan.ID)}, signal, []SignalEvidenceInput{{EvidenceSpanID: storedSpan.ID, Role: "supporting"}})
 	if err == nil {
 		t.Fatal("notes-only signal completion succeeded")
+	}
+	for _, testCase := range []struct {
+		name  string
+		query string
+		id    string
+	}{
+		{name: "observation", query: `SELECT count(*) FROM stacks.observations WHERE id = $1`, id: string(canonicalObservation.ID())},
+		{name: "observation_evidence", query: `SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, id: string(canonicalObservation.ID())},
+		{name: "signal", query: `SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, id: signal.ID},
+		{name: "signal_evidence", query: `SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, id: signal.ID},
+	} {
+		if got := countRows(t, pool, testCase.query, testCase.id); got != 0 {
+			t.Fatalf("failed notes-only completion left %s rows = %d, want 0", testCase.name, got)
+		}
 	}
 }
 
@@ -5536,6 +6923,453 @@ func createSyntheticMentionAndSpan(t *testing.T, pool *pgxpool.Pool) (string, st
 	return mention.ID, storedSpan.ID
 }
 
+type canonicalIngestionFixture struct {
+	pool       *pgxpool.Pool
+	repository *IngestionRepository
+	state      ingest.VersionState
+	derivation ingest.DerivationIdentity
+	version    knowledge.DocumentVersion
+	evidence   []ingest.EvidenceRecord
+	mentions   []ingest.MentionRecord
+	draft      ingest.ObservationDraft
+	signal     ingest.SignalRecord
+}
+
+func newCanonicalIngestionFixture(t *testing.T, pool *pgxpool.Pool, label string) canonicalIngestionFixture {
+	t.Helper()
+	providerDocumentID := testIdentifier("canonical-ingestion-" + label)
+	transcript := "Synthetic Manager assigned Synthetic Employee."
+	version := testIngestionDocumentVersion(t, providerDocumentID, "synthetic-version-1", transcript)
+	derivation := testExtractionDerivation(t, version)
+	repository := NewIngestionRepository(pool)
+	state, err := repository.PrepareVersion(
+		context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare canonical ingestion fixture: %v", err)
+	}
+	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0,
+		EndOffset: len(transcript), Quote: transcript,
+	})
+	if err != nil {
+		t.Fatalf("new canonical ingestion evidence: %v", err)
+	}
+	predicate, err := observation.NewPredicate("interaction_signal")
+	if err != nil {
+		t.Fatalf("new canonical ingestion predicate: %v", err)
+	}
+	validStart := time.Date(2026, time.July, 24, 0, 0, 0, 0, time.UTC)
+	validTime, err := observation.Since(validStart)
+	if err != nil {
+		t.Fatalf("new canonical ingestion valid time: %v", err)
+	}
+	sourceConfidence, err := observation.NewUnitIntervalConfidence(0.8)
+	if err != nil {
+		t.Fatalf("new canonical ingestion source confidence: %v", err)
+	}
+	observationID := observation.ObservationID(uuid.NewString())
+	return canonicalIngestionFixture{
+		pool: pool, repository: repository, state: state, derivation: derivation, version: version,
+		evidence: []ingest.EvidenceRecord{{Key: "statement", Span: span}},
+		mentions: []ingest.MentionRecord{
+			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
+			{Key: "employee", EvidenceKey: "statement", Surface: "Synthetic Employee", NormalizedName: "synthetic employee", Role: "reference"},
+		},
+		draft: ingest.ObservationDraft{
+			ID: observationID, SubjectMentionKey: "manager", ObjectMentionKey: "employee",
+			Predicate: predicate, ValidTime: validTime, RecordedAt: state.RecordedAt,
+			EvidenceKeys: []string{"statement"}, SourceConfidence: sourceConfidence,
+		},
+		signal: ingest.SignalRecord{
+			ID: uuid.NewString(), ObservationID: string(observationID),
+			Category: "delegation_autonomy", Direction: "strengthening",
+			ExtractionModelID: derivation.ModelID, PromptVersion: derivation.PromptVersion,
+			Rationale: "Synthetic source-grounded signal.", Confidence: 0.8,
+			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "statement", Role: "supporting"}},
+		},
+	}
+}
+
+func newCompletedRetryFixture(t *testing.T, pool *pgxpool.Pool, label string) canonicalIngestionFixture {
+	t.Helper()
+	fixture := newCanonicalIngestionFixture(t, pool, label)
+	transcript := fixture.version.Sections()[0].Text()
+	employeeStart := strings.Index(transcript, "Synthetic Employee")
+	employeeEnd := employeeStart + len("Synthetic Employee")
+	employeeSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: fixture.version, SectionID: "tab-synthetic",
+		StartOffset: employeeStart, EndOffset: employeeEnd, Quote: transcript[employeeStart:employeeEnd],
+	})
+	if err != nil {
+		t.Fatalf("new completed-retry employee evidence: %v", err)
+	}
+	fixture.evidence = append(fixture.evidence, ingest.EvidenceRecord{Key: "employee-name", Span: employeeSpan})
+	managerStart := strings.Index(transcript, "Synthetic Manager")
+	managerEnd := managerStart + len("Synthetic Manager")
+	managerSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+		Document: fixture.version, SectionID: "tab-synthetic",
+		StartOffset: managerStart, EndOffset: managerEnd, Quote: transcript[managerStart:managerEnd],
+	})
+	if err != nil {
+		t.Fatalf("new completed-retry manager evidence: %v", err)
+	}
+	fixture.evidence = append(fixture.evidence, ingest.EvidenceRecord{Key: "manager-name", Span: managerSpan})
+
+	resolvedEntityID := uuid.NewString()
+	if _, err := NewEntityRepository(pool).CreateEntity(context.Background(), EntityInput{
+		ID: resolvedEntityID, Kind: "person", DisplayName: "Synthetic Completed Retry Person",
+	}); err != nil {
+		t.Fatalf("create completed-retry resolution entity: %v", err)
+	}
+	fixture.mentions[0].Resolution = entity.Resolution{
+		EntityID: resolvedEntityID, AutoResolved: true,
+		Candidates: []entity.Candidate{{
+			EntityID: resolvedEntityID, Confidence: 0.9, Reason: "exact_synthetic_name",
+		}},
+	}
+	return fixture
+}
+
+func completedRetryResolutionState(t *testing.T, fixture canonicalIngestionFixture) (string, string, string) {
+	t.Helper()
+	var mentionID, proposalID, decisionID string
+	if err := fixture.pool.QueryRow(context.Background(), `
+		SELECT mention.id::text, proposal.id::text, decision.id::text
+		FROM stacks.resolution_proposals AS proposal
+		JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+		JOIN stacks.resolution_decisions AS decision ON decision.proposal_id = proposal.id
+		WHERE mention.extraction_run_id = $1
+		  AND mention.surface = $2
+		  AND decision.supersedes_id IS NULL`,
+		fixture.state.DerivationID, fixture.mentions[0].Surface,
+	).Scan(&mentionID, &proposalID, &decisionID); err != nil {
+		t.Fatalf("load completed-retry resolution state: %v", err)
+	}
+	return mentionID, proposalID, decisionID
+}
+
+type completedRetryWriteSetSnapshot map[string]string
+
+func snapshotCompletedRetryWriteSet(t *testing.T, fixture canonicalIngestionFixture) completedRetryWriteSetSnapshot {
+	t.Helper()
+	queries := map[string]string{
+		"evidence": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT evidence.xmin::text AS row_version, evidence.*,
+				       encode(tab.content_digest, 'hex') AS tab_content_digest
+				FROM stacks.evidence_spans AS evidence
+				JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
+				JOIN stacks.document_versions AS version ON version.id = tab.document_version_id
+				WHERE version.id = $1
+				ORDER BY evidence.id
+			) AS row_data`,
+		"tabs": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.display_order, row_data.id)::text, '[]')
+			FROM (
+				SELECT tab.xmin::text AS row_version, tab.*
+				FROM stacks.document_tabs AS tab
+				WHERE tab.document_version_id = $1
+				ORDER BY tab.display_order, tab.id
+			) AS row_data`,
+		"mentions": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT mention.xmin::text AS row_version, mention.*
+				FROM stacks.mentions AS mention
+				WHERE mention.extraction_run_id = $1
+				ORDER BY mention.id
+			) AS row_data`,
+		"proposals": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT proposal.xmin::text AS row_version, proposal.*
+				FROM stacks.resolution_proposals AS proposal
+				JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+				WHERE mention.extraction_run_id = $1
+				ORDER BY proposal.id
+			) AS row_data`,
+		"candidates": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT candidate.xmin::text AS row_version, candidate.*
+				FROM stacks.resolution_candidates AS candidate
+				JOIN stacks.resolution_proposals AS proposal ON proposal.id = candidate.proposal_id
+				JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+				WHERE mention.extraction_run_id = $1
+				ORDER BY candidate.id
+			) AS row_data`,
+		"decisions": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT decision.xmin::text AS row_version, decision.*
+				FROM stacks.resolution_decisions AS decision
+				JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+				JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+				WHERE mention.extraction_run_id = $1
+				ORDER BY decision.id
+			) AS row_data`,
+		"aliases": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT assertion.xmin::text AS row_version, assertion.*
+				FROM stacks.entity_alias_assertions AS assertion
+				JOIN stacks.resolution_decisions AS decision ON decision.id = assertion.decision_id
+				JOIN stacks.resolution_proposals AS proposal ON proposal.id = decision.proposal_id
+				JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+				WHERE mention.extraction_run_id = $1
+				ORDER BY assertion.id
+			) AS row_data`,
+		"observations": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT value.xmin::text AS row_version, value.*
+				FROM stacks.observations AS value
+				WHERE value.extraction_run_id = $1
+				ORDER BY value.id
+			) AS row_data`,
+		"observation_evidence": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.observation_id, row_data.evidence_span_id)::text, '[]')
+			FROM (
+				SELECT link.xmin::text AS row_version, link.*
+				FROM stacks.observation_evidence AS link
+				JOIN stacks.observations AS value ON value.id = link.observation_id
+				WHERE value.extraction_run_id = $1
+				ORDER BY link.observation_id, link.evidence_span_id
+			) AS row_data`,
+		"signals": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.id)::text, '[]')
+			FROM (
+				SELECT signal.xmin::text AS row_version, signal.*
+				FROM stacks.interaction_signals AS signal
+				JOIN stacks.observations AS value ON value.id = signal.observation_id
+				WHERE value.extraction_run_id = $1
+				ORDER BY signal.id
+			) AS row_data`,
+		"signal_evidence": `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY row_data.signal_id, row_data.evidence_span_id, row_data.role)::text, '[]')
+			FROM (
+				SELECT link.xmin::text AS row_version, link.*
+				FROM stacks.signal_evidence AS link
+				JOIN stacks.interaction_signals AS signal ON signal.id = link.signal_id
+				JOIN stacks.observations AS value ON value.id = signal.observation_id
+				WHERE value.extraction_run_id = $1
+				ORDER BY link.signal_id, link.evidence_span_id, link.role
+			) AS row_data`,
+		"run": `
+			SELECT to_jsonb(row_data)::text
+			FROM (
+				SELECT run.xmin::text AS row_version, run.*
+				FROM stacks.extraction_runs AS run
+				WHERE run.id = $1
+			) AS row_data`,
+		"version": `
+			SELECT to_jsonb(row_data)::text
+			FROM (
+				SELECT version.xmin::text AS version_row_version, version.*,
+				       source.xmin::text AS source_row_version,
+				       source.current_document_version_id
+				FROM stacks.document_versions AS version
+				JOIN stacks.source_documents AS source ON source.id = version.source_document_id
+				WHERE version.id = $1
+			) AS row_data`,
+	}
+	snapshot := make(completedRetryWriteSetSnapshot, len(queries))
+	for name, query := range queries {
+		var value string
+		identifier := fixture.state.DerivationID
+		if name == "evidence" || name == "tabs" || name == "version" {
+			identifier = fixture.state.ID
+		}
+		if err := fixture.pool.QueryRow(context.Background(), query, identifier).Scan(&value); err != nil {
+			t.Fatalf("snapshot completed-retry %s: %v", name, err)
+		}
+		snapshot[name] = value
+	}
+	return snapshot
+}
+
+func (fixture canonicalIngestionFixture) complete(t *testing.T) {
+	t.Helper()
+	if err := fixture.repository.CompleteVersion(context.Background(), fixture.completion()); err != nil {
+		t.Fatalf("complete canonical ingestion fixture: %v", err)
+	}
+}
+
+func (fixture canonicalIngestionFixture) completion() ingest.Completion {
+	return ingest.Completion{
+		VersionID: fixture.state.ID, DerivationID: fixture.state.DerivationID, LeaseOwner: fixture.state.LeaseOwner,
+		DataMode: modelpolicy.DataModePersonal, Evidence: fixture.evidence, Mentions: fixture.mentions,
+		Observations: []ingest.ObservationDraft{fixture.draft}, Signals: []ingest.SignalRecord{fixture.signal},
+	}
+}
+
+type canonicalIngestionCompletionSnapshot struct {
+	evidenceRows, mentionRows, proposalRows, observationRows, signalRows int
+	observationEvidenceRows, signalEvidenceRows                          int
+	processingStatus                                                     string
+	completedAt, leaseExpiresAt                                          *time.Time
+	completedByOwner, leaseOwner, currentVersionID                       *string
+	currentlyAdmissible                                                  bool
+}
+
+func snapshotCanonicalIngestionCompletion(t *testing.T, fixture canonicalIngestionFixture) canonicalIngestionCompletionSnapshot {
+	t.Helper()
+	ctx := context.Background()
+	snapshot := canonicalIngestionCompletionSnapshot{
+		evidenceRows: countRows(t, fixture.pool, `
+			SELECT count(*)
+			FROM stacks.evidence_spans AS evidence
+			JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
+			WHERE tab.document_version_id = $1`, fixture.state.ID),
+		mentionRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.mentions WHERE extraction_run_id = $1`, fixture.state.DerivationID),
+		proposalRows: countRows(t, fixture.pool, `
+			SELECT count(*)
+			FROM stacks.resolution_proposals AS proposal
+			JOIN stacks.mentions AS mention ON mention.id = proposal.mention_id
+			WHERE mention.extraction_run_id = $1`, fixture.state.DerivationID),
+		observationRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.observations WHERE id = $1`, string(fixture.draft.ID)),
+		signalRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.interaction_signals WHERE id = $1`, fixture.signal.ID),
+		observationEvidenceRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, string(fixture.draft.ID)),
+		signalEvidenceRows: countRows(t, fixture.pool,
+			`SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, fixture.signal.ID),
+	}
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT processing_status, completed_at, completed_by_owner, lease_owner, lease_expires_at,
+		       currently_admissible
+		FROM stacks.extraction_runs
+		WHERE id = $1`, fixture.state.DerivationID).Scan(
+		&snapshot.processingStatus, &snapshot.completedAt, &snapshot.completedByOwner,
+		&snapshot.leaseOwner, &snapshot.leaseExpiresAt, &snapshot.currentlyAdmissible,
+	); err != nil {
+		t.Fatalf("snapshot canonical ingestion run: %v", err)
+	}
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT source.current_document_version_id::text
+		FROM stacks.source_documents AS source
+		JOIN stacks.document_versions AS version ON version.source_document_id = source.id
+		WHERE version.id = $1`, fixture.state.ID).Scan(&snapshot.currentVersionID); err != nil {
+		t.Fatalf("snapshot canonical current document pointer: %v", err)
+	}
+	return snapshot
+}
+
+func prepareIngestionEvidence(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	version knowledge.DocumentVersion,
+	inputs []struct {
+		key   string
+		quote string
+	},
+) (ingest.VersionState, []ingest.EvidenceRecord) {
+	t.Helper()
+	repository := NewIngestionRepository(pool)
+	state, err := repository.PrepareVersion(
+		context.Background(), version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare ingestion evidence fixture: %v", err)
+	}
+	transcript := version.Sections()[0].Text()
+	records := make([]ingest.EvidenceRecord, 0, len(inputs))
+	for _, input := range inputs {
+		start := strings.Index(transcript, input.quote)
+		if start < 0 {
+			t.Fatalf("synthetic evidence quote %q is absent", input.key)
+		}
+		span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
+			Document: version, SectionID: "tab-synthetic", StartOffset: start,
+			EndOffset: start + len(input.quote), Quote: input.quote,
+		})
+		if err != nil {
+			t.Fatalf("new synthetic ingestion evidence %q: %v", input.key, err)
+		}
+		records = append(records, ingest.EvidenceRecord{Key: input.key, Span: span})
+	}
+	return state, records
+}
+
+func ingestionEvidenceID(t *testing.T, pool *pgxpool.Pool, derivationID, quote string) string {
+	t.Helper()
+	var evidenceID string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT evidence.id::text
+		FROM stacks.evidence_spans AS evidence
+		JOIN stacks.document_tabs AS tab ON tab.id = evidence.document_tab_id
+		JOIN stacks.extraction_runs AS run ON run.document_version_id = tab.document_version_id
+		WHERE run.id = $1 AND evidence.quote = $2`, derivationID, quote).Scan(&evidenceID); err != nil {
+		t.Fatalf("load synthetic ingestion evidence ID: %v", err)
+	}
+	return evidenceID
+}
+
+func testIngestionDocumentVersion(
+	t *testing.T,
+	providerDocumentID string,
+	providerVersion string,
+	transcript string,
+) knowledge.DocumentVersion {
+	t.Helper()
+	recordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 0, time.UTC)
+	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider:           "synthetic-drive",
+		ProviderDocumentID: providerDocumentID,
+		Title:              "Synthetic ingestion meeting",
+		Locator:            "https://docs.example.invalid/document/" + providerDocumentID,
+		ProviderVersion:    providerVersion,
+		ProviderRevision:   providerVersion + "-revision",
+		ModifiedAt:         recordedAt,
+		RecordedAt:         recordedAt,
+		Sections: testEvidenceSections(t, []source.Tab{{
+			ID: "tab-synthetic", Title: "Synthetic Transcript", Order: 0,
+			Role: source.TabRoleTranscript, Text: transcript,
+		}}),
+	})
+	if err != nil {
+		t.Fatalf("new synthetic ingestion document version: %v", err)
+	}
+	return version
+}
+
+func testMultiSectionIngestionVersion(t *testing.T, label string, orders ...int) knowledge.DocumentVersion {
+	t.Helper()
+	if len(orders) != 2 {
+		t.Fatalf("multi-section test orders = %v, want exactly two", orders)
+	}
+	recordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 0, time.UTC)
+	providerDocumentID := testIdentifier("multi-section-" + label)
+	version, err := knowledge.NewDocumentVersion(knowledge.DocumentVersionInput{
+		Provider:           "synthetic-drive",
+		ProviderDocumentID: providerDocumentID,
+		Title:              "Synthetic multi-section meeting",
+		Locator:            "https://docs.example.invalid/document/" + providerDocumentID,
+		ProviderVersion:    "synthetic-version-1",
+		ProviderRevision:   "synthetic-version-1-revision",
+		ModifiedAt:         recordedAt,
+		RecordedAt:         recordedAt,
+		Sections: testEvidenceSections(t, []source.Tab{
+			{
+				ID: "tab-synthetic-a", Title: "Synthetic Transcript A", Order: orders[0],
+				Role: source.TabRoleTranscript, Text: "Synthetic first section.",
+			},
+			{
+				ID: "tab-synthetic-b", Title: "Synthetic Transcript B", Order: orders[1],
+				Role: source.TabRoleTranscript, Text: "Synthetic second section.",
+			},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("new multi-section ingestion version: %v", err)
+	}
+	return version
+}
+
 func testIdentifier(prefix string) string {
 	return prefix + "-" + uuid.NewString()
 }
@@ -5546,6 +7380,117 @@ func testDocumentVersion(t *testing.T, providerDocumentID string) knowledge.Docu
 
 func testExtractionDerivation(t *testing.T, version knowledge.DocumentVersion) ingest.DerivationIdentity {
 	return testExtractionDerivationForProvider(t, version, modelpolicy.ProviderBedrock)
+}
+
+func testOwningExtractionRun(t *testing.T, pool *pgxpool.Pool, version knowledge.DocumentVersion) owningExtractionRun {
+	t.Helper()
+	state, err := NewIngestionRepository(pool).PrepareVersion(
+		context.Background(), version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("prepare synthetic extraction run: %v", err)
+	}
+	var run owningExtractionRun
+	if err := pool.QueryRow(context.Background(), `
+		SELECT id::text, model_id, prompt_version, recorded_at
+		FROM stacks.extraction_runs
+		WHERE id = $1`, state.DerivationID).Scan(&run.ID, &run.ModelID, &run.PromptVersion, &run.RecordedAt); err != nil {
+		t.Fatalf("load synthetic extraction run: %v", err)
+	}
+	return run
+}
+
+func testCanonicalObservation(
+	t *testing.T,
+	run owningExtractionRun,
+	id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID string,
+	predicate string,
+	validTime observation.TemporalExtent,
+	evidenceIDs ...string,
+) observation.Observation {
+	t.Helper()
+	links := make([]observation.EvidenceLink, len(evidenceIDs))
+	for index, evidenceID := range evidenceIDs {
+		links[index] = observation.EvidenceLink{EvidenceID: knowledge.EvidenceID(evidenceID), Role: observation.EvidenceSupporting}
+	}
+	return testCanonicalObservationWithLinks(t, run, id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID, predicate, validTime, links, nil)
+}
+
+func testCanonicalObservationWithConfidence(
+	t *testing.T,
+	run owningExtractionRun,
+	id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID string,
+	predicate string,
+	validTime observation.TemporalExtent,
+	confidence float64,
+	evidenceIDs ...string,
+) observation.Observation {
+	t.Helper()
+	legacyConfidence, err := observation.NewLegacyConfidence(confidence)
+	if err != nil {
+		t.Fatalf("new legacy confidence: %v", err)
+	}
+	links := make([]observation.EvidenceLink, len(evidenceIDs))
+	for index, evidenceID := range evidenceIDs {
+		links[index] = observation.EvidenceLink{EvidenceID: knowledge.EvidenceID(evidenceID), Role: observation.EvidenceSupporting}
+	}
+	return testCanonicalObservationWithLinks(t, run, id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID, predicate, validTime, links, &legacyConfidence)
+}
+
+func testCanonicalObservationWithLinks(
+	t *testing.T,
+	run owningExtractionRun,
+	id, subjectEntityID, subjectMentionID, objectEntityID, objectMentionID string,
+	predicate string,
+	validTime observation.TemporalExtent,
+	links []observation.EvidenceLink,
+	confidence *observation.Confidence,
+) observation.Observation {
+	t.Helper()
+	subject := testCanonicalTerm(t, subjectEntityID, subjectMentionID)
+	object := testCanonicalTerm(t, objectEntityID, objectMentionID)
+	value, err := observation.NewObservation(observation.ObservationInput{
+		ID:        observation.ObservationID(id),
+		Statement: observation.Statement{Subject: subject, Predicate: observation.Predicate(predicate), Object: object},
+		ValidTime: validTime, RecordedAt: run.RecordedAt, Evidence: links,
+		Derivation: observation.Derivation{
+			Method: "synthetic", Version: run.PromptVersion, RunID: run.ID, Model: run.ModelID, PromptVersion: run.PromptVersion,
+		},
+		Status: observation.StatusInferred, Confidence: confidence,
+	})
+	if err != nil {
+		t.Fatalf("new canonical observation: %v", err)
+	}
+	return value
+}
+
+func testCanonicalTerm(t *testing.T, entityID, mentionID string) observation.Term {
+	t.Helper()
+	var (
+		term observation.Term
+		err  error
+	)
+	switch {
+	case entityID != "":
+		term, err = observation.NewEntityTerm(entityID, mentionID)
+	case mentionID != "":
+		term, err = observation.NewMentionTerm(mentionID)
+	default:
+		return observation.AbsentTerm()
+	}
+	if err != nil {
+		t.Fatalf("new canonical term: %v", err)
+	}
+	return term
+}
+
+func testCanonicalInstant(t *testing.T, value time.Time) observation.TemporalExtent {
+	t.Helper()
+	instant, err := observation.AtTime(value)
+	if err != nil {
+		t.Fatalf("new canonical instant: %v", err)
+	}
+	return instant
 }
 
 func testExtractionDerivationForProvider(t *testing.T, version knowledge.DocumentVersion, provider modelpolicy.Provider) ingest.DerivationIdentity {

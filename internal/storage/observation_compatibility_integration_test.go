@@ -8,6 +8,7 @@ import (
 	"time"
 
 	knowledge "github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -27,18 +28,10 @@ var legacyTermShapes = []legacyTermShape{
 	{name: "entity_with_grounding_mention", entityID: true, mentionID: true},
 }
 
-type legacyObservationProjection struct {
-	extractionRunID  string
-	recordedAt       time.Time
-	derivation       string
-	modelID          string
-	promptVersion    string
-	supportingIDs    []string
-	contradictingIDs []string
-}
-
 type legacyObservationFixture struct {
 	extractionRunID  string
+	runModelID       string
+	runPromptVersion string
 	subjectEntityID  string
 	objectEntityID   string
 	subjectMentionID string
@@ -65,20 +58,12 @@ func TestLegacyObservationCompatibilityShapes(t *testing.T) {
 						epistemicStatus: "observed", digestLabel: observationID,
 					})
 
-					var storedSubjectEntityID, storedObjectEntityID, storedSubjectMentionID, storedObjectMentionID *string
-					if err := pool.QueryRow(ctx, `
-						SELECT subject_entity_id::text, object_entity_id::text,
-						       subject_mention_id::text, object_mention_id::text
-						FROM stacks.observations
-						WHERE id = $1`, observationID).Scan(
-						&storedSubjectEntityID, &storedObjectEntityID, &storedSubjectMentionID, &storedObjectMentionID,
-					); err != nil {
-						t.Fatalf("read legacy observation references: %v", err)
+					decoded, err := loadLegacyObservation(ctx, pool, observationID)
+					if err != nil {
+						t.Fatalf("load legacy reference shape: %v", err)
 					}
-					assertLegacyNullableReference(t, "subject entity", storedSubjectEntityID, subjectEntityID)
-					assertLegacyNullableReference(t, "object entity", storedObjectEntityID, objectEntityID)
-					assertLegacyNullableReference(t, "subject mention", storedSubjectMentionID, subjectMentionID)
-					assertLegacyNullableReference(t, "object mention", storedObjectMentionID, objectMentionID)
+					assertLoadedLegacyTerm(t, "subject", decoded.Observation.Statement().Subject, subject, fixture.subjectEntityID, fixture.subjectMentionID)
+					assertLoadedLegacyTerm(t, "object", decoded.Observation.Statement().Object, object, fixture.objectEntityID, fixture.objectMentionID)
 				})
 			}
 		}
@@ -122,6 +107,30 @@ func TestLegacyObservationCompatibilityShapes(t *testing.T) {
 							epistemicStatus: status, confidence: confidence,
 							validStart: temporalCase.start, validEnd: temporalCase.end, digestLabel: observationID,
 						})
+						decoded, err := loadLegacyObservation(ctx, pool, observationID)
+						if err != nil {
+							t.Fatalf("load legacy temporal shape: %v", err)
+						}
+						if decoded.Observation.Status() != observation.EpistemicStatus(status) {
+							t.Fatalf("canonical status = %q, want %q", decoded.Observation.Status(), status)
+						}
+						if confidence == nil {
+							if _, ok := decoded.Observation.Confidence(); ok {
+								t.Fatalf("canonical confidence = present, want absent")
+							}
+						} else if got, ok := decoded.Observation.Confidence(); !ok || got.Value() != *confidence {
+							t.Fatalf("canonical confidence = %v/%v, want %v", got, ok, *confidence)
+						}
+						wantKind := observation.TemporalUnknown
+						switch temporalCase.name {
+						case "start_only", "increasing_bounds":
+							wantKind = observation.TemporalInterval
+						case "equal_bounds":
+							wantKind = observation.TemporalInstant
+						}
+						if decoded.Observation.ValidTime().Kind() != wantKind {
+							t.Fatalf("canonical valid time kind = %v, want %v", decoded.Observation.ValidTime().Kind(), wantKind)
+						}
 					})
 				}
 			}
@@ -174,8 +183,22 @@ func TestLegacyObservationCompatibilityShapes(t *testing.T) {
 			VALUES ($1, $2)`, observationID, fixture.evidenceSpanID); err != nil {
 			t.Fatalf("link legacy observation evidence: %v", err)
 		}
+		updateLegacyObservationDigest(t, ctx, pool, observationID, []knowledge.EvidenceID{knowledge.EvidenceID(fixture.evidenceSpanID)})
 
 		signalID := uuid.NewString()
+		signalInput := SignalInput{
+			ID: signalID, ObservationID: observationID, Category: "delegation_autonomy", Direction: "weakening",
+			ExtractionModelID: "synthetic-compatibility-model", PromptVersion: "compatibility-v1",
+			Rationale: "Synthetic source-grounded rationale.", Confidence: 0.75,
+		}
+		signalEvidence := []SignalEvidenceInput{
+			{EvidenceSpanID: fixture.evidenceSpanID, Role: "supporting"},
+			{EvidenceSpanID: fixture.evidenceSpanID, Role: "contradicting"},
+		}
+		signalDigest, err := ComputeSignalDigest(signalInput, signalEvidence)
+		if err != nil {
+			t.Fatalf("compute compatibility signal digest: %v", err)
+		}
 		transaction, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatalf("start legacy signal transaction: %v", err)
@@ -186,7 +209,7 @@ func TestLegacyObservationCompatibilityShapes(t *testing.T) {
 				(id, observation_id, category, direction, extraction_model_id, prompt_version, rationale, confidence, digest)
 			VALUES ($1, $2, 'delegation_autonomy', 'weakening', 'synthetic-compatibility-model',
 			        'compatibility-v1', 'Synthetic source-grounded rationale.', 0.75, $3)`,
-			signalID, observationID, legacyObservationDigest(signalID)); err != nil {
+			signalID, observationID, signalDigest[:]); err != nil {
 			t.Fatalf("insert legacy interaction signal: %v", err)
 		}
 		for _, role := range []string{"supporting", "contradicting"} {
@@ -200,51 +223,26 @@ func TestLegacyObservationCompatibilityShapes(t *testing.T) {
 			t.Fatalf("commit legacy signal transaction: %v", err)
 		}
 
-		var projection legacyObservationProjection
-		if err := pool.QueryRow(ctx, `
-			SELECT observation.extraction_run_id::text, observation.recorded_at, observation.derivation,
-			       signal.extraction_model_id, signal.prompt_version
-			FROM stacks.observations AS observation
-			JOIN stacks.interaction_signals AS signal ON signal.observation_id = observation.id
-			WHERE observation.id = $1`, observationID).Scan(
-			&projection.extractionRunID, &projection.recordedAt, &projection.derivation,
-			&projection.modelID, &projection.promptVersion,
-		); err != nil {
-			t.Fatalf("read legacy observation provenance: %v", err)
+		decoded, err := loadLegacyObservation(ctx, pool, observationID)
+		if err != nil {
+			t.Fatalf("load legacy observation provenance: %v", err)
 		}
-		projection.supportingIDs = legacyEvidenceIDs(t, pool, observationID, `
-			SELECT evidence_span_id::text
-			FROM stacks.observation_evidence
-			WHERE observation_id = $1`, observationID)
-		projection.contradictingIDs = legacyEvidenceIDs(t, pool, observationID, `
-			SELECT evidence_span_id::text
-			FROM stacks.signal_evidence
-			WHERE signal_id = $1 AND role = 'contradicting'`, signalID)
-		signalSupportingIDs := legacyEvidenceIDs(t, pool, observationID, `
-			SELECT evidence_span_id::text
-			FROM stacks.signal_evidence
-			WHERE signal_id = $1 AND role = 'supporting'`, signalID)
-
-		if projection.extractionRunID != fixture.extractionRunID || !projection.recordedAt.Equal(legacyRecordedAt) ||
-			projection.derivation != "model_extraction" || projection.modelID != "synthetic-compatibility-model" ||
-			projection.promptVersion != "compatibility-v1" {
-			t.Fatalf("legacy observation projection = %#v", projection)
+		want := []observation.EvidenceLink{
+			{EvidenceID: knowledge.EvidenceID(fixture.evidenceSpanID), Role: observation.EvidenceSupporting},
+			{EvidenceID: knowledge.EvidenceID(fixture.evidenceSpanID), Role: observation.EvidenceContradicting},
 		}
-		assertLegacyEvidenceIDs(t, "observation supporting", projection.supportingIDs, fixture.evidenceSpanID)
-		assertLegacyEvidenceIDs(t, "signal supporting", signalSupportingIDs, fixture.evidenceSpanID)
-		assertLegacyEvidenceIDs(t, "signal contradicting", projection.contradictingIDs, fixture.evidenceSpanID)
-
-		var category, direction, rationale string
-		var confidence float64
-		if err := pool.QueryRow(ctx, `
-			SELECT category, direction, rationale, confidence
-			FROM stacks.interaction_signals
-			WHERE observation_id = $1`, observationID).Scan(&category, &direction, &rationale, &confidence); err != nil {
-			t.Fatalf("read legacy interaction signal: %v", err)
+		if !sameEvidenceLinks(decoded.Observation.EvidenceLinks(), want) {
+			t.Fatalf("canonical evidence links = %#v, want %#v", decoded.Observation.EvidenceLinks(), want)
 		}
-		if category != "delegation_autonomy" || direction != "weakening" ||
-			rationale != "Synthetic source-grounded rationale." || confidence != 0.75 {
-			t.Fatalf("legacy interaction signal = %q/%q/%q/%v", category, direction, rationale, confidence)
+		if !sameEvidenceIDs(decoded.Compatibility.observationEvidenceOrigin, []knowledge.EvidenceID{knowledge.EvidenceID(fixture.evidenceSpanID)}) {
+			t.Fatalf("private origin = %#v", decoded.Compatibility.observationEvidenceOrigin)
+		}
+		if decoded.Signal == nil || decoded.Signal.Input.ObservationID != observationID ||
+			decoded.Signal.Input.Category != "delegation_autonomy" || decoded.Signal.Input.Direction != "weakening" ||
+			decoded.Signal.Input.ExtractionModelID != "synthetic-compatibility-model" ||
+			decoded.Signal.Input.PromptVersion != "compatibility-v1" || decoded.Signal.Input.Rationale != "Synthetic source-grounded rationale." ||
+			decoded.Signal.Input.Confidence != 0.75 {
+			t.Fatalf("canonical signal = %#v", decoded.Signal)
 		}
 	})
 
@@ -304,6 +302,7 @@ type legacyObservationInsert struct {
 	objectMentionID  *string
 	validStart       *time.Time
 	validEnd         *time.Time
+	predicate        string
 	epistemicStatus  string
 	confidence       *float64
 	digestLabel      string
@@ -332,6 +331,13 @@ func createLegacyObservationFixture(t *testing.T, pool *pgxpool.Pool) legacyObse
 	if err != nil {
 		t.Fatalf("prepare legacy compatibility extraction run: %v", err)
 	}
+	var runModelID, runPromptVersion string
+	if err := pool.QueryRow(ctx, `
+		SELECT model_id, prompt_version
+		FROM stacks.extraction_runs
+		WHERE id = $1`, state.DerivationID).Scan(&runModelID, &runPromptVersion); err != nil {
+		t.Fatalf("read legacy compatibility extraction run: %v", err)
+	}
 	entities := NewEntityRepository(pool)
 	subjectEntity, err := entities.CreateEntity(ctx, EntityInput{ID: uuid.NewString(), Kind: "person", DisplayName: "Synthetic Compatibility Subject"})
 	if err != nil {
@@ -350,7 +356,7 @@ func createLegacyObservationFixture(t *testing.T, pool *pgxpool.Pool) legacyObse
 		t.Fatalf("create legacy compatibility object mention: %v", err)
 	}
 	return legacyObservationFixture{
-		extractionRunID: state.DerivationID,
+		extractionRunID: state.DerivationID, runModelID: runModelID, runPromptVersion: runPromptVersion,
 		subjectEntityID: subjectEntity.ID, objectEntityID: objectEntity.ID,
 		subjectMentionID: subjectMention.ID, objectMentionID: objectMention.ID,
 		evidenceSpanID: storedSpan.ID,
@@ -359,11 +365,43 @@ func createLegacyObservationFixture(t *testing.T, pool *pgxpool.Pool) legacyObse
 
 func insertLegacyObservation(t *testing.T, ctx context.Context, pool *pgxpool.Pool, input legacyObservationInsert) {
 	t.Helper()
+	predicate := input.predicate
+	if predicate == "" {
+		predicate = "legacy_compatibility"
+		if input.digestLabel != "" {
+			predicate += "_" + input.digestLabel
+		}
+	}
+	row := legacyObservationRow{
+		ID: input.id, ExtractionRunID: input.extractionRunID, Predicate: predicate,
+		ValidStart: input.validStart, ValidEnd: input.validEnd, RecordedAt: legacyRecordedAt,
+		Derivation: "model_extraction", EpistemicStatus: input.epistemicStatus, Confidence: input.confidence,
+	}
+	if input.subjectEntityID != nil {
+		row.SubjectEntityID = *input.subjectEntityID
+	}
+	if input.objectEntityID != nil {
+		row.ObjectEntityID = *input.objectEntityID
+	}
+	if input.subjectMentionID != nil {
+		row.SubjectMentionID = *input.subjectMentionID
+	}
+	if input.objectMentionID != nil {
+		row.ObjectMentionID = *input.objectMentionID
+	}
+	digest, err := computeObservationDigestV1(legacyObservationWrite{Row: row, Origin: []knowledge.EvidenceID{}})
+	if err != nil {
+		t.Fatalf("compute legacy observation digest: %v", err)
+	}
+	var extractionRunID any
+	if input.extractionRunID != "" {
+		extractionRunID = input.extractionRunID
+	}
 	if _, err := pool.Exec(ctx, legacyObservationInsertSQL,
-		input.id, input.extractionRunID, input.subjectEntityID, input.objectEntityID,
-		input.subjectMentionID, input.objectMentionID, "legacy_compatibility", input.validStart,
+		input.id, extractionRunID, input.subjectEntityID, input.objectEntityID,
+		input.subjectMentionID, input.objectMentionID, predicate, input.validStart,
 		input.validEnd, legacyRecordedAt, "model_extraction", input.epistemicStatus,
-		input.confidence, legacyObservationDigest(input.digestLabel),
+		input.confidence, digest[:],
 	); err != nil {
 		t.Fatalf("insert legacy observation: %v", err)
 	}
@@ -402,32 +440,4 @@ func timePointer(value time.Time) *time.Time {
 
 func stringPointer(value string) *string {
 	return &value
-}
-
-func legacyEvidenceIDs(t *testing.T, pool *pgxpool.Pool, observationID, query string, arguments ...any) []string {
-	t.Helper()
-	rows, err := pool.Query(context.Background(), query, arguments...)
-	if err != nil {
-		t.Fatalf("query legacy evidence for observation %q: %v", observationID, err)
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			t.Fatalf("scan legacy evidence for observation %q: %v", observationID, err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate legacy evidence for observation %q: %v", observationID, err)
-	}
-	return ids
-}
-
-func assertLegacyEvidenceIDs(t *testing.T, name string, actual []string, expected string) {
-	t.Helper()
-	if len(actual) != 1 || actual[0] != expected {
-		t.Fatalf("%s IDs = %#v, want [%q]", name, actual, expected)
-	}
 }
