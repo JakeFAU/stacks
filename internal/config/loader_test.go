@@ -81,6 +81,19 @@ func TestLoadWithOptionsKeepsLoadsIndependent(t *testing.T) {
 	}
 }
 
+func TestLoadWithOptionsUsesIndependentBindingMetadata(t *testing.T) {
+	first := configurationEnvironmentBindings()
+	if len(first) == 0 {
+		t.Fatal("configurationEnvironmentBindings() returned no bindings")
+	}
+	first[0] = environmentBinding{}
+
+	second := configurationEnvironmentBindings()
+	if len(second) == 0 || second[0] != (environmentBinding{key: configKeyHTTPHost, name: HTTPHostEnvironmentVariable}) {
+		t.Fatal("configurationEnvironmentBindings() shared mutable binding metadata")
+	}
+}
+
 func TestLoadWithOptionsUsesDefaultsForEmptyDefaultedFileStrings(t *testing.T) {
 	clearConfigurationEnvironment(t)
 	path := writeConfigFixture(t, ".yaml", `

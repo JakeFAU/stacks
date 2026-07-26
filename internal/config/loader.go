@@ -58,42 +58,44 @@ type environmentBinding struct {
 	name string
 }
 
-var configurationEnvironmentBindings = []environmentBinding{
-	{configKeyHTTPHost, HTTPHostEnvironmentVariable},
-	{configKeyHTTPPort, HTTPPortEnvironmentVariable},
-	{configKeyHTTPReadHeaderTimeout, ReadHeaderTimeoutEnvironmentVariable},
-	{configKeyLogLevel, LogLevelEnvironmentVariable},
-	{configKeyTelemetryEnabled, OTelEnabledEnvironmentVariable},
-	{configKeyTelemetryEndpoint, OTelEndpointEnvironmentVariable},
-	{configKeyTelemetryInsecure, OTelInsecureEnvironmentVariable},
-	{configKeyTelemetryMetricInterval, OTelMetricIntervalEnvironmentVariable},
-	{configKeyTelemetryServiceName, OTelServiceNameEnvironmentVariable},
-	{configKeyTelemetryTraceSampleRatio, OTelTraceSampleRatioEnvironmentVariable},
-	{configKeyDatabaseScopes, DatabaseScopesEnvironmentVariable},
-	{configKeyDatabaseApplicationRole, DatabaseAppRoleEnvironmentVariable},
-	{configKeyGoogleFolderID, GoogleFolderIDEnvironmentVariable},
-	{configKeyGoogleOAuthClientFile, GoogleOAuthClientFileEnvironmentVariable},
-	{configKeyGoogleOAuthTokenFile, GoogleOAuthTokenFileEnvironmentVariable},
-	{configKeyGoogleTranscriptTitles, TranscriptTitlesEnvironmentVariable},
-	{configKeyGoogleNotesTitles, NotesTitlesEnvironmentVariable},
-	{configKeyDirectoryEnabled, GoogleDirectoryEnabledEnvironmentVariable},
-	{configKeyDirectoryOAuthClientFile, GoogleDirectoryClientFileEnvironmentVariable},
-	{configKeyDirectoryOAuthTokenFile, GoogleDirectoryTokenFileEnvironmentVariable},
-	{configKeyDirectoryEmailDomains, GoogleDirectoryDomainsEnvironmentVariable},
-	{configKeyDirectoryFreshness, GoogleDirectoryFreshnessEnvironmentVariable},
-	{configKeyDirectoryRetryAfter, GoogleDirectoryRetryAfterEnvironmentVariable},
-	{configKeyDirectoryMaxAttempts, GoogleDirectoryMaxAttemptsEnvironmentVariable},
-	{configKeyModelDataMode, DataModeEnvironmentVariable},
-	{configKeyModelProvider, ModelProviderEnvironmentVariable},
-	{configKeyModelID, ModelIDEnvironmentVariable},
-	{configKeyModelMaxOutputTokens, ModelMaxTokensEnvironmentVariable},
-	{configKeyModelMaxAttempts, ModelMaxAttemptsEnvironmentVariable},
-	{configKeyModelAWSProfile, AWSProfileEnvironmentVariable},
-	{configKeyModelAWSRegion, AWSRegionEnvironmentVariable},
-	{configKeyIngestionLeaseDuration, IngestionLeaseDurationEnvironmentVariable},
-	{configKeyIngestionAttemptTimeout, IngestionAttemptTimeoutEnvironmentVariable},
-	{configKeyExtractionPromptVersion, ExtractionPromptVersionEnvironmentVariable},
-	{configKeyAnalysisPromptVersion, AnalysisPromptVersionEnvironmentVariable},
+func configurationEnvironmentBindings() []environmentBinding {
+	return []environmentBinding{
+		{configKeyHTTPHost, HTTPHostEnvironmentVariable},
+		{configKeyHTTPPort, HTTPPortEnvironmentVariable},
+		{configKeyHTTPReadHeaderTimeout, ReadHeaderTimeoutEnvironmentVariable},
+		{configKeyLogLevel, LogLevelEnvironmentVariable},
+		{configKeyTelemetryEnabled, OTelEnabledEnvironmentVariable},
+		{configKeyTelemetryEndpoint, OTelEndpointEnvironmentVariable},
+		{configKeyTelemetryInsecure, OTelInsecureEnvironmentVariable},
+		{configKeyTelemetryMetricInterval, OTelMetricIntervalEnvironmentVariable},
+		{configKeyTelemetryServiceName, OTelServiceNameEnvironmentVariable},
+		{configKeyTelemetryTraceSampleRatio, OTelTraceSampleRatioEnvironmentVariable},
+		{configKeyDatabaseScopes, DatabaseScopesEnvironmentVariable},
+		{configKeyDatabaseApplicationRole, DatabaseAppRoleEnvironmentVariable},
+		{configKeyGoogleFolderID, GoogleFolderIDEnvironmentVariable},
+		{configKeyGoogleOAuthClientFile, GoogleOAuthClientFileEnvironmentVariable},
+		{configKeyGoogleOAuthTokenFile, GoogleOAuthTokenFileEnvironmentVariable},
+		{configKeyGoogleTranscriptTitles, TranscriptTitlesEnvironmentVariable},
+		{configKeyGoogleNotesTitles, NotesTitlesEnvironmentVariable},
+		{configKeyDirectoryEnabled, GoogleDirectoryEnabledEnvironmentVariable},
+		{configKeyDirectoryOAuthClientFile, GoogleDirectoryClientFileEnvironmentVariable},
+		{configKeyDirectoryOAuthTokenFile, GoogleDirectoryTokenFileEnvironmentVariable},
+		{configKeyDirectoryEmailDomains, GoogleDirectoryDomainsEnvironmentVariable},
+		{configKeyDirectoryFreshness, GoogleDirectoryFreshnessEnvironmentVariable},
+		{configKeyDirectoryRetryAfter, GoogleDirectoryRetryAfterEnvironmentVariable},
+		{configKeyDirectoryMaxAttempts, GoogleDirectoryMaxAttemptsEnvironmentVariable},
+		{configKeyModelDataMode, DataModeEnvironmentVariable},
+		{configKeyModelProvider, ModelProviderEnvironmentVariable},
+		{configKeyModelID, ModelIDEnvironmentVariable},
+		{configKeyModelMaxOutputTokens, ModelMaxTokensEnvironmentVariable},
+		{configKeyModelMaxAttempts, ModelMaxAttemptsEnvironmentVariable},
+		{configKeyModelAWSProfile, AWSProfileEnvironmentVariable},
+		{configKeyModelAWSRegion, AWSRegionEnvironmentVariable},
+		{configKeyIngestionLeaseDuration, IngestionLeaseDurationEnvironmentVariable},
+		{configKeyIngestionAttemptTimeout, IngestionAttemptTimeoutEnvironmentVariable},
+		{configKeyExtractionPromptVersion, ExtractionPromptVersionEnvironmentVariable},
+		{configKeyAnalysisPromptVersion, AnalysisPromptVersionEnvironmentVariable},
+	}
 }
 
 // Load returns settings assembled from defaults and approved environment values.
@@ -152,7 +154,7 @@ func setDefaults(values *viper.Viper) {
 }
 
 func bindEnvironment(values *viper.Viper) error {
-	for _, binding := range configurationEnvironmentBindings {
+	for _, binding := range configurationEnvironmentBindings() {
 		if err := values.BindEnv(binding.key, binding.name); err != nil {
 			return fmt.Errorf("bind %s: %w", binding.name, err)
 		}
