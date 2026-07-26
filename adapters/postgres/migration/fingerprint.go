@@ -431,21 +431,31 @@ func functionParameterTypes(
 		tokens := strings.Fields(declaration)
 		types := make(map[uint32]struct{})
 		for index := range tokens {
+			suffix := strings.Join(tokens[index:], " ")
 			var oid sql.NullInt64
+			var namespace string
 			err := connection.QueryRow(
 				ctx,
-				`SELECT pg_catalog.to_regtype($1)::oid`,
-				strings.Join(tokens[index:], " "),
-			).Scan(&oid)
+				`SELECT type_record.oid, namespace.nspname
+				   FROM pg_catalog.pg_type AS type_record
+				   JOIN pg_catalog.pg_namespace AS namespace
+				     ON namespace.oid = type_record.typnamespace
+				  WHERE type_record.oid = pg_catalog.to_regtype($1)`,
+				suffix,
+			).Scan(&oid, &namespace)
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
 				}
 				continue
 			}
-			if oid.Valid {
-				types[uint32(oid.Int64)] = struct{}{}
+			qualifier, qualified := functionTypeQualifier(suffix)
+			if !oid.Valid ||
+				(namespace != "pg_catalog" && !qualified) ||
+				(qualified && namespace != qualifier) {
+				continue
 			}
+			types[uint32(oid.Int64)] = struct{}{}
 		}
 		if len(types) == 0 {
 			return nil, exactFunctionResolutionError(ctx)
@@ -453,6 +463,20 @@ func functionParameterTypes(
 		result = append(result, types)
 	}
 	return result, nil
+}
+
+func functionTypeQualifier(value string) (string, bool) {
+	if strings.Contains(value, " ") {
+		return "", false
+	}
+	for strings.HasSuffix(value, "[]") {
+		value = strings.TrimSuffix(value, "[]")
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) != 2 {
+		return "", false
+	}
+	return parts[0], true
 }
 
 func parseFunctionArgumentTypes(value string) ([]uint32, error) {

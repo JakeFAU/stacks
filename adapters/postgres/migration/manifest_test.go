@@ -184,6 +184,87 @@ func TestManifestAcceptsNamedFunctionParameterDeclaration(t *testing.T) {
 	}
 }
 
+func TestManifestAcceptsSimpleFunctionParameterGrammar(t *testing.T) {
+	t.Parallel()
+
+	for _, parameters := range []string{
+		"()",
+		"(integer)",
+		"(value int)",
+		"(double precision)",
+		"(value timestamp with time zone)",
+		"(synthetic_types.custom_type)",
+		"(value synthetic_types.custom_type[])",
+		"(left_value integer, right_value text[])",
+		"(value synthetic_types.custom_type[][])",
+	} {
+		parameters := parameters
+		t.Run(parameters, func(t *testing.T) {
+			t.Parallel()
+			manifest := validManifest("synthetic", "synthetic_version")
+			manifest.OwnedObjects = []OwnedObject{{
+				Kind:               ObjectFunction,
+				Schema:             "synthetic_exact",
+				Name:               "normalize",
+				FunctionParameters: parameters,
+			}}
+			if err := manifest.Validate(); err != nil {
+				t.Fatalf("Manifest.Validate() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestManifestRejectsUnsupportedFunctionParameterGrammar(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		parameters string
+	}{
+		{name: "default keyword", parameters: "(value integer default 1)"},
+		{name: "equals default", parameters: "(value integer = 1)"},
+		{name: "explicit in", parameters: "(in value integer)"},
+		{name: "out", parameters: "(out value integer)"},
+		{name: "inout", parameters: "(inout value integer)"},
+		{name: "variadic", parameters: "(variadic value integer[])"},
+		{name: "table", parameters: "(table value integer)"},
+		{name: "type modifier", parameters: "(value numeric(10))"},
+		{name: "nested comma", parameters: "(value numeric(10,2))"},
+		{name: "quoted parameter", parameters: `("value" integer)`},
+		{name: "quoted type", parameters: `(value "integer")`},
+		{name: "quoted qualified type", parameters: `(value synthetic_types."custom_type")`},
+		{name: "punctuation", parameters: "(value integer;drop)"},
+		{name: "leading empty segment", parameters: "(, value integer)"},
+		{name: "middle empty segment", parameters: "(value integer,, other text)"},
+		{name: "trailing empty segment", parameters: "(value integer, )"},
+		{name: "overqualified type", parameters: "(value first.second.third)"},
+		{name: "leading whitespace", parameters: "( value integer)"},
+		{name: "repeated whitespace", parameters: "(value  integer)"},
+		{name: "missing comma space", parameters: "(value integer,other text)"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			manifest := validManifest("synthetic", "synthetic_version")
+			manifest.OwnedObjects = []OwnedObject{{
+				Kind:               ObjectFunction,
+				Schema:             "synthetic_exact",
+				Name:               "normalize",
+				FunctionParameters: test.parameters,
+			}}
+			err := manifest.Validate()
+			if err == nil {
+				t.Fatal("Manifest.Validate() error = nil, want unsupported parameter rejection")
+			}
+			if strings.Contains(err.Error(), test.parameters) {
+				t.Fatalf("Manifest.Validate() error exposed parameter declaration: %q", err)
+			}
+		})
+	}
+}
+
 func TestManifestRejectsInvalidMigrationOrderingAndIdentity(t *testing.T) {
 	t.Parallel()
 

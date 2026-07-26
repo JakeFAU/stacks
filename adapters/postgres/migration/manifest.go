@@ -65,9 +65,12 @@ const (
 
 // OwnedObject identifies one exact object owned by a migration scope. Parent
 // is set only for triggers and contains the owning table name.
-// FunctionParameters is the normalized SQL parameter declaration including
-// parentheses and is set only for functions. PostgreSQL resolves its identity
-// argument types during catalog inspection.
+// FunctionParameters is set only for functions and uses a deliberately narrow
+// simple-input grammar with lowercase ordinary identifiers, single spaces, and
+// comma-space separators. It supports optional parameter names, unqualified
+// built-in type spellings, schema-qualified custom types, arrays, and built-in
+// multiword types. Modes, defaults, type modifiers, quoted identifiers, and
+// other PostgreSQL declaration syntax are unsupported.
 type OwnedObject struct {
 	Kind               ObjectKind
 	Schema             string
@@ -527,12 +530,8 @@ func validateOwnedObject(object OwnedObject) error {
 		return fmt.Errorf("%s object parent must be blank", object.Kind)
 	}
 	if object.Kind == ObjectFunction {
-		if len(object.FunctionParameters) < 2 ||
-			object.FunctionParameters[0] != '(' ||
-			object.FunctionParameters[len(object.FunctionParameters)-1] != ')' ||
-			strings.TrimSpace(object.FunctionParameters) != object.FunctionParameters ||
-			strings.ContainsAny(object.FunctionParameters, "\x00\r\n") {
-			return fmt.Errorf("function object parameter declaration is required")
+		if err := validateFunctionParameters(object.FunctionParameters); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -540,6 +539,78 @@ func validateOwnedObject(object OwnedObject) error {
 		return fmt.Errorf("%s object function parameters must be blank", object.Kind)
 	}
 	return nil
+}
+
+func validateFunctionParameters(parameters string) error {
+	if len(parameters) < 2 ||
+		parameters[0] != '(' ||
+		parameters[len(parameters)-1] != ')' ||
+		strings.TrimSpace(parameters) != parameters ||
+		strings.ContainsAny(parameters, "\x00\r\n") {
+		return fmt.Errorf("function object parameters must use normalized simple-input grammar")
+	}
+	body := parameters[1 : len(parameters)-1]
+	if body == "" {
+		return nil
+	}
+
+	segments := strings.Split(body, ",")
+	normalized := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			return fmt.Errorf("function object parameters must use normalized simple-input grammar")
+		}
+		tokens := strings.Fields(segment)
+		if strings.Join(tokens, " ") != segment ||
+			!validateFunctionParameterTokens(tokens) {
+			return fmt.Errorf("function object parameters must use normalized simple-input grammar")
+		}
+		normalized = append(normalized, segment)
+	}
+	if strings.Join(normalized, ", ") != body {
+		return fmt.Errorf("function object parameters must use normalized simple-input grammar")
+	}
+	return nil
+}
+
+func validateFunctionParameterTokens(tokens []string) bool {
+	if len(tokens) == 0 {
+		return false
+	}
+	for _, token := range tokens {
+		switch token {
+		case "default", "in", "out", "inout", "variadic", "table":
+			return false
+		}
+	}
+
+	qualified, valid := validateFunctionTypeToken(tokens[len(tokens)-1])
+	if !valid || (qualified && len(tokens) > 2) {
+		return false
+	}
+	for _, token := range tokens[:len(tokens)-1] {
+		if !identifierPattern.MatchString(token) {
+			return false
+		}
+	}
+	return true
+}
+
+func validateFunctionTypeToken(token string) (bool, bool) {
+	for strings.HasSuffix(token, "[]") {
+		token = strings.TrimSuffix(token, "[]")
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 1 && len(parts) != 2 {
+		return false, false
+	}
+	for _, part := range parts {
+		if !identifierPattern.MatchString(part) {
+			return false, false
+		}
+	}
+	return len(parts) == 2, true
 }
 
 func validateGrants(manifest Manifest, ownership ownershipSet) error {
