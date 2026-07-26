@@ -106,6 +106,35 @@ func readCatalog(
 	connection *pgx.Conn,
 	manifest Manifest,
 ) ([]CatalogObject, error) {
+	transaction, err := connection.BeginTx(
+		ctx,
+		pgx.TxOptions{AccessMode: pgx.ReadOnly},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("begin stable PostgreSQL catalog inspection: %w", err)
+	}
+	defer func() {
+		_ = transaction.Rollback(context.Background())
+	}()
+	if _, err := transaction.Exec(
+		ctx,
+		"SET LOCAL search_path = pg_catalog",
+	); err != nil {
+		return nil, fmt.Errorf("set stable PostgreSQL catalog search path: %w", err)
+	}
+	return readCatalogInTransaction(ctx, transaction, manifest)
+}
+
+type catalogQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func readCatalogInTransaction(
+	ctx context.Context,
+	connection catalogQuerier,
+	manifest Manifest,
+) ([]CatalogObject, error) {
 	treeSchemas := append([]string(nil), manifest.OwnedSchemaTrees...)
 	exactSchemas := exactObjectNames(manifest.OwnedObjects, ObjectSchema)
 	exactTables := exactObjects(manifest.OwnedObjects, ObjectTable)
@@ -321,7 +350,7 @@ func readCatalog(
 
 func resolveExactFunctionOIDs(
 	ctx context.Context,
-	connection *pgx.Conn,
+	connection catalogQuerier,
 	functions []OwnedObject,
 ) ([]uint32, error) {
 	oids := make([]uint32, 0, len(functions))
@@ -347,7 +376,7 @@ type exactFunctionCandidate struct {
 
 func resolveExactFunctionOID(
 	ctx context.Context,
-	connection *pgx.Conn,
+	connection catalogQuerier,
 	function OwnedObject,
 ) (uint32, error) {
 	candidates, err := exactFunctionCandidates(ctx, connection, function)
@@ -376,7 +405,7 @@ func resolveExactFunctionOID(
 
 func exactFunctionCandidates(
 	ctx context.Context,
-	connection *pgx.Conn,
+	connection catalogQuerier,
 	function OwnedObject,
 ) ([]exactFunctionCandidate, error) {
 	rows, err := connection.Query(
@@ -416,7 +445,7 @@ func exactFunctionCandidates(
 
 func functionIdentityTypes(
 	ctx context.Context,
-	connection *pgx.Conn,
+	connection catalogQuerier,
 	identityArguments string,
 ) ([]map[uint32]struct{}, error) {
 	identityTypes, valid := splitFunctionArguments(identityArguments)
@@ -504,7 +533,7 @@ func exactFunctionResolutionError(ctx context.Context) error {
 
 func queryCatalogObjects(
 	ctx context.Context,
-	connection *pgx.Conn,
+	connection catalogQuerier,
 	query string,
 	arguments []any,
 	add func(CatalogObject),

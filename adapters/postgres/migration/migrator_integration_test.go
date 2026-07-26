@@ -395,12 +395,13 @@ func TestMigratorPreservesCancellationAndReleasesSessionLock(t *testing.T) {
 
 	observer := openTestConnection(t, ctx, database.AdminURL())
 	defer observer.Close(context.Background())
-	waitForGrantedAdvisoryLock(t, ctx, observer, applicationName, completed)
+	backendPID := waitForGrantedAdvisoryLock(t, ctx, observer, applicationName, completed)
 	cancelApply()
 	err := <-completed
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled Migrator.Apply() error = %v, want context.Canceled", err)
 	}
+	waitForCanceledBackendCleanup(t, ctx, observer, backendPID)
 
 	var acquired bool
 	if err := observer.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", advisoryLockKey()).Scan(
@@ -409,7 +410,7 @@ func TestMigratorPreservesCancellationAndReleasesSessionLock(t *testing.T) {
 		t.Fatalf("try migration advisory lock after cancellation: %v", err)
 	}
 	if !acquired {
-		t.Fatal("migration advisory lock remained held after cancellation")
+		t.Fatal("migration advisory lock remained held after canceled backend cleanup")
 	}
 	if _, err := observer.Exec(ctx, "SELECT pg_advisory_unlock($1)", advisoryLockKey()); err != nil {
 		t.Fatalf("release observed migration advisory lock: %v", err)
@@ -693,7 +694,7 @@ func waitForGrantedAdvisoryLock(
 	observer *pgx.Conn,
 	applicationName string,
 	completed <-chan error,
-) {
+) int32 {
 	t.Helper()
 	for {
 		select {
@@ -701,22 +702,56 @@ func waitForGrantedAdvisoryLock(
 			t.Fatalf("Migrator.Apply() completed before granted lock observation: %v", err)
 		default:
 		}
-		var observed bool
+		var backendPID int32
 		err := observer.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1
-				FROM pg_locks AS lock
-				JOIN pg_stat_activity AS activity USING (pid)
-				WHERE activity.application_name = $1
-				  AND lock.locktype = 'advisory'
-				  AND lock.granted
-			)`,
+			SELECT activity.pid
+			  FROM pg_locks AS lock
+			  JOIN pg_stat_activity AS activity USING (pid)
+			 WHERE activity.application_name = $1
+			   AND activity.datname = pg_catalog.current_database()
+			   AND lock.locktype = 'advisory'
+			   AND lock.granted
+			 LIMIT 1`,
 			applicationName,
-		).Scan(&observed)
+		).Scan(&backendPID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
 		if err != nil {
 			t.Fatalf("observe granted advisory lock: %v", err)
 		}
-		if observed {
+		return backendPID
+	}
+}
+
+func waitForCanceledBackendCleanup(
+	t *testing.T,
+	ctx context.Context,
+	observer *pgx.Conn,
+	backendPID int32,
+) {
+	t.Helper()
+	for {
+		var backendExists bool
+		var backendLockHeld bool
+		if err := observer.QueryRow(ctx, `
+			SELECT EXISTS (
+			           SELECT 1
+			             FROM pg_catalog.pg_stat_activity
+			            WHERE pid = $1
+			       ),
+			       EXISTS (
+			           SELECT 1
+			             FROM pg_catalog.pg_locks
+			            WHERE pid = $1
+			              AND locktype = 'advisory'
+			              AND granted
+			       )`,
+			backendPID,
+		).Scan(&backendExists, &backendLockHeld); err != nil {
+			t.Fatalf("inspect canceled migration backend cleanup: %v", err)
+		}
+		if !backendExists && !backendLockHeld {
 			return
 		}
 	}

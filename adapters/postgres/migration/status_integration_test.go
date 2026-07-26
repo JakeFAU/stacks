@@ -35,6 +35,77 @@ func TestInspectorApplicationRoleReportsBothKnownScopesCurrent(t *testing.T) {
 	assertScopeStatus(t, statuses, "directory", migration.StateCurrent, 1, 1, false)
 }
 
+func TestInspectorApplicationRoleSearchPathDoesNotChangeFingerprint(t *testing.T) {
+	database, manifests := installKnownScopes(t)
+	ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
+	defer cancel()
+	admin := openStatusConnection(t, ctx, database.AdminURL())
+	if _, err := admin.Exec(
+		ctx,
+		"ALTER ROLE "+pgx.Identifier{statusApplicationRole}.Sanitize()+
+			" IN DATABASE "+pgx.Identifier{database.Name()}.Sanitize()+
+			" SET search_path = stacks_core",
+	); err != nil {
+		admin.Close(context.Background())
+		t.Fatalf("configure application role search path: %v", err)
+	}
+	if err := admin.Close(ctx); err != nil {
+		t.Fatalf("close application search-path administrator: %v", err)
+	}
+
+	for _, manifest := range manifests {
+		fingerprint, err := migration.InspectFingerprint(
+			ctx,
+			database.ApplicationURL(),
+			manifest,
+		)
+		if err != nil {
+			t.Fatalf(
+				"inspect application-role %s fingerprint: %v",
+				manifest.Scope,
+				err,
+			)
+		}
+		if fingerprint != manifest.ExpectedFingerprint {
+			t.Fatalf(
+				"application-role %s fingerprint = %x, want %x",
+				manifest.Scope,
+				fingerprint,
+				manifest.ExpectedFingerprint,
+			)
+		}
+	}
+
+	connection := openStatusConnection(t, ctx, database.ApplicationURL())
+	defer connection.Close(context.Background())
+
+	const applicationSearchPath = "stacks_core"
+	statuses, err := (migration.Inspector{
+		Manifests:  manifests,
+		Configured: []migration.Scope{"core"},
+	}).StatusWithConnection(ctx, connection)
+	if err != nil {
+		t.Fatalf("Inspector.StatusWithConnection() error = %v", err)
+	}
+	assertScopeStatus(t, statuses, "core", migration.StateCurrent, 3, 3, true)
+	assertScopeStatus(t, statuses, "directory", migration.StateCurrent, 1, 1, false)
+
+	var searchPath string
+	if err := connection.QueryRow(
+		ctx,
+		"SELECT pg_catalog.current_setting('search_path')",
+	).Scan(&searchPath); err != nil {
+		t.Fatalf("read application search path: %v", err)
+	}
+	if searchPath != applicationSearchPath {
+		t.Fatalf(
+			"application search path = %q after status, want unchanged %q",
+			searchPath,
+			applicationSearchPath,
+		)
+	}
+}
+
 func TestCleanInstallExpectedFingerprintsAreReproducibleAcrossTwoDatabases(t *testing.T) {
 	var first map[migration.Scope][sha256.Size]byte
 	for install := 0; install < 2; install++ {
