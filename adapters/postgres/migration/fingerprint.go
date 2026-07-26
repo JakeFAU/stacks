@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -327,22 +328,10 @@ func resolveExactFunctionOIDs(
 	oids := make([]uint32, 0, len(functions))
 	seen := make(map[uint32]struct{}, len(functions))
 	for _, function := range functions {
-		declaration := function.Schema + "." + function.Name + function.FunctionSignature
-		var oid sql.NullInt64
-		if err := connection.QueryRow(
-			ctx,
-			`SELECT pg_catalog.to_regprocedure($1)::oid`,
-			declaration,
-		).Scan(&oid); err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, fmt.Errorf("resolve exact owned PostgreSQL function")
+		resolved, err := resolveExactFunctionOID(ctx, connection, function)
+		if err != nil {
+			return nil, err
 		}
-		if !oid.Valid {
-			return nil, fmt.Errorf("resolve exact owned PostgreSQL function")
-		}
-		resolved := uint32(oid.Int64)
 		if _, duplicate := seen[resolved]; duplicate {
 			return nil, fmt.Errorf("resolve exact owned PostgreSQL function")
 		}
@@ -350,6 +339,155 @@ func resolveExactFunctionOIDs(
 		oids = append(oids, resolved)
 	}
 	return oids, nil
+}
+
+type exactFunctionCandidate struct {
+	oid           uint32
+	argumentTypes []uint32
+}
+
+func resolveExactFunctionOID(
+	ctx context.Context,
+	connection *pgx.Conn,
+	function OwnedObject,
+) (uint32, error) {
+	candidates, err := exactFunctionCandidates(ctx, connection, function)
+	if err != nil {
+		return 0, err
+	}
+	parameterTypes, err := functionParameterTypes(
+		ctx,
+		connection,
+		function.FunctionParameters,
+	)
+	if err != nil {
+		return 0, err
+	}
+	matches := make([]uint32, 0, 1)
+	for _, candidate := range candidates {
+		if matchesFunctionParameterTypes(candidate.argumentTypes, parameterTypes) {
+			matches = append(matches, candidate.oid)
+		}
+	}
+	if len(matches) != 1 {
+		return 0, fmt.Errorf("resolve exact owned PostgreSQL function")
+	}
+	return matches[0], nil
+}
+
+func exactFunctionCandidates(
+	ctx context.Context,
+	connection *pgx.Conn,
+	function OwnedObject,
+) ([]exactFunctionCandidate, error) {
+	rows, err := connection.Query(
+		ctx,
+		`SELECT procedure.oid, procedure.proargtypes::text
+		   FROM pg_catalog.pg_proc AS procedure
+		   JOIN pg_catalog.pg_namespace AS namespace
+		     ON namespace.oid = procedure.pronamespace
+		  WHERE namespace.nspname = $1
+		    AND procedure.proname = $2`,
+		function.Schema,
+		function.Name,
+	)
+	if err != nil {
+		return nil, exactFunctionResolutionError(ctx)
+	}
+	defer rows.Close()
+
+	var candidates []exactFunctionCandidate
+	for rows.Next() {
+		var candidate exactFunctionCandidate
+		var argumentTypes string
+		if err := rows.Scan(&candidate.oid, &argumentTypes); err != nil {
+			return nil, exactFunctionResolutionError(ctx)
+		}
+		candidate.argumentTypes, err = parseFunctionArgumentTypes(argumentTypes)
+		if err != nil {
+			return nil, exactFunctionResolutionError(ctx)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exactFunctionResolutionError(ctx)
+	}
+	return candidates, nil
+}
+
+func functionParameterTypes(
+	ctx context.Context,
+	connection *pgx.Conn,
+	signature string,
+) ([]map[uint32]struct{}, error) {
+	parameters := strings.TrimSpace(signature[1 : len(signature)-1])
+	if parameters == "" {
+		return nil, nil
+	}
+
+	declarations := strings.Split(parameters, ",")
+	result := make([]map[uint32]struct{}, 0, len(declarations))
+	for _, declaration := range declarations {
+		tokens := strings.Fields(declaration)
+		types := make(map[uint32]struct{})
+		for index := range tokens {
+			var oid sql.NullInt64
+			err := connection.QueryRow(
+				ctx,
+				`SELECT pg_catalog.to_regtype($1)::oid`,
+				strings.Join(tokens[index:], " "),
+			).Scan(&oid)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				continue
+			}
+			if oid.Valid {
+				types[uint32(oid.Int64)] = struct{}{}
+			}
+		}
+		if len(types) == 0 {
+			return nil, exactFunctionResolutionError(ctx)
+		}
+		result = append(result, types)
+	}
+	return result, nil
+}
+
+func parseFunctionArgumentTypes(value string) ([]uint32, error) {
+	fields := strings.Fields(value)
+	result := make([]uint32, 0, len(fields))
+	for _, field := range fields {
+		oid, err := strconv.ParseUint(field, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, uint32(oid))
+	}
+	return result, nil
+}
+
+func matchesFunctionParameterTypes(
+	actual []uint32,
+	allowed []map[uint32]struct{},
+) bool {
+	if len(actual) != len(allowed) {
+		return false
+	}
+	for index, oid := range actual {
+		if _, ok := allowed[index][oid]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func exactFunctionResolutionError(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("resolve exact owned PostgreSQL function")
 }
 
 func queryCatalogObjects(

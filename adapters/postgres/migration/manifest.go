@@ -65,14 +65,15 @@ const (
 
 // OwnedObject identifies one exact object owned by a migration scope. Parent
 // is set only for triggers and contains the owning table name.
-// FunctionSignature is the canonical identity-argument list including
-// parentheses and is set only for functions.
+// FunctionParameters is the normalized SQL parameter declaration including
+// parentheses and is set only for functions. PostgreSQL resolves its identity
+// argument types during catalog inspection.
 type OwnedObject struct {
-	Kind              ObjectKind
-	Schema            string
-	Parent            string
-	Name              string
-	FunctionSignature string
+	Kind               ObjectKind
+	Schema             string
+	Parent             string
+	Name               string
+	FunctionParameters string
 }
 
 // Manifest describes one independently versioned migration scope.
@@ -514,8 +515,8 @@ func validateOwnedObject(object OwnedObject) error {
 		return nil
 	}
 	if object.Kind == ObjectTrigger {
-		if object.FunctionSignature != "" {
-			return fmt.Errorf("trigger object function signature must be blank")
+		if object.FunctionParameters != "" {
+			return fmt.Errorf("trigger object function parameters must be blank")
 		}
 		if err := validateIdentifier("parent", object.Parent); err != nil {
 			return err
@@ -526,17 +527,17 @@ func validateOwnedObject(object OwnedObject) error {
 		return fmt.Errorf("%s object parent must be blank", object.Kind)
 	}
 	if object.Kind == ObjectFunction {
-		if len(object.FunctionSignature) < 2 ||
-			object.FunctionSignature[0] != '(' ||
-			object.FunctionSignature[len(object.FunctionSignature)-1] != ')' ||
-			strings.TrimSpace(object.FunctionSignature) != object.FunctionSignature ||
-			strings.ContainsAny(object.FunctionSignature, "\x00\r\n") {
-			return fmt.Errorf("function object canonical signature is required")
+		if len(object.FunctionParameters) < 2 ||
+			object.FunctionParameters[0] != '(' ||
+			object.FunctionParameters[len(object.FunctionParameters)-1] != ')' ||
+			strings.TrimSpace(object.FunctionParameters) != object.FunctionParameters ||
+			strings.ContainsAny(object.FunctionParameters, "\x00\r\n") {
+			return fmt.Errorf("function object parameter declaration is required")
 		}
 		return nil
 	}
-	if object.FunctionSignature != "" {
-		return fmt.Errorf("%s object function signature must be blank", object.Kind)
+	if object.FunctionParameters != "" {
+		return fmt.Errorf("%s object function parameters must be blank", object.Kind)
 	}
 	return nil
 }
@@ -709,7 +710,7 @@ func (ownership ownershipSet) owns(object OwnedObject) bool {
 }
 
 func (object OwnedObject) key() string {
-	return object.Schema + "\x00" + string(object.Kind) + "\x00" + object.Parent + "\x00" + object.Name + "\x00" + object.FunctionSignature
+	return object.Schema + "\x00" + string(object.Kind) + "\x00" + object.Parent + "\x00" + object.Name + "\x00" + object.FunctionParameters
 }
 
 func (object OwnedObject) description() string {
@@ -742,10 +743,10 @@ func createdObjects(sql string) []OwnedObject {
 				})
 			case ObjectFunction:
 				objects = append(objects, OwnedObject{
-					Kind:              ObjectFunction,
-					Schema:            strings.ToLower(match[1]),
-					Name:              strings.ToLower(match[2]),
-					FunctionSignature: "(" + strings.TrimSpace(strings.ToLower(match[3])) + ")",
+					Kind:               ObjectFunction,
+					Schema:             strings.ToLower(match[1]),
+					Name:               strings.ToLower(match[2]),
+					FunctionParameters: "(" + strings.TrimSpace(strings.ToLower(match[3])) + ")",
 				})
 			case ObjectTrigger:
 				objects = append(objects, OwnedObject{

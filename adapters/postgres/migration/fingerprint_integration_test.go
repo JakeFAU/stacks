@@ -64,24 +64,24 @@ func TestReadCatalogExactFunctionSelectsOnlyDeclaredOverload(t *testing.T) {
 
 	if _, err := connection.Exec(ctx, `
 		CREATE SCHEMA synthetic_exact;
-		CREATE FUNCTION synthetic_exact.normalize()
-		RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+		CREATE FUNCTION synthetic_exact.normalize(value integer)
+		RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT value';
 	`); err != nil {
 		t.Fatalf("create declared function overload: %v", err)
 	}
 	manifest := Manifest{OwnedObjects: []OwnedObject{{
-		Kind:              ObjectFunction,
-		Schema:            "synthetic_exact",
-		Name:              "normalize",
-		FunctionSignature: "()",
+		Kind:               ObjectFunction,
+		Schema:             "synthetic_exact",
+		Name:               "normalize",
+		FunctionParameters: "(value integer)",
 	}}}
 	before, err := readCatalog(ctx, connection, manifest)
 	if err != nil {
 		t.Fatalf("read declared function overload: %v", err)
 	}
 	if _, err := connection.Exec(ctx, `
-		CREATE FUNCTION synthetic_exact.normalize(value integer)
-		RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT value';
+		CREATE FUNCTION synthetic_exact.normalize(value text)
+		RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT value';
 	`); err != nil {
 		t.Fatalf("create unowned function overload: %v", err)
 	}
@@ -112,10 +112,10 @@ func TestReadCatalogExactFunctionResolvesEquivalentTypeSpelling(t *testing.T) {
 		t.Fatalf("create exact function with canonical type spelling: %v", err)
 	}
 	manifest := Manifest{OwnedObjects: []OwnedObject{{
-		Kind:              ObjectFunction,
-		Schema:            "synthetic_exact",
-		Name:              "normalize",
-		FunctionSignature: "(int)",
+		Kind:               ObjectFunction,
+		Schema:             "synthetic_exact",
+		Name:               "normalize",
+		FunctionParameters: "(value int)",
 	}}}
 	objects, err := readCatalog(ctx, connection, manifest)
 	if err != nil {
@@ -144,10 +144,10 @@ func TestReadCatalogMissingExactFunctionReturnsBoundedError(t *testing.T) {
 
 	const privateSignature = "(private_missing_type)"
 	_, err = readCatalog(ctx, connection, Manifest{OwnedObjects: []OwnedObject{{
-		Kind:              ObjectFunction,
-		Schema:            "synthetic_exact",
-		Name:              "missing",
-		FunctionSignature: privateSignature,
+		Kind:               ObjectFunction,
+		Schema:             "synthetic_exact",
+		Name:               "missing",
+		FunctionParameters: privateSignature,
 	}}})
 	if err == nil {
 		t.Fatal("readCatalog() error = nil, want missing exact function rejection")
@@ -174,19 +174,19 @@ func TestReadCatalogAmbiguousExactFunctionReturnsBoundedError(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("create ambiguous exact function declaration: %v", err)
 	}
-	const privateSignature = "(integer)"
+	const privateSignature = "(other integer)"
 	_, err = readCatalog(ctx, connection, Manifest{OwnedObjects: []OwnedObject{
 		{
-			Kind:              ObjectFunction,
-			Schema:            "synthetic_exact",
-			Name:              "normalize",
-			FunctionSignature: "(int)",
+			Kind:               ObjectFunction,
+			Schema:             "synthetic_exact",
+			Name:               "normalize",
+			FunctionParameters: "(value int)",
 		},
 		{
-			Kind:              ObjectFunction,
-			Schema:            "synthetic_exact",
-			Name:              "normalize",
-			FunctionSignature: privateSignature,
+			Kind:               ObjectFunction,
+			Schema:             "synthetic_exact",
+			Name:               "normalize",
+			FunctionParameters: privateSignature,
 		},
 	}})
 	if err == nil {

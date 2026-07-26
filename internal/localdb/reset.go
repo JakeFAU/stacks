@@ -228,7 +228,11 @@ func (resetter Resetter) inspectTarget(
 		)...,
 	)
 	if err != nil {
-		return resetTarget{}, fmt.Errorf("reset local PostgreSQL: inspect Compose configuration")
+		return resetTarget{}, newOperationError(
+			ctx,
+			"inspect Compose configuration",
+			err,
+		)
 	}
 	var config composeModel
 	if err := json.Unmarshal(configOutput, &config); err != nil {
@@ -269,7 +273,11 @@ func (resetter Resetter) inspectTarget(
 		)...,
 	)
 	if err != nil {
-		return resetTarget{}, fmt.Errorf("reset local PostgreSQL: inspect PostgreSQL service")
+		return resetTarget{}, newOperationError(
+			ctx,
+			"inspect PostgreSQL service",
+			err,
+		)
 	}
 	containerIDs := strings.Fields(string(containerOutput))
 	if len(containerIDs) != 1 {
@@ -286,7 +294,11 @@ func (resetter Resetter) inspectTarget(
 		containerIDs[0],
 	)
 	if err != nil {
-		return resetTarget{}, fmt.Errorf("reset local PostgreSQL: inspect live PostgreSQL service")
+		return resetTarget{}, newOperationError(
+			ctx,
+			"inspect live PostgreSQL service",
+			err,
+		)
 	}
 	var container containerInspection
 	if err := json.Unmarshal(containerInspectionOutput, &container); err != nil {
@@ -327,7 +339,11 @@ func (resetter Resetter) inspectTarget(
 		volume.Name,
 	)
 	if err != nil {
-		return resetTarget{}, fmt.Errorf("reset local PostgreSQL: inspect PostgreSQL volume")
+		return resetTarget{}, newOperationError(
+			ctx,
+			"inspect PostgreSQL volume",
+			err,
+		)
 	}
 	var inspected volumeInspection
 	if err := json.Unmarshal(volumeOutput, &inspected); err != nil {
@@ -357,7 +373,7 @@ type containerMount struct {
 func (resetter Resetter) inspectLocalContext(ctx context.Context) (string, error) {
 	output, err := resetter.Runner.Run(ctx, "docker", "context", "show")
 	if err != nil {
-		return "", fmt.Errorf("reset local PostgreSQL: inspect Docker context")
+		return "", newOperationError(ctx, "inspect Docker context", err)
 	}
 	fields := strings.Fields(string(output))
 	if len(fields) != 1 {
@@ -376,7 +392,11 @@ func (resetter Resetter) inspectLocalContext(ctx context.Context) (string, error
 		"{{json .Endpoints.docker.Host}}",
 	)
 	if err != nil {
-		return "", fmt.Errorf("reset local PostgreSQL: inspect Docker context endpoint")
+		return "", newOperationError(
+			ctx,
+			"inspect Docker context endpoint",
+			err,
+		)
 	}
 	var endpoint string
 	if err := json.Unmarshal(output, &endpoint); err != nil ||

@@ -150,7 +150,7 @@ func TestFingerprintManifestRejectsZeroExpectedFingerprint(t *testing.T) {
 	}
 }
 
-func TestManifestRejectsExactFunctionWithoutCanonicalSignature(t *testing.T) {
+func TestManifestRejectsExactFunctionWithoutParameterDeclaration(t *testing.T) {
 	t.Parallel()
 
 	manifest := validManifest("synthetic", "synthetic_version")
@@ -161,6 +161,26 @@ func TestManifestRejectsExactFunctionWithoutCanonicalSignature(t *testing.T) {
 	}}
 	if err := manifest.Validate(); err == nil {
 		t.Fatal("Manifest.Validate() error = nil, want ambiguous exact function ownership rejection")
+	}
+}
+
+func TestManifestAcceptsNamedFunctionParameterDeclaration(t *testing.T) {
+	t.Parallel()
+
+	manifest := validManifest("synthetic", "synthetic_version")
+	setMigrationSQL(
+		&manifest.Migrations[0],
+		`CREATE FUNCTION synthetic_exact.normalize(value integer)
+		 RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT value'`,
+	)
+	manifest.OwnedObjects = []OwnedObject{{
+		Kind:               ObjectFunction,
+		Schema:             "synthetic_exact",
+		Name:               "normalize",
+		FunctionParameters: "(value integer)",
+	}}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("Manifest.Validate() error = %v", err)
 	}
 }
 

@@ -602,6 +602,121 @@ func TestResetReturnsBoundedWarningWriteErrorBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestResetPreservesBoundedCancellationAtEveryInspectionStage(t *testing.T) {
+	stages := []struct {
+		name       string
+		failureKey string
+		wantError  string
+		wantCalls  int
+	}{
+		{
+			name:       "Docker context selection",
+			failureKey: "docker context show",
+			wantError:  "reset local PostgreSQL: inspect Docker context operation failed",
+			wantCalls:  1,
+		},
+		{
+			name:       "Docker context endpoint inspection",
+			failureKey: "docker --context default context inspect default --format {{json .Endpoints.docker.Host}}",
+			wantError:  "reset local PostgreSQL: inspect Docker context endpoint operation failed",
+			wantCalls:  2,
+		},
+		{
+			name:       "Compose configuration inspection",
+			failureKey: composeCommand("config", "--format", "json"),
+			wantError:  "reset local PostgreSQL: inspect Compose configuration operation failed",
+			wantCalls:  3,
+		},
+		{
+			name:       "PostgreSQL service inspection",
+			failureKey: composeCommand("ps", "-q", postgresService),
+			wantError:  "reset local PostgreSQL: inspect PostgreSQL service operation failed",
+			wantCalls:  4,
+		},
+		{
+			name:       "live PostgreSQL container inspection",
+			failureKey: dockerHostCommand("inspect", "--format", "{{json .}}", "container-one"),
+			wantError:  "reset local PostgreSQL: inspect live PostgreSQL service operation failed",
+			wantCalls:  5,
+		},
+		{
+			name:       "PostgreSQL volume inspection",
+			failureKey: dockerHostCommand("volume", "inspect", "--format", "{{json .}}", "stacks_postgres_data"),
+			wantError:  "reset local PostgreSQL: inspect PostgreSQL volume operation failed",
+			wantCalls:  6,
+		},
+	}
+	causes := []struct {
+		name  string
+		cause error
+	}{
+		{name: "canceled", cause: context.Canceled},
+		{name: "deadline", cause: context.DeadlineExceeded},
+	}
+	for _, stage := range stages {
+		stage := stage
+		t.Run(stage.name, func(t *testing.T) {
+			for _, testCause := range causes {
+				testCause := testCause
+				t.Run(testCause.name, func(t *testing.T) {
+					runner := successfulResetRunner(validLiveContainerInspection())
+					privateFailure := fmt.Errorf(
+						"synthetic secret /private/path: %w",
+						testCause.cause,
+					)
+					runner.errors = map[string]error{stage.failureKey: privateFailure}
+					migrator := &fakeMigrator{}
+					var output strings.Builder
+					err := validResetter(runner, migrator).Reset(
+						t.Context(),
+						ConfirmationToken,
+						&output,
+					)
+					if err == nil {
+						t.Fatal("Resetter.Reset() error = nil, want inspection failure")
+					}
+					if err.Error() != stage.wantError {
+						t.Fatalf(
+							"Resetter.Reset() error = %q, want %q",
+							err,
+							stage.wantError,
+						)
+					}
+					if !errors.Is(err, testCause.cause) {
+						t.Fatalf("errors.Is(%v) = false for %v", err, testCause.cause)
+					}
+					if errors.Is(err, privateFailure) {
+						t.Fatalf("operation error unwrap exposed private runner error: %v", err)
+					}
+					if len(runner.calls) != stage.wantCalls {
+						t.Fatalf(
+							"runner calls = %d, want stop after %d: %#v",
+							len(runner.calls),
+							stage.wantCalls,
+							runner.calls,
+						)
+					}
+					if output.Len() != 0 {
+						t.Fatalf("warning output = %q, want none before inspection completes", output.String())
+					}
+					assertNoResetMutation(t, runner.calls)
+					if migrator.calls != 0 {
+						t.Fatalf(
+							"migrator calls = %d, want none after inspection failure",
+							migrator.calls,
+						)
+					}
+					for _, forbidden := range []string{"synthetic", "secret", "/private/path"} {
+						if strings.Contains(err.Error(), forbidden) {
+							t.Fatalf("inspection error exposed private detail: %q", err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestResetPreservesCancellationIdentityAndStopsAtFailedStage(t *testing.T) {
 	expectedMutations := []string{
 		composeCommand("stop", postgresService),
