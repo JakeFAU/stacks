@@ -172,8 +172,9 @@ The migration intentionally changes these behaviors:
 
 - `stacks --help` and nested help become supported;
 - usage is generated from the command tree rather than handwritten errors;
-- invalid nested commands receive Cobra's bounded command error and
-  suggestions;
+- unknown commands and other pre-leaf syntax failures return the bounded
+  generic `invalid command syntax` error without Cobra suggestions, because
+  suggestions can repeat user input;
 - `stacks serve` rejects extra arguments instead of ignoring them;
 - flags use documented double-dash long syntax;
 - command parsing and help can complete without command-specific provider

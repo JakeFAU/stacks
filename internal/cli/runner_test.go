@@ -92,6 +92,60 @@ func TestRunnerRejectsExplicitBlankDirectoryEntityWithoutExecuting(t *testing.T)
 	}
 }
 
+func TestRunnerClearsAcceptDirectoryEntityBetweenExecutions(t *testing.T) {
+	var invocations []Invocation
+	runner := Runner{Execute: func(_ context.Context, invocation Invocation) error {
+		invocations = append(invocations, invocation)
+		return nil
+	}}
+	if err := runner.Run(t.Context(), []string{
+		"review", "accept-directory", "proposal-1", "profile-1", "--entity", "person-1",
+	}); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	if err := runner.Run(t.Context(), []string{
+		"review", "accept-directory", "proposal-2", "profile-2",
+	}); err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+
+	if len(invocations) != 2 {
+		t.Fatalf("Execute invocations = %#v, want 2", invocations)
+	}
+	if invocations[0].AcceptDirectory == nil || *invocations[0].AcceptDirectory != (AcceptDirectoryInput{
+		ProposalID: "proposal-1", DirectoryProfileID: "profile-1", EntityID: "person-1",
+	}) {
+		t.Fatalf("first accept-directory invocation = %#v, want entity person-1", invocations[0])
+	}
+	if invocations[1].AcceptDirectory == nil || *invocations[1].AcceptDirectory != (AcceptDirectoryInput{
+		ProposalID: "proposal-2", DirectoryProfileID: "profile-2",
+	}) {
+		t.Fatalf("second accept-directory invocation = %#v, want an empty entity ID", invocations[1])
+	}
+}
+
+func TestRunnerRejectsExplicitBlankCreateNameWithoutExecutingOrWritingStderr(t *testing.T) {
+	var errorOutput strings.Builder
+	calls := 0
+	runner := Runner{
+		Error: &errorOutput,
+		Execute: func(context.Context, Invocation) error {
+			calls++
+			return nil
+		},
+	}
+	err := runner.Run(t.Context(), []string{"review", "create", "proposal-1", "--name", ""})
+	if err == nil || !strings.Contains(err.Error(), "--name is required") {
+		t.Fatalf("Run() error = %v, want blank name rejection", err)
+	}
+	if calls != 0 {
+		t.Fatalf("Execute calls = %d, want 0", calls)
+	}
+	if errorOutput.Len() != 0 {
+		t.Fatalf("stderr = %q, want no private flag value", errorOutput.String())
+	}
+}
+
 func TestRunnerUsesFreshFlagsAndWritersForEachExecution(t *testing.T) {
 	var first, second Invocation
 	firstOutput := new(strings.Builder)

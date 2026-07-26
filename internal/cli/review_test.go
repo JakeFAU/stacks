@@ -26,13 +26,16 @@ func TestReviewCommandAcceptDirectoryRequiresExactProposalAndSnapshotIDs(t *test
 	}}
 	command := ReviewCommand{Service: &ReviewService{Store: store}}
 
-	for _, invocation := range []Invocation{
-		{Command: CommandReview, Action: ActionAcceptDirectory},
-		{Command: CommandReview, Action: ActionAcceptDirectory},
+	for _, testCase := range []struct {
+		invocation Invocation
+		want       string
+	}{
+		{invocation: Invocation{Command: CommandReview, Action: ActionAcceptDirectory}, want: "invocation is invalid"},
+		{invocation: Invocation{Command: CommandReview, Action: ActionAcceptDirectory, AcceptDirectory: &AcceptDirectoryInput{ProposalID: "proposal-directory"}}, want: "proposal ID and directory profile ID are required"},
 	} {
-		err := command.Run(context.Background(), invocation)
-		if err == nil || !strings.Contains(err.Error(), "invocation is invalid") {
-			t.Fatalf("Run(%#v) error = %v, want invalid invocation error", invocation, err)
+		err := command.Run(context.Background(), testCase.invocation)
+		if err == nil || !strings.Contains(err.Error(), testCase.want) {
+			t.Fatalf("Run(%#v) error = %v, want %q", testCase.invocation, err, testCase.want)
 		}
 	}
 	if store.acceptedDirectory != (AcceptDirectoryInput{}) {
