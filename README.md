@@ -125,6 +125,10 @@ go run ./cmd/stacks --config config.example.yaml config validate serve
 go run ./cmd/stacks config validate serve --config config.example.json
 ```
 
+Omitting `--config` uses named defaults plus non-empty environment values.
+Passing `--config` explicitly with an empty or whitespace-only value is invalid;
+it is not an alias for omission.
+
 The precedence order, highest first, is an explicitly changed operational
 command flag, a non-empty explicitly bound environment variable, the selected
 file, then a named Go default. `--config` selects a source rather than
@@ -200,6 +204,20 @@ These inputs remain environment-only:
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Direct model-provider credentials |
 | AWS default-chain credentials, including `AWS_BEARER_TOKEN_BEDROCK` | AWS SDK credential boundary |
 | `STACKS_EMPLOYEE_ENTITY_ID`, `STACKS_MANAGER_ENTITY_ID` | Temporary `analyze` action inputs, not installation configuration |
+
+The following unsupported legacy provider environment variables are
+environment-only rejection signals, not supported inputs. Any non-empty value
+makes configuration loading fail:
+
+- `STACKS_BEDROCK_MODEL_ID`
+- `STACKS_BEDROCK_MAX_TOKENS`
+- `STACKS_BEDROCK_MAX_ATTEMPTS`
+- `OPENAI_BASE_URL`
+- `OPENAI_ORG_ID`
+- `OPENAI_PROJECT_ID`
+- `ANTHROPIC_BASE_URL`
+- `ANTHROPIC_AUTH_TOKEN`
+- `ANTHROPIC_PROFILE`
 
 Any secret-looking, action-input, or unsupported legacy provider name in a
 configuration file is an unknown key and fails closed.
