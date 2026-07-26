@@ -104,6 +104,127 @@ func TestProviderRevisionChurnAppendsProvenanceWithoutRewritingContent(t *testin
 	}
 }
 
+func TestSourceRevisionObservationRejectsRecordedTimeDifferentFromContent(t *testing.T) {
+	fixture := newDocumentRepositoryFixture(t)
+	document := canonicalDocument(t, "source-opaque-a", "revision-a", documentRecordedAt)
+
+	var (
+		mismatchedCreated         bool
+		mismatchedErr             error
+		rowsAfterMismatchedInsert int
+		correctCreated            bool
+		correctErr                error
+	)
+	if err := fixture.database.InTransaction(fixture.ctx, func(transaction *postgres.Transaction) error {
+		put, err := transaction.PutDocumentVersion(fixture.ctx, document)
+		if err != nil {
+			return err
+		}
+		mismatched := sourceRevision(
+			t,
+			document,
+			"revision-mismatched",
+			put.Ref.RecordedAt.Add(time.Microsecond),
+		)
+		mismatchedCreated, mismatchedErr = transaction.PutSourceRevisionObservation(
+			fixture.ctx,
+			mismatched,
+		)
+		if err := transaction.QueryRow(
+			fixture.ctx,
+			`SELECT count(*)
+			 FROM stacks_core.source_revision_observations
+			 WHERE document_version_id = $1`,
+			put.Ref.VersionID,
+		).Scan(&rowsAfterMismatchedInsert); err != nil {
+			return err
+		}
+		correct := sourceRevision(
+			t,
+			document,
+			document.ProviderRevision(),
+			put.Ref.RecordedAt,
+		)
+		correctCreated, correctErr = transaction.PutSourceRevisionObservation(
+			fixture.ctx,
+			correct,
+		)
+		return correctErr
+	}); err != nil {
+		t.Fatalf("persist source revision authority fixture: %v", err)
+	}
+
+	if !errors.Is(mismatchedErr, postgres.ErrConflict) {
+		t.Fatalf(
+			"mismatched PutSourceRevisionObservation() = (%v, %v), want false and ErrConflict",
+			mismatchedCreated,
+			mismatchedErr,
+		)
+	}
+	if mismatchedCreated {
+		t.Fatal("mismatched PutSourceRevisionObservation() created = true, want false")
+	}
+	if rowsAfterMismatchedInsert != 0 {
+		t.Fatalf(
+			"revision rows after mismatched insert = %d, want 0",
+			rowsAfterMismatchedInsert,
+		)
+	}
+	if !correctCreated || correctErr != nil {
+		t.Fatalf(
+			"correct PutSourceRevisionObservation() = (%v, %v), want true and nil",
+			correctCreated,
+			correctErr,
+		)
+	}
+}
+
+func TestLoadDocumentVersionRejectsSourceRevisionRecordedTimeDifferentFromContent(t *testing.T) {
+	fixture := newDocumentRepositoryFixture(t)
+	document := canonicalDocument(t, "source-opaque-a", "revision-a", documentRecordedAt)
+	put, err := fixture.database.PutDocumentVersion(fixture.ctx, document)
+	if err != nil {
+		t.Fatalf("PutDocumentVersion() error = %v", err)
+	}
+	corrupt := sourceRevision(
+		t,
+		document,
+		"revision-corrupt",
+		put.Ref.RecordedAt.Add(time.Microsecond),
+	)
+	corruptDigest := corrupt.Digest()
+	if _, err := fixture.admin.Exec(fixture.ctx, `
+		INSERT INTO stacks_core.source_revision_observations (
+			id,
+			source_document_id,
+			document_version_id,
+			digest_version,
+			digest,
+			provider_version,
+			provider_revision,
+			first_recorded_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		corrupt.ID(),
+		put.Ref.SourceDocumentID,
+		put.Ref.VersionID,
+		corrupt.DigestVersion(),
+		corruptDigest[:],
+		corrupt.ProviderVersion(),
+		corrupt.ProviderRevision(),
+		corrupt.FirstRecordedAt(),
+	); err != nil {
+		t.Fatalf("insert corrupt source revision fixture: %v", err)
+	}
+
+	if _, err := fixture.database.LoadDocumentVersion(
+		fixture.ctx,
+		put.Ref.VersionID,
+	); !errors.Is(err, postgres.ErrConflict) {
+		t.Fatalf("LoadDocumentVersion() error = %v, want ErrConflict", err)
+	}
+}
+
 func TestDocumentVersionExactRetryIsReadOnly(t *testing.T) {
 	fixture := newDocumentRepositoryFixture(t)
 	document := canonicalDocument(t, "source-opaque-a", "revision-a", documentRecordedAt)

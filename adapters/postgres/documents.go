@@ -287,9 +287,12 @@ func (transaction *Transaction) PutSourceRevisionObservation(
 		[]byte(revision.DocumentDigestVersion()),
 		documentDigest[:],
 	)
-	var storedProviderVersion string
+	var (
+		storedProviderVersion string
+		storedRecordedAt      time.Time
+	)
 	if err := transaction.transaction.QueryRow(ctx, `
-		SELECT provider_version
+		SELECT provider_version, recorded_at
 		FROM stacks_core.document_versions
 		WHERE id = $1
 		  AND source_document_id = $2
@@ -299,12 +302,25 @@ func (transaction *Transaction) PutSourceRevisionObservation(
 		sourceID,
 		revision.DocumentDigestVersion(),
 		documentDigest[:],
-	).Scan(&storedProviderVersion); err != nil {
+	).Scan(&storedProviderVersion, &storedRecordedAt); err != nil {
 		return false, wrapDocumentError(ctx, "load source revision content version", err)
+	}
+	storedRecordedAt, err := canonicalStoredTime(storedRecordedAt)
+	if err != nil {
+		return false, fmt.Errorf(
+			"put source revision observation: stored content recorded time: %w",
+			err,
+		)
 	}
 	if storedProviderVersion != revision.ProviderVersion() {
 		return false, fmt.Errorf(
 			"put source revision observation: provider version does not match content: %w",
+			ErrConflict,
+		)
+	}
+	if storedRecordedAt != revision.FirstRecordedAt() {
+		return false, fmt.Errorf(
+			"put source revision observation: first recorded time does not match content: %w",
 			ErrConflict,
 		)
 	}
@@ -694,6 +710,13 @@ func loadDocumentVersionRecord(
 			return DocumentVersionRecord{}, fmt.Errorf(
 				"stored source revision recorded time: %w",
 				err,
+			)
+		}
+		if firstRecordedAt != recordedAt {
+			revisionRows.Close()
+			return DocumentVersionRecord{}, fmt.Errorf(
+				"stored source revision recorded time differs from content: %w",
+				ErrConflict,
 			)
 		}
 		revision, err := evidence.NewSourceRevisionObservation(

@@ -309,19 +309,34 @@ func documentRevisionID(
 	firstRecordedAt time.Time,
 ) string {
 	t.Helper()
+	return sourceRevision(
+		t,
+		document,
+		document.ProviderRevision(),
+		firstRecordedAt,
+	).ID()
+}
+
+func sourceRevision(
+	t testing.TB,
+	document evidence.DocumentVersion,
+	providerRevision string,
+	firstRecordedAt time.Time,
+) evidence.SourceRevisionObservation {
+	t.Helper()
 	revision, err := evidence.NewSourceRevisionObservation(evidence.SourceRevisionObservationInput{
 		Provider:              document.Provider(),
 		ProviderDocumentID:    document.ProviderDocumentID(),
 		DocumentDigestVersion: document.DigestVersion(),
 		DocumentDigest:        document.Digest(),
 		ProviderVersion:       document.ProviderVersion(),
-		ProviderRevision:      document.ProviderRevision(),
+		ProviderRevision:      providerRevision,
 		FirstRecordedAt:       firstRecordedAt,
 	})
 	if err != nil {
 		t.Fatalf("NewSourceRevisionObservation() error = %v", err)
 	}
-	return revision.ID()
+	return revision
 }
 
 func rowXID(
