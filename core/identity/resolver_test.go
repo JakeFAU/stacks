@@ -50,7 +50,7 @@ func TestResolverAutoResolvesAcceptedExactEmail(t *testing.T) {
 	}
 }
 
-func TestResolverAutoResolvesUniqueAcceptedNameAlias(t *testing.T) {
+func TestResolverKeepsUniqueExactNameAsReviewCandidate(t *testing.T) {
 	resolution := identity.Resolver{}.Resolve(identity.Mention{Name: "  RIYA\u00a0CHEN  "}, []identity.EntitySnapshot{{
 		ID:   "person-1",
 		Kind: identity.KindPerson,
@@ -60,8 +60,13 @@ func TestResolverAutoResolvesUniqueAcceptedNameAlias(t *testing.T) {
 		}},
 	}})
 
-	if resolution.EntityID != "person-1" {
-		t.Fatalf("EntityID = %q, want unique accepted alias entity", resolution.EntityID)
+	if resolution.EntityID != "" || resolution.AutoResolved {
+		t.Fatalf("resolution = %#v, want exact name kept unresolved", resolution)
+	}
+	if len(resolution.Candidates) != 1 ||
+		resolution.Candidates[0].EntityID != "person-1" ||
+		resolution.Candidates[0].Confidence != 1 {
+		t.Fatalf("candidates = %#v, want unique exact-name review candidate", resolution.Candidates)
 	}
 }
 
@@ -76,6 +81,17 @@ func TestResolverLeavesDuplicateAcceptedAliasPending(t *testing.T) {
 	}
 	if resolution.AutoResolved {
 		t.Fatal("AutoResolved = true, want false")
+	}
+}
+
+func TestResolverLeavesDuplicateAcceptedEmailPending(t *testing.T) {
+	resolution := identity.Resolver{}.Resolve(identity.Mention{Email: "riya.chen@synthetic.example"}, []identity.EntitySnapshot{
+		{ID: "person-1", Kind: identity.KindPerson, Aliases: []identity.Alias{{Type: identity.AliasTypeEmail, Value: "Riya.Chen@synthetic.example"}}},
+		{ID: "person-2", Kind: identity.KindPerson, Aliases: []identity.Alias{{Type: identity.AliasTypeEmail, Value: "riya.chen@synthetic.example"}}},
+	})
+
+	if resolution.EntityID != "" || resolution.AutoResolved {
+		t.Fatalf("resolution = %#v, want duplicate accepted emails kept unresolved", resolution)
 	}
 }
 
@@ -136,7 +152,10 @@ func TestResolverComparesNameAndEmailOnlyToMatchingAliasTypes(t *testing.T) {
 		{ID: "person-email", Kind: identity.KindPerson, Aliases: []identity.Alias{{Type: identity.AliasTypeEmail, Value: "riya.chen@synthetic.example"}}},
 	})
 
-	if !resolution.AutoResolved || resolution.EntityID != "person-name" {
-		t.Fatalf("resolution = %#v, want exact typed name alias only", resolution)
+	if resolution.AutoResolved || resolution.EntityID != "" {
+		t.Fatalf("resolution = %#v, want nonmatching email unable to auto-resolve exact name", resolution)
+	}
+	if len(resolution.Candidates) != 1 || resolution.Candidates[0].EntityID != "person-name" {
+		t.Fatalf("candidates = %#v, want only matching typed name alias ranked", resolution.Candidates)
 	}
 }

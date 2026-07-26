@@ -103,7 +103,10 @@ func TestReviewServiceCorrectDelegatesAppendOnlyReplacement(t *testing.T) {
 
 func TestReviewCommandWritesPrivateProposalContextOnlyToStdout(t *testing.T) {
 	const privateContext = "Synthetic confidential transcript context"
-	store := &fakeReviewStore{proposal: ReviewProposal{ID: "proposal-1", Context: privateContext}}
+	store := &fakeReviewStore{proposal: ReviewProposal{
+		ID:       "proposal-1",
+		Evidence: []ReviewEvidence{{ID: "evidence-1", Quote: privateContext}},
+	}}
 	var stdout strings.Builder
 	command := ReviewCommand{Service: &ReviewService{Store: store}, Output: &stdout}
 
@@ -118,11 +121,56 @@ func TestReviewCommandWritesPrivateProposalContextOnlyToStdout(t *testing.T) {
 	}
 }
 
+func TestReviewCommandShowsOrderedProvenanceAndEffectiveAuthority(t *testing.T) {
+	confidence := 0.75
+	store := &fakeReviewStore{proposal: ReviewProposal{
+		ID: "proposal-provenance",
+		Evidence: []ReviewEvidence{
+			{ID: "evidence-1", Quote: "First cited span"},
+			{ID: "evidence-2", Quote: "Second cited span"},
+		},
+		Candidates: []ReviewCandidate{{
+			EntityID:        "person-1",
+			DisplayName:     "Synthetic Person",
+			SourceKind:      "accepted_alias",
+			SourceReference: "opaque-alias-1",
+			Confidence:      &confidence,
+			Reason:          "synthetic candidate",
+		}},
+		EffectiveDecision: &ReviewDecision{
+			ID: "decision-1", ProposalID: "proposal-provenance",
+			EntityID: "person-1", Outcome: "accepted", Authority: "reviewer",
+		},
+	}}
+	var stdout strings.Builder
+	command := ReviewCommand{Service: &ReviewService{Store: store}, Output: &stdout}
+
+	if err := command.Run(context.Background(), []string{"show", "proposal-provenance"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		"evidence evidence-1: First cited span",
+		"evidence evidence-2: Second cited span",
+		"effective decision: decision-1 outcome: accepted entity: person-1 authority: reviewer",
+		"source-kind: accepted_alias source-ref: opaque-alias-1",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("stdout = %q, want %q", output, want)
+		}
+	}
+	if strings.Index(output, "evidence evidence-1") > strings.Index(output, "evidence evidence-2") {
+		t.Fatalf("stdout evidence order = %q, want proposal order", output)
+	}
+}
+
 func TestReviewCommandListRendersCompactHighestRankedGuessAndContext(t *testing.T) {
 	confidence := 0.8125
 	store := &fakeReviewStore{proposal: ReviewProposal{
-		ID:      "proposal-1",
-		Context: "Synthetic transcript context",
+		ID: "proposal-1",
+		Evidence: []ReviewEvidence{{
+			ID: "evidence-1", Quote: "Synthetic transcript context",
+		}},
 		Candidates: []ReviewCandidate{
 			{EntityID: "person-primary", Confidence: &confidence, Reason: "exact accepted alias similarity"},
 			{EntityID: "person-alternative", Reason: "weaker name similarity"},
@@ -142,8 +190,12 @@ func TestReviewCommandListRendersCompactHighestRankedGuessAndContext(t *testing.
 
 func TestReviewCommandListBoundsPrivateTextToOneLine(t *testing.T) {
 	store := &fakeReviewStore{proposal: ReviewProposal{
-		ID:      "proposal-1",
-		Context: "first line\n" + strings.Repeat("private context ", 30) + "unbounded-context-suffix",
+		ID: "proposal-1",
+		Evidence: []ReviewEvidence{{
+			ID: "evidence-1",
+			Quote: "first line\n" + strings.Repeat("private context ", 30) +
+				"unbounded-context-suffix",
+		}},
 		Candidates: []ReviewCandidate{{
 			EntityID: "person-primary",
 			Reason:   strings.Repeat("bounded reason ", 30) + "unbounded-reason-suffix",
@@ -171,13 +223,15 @@ func TestReviewCommandDirectoryCandidateListIsMaskedAndShowHasRequestedDetail(t 
 	)
 	confidence := 0.75
 	store := &fakeReviewStore{proposal: ReviewProposal{
-		ID:      "proposal-directory",
-		Context: "Synthetic cited review context",
+		ID: "proposal-directory",
+		Evidence: []ReviewEvidence{{
+			ID: "evidence-directory", Quote: "Synthetic cited review context",
+		}},
 		Candidates: []ReviewCandidate{{
 			DirectoryProfileID: "profile-directory",
 			DisplayName:        "Synthetic Directory Person",
 			MaskedEmail:        "r***@corp.example",
-			Source:             "domain_profile",
+			DirectorySource:    "domain_profile",
 			Confidence:         &confidence,
 			Reason:             "directory name candidate requires review",
 		}},

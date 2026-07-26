@@ -17,7 +17,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -28,6 +28,29 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+
+      - name: Create synthetic PostgreSQL environment
+        run: |
+          umask 077
+          {
+            echo 'STACKS_DB_ADMIN_PASSWORD=synthetic-ci-admin-password'
+            echo 'STACKS_DB_APP_PASSWORD=synthetic-ci-app-password'
+            echo 'STACKS_DATABASE_URL=postgres://stacks_app:synthetic-ci-app-password@127.0.0.1:5432/stacks?sslmode=disable'
+            echo 'STACKS_MIGRATION_DATABASE_URL=postgres://stacks_admin:synthetic-ci-admin-password@127.0.0.1:5432/stacks?sslmode=disable'
+            echo 'STACKS_DATABASE_SCOPES=core'
+            echo 'STACKS_DATABASE_APP_ROLE=stacks_app'
+            echo 'STACKS_TEST_DATABASE_URL=postgres://stacks_app:synthetic-ci-app-password@127.0.0.1:5432/stacks?sslmode=disable'
+            echo 'STACKS_TEST_MIGRATION_DATABASE_URL=postgres://stacks_admin:synthetic-ci-admin-password@127.0.0.1:5432/stacks?sslmode=disable'
+          } > .env.ci
+
+      - name: Start PostgreSQL
+        run: make db-up ENV_FILE=.env.ci
+
+      - name: Apply canonical migrations
+        run: make db-migrate ENV_FILE=.env.ci
+
+      - name: Check migration status
+        run: make db-status ENV_FILE=.env.ci
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
@@ -46,3 +69,10 @@ jobs:
 
       - name: Build
         run: make build
+
+      - name: Test PostgreSQL integration
+        run: make test-integration ENV_FILE=.env.ci
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: make db-down ENV_FILE=.env.ci

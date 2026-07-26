@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	// MaxAttemptsLimit matches the configured PoC default and prevents retry
+	// MaxAttemptsLimit matches the configured application default and prevents retry
 	// amplification from an unexpectedly large runtime value.
 	MaxAttemptsLimit = 5
 

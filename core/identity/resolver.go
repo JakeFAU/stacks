@@ -10,15 +10,15 @@ import (
 type Resolver struct{}
 
 // Resolve returns an automatic identity only when exactly one person has an
-// accepted exact email or accepted exact name alias. Every other match is kept
-// as a deterministic ranked candidate for review.
+// accepted exact email alias. Name matches remain deterministic ranked
+// candidates for review.
 func (Resolver) Resolve(mention Mention, snapshots []EntitySnapshot) Resolution {
 	normalizedName := NormalizeName(mention.Name)
 	normalizedEmail := NormalizeEmail(mention.Email)
 	if !ValidEmail(normalizedEmail) {
 		normalizedEmail = ""
 	}
-	exactMatches := matchingAcceptedIdentifiers(normalizedName, normalizedEmail, snapshots)
+	exactMatches := matchingAcceptedEmails(normalizedEmail, snapshots)
 	if len(exactMatches) == 1 {
 		return Resolution{EntityID: exactMatches[0], AutoResolved: true}
 	}
@@ -26,22 +26,17 @@ func (Resolver) Resolve(mention Mention, snapshots []EntitySnapshot) Resolution 
 	return Resolution{Candidates: rankCandidates(normalizedName, snapshots)}
 }
 
-func matchingAcceptedIdentifiers(normalizedName, normalizedEmail string, snapshots []EntitySnapshot) []string {
+func matchingAcceptedEmails(normalizedEmail string, snapshots []EntitySnapshot) []string {
 	matches := make(map[string]struct{})
 	for _, snapshot := range snapshots {
 		if snapshot.Kind != KindPerson || snapshot.ID == "" {
 			continue
 		}
 		for _, alias := range snapshot.Aliases {
-			switch alias.Type {
-			case AliasTypeEmail:
-				if normalizedEmail != "" && normalizedEmail == NormalizeEmail(alias.Value) {
-					matches[snapshot.ID] = struct{}{}
-				}
-			case AliasTypeName:
-				if normalizedName != "" && normalizedName == NormalizeName(alias.Value) {
-					matches[snapshot.ID] = struct{}{}
-				}
+			if alias.Type == AliasTypeEmail &&
+				normalizedEmail != "" &&
+				normalizedEmail == NormalizeEmail(alias.Value) {
+				matches[snapshot.ID] = struct{}{}
 			}
 		}
 	}

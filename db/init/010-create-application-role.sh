@@ -23,17 +23,6 @@ GRANT CONNECT ON DATABASE stacks TO stacks_app;
 
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 
-CREATE SCHEMA stacks AUTHORIZATION stacks_admin;
-CREATE SCHEMA extensions AUTHORIZATION stacks_admin;
-
-GRANT USAGE ON SCHEMA stacks, extensions TO stacks_app;
-
-ALTER DEFAULT PRIVILEGES FOR ROLE stacks_admin IN SCHEMA stacks
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO stacks_app;
-
-ALTER DEFAULT PRIVILEGES FOR ROLE stacks_admin IN SCHEMA stacks
-  GRANT USAGE, SELECT ON SEQUENCES TO stacks_app;
-
 ALTER ROLE stacks_app IN DATABASE stacks
-  SET search_path = stacks, extensions;
+  SET search_path = stacks_core;
 SQL

@@ -13,7 +13,7 @@ import (
 	"stacks/internal/config"
 )
 
-func TestExecuteServesWithoutPoCSettings(t *testing.T) {
+func TestExecuteServesWithoutApplicationSettings(t *testing.T) {
 	called := false
 	runtime := RuntimeFunc(func(context.Context, config.Settings) error {
 		called = true
@@ -30,7 +30,7 @@ func TestExecuteServesWithoutPoCSettings(t *testing.T) {
 }
 
 func TestExecuteRoutesEntityAndReviewCommandsWithRemainingArguments(t *testing.T) {
-	settings := config.Settings{PoC: config.PoCSettings{DatabaseURL: "postgres://synthetic"}}
+	settings := config.Settings{Database: config.DatabaseSettings{URL: "postgres://synthetic"}}
 	cases := []struct {
 		name        string
 		arguments   []string
@@ -67,7 +67,7 @@ func TestExecuteRoutesEntityAndReviewCommandsWithRemainingArguments(t *testing.T
 }
 
 func TestExecuteRoutesGoogleAuthWithRemainingArguments(t *testing.T) {
-	settings := config.Settings{PoC: config.PoCSettings{
+	settings := config.Settings{Application: config.ApplicationSettings{
 		GoogleOAuthClientFile: "/synthetic/client.json",
 		GoogleOAuthTokenFile:  "/synthetic/token.json",
 	}}
@@ -91,8 +91,7 @@ func TestExecuteRoutesGoogleAuthWithRemainingArguments(t *testing.T) {
 }
 
 func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
-	settings := config.Settings{PoC: config.PoCSettings{
-		DatabaseURL:           "postgres://synthetic",
+	settings := config.Settings{Database: config.DatabaseSettings{URL: "postgres://synthetic"}, Application: config.ApplicationSettings{
 		GoogleFolderID:        "synthetic-folder",
 		GoogleOAuthClientFile: "/synthetic/client.json",
 		GoogleOAuthTokenFile:  "/synthetic/token.json",
@@ -105,7 +104,7 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 		IngestionLeaseDuration:  5 * time.Minute,
 		IngestionAttemptTimeout: 4 * time.Minute,
 		ExtractionPromptVersion: "extract-v2",
-		AnalysisPromptVersion:   "analyze-v1",
+		ManagerConfidence:       config.ManagerConfidenceSettings{PromptVersion: "analyze-v1"},
 	}}
 	providerCalls := 0
 	syncCalls := 0
@@ -132,8 +131,7 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 }
 
 func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
-	settings := config.Settings{PoC: config.PoCSettings{
-		DatabaseURL:           "postgres://synthetic",
+	settings := config.Settings{Database: config.DatabaseSettings{URL: "postgres://synthetic"}, Application: config.ApplicationSettings{
 		GoogleFolderID:        "synthetic-folder",
 		GoogleOAuthClientFile: "/synthetic/client.json",
 		GoogleOAuthTokenFile:  "/synthetic/token.json",
@@ -169,14 +167,15 @@ func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
 }
 
 func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
-	settings := config.Settings{PoC: config.PoCSettings{
-		DatabaseURL: "postgres://synthetic",
+	settings := config.Settings{Database: config.DatabaseSettings{URL: "postgres://synthetic"}, Application: config.ApplicationSettings{
 		Model: config.ModelSettings{
 			DataMode: "personal", Provider: "bedrock", ModelID: "synthetic-model",
 			MaxOutputTokens: 256, MaxAttempts: 1, AWSProfile: "synthetic-profile", AWSRegion: "us-east-1",
 		},
-		ExtractionPromptVersion: "extract-v2", AnalysisPromptVersion: "analyze-v1",
-		EmployeeEntityID: "employee-id", ManagerEntityID: "manager-id",
+		ExtractionPromptVersion: "extract-v2",
+		ManagerConfidence: config.ManagerConfidenceSettings{
+			PromptVersion: "analyze-v1", EmployeeEntityID: "employee-id", ManagerEntityID: "manager-id",
+		},
 	}}
 	providerCalls := 0
 	analyzeCalls := 0
@@ -206,7 +205,7 @@ func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *
 	tests := []struct {
 		name      string
 		arguments []string
-		settings  config.PoCSettings
+		settings  config.ApplicationSettings
 	}{
 		{
 			name: "sync legacy extraction", arguments: []string{"sync"},
@@ -234,7 +233,10 @@ func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *
 				return nil, fmt.Errorf("provider must not be constructed")
 			})
 
-			err := Execute(context.Background(), testCase.arguments, config.Settings{PoC: testCase.settings},
+			err := Execute(context.Background(), testCase.arguments, config.Settings{
+				Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
+				Application: testCase.settings,
+			},
 				RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
 				provider, io.Discard, io.Discard)
 			if err == nil || !strings.Contains(err.Error(), "run stacks sync") {
@@ -247,9 +249,9 @@ func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *
 	}
 }
 
-func validSyncSettingsForExecute(extractionVersion, analysisVersion string) config.PoCSettings {
-	return config.PoCSettings{
-		DatabaseURL: "postgres://synthetic", GoogleFolderID: "synthetic-folder",
+func validSyncSettingsForExecute(extractionVersion, analysisVersion string) config.ApplicationSettings {
+	return config.ApplicationSettings{
+		GoogleFolderID:        "synthetic-folder",
 		GoogleOAuthClientFile: "/synthetic/client.json", GoogleOAuthTokenFile: "/synthetic/token.json",
 		TranscriptTitles: []string{"Transcript"}, NotesTitles: []string{"Notes"},
 		Model: config.ModelSettings{
@@ -257,13 +259,14 @@ func validSyncSettingsForExecute(extractionVersion, analysisVersion string) conf
 			MaxOutputTokens: 256, MaxAttempts: 1, AWSRegion: "us-east-1",
 		},
 		IngestionLeaseDuration: 5 * time.Minute, IngestionAttemptTimeout: 4 * time.Minute,
-		ExtractionPromptVersion: extractionVersion, AnalysisPromptVersion: analysisVersion,
+		ExtractionPromptVersion: extractionVersion,
+		ManagerConfidence:       config.ManagerConfidenceSettings{PromptVersion: analysisVersion},
 	}
 }
 
-func validAnalyzeSettingsForExecute(extractionVersion, analysisVersion string) config.PoCSettings {
+func validAnalyzeSettingsForExecute(extractionVersion, analysisVersion string) config.ApplicationSettings {
 	settings := validSyncSettingsForExecute(extractionVersion, analysisVersion)
-	settings.EmployeeEntityID = "employee-id"
-	settings.ManagerEntityID = "manager-id"
+	settings.ManagerConfidence.EmployeeEntityID = "employee-id"
+	settings.ManagerConfidence.ManagerEntityID = "manager-id"
 	return settings
 }

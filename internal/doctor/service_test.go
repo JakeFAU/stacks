@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JakeFAU/stacks/adapters/postgres/migration"
+
 	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 )
@@ -386,7 +388,8 @@ func TestDoctorChecksEveryReadOnlyDependencyWithoutMutation(t *testing.T) {
 	report := (Service{Database: database, Google: google, AWS: aws}).Check(context.Background())
 
 	assertCheck(t, report, CheckDatabaseConnectivity, StatusOK, "PostgreSQL is reachable")
-	assertCheck(t, report, CheckDatabaseMigrations, StatusOK, "database migrations are current")
+	assertCheck(t, report, CheckDatabaseMigrationsCore, StatusOK, "core migrations are current")
+	assertCheck(t, report, CheckDatabaseMigrationsDirectory, StatusOK, "directory migrations are not configured")
 	assertCheck(t, report, CheckGoogleAuthorization, StatusOK, "Google OAuth configuration and token are readable")
 	assertCheck(t, report, CheckGoogleFolder, StatusOK, "configured Google Drive folder is readable")
 	assertCheck(t, report, CheckGoogleTabs, StatusOK, "representative document classified 3 tabs: transcript=1 gemini-notes=1 other=1")
@@ -682,12 +685,27 @@ func (fake *fakeDatabase) Ping(ctx context.Context) error {
 	return fake.pingErr
 }
 
-func (fake *fakeDatabase) MigrationsCurrent(ctx context.Context) (bool, error) {
+func (fake *fakeDatabase) MigrationStatus(ctx context.Context) ([]migration.ScopeStatus, error) {
 	fake.migrationsCalls++
+	current := fake.migrationsCurrent
 	if fake.migrations != nil {
-		return fake.migrations(ctx)
+		var err error
+		current, err = fake.migrations(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return fake.migrationsCurrent, fake.migrationsErr
+	if fake.migrationsErr != nil {
+		return nil, fake.migrationsErr
+	}
+	coreState := migration.StatePending
+	if current {
+		coreState = migration.StateCurrent
+	}
+	return []migration.ScopeStatus{
+		{Scope: "core", State: coreState, Configured: true},
+		{Scope: "directory", State: migration.StateAbsent, Configured: false},
+	}, nil
 }
 
 func (fake *fakeDatabase) ApplyMigrations(context.Context) error {

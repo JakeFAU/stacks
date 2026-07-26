@@ -10,11 +10,19 @@ import (
 	"syscall"
 	"time"
 
+	postgres "github.com/JakeFAU/stacks/adapters/postgres"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/smithy-go"
+	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+
+	"github.com/JakeFAU/stacks/adapters/postgres/coremigrations"
+	"github.com/JakeFAU/stacks/adapters/postgres/directorymigrations"
+	"github.com/JakeFAU/stacks/adapters/postgres/migration"
 
 	"stacks/internal/analysis"
 	"stacks/internal/app"
@@ -26,12 +34,12 @@ import (
 	"stacks/internal/extract"
 	"stacks/internal/googledirectory"
 	"stacks/internal/ingest"
+	"stacks/internal/localdb"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
 	"stacks/internal/source"
 	"stacks/internal/source/drive"
-	"stacks/internal/storage"
 )
 
 const (
@@ -79,7 +87,7 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			return pocCommandProvider(ctx, settings, stdout, stderr, runtime.TracerProvider().Tracer("stacks"), decisions, invocations)
+			return commandProvider(ctx, settings, stdout, stderr, runtime.TracerProvider().Tracer("stacks"), decisions, invocations)
 		}),
 		os.Stdout,
 		os.Stderr,
@@ -98,7 +106,7 @@ func main() {
 	}
 }
 
-func pocCommandProvider(
+func commandProvider(
 	ctx context.Context,
 	settings config.Settings,
 	stdout, _ io.Writer,
@@ -106,41 +114,60 @@ func pocCommandProvider(
 	decisions *observability.DecisionRecorder,
 	invocations modeltelemetry.Recorder,
 ) (map[string]cli.Command, error) {
-	return pocCommandProviderWithRuntime(ctx, settings, stdout, io.Discard, tracer, decisions, invocations, defaultPoCCommandRuntime())
+	return commandProviderWithRuntime(ctx, settings, stdout, io.Discard, tracer, decisions, invocations, defaultCommandRuntime())
 }
 
 type doctorDatabase interface {
-	doctor.Database
+	Ping(context.Context) error
+	InspectMigrationStatus(
+		context.Context,
+		[]migration.Manifest,
+		[]migration.Scope,
+	) ([]migration.ScopeStatus, error)
 	Close()
 }
 
-type pocCommandRuntime struct {
-	newDriveAuthorizer     func(string, string, io.Writer) cli.GoogleAuthorizer
-	newDirectoryAuthorizer func(string, string, io.Writer) cli.GoogleAuthorizer
-	newDoctorDatabase      func(string) doctorDatabase
-	newDoctorGoogle        func(config.PoCSettings) doctor.Google
-	newDoctorDirectory     func(config.GoogleDirectorySettings) doctor.DirectoryProbe
-	newDoctorProviderProbe func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
-	newSource              func(context.Context, config.PoCSettings) (source.Source, error)
-	newDirectoryLookup     func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error)
-	openSyncRepositories   func(context.Context, string, bool) (ingest.Repository, directory.Repository, func(), error)
-	openReviewRepositories func(context.Context, string, bool) (*storage.EntityRepository, directory.Repository, func(), error)
-	openAnalysisRepository func(context.Context, string) (analysis.Repository, func(), error)
-	newModel               func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error)
+type commandRuntime struct {
+	newDriveAuthorizer        func(string, string, io.Writer) cli.GoogleAuthorizer
+	newDirectoryAuthorizer    func(string, string, io.Writer) cli.GoogleAuthorizer
+	openDoctorDatabase        func(context.Context, string) (doctorDatabase, error)
+	newDoctorGoogle           func(config.ApplicationSettings) doctor.Google
+	newDoctorDirectory        func(config.GoogleDirectorySettings) doctor.DirectoryProbe
+	newDoctorProviderProbe    func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
+	newSource                 func(context.Context, config.ApplicationSettings) (source.Source, error)
+	newDirectoryLookup        func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error)
+	openCanonicalRepositories func(context.Context, string, bool) (canonicalRepositories, error)
+	newModel                  func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error)
+	newMigrationApplier       func(config.DatabaseSettings) cli.MigrationApplier
+	newMigrationInspector     func(config.DatabaseSettings) cli.MigrationInspector
+	newDatabaseResetter       func(config.DatabaseSettings) cli.DatabaseResetter
 }
 
-func defaultPoCCommandRuntime() pocCommandRuntime {
-	return pocCommandRuntime{
+type canonicalRepositories struct {
+	ingestion ingest.Repository
+	directory directory.Repository
+	entities  cli.EntityStore
+	review    cli.CanonicalReviewRepository
+	analysis  analysis.Repository
+	close     func()
+}
+
+type commandIDGenerator struct{}
+
+func (commandIDGenerator) NewID() string { return uuid.NewString() }
+
+func defaultCommandRuntime() commandRuntime {
+	return commandRuntime{
 		newDriveAuthorizer: func(clientFile, tokenFile string, output io.Writer) cli.GoogleAuthorizer {
 			return drive.NewAuthorizer(clientFile, tokenFile, output)
 		},
 		newDirectoryAuthorizer: func(clientFile, tokenFile string, output io.Writer) cli.GoogleAuthorizer {
 			return googledirectory.NewAuthorizer(clientFile, tokenFile, output)
 		},
-		newDoctorDatabase: func(databaseURL string) doctorDatabase {
-			return doctor.NewPostgresProbe(databaseURL)
+		openDoctorDatabase: func(ctx context.Context, databaseURL string) (doctorDatabase, error) {
+			return postgres.Open(ctx, databaseURL)
 		},
-		newDoctorGoogle: func(settings config.PoCSettings) doctor.Google {
+		newDoctorGoogle: func(settings config.ApplicationSettings) doctor.Google {
 			return doctor.NewGoogleProbe(
 				settings.GoogleOAuthClientFile, settings.GoogleOAuthTokenFile, settings.GoogleFolderID,
 				drive.NewTabClassifier(settings.TranscriptTitles, settings.NotesTitles),
@@ -150,7 +177,7 @@ func defaultPoCCommandRuntime() pocCommandRuntime {
 			return googledirectory.NewProbe(settings.OAuthClientFile, settings.OAuthTokenFile)
 		},
 		newDoctorProviderProbe: newDoctorProviderProbe,
-		newSource: func(ctx context.Context, settings config.PoCSettings) (source.Source, error) {
+		newSource: func(ctx context.Context, settings config.ApplicationSettings) (source.Source, error) {
 			httpClient, err := drive.NewAuthorizedHTTPClient(ctx, settings.GoogleOAuthClientFile, settings.GoogleOAuthTokenFile)
 			if err != nil {
 				return nil, err
@@ -168,127 +195,188 @@ func defaultPoCCommandRuntime() pocCommandRuntime {
 			}
 			return googledirectory.NewClient(ctx, httpClient, googleDirectoryMaximumResults)
 		},
-		openSyncRepositories: func(ctx context.Context, databaseURL string, includeDirectory bool) (ingest.Repository, directory.Repository, func(), error) {
-			pool, err := storage.Open(ctx, databaseURL)
+		openCanonicalRepositories: func(ctx context.Context, databaseURL string, includeDirectory bool) (canonicalRepositories, error) {
+			database, err := postgres.Open(ctx, databaseURL)
 			if err != nil {
-				return nil, nil, nil, err
+				return canonicalRepositories{}, err
 			}
 			var directoryRepository directory.Repository
 			if includeDirectory {
-				directoryRepository = storage.NewDirectoryRepository(pool)
+				directoryRepository = directory.NewPostgresRepository(database)
 			}
-			return storage.NewIngestionRepository(pool), directoryRepository, pool.Close, nil
-		},
-		openReviewRepositories: func(ctx context.Context, databaseURL string, includeDirectory bool) (*storage.EntityRepository, directory.Repository, func(), error) {
-			pool, err := storage.Open(ctx, databaseURL)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			var directoryRepository directory.Repository
-			if includeDirectory {
-				directoryRepository = storage.NewDirectoryRepository(pool)
-			}
-			return storage.NewEntityRepository(pool), directoryRepository, pool.Close, nil
-		},
-		openAnalysisRepository: func(ctx context.Context, databaseURL string) (analysis.Repository, func(), error) {
-			pool, err := storage.Open(ctx, databaseURL)
-			if err != nil {
-				return nil, nil, err
-			}
-			return storage.NewAnalysisRepository(pool), pool.Close, nil
+			reviewRepository := app.NewReviewRepository(
+				postgres.ReviewerStore{
+					Database: database, IncludeDirectory: includeDirectory,
+				},
+				commandIDGenerator{},
+				app.ClockFunc(time.Now),
+			)
+			return canonicalRepositories{
+				ingestion: ingest.NewPostgresRepository(database),
+				directory: directoryRepository,
+				entities:  reviewRepository,
+				review:    reviewRepository,
+				analysis:  analysis.PostgresRepository{Database: database},
+				close:     database.Close,
+			}, nil
 		},
 		newModel: newModelWithContext,
+		newMigrationApplier: func(settings config.DatabaseSettings) cli.MigrationApplier {
+			return embeddedMigrationApplier{settings: settings}
+		},
+		newMigrationInspector: func(settings config.DatabaseSettings) cli.MigrationInspector {
+			return embeddedMigrationInspector{settings: settings}
+		},
+		newDatabaseResetter: func(settings config.DatabaseSettings) cli.DatabaseResetter {
+			return localdb.Resetter{
+				DatabaseURLs: []string{settings.URL, settings.MigrationURL},
+				Runner:       localdb.ExecRunner{},
+				Migrator:     embeddedMigrationApplier{settings: settings},
+			}
+		},
 	}
 }
 
-func pocCommandProviderWithRuntime(
+func commandProviderWithRuntime(
 	_ context.Context,
 	settings config.Settings,
 	stdout, _ io.Writer,
 	tracer trace.Tracer,
 	decisions *observability.DecisionRecorder,
 	invocations modeltelemetry.Recorder,
-	runtime pocCommandRuntime,
+	runtime commandRuntime,
 ) (map[string]cli.Command, error) {
 	return map[string]cli.Command{
+		string(config.CommandDBMigrate): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			return runDatabaseCommand(ctx, tracer, "database.migrate", func(ctx context.Context) error {
+				if err := settings.Validate(config.CommandDBMigrate); err != nil {
+					return err
+				}
+				if runtime.newMigrationApplier == nil {
+					return errors.New("db-migrate command dependencies are not configured")
+				}
+				return (cli.DBMigrateCommand{
+					Migrator: runtime.newMigrationApplier(settings.Database),
+					Output:   stdout,
+				}).Run(ctx, args)
+			})
+		}),
+		string(config.CommandDBStatus): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			return runDatabaseCommand(ctx, tracer, "database.status", func(ctx context.Context) error {
+				if err := settings.Validate(config.CommandDBStatus); err != nil {
+					return err
+				}
+				if runtime.newMigrationInspector == nil {
+					return errors.New("db-status command dependencies are not configured")
+				}
+				return (cli.DBStatusCommand{
+					Inspector: runtime.newMigrationInspector(settings.Database),
+					Output:    stdout,
+				}).Run(ctx, args)
+			})
+		}),
+		string(config.CommandDBReset): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			return runDatabaseCommand(ctx, tracer, "database.reset", func(ctx context.Context) error {
+				if err := settings.Validate(config.CommandDBReset); err != nil {
+					return err
+				}
+				if runtime.newDatabaseResetter == nil {
+					return errors.New("db-reset command dependencies are not configured")
+				}
+				return (cli.DBResetCommand{
+					Resetter: runtime.newDatabaseResetter(settings.Database),
+					Output:   stdout,
+				}).Run(ctx, args)
+			})
+		}),
 		string(config.CommandAuth): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			if err := settings.Validate(config.CommandAuth); err != nil {
+				return err
+			}
 			if len(args) != 1 {
 				return (cli.AuthCommand{}).Run(ctx, args)
 			}
 			switch config.GoogleAuthTarget(args[0]) {
 			case config.GoogleAuthDrive:
-				if err := settings.PoC.ValidateGoogleAuth(config.GoogleAuthDrive); err != nil {
+				if err := settings.Application.ValidateGoogleAuth(config.GoogleAuthDrive); err != nil {
 					return err
 				}
 				if runtime.newDriveAuthorizer == nil {
 					return errors.New("google authorization is not configured")
 				}
 				return (cli.AuthCommand{GoogleDrive: runtime.newDriveAuthorizer(
-					settings.PoC.GoogleOAuthClientFile, settings.PoC.GoogleOAuthTokenFile, stdout,
+					settings.Application.GoogleOAuthClientFile, settings.Application.GoogleOAuthTokenFile, stdout,
 				)}).Run(ctx, args)
 			case config.GoogleAuthDirectory:
-				if err := settings.PoC.ValidateGoogleAuth(config.GoogleAuthDirectory); err != nil {
+				if err := settings.Application.ValidateGoogleAuth(config.GoogleAuthDirectory); err != nil {
 					return err
 				}
 				if runtime.newDirectoryAuthorizer == nil {
 					return errors.New("google directory authorization is not configured")
 				}
 				return (cli.AuthCommand{GoogleDirectory: runtime.newDirectoryAuthorizer(
-					settings.PoC.Directory.OAuthClientFile, settings.PoC.Directory.OAuthTokenFile, stdout,
+					settings.Application.Directory.OAuthClientFile, settings.Application.Directory.OAuthTokenFile, stdout,
 				)}).Run(ctx, args)
 			default:
 				return (cli.AuthCommand{}).Run(ctx, args)
 			}
 		}),
 		string(config.CommandDoctor): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			if err := settings.PoC.Validate(config.CommandDoctor); err != nil {
+			if err := settings.Validate(config.CommandDoctor); err != nil {
 				return err
 			}
-			if runtime.newDoctorDatabase == nil ||
+			if runtime.openDoctorDatabase == nil ||
 				runtime.newDoctorGoogle == nil ||
 				runtime.newDoctorProviderProbe == nil ||
-				(settings.PoC.Directory.Enabled && runtime.newDoctorDirectory == nil) {
+				(settings.Application.Directory.Enabled && runtime.newDoctorDirectory == nil) {
 				return errors.New("doctor command dependencies are not configured")
 			}
-			database := runtime.newDoctorDatabase(settings.PoC.DatabaseURL)
+			database, err := runtime.openDoctorDatabase(ctx, settings.Database.URL)
+			if err != nil {
+				return err
+			}
 			defer database.Close()
-			model, disclosure, err := runtime.newDoctorProviderProbe(settings.PoC.Model)
+			probe := doctor.NewPostgresProbeWithScopes(
+				database,
+				configuredMigrationScopes(settings.Database.Scopes),
+			)
+			model, disclosure, err := runtime.newDoctorProviderProbe(settings.Application.Model)
 			if err != nil {
 				return err
 			}
 			var directoryProbe doctor.DirectoryProbe
-			if settings.PoC.Directory.Enabled {
-				directoryProbe = runtime.newDoctorDirectory(settings.PoC.Directory)
+			if settings.Application.Directory.Enabled {
+				directoryProbe = runtime.newDoctorDirectory(settings.Application.Directory)
 			}
 			return (cli.DoctorCommand{
 				Service: doctor.Service{
-					Database: database, Google: runtime.newDoctorGoogle(settings.PoC),
-					DirectoryEnabled: settings.PoC.Directory.Enabled, Directory: directoryProbe,
-					Invocation: modelInvocation(settings.PoC.Model), Model: model, Disclosure: disclosure,
+					Database: probe, Google: runtime.newDoctorGoogle(settings.Application),
+					DirectoryEnabled: settings.Application.Directory.Enabled, Directory: directoryProbe,
+					Invocation: modelInvocation(settings.Application.Model), Model: model, Disclosure: disclosure,
 				},
 				Output: stdout,
 			}).Run(ctx, args)
 		}),
 		string(config.CommandSync): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			if err := settings.PoC.Validate(config.CommandSync); err != nil {
+			if err := settings.Validate(config.CommandSync); err != nil {
 				return err
 			}
-			if err := requireRestrictedDisclosure(ctx, settings.PoC.Model, runtime); err != nil {
+			if err := requireRestrictedDisclosure(ctx, settings.Application.Model, runtime); err != nil {
 				return err
 			}
 			if runtime.newSource == nil ||
-				runtime.openSyncRepositories == nil ||
+				runtime.openCanonicalRepositories == nil ||
 				runtime.newModel == nil ||
-				(settings.PoC.Directory.Enabled && runtime.newDirectoryLookup == nil) {
+				(settings.Application.Directory.Enabled && runtime.newDirectoryLookup == nil) {
 				return errors.New("sync command dependencies are not configured")
 			}
-			sourceBoundary, err := runtime.newSource(ctx, settings.PoC)
+			sourceBoundary, err := runtime.newSource(ctx, settings.Application)
 			if err != nil {
 				return err
 			}
 			var directoryLookup directory.Lookup
-			if settings.PoC.Directory.Enabled {
-				directoryLookup, err = runtime.newDirectoryLookup(ctx, settings.PoC.Directory)
+			if settings.Application.Directory.Enabled {
+				directoryLookup, err = runtime.newDirectoryLookup(ctx, settings.Application.Directory)
 				if cancellationErr := canonicalContextError(ctx, err); cancellationErr != nil {
 					return cancellationErr
 				}
@@ -296,23 +384,23 @@ func pocCommandProviderWithRuntime(
 					directoryLookup = nil
 				}
 			}
-			repository, directoryRepository, closeRepository, err := runtime.openSyncRepositories(
+			repositories, err := runtime.openCanonicalRepositories(
 				ctx,
-				settings.PoC.DatabaseURL,
-				settings.PoC.Directory.Enabled,
+				settings.Database.URL,
+				settings.Application.Directory.Enabled,
 			)
 			if err != nil {
 				return err
 			}
-			if closeRepository != nil {
-				defer closeRepository()
+			if repositories.close != nil {
+				defer repositories.close()
 			}
 			var directoryService *directory.Service
-			if settings.PoC.Directory.Enabled {
+			if settings.Application.Directory.Enabled {
 				directoryService, err = newDirectoryService(
-					settings.PoC.Directory,
+					settings.Application.Directory,
 					directoryLookup,
-					directoryRepository,
+					repositories.directory,
 					tracer,
 					decisions,
 					time.Now,
@@ -321,46 +409,57 @@ func pocCommandProviderWithRuntime(
 					return err
 				}
 			}
-			model, err := runtime.newModel(ctx, settings.PoC.Model, invocations, tracer)
+			model, err := runtime.newModel(ctx, settings.Application.Model, invocations, tracer)
 			if err != nil {
 				return err
 			}
 			service := newIngestionService(
-				settings.PoC, sourceBoundary, model, repository,
+				settings.Application, sourceBoundary, model, repositories.ingestion,
 				directoryService, tracer, decisions, time.Now,
 			)
 			return (cli.SyncCommand{Service: service, Output: stdout}).Run(ctx, args)
 		}),
 		string(config.CommandEntities): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			if err := settings.PoC.Validate(config.CommandEntities); err != nil {
+			if err := settings.Validate(config.CommandEntities); err != nil {
 				return err
 			}
-			pool, err := storage.Open(ctx, settings.PoC.DatabaseURL)
+			if runtime.openCanonicalRepositories == nil {
+				return errors.New("entities command dependencies are not configured")
+			}
+			repositories, err := runtime.openCanonicalRepositories(
+				ctx,
+				settings.Database.URL,
+				false,
+			)
 			if err != nil {
 				return err
 			}
-			defer pool.Close()
-			store := cli.NewStorageReviewStore(storage.NewEntityRepository(pool))
-			return (cli.EntitiesCommand{Service: &cli.EntityService{Store: store}, Output: stdout}).Run(ctx, args)
+			if repositories.close != nil {
+				defer repositories.close()
+			}
+			return (cli.EntitiesCommand{
+				Service: &cli.EntityService{Store: repositories.entities},
+				Output:  stdout,
+			}).Run(ctx, args)
 		}),
 		string(config.CommandReview): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			if err := settings.PoC.Validate(config.CommandReview); err != nil {
+			if err := settings.Validate(config.CommandReview); err != nil {
 				return err
 			}
-			if settings.PoC.Directory.Enabled &&
-				settings.PoC.Model.DataMode == modelpolicy.DataModeRestricted {
-				if err := requireRestrictedDisclosure(ctx, settings.PoC.Model, runtime); err != nil {
+			if settings.Application.Directory.Enabled &&
+				settings.Application.Model.DataMode == modelpolicy.DataModeRestricted {
+				if err := requireRestrictedDisclosure(ctx, settings.Application.Model, runtime); err != nil {
 					return err
 				}
 			}
-			if runtime.openReviewRepositories == nil ||
-				(settings.PoC.Directory.Enabled && runtime.newDirectoryLookup == nil) {
+			if runtime.openCanonicalRepositories == nil ||
+				(settings.Application.Directory.Enabled && runtime.newDirectoryLookup == nil) {
 				return errors.New("review command dependencies are not configured")
 			}
 			var directoryLookup directory.Lookup
 			var err error
-			if settings.PoC.Directory.Enabled {
-				directoryLookup, err = runtime.newDirectoryLookup(ctx, settings.PoC.Directory)
+			if settings.Application.Directory.Enabled {
+				directoryLookup, err = runtime.newDirectoryLookup(ctx, settings.Application.Directory)
 				if cancellationErr := canonicalContextError(ctx, err); cancellationErr != nil {
 					return cancellationErr
 				}
@@ -368,23 +467,23 @@ func pocCommandProviderWithRuntime(
 					directoryLookup = nil
 				}
 			}
-			entityRepository, directoryRepository, closeRepositories, err := runtime.openReviewRepositories(
+			repositories, err := runtime.openCanonicalRepositories(
 				ctx,
-				settings.PoC.DatabaseURL,
-				settings.PoC.Directory.Enabled,
+				settings.Database.URL,
+				settings.Application.Directory.Enabled,
 			)
 			if err != nil {
 				return err
 			}
-			if closeRepositories != nil {
-				defer closeRepositories()
+			if repositories.close != nil {
+				defer repositories.close()
 			}
 			var verifier cli.ReviewerEmailVerifier
-			if settings.PoC.Directory.Enabled {
+			if settings.Application.Directory.Enabled {
 				directoryService, err := newDirectoryService(
-					settings.PoC.Directory,
+					settings.Application.Directory,
 					directoryLookup,
-					directoryRepository,
+					repositories.directory,
 					tracer,
 					decisions,
 					time.Now,
@@ -394,43 +493,152 @@ func pocCommandProviderWithRuntime(
 				}
 				verifier = directoryService
 			}
-			store := cli.NewStorageReviewStore(entityRepository, verifier)
-			return (cli.ReviewCommand{Service: &cli.ReviewService{Store: store}, Output: stdout}).Run(ctx, args)
+			store := cli.NewCanonicalReviewStore(repositories.review, verifier)
+			return (cli.ReviewCommand{
+				Service: &cli.ReviewService{Store: store}, Output: stdout,
+			}).Run(ctx, args)
 		}),
 		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, args []string) error {
-			if err := settings.PoC.Validate(config.CommandAnalyze); err != nil {
+			if err := settings.Validate(config.CommandAnalyze); err != nil {
 				return err
 			}
-			if err := requireRestrictedDisclosure(ctx, settings.PoC.Model, runtime); err != nil {
+			if err := requireRestrictedDisclosure(ctx, settings.Application.Model, runtime); err != nil {
 				return err
 			}
-			if runtime.openAnalysisRepository == nil || runtime.newModel == nil {
+			if runtime.openCanonicalRepositories == nil || runtime.newModel == nil {
 				return errors.New("analyze command dependencies are not configured")
 			}
-			repository, closeRepository, err := runtime.openAnalysisRepository(ctx, settings.PoC.DatabaseURL)
+			repositories, err := runtime.openCanonicalRepositories(
+				ctx,
+				settings.Database.URL,
+				false,
+			)
 			if err != nil {
 				return err
 			}
-			if closeRepository != nil {
-				defer closeRepository()
+			if repositories.close != nil {
+				defer repositories.close()
 			}
-			model, err := runtime.newModel(ctx, settings.PoC.Model, invocations, tracer)
+			model, err := runtime.newModel(ctx, settings.Application.Model, invocations, tracer)
 			if err != nil {
 				return err
 			}
 			service := newAnalysisService(
-				settings.PoC, repository, model,
+				settings.Application, repositories.analysis, model,
 				tracer, decisions, time.Now,
 			)
 			return (cli.AnalyzeCommand{
-				Service: service, EmployeeID: settings.PoC.EmployeeEntityID,
-				ManagerID: settings.PoC.ManagerEntityID, Output: stdout,
+				Service: service, EmployeeID: settings.Application.ManagerConfidence.EmployeeEntityID,
+				ManagerID: settings.Application.ManagerConfidence.ManagerEntityID, Output: stdout,
 			}).Run(ctx, args)
 		}),
 	}, nil
 }
 
-func requireRestrictedDisclosure(ctx context.Context, settings config.ModelSettings, runtime pocCommandRuntime) error {
+func runDatabaseCommand(
+	ctx context.Context,
+	tracer trace.Tracer,
+	name string,
+	run func(context.Context) error,
+) (runErr error) {
+	if tracer == nil {
+		return run(ctx)
+	}
+	ctx, span := tracer.Start(ctx, name)
+	defer func() {
+		outcome := "success"
+		if runErr != nil {
+			outcome = "failure"
+			span.SetStatus(codes.Error, "database operation failed")
+		} else {
+			span.SetStatus(codes.Ok, "")
+		}
+		span.SetAttributes(attribute.String("stacks.outcome", outcome))
+		span.End()
+	}()
+	return run(ctx)
+}
+
+type embeddedMigrationApplier struct {
+	settings config.DatabaseSettings
+}
+
+func (applier embeddedMigrationApplier) Apply(
+	ctx context.Context,
+) (migration.ApplyResult, error) {
+	manifests, err := selectedMigrationManifests(applier.settings.Scopes)
+	if err != nil {
+		return migration.ApplyResult{}, err
+	}
+	return (migration.Migrator{
+		DatabaseURL:     applier.settings.MigrationURL,
+		ApplicationRole: applier.settings.ApplicationRole,
+		Manifests:       manifests,
+	}).Apply(ctx)
+}
+
+type embeddedMigrationInspector struct {
+	settings config.DatabaseSettings
+}
+
+func (inspector embeddedMigrationInspector) Status(
+	ctx context.Context,
+) ([]migration.ScopeStatus, error) {
+	manifests, err := knownMigrationManifests()
+	if err != nil {
+		return nil, err
+	}
+	return (migration.Inspector{
+		DatabaseURL: inspector.settings.URL,
+		Manifests:   manifests,
+		Configured:  configuredMigrationScopes(inspector.settings.Scopes),
+	}).Status(ctx)
+}
+
+func selectedMigrationManifests(
+	scopes []config.DatabaseScope,
+) ([]migration.Manifest, error) {
+	known, err := knownMigrationManifests()
+	if err != nil {
+		return nil, err
+	}
+	selected := make(map[migration.Scope]bool, len(scopes))
+	for _, scope := range configuredMigrationScopes(scopes) {
+		selected[scope] = true
+	}
+	result := make([]migration.Manifest, 0, len(selected))
+	for _, manifest := range known {
+		if selected[manifest.Scope] {
+			result = append(result, manifest)
+		}
+	}
+	return result, nil
+}
+
+func knownMigrationManifests() ([]migration.Manifest, error) {
+	core, err := coremigrations.Manifest()
+	if err != nil {
+		return nil, err
+	}
+	directoryManifest, err := directorymigrations.Manifest()
+	if err != nil {
+		return nil, err
+	}
+	return []migration.Manifest{core, directoryManifest}, nil
+}
+
+func configuredMigrationScopes(scopes []config.DatabaseScope) []migration.Scope {
+	if len(scopes) == 0 {
+		return []migration.Scope{"core"}
+	}
+	result := make([]migration.Scope, len(scopes))
+	for index, scope := range scopes {
+		result[index] = migration.Scope(scope)
+	}
+	return result
+}
+
+func requireRestrictedDisclosure(ctx context.Context, settings config.ModelSettings, runtime commandRuntime) error {
 	if settings.DataMode == modelpolicy.DataModePersonal {
 		return nil
 	}
@@ -469,7 +677,7 @@ func modelInvocation(settings config.ModelSettings) modelpolicy.Invocation {
 }
 
 func newIngestionService(
-	settings config.PoCSettings,
+	settings config.ApplicationSettings,
 	sourceBoundary source.Source,
 	model extract.Model,
 	repository ingest.Repository,
@@ -529,7 +737,7 @@ func waitForDirectoryRetry(ctx context.Context, delay time.Duration) error {
 }
 
 func newAnalysisService(
-	settings config.PoCSettings,
+	settings config.ApplicationSettings,
 	repository analysis.Repository,
 	model extract.Model,
 	tracer trace.Tracer,
@@ -537,7 +745,7 @@ func newAnalysisService(
 	now func() time.Time,
 ) *analysis.Service {
 	return &analysis.Service{
-		Repository: repository, Model: model, PromptVersion: settings.AnalysisPromptVersion,
+		Repository: repository, Model: model, PromptVersion: settings.ManagerConfidence.PromptVersion,
 		Provider: settings.Model.Provider, DataMode: settings.Model.DataMode,
 		Region: modelInvocation(settings.Model).Region, ModelID: strings.TrimSpace(settings.Model.ModelID),
 		MaxTokens: settings.Model.MaxOutputTokens, Tracer: tracer,

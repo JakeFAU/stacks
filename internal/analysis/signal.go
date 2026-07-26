@@ -51,7 +51,6 @@ type Signal struct {
 	Confidence       float64
 	Validated        bool
 	TranscriptBacked bool
-	Inputs           []InputReference
 	Citations        []Citation
 }
 
@@ -75,6 +74,7 @@ type Citation struct {
 	Quote              string
 	Locator            string
 	Role               CitationRole
+	SectionRole        string
 	Transcript         bool
 }
 

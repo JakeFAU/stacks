@@ -10,9 +10,40 @@ import (
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
+	"github.com/JakeFAU/stacks/adapters/postgres/migration"
+
 	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 )
+
+func TestPostgresProbeUsesOneCallerOwnedQueryBoundary(t *testing.T) {
+	database := &recordingPostgresDatabase{}
+	probe := NewPostgresProbeWithScopes(database, []migration.Scope{"core"})
+
+	if err := probe.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping() error = %v", err)
+	}
+	statuses, err := probe.MigrationStatus(context.Background())
+	if err != nil {
+		t.Fatalf("MigrationStatus() error = %v", err)
+	}
+	if database.pings != 1 || database.inspections != 1 {
+		t.Fatalf(
+			"caller-owned query boundary calls = ping:%d status:%d, want 1/1",
+			database.pings,
+			database.inspections,
+		)
+	}
+	if len(database.manifests) != 2 || len(database.configured) != 1 ||
+		database.configured[0] != "core" || len(statuses) != 2 {
+		t.Fatalf(
+			"migration inspection = manifests:%d configured:%v statuses:%d, want 2/[core]/2",
+			len(database.manifests),
+			database.configured,
+			len(statuses),
+		)
+	}
+}
 
 func TestRequireRestrictedDisclosureSkipsPersonalMode(t *testing.T) {
 	probe := &fakeDisclosureProbe{state: InvocationLoggingEnabled}
@@ -26,6 +57,32 @@ func TestRequireRestrictedDisclosureSkipsPersonalMode(t *testing.T) {
 	if probe.calls != 0 {
 		t.Fatalf("InvocationLogging() calls = %d, want zero", probe.calls)
 	}
+}
+
+type recordingPostgresDatabase struct {
+	pings       int
+	inspections int
+	manifests   []migration.Manifest
+	configured  []migration.Scope
+}
+
+func (database *recordingPostgresDatabase) Ping(context.Context) error {
+	database.pings++
+	return nil
+}
+
+func (database *recordingPostgresDatabase) InspectMigrationStatus(
+	_ context.Context,
+	manifests []migration.Manifest,
+	configured []migration.Scope,
+) ([]migration.ScopeStatus, error) {
+	database.inspections++
+	database.manifests = append([]migration.Manifest(nil), manifests...)
+	database.configured = append([]migration.Scope(nil), configured...)
+	return []migration.ScopeStatus{
+		{Scope: "core", State: migration.StateCurrent, Configured: true},
+		{Scope: "directory", State: migration.StateAbsent, Configured: false},
+	}, nil
 }
 
 func TestRequireRestrictedDisclosureRejectsDirectProvidersWithoutInspection(t *testing.T) {
@@ -105,167 +162,6 @@ func TestRequireRestrictedDisclosureRejectsCancellationAfterDisabledResult(t *te
 
 	if !errors.Is(err, ErrDisclosureNotConfirmed) || !errors.Is(err, context.Canceled) || err != nil && len(err.Error()) > 160 {
 		t.Fatalf("RequireRestrictedDisclosure() error = %v, want bounded disclosure failure and canonical context.Canceled", err)
-	}
-}
-
-func TestPostgresProbeChecksRequiredMigrationWithoutApplyingIt(t *testing.T) {
-	connection := &fakePostgresConnection{
-		appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
-	}
-	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
-		return connection, nil
-	})
-	defer probe.Close()
-
-	if err := probe.Ping(context.Background()); err != nil {
-		t.Fatalf("Ping() error = %v", err)
-	}
-	current, err := probe.MigrationsCurrent(context.Background())
-	if err != nil {
-		t.Fatalf("MigrationsCurrent() error = %v", err)
-	}
-	if !current {
-		t.Fatal("MigrationsCurrent() = false, want true")
-	}
-	if connection.pingCalls != 1 || connection.queryCalls != 1 || connection.mutationCalls != 0 {
-		t.Fatalf("calls = ping:%d query:%d mutation:%d, want 1/1/0", connection.pingCalls, connection.queryCalls, connection.mutationCalls)
-	}
-	normalizedQuery := strings.ToLower(connection.lastQuery)
-	if strings.Contains(normalizedQuery, "max(") || !strings.Contains(normalizedQuery, "unnest") || !strings.Contains(normalizedQuery, "distinct on") {
-		t.Fatalf("migration query = %q, want required-set comparison against each version's latest state", connection.lastQuery)
-	}
-}
-
-func TestPostgresProbeRejectsAppliedMigrationSetWithInteriorGap(t *testing.T) {
-	connection := &fakePostgresConnection{
-		appliedMigrationVersions: []int64{1, 2, 4, 5, 6},
-	}
-	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
-		return connection, nil
-	})
-	defer probe.Close()
-
-	current, err := probe.MigrationsCurrent(context.Background())
-	if err != nil {
-		t.Fatalf("MigrationsCurrent() error = %v", err)
-	}
-	if current {
-		t.Fatal("MigrationsCurrent() = true, want false for missing applied migration 3")
-	}
-}
-
-func TestPostgresProbeRequiresLegacyAdmissionMigration(t *testing.T) {
-	connection := &fakePostgresConnection{appliedMigrationVersions: []int64{1, 2, 3, 4, 5}}
-	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
-		return connection, nil
-	})
-	defer probe.Close()
-
-	current, err := probe.MigrationsCurrent(context.Background())
-	if err != nil {
-		t.Fatalf("MigrationsCurrent() error = %v", err)
-	}
-	if current {
-		t.Fatal("MigrationsCurrent() = true, want migration 6 required")
-	}
-}
-
-func TestPostgresProbeRequiresCompatibilityAdmissionMigration(t *testing.T) {
-	connection := &fakePostgresConnection{appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6}}
-	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
-		return connection, nil
-	})
-	defer probe.Close()
-
-	current, err := probe.MigrationsCurrent(context.Background())
-	if err != nil {
-		t.Fatalf("MigrationsCurrent() error = %v", err)
-	}
-	if current {
-		t.Fatal("MigrationsCurrent() = true, want migration 7 required")
-	}
-}
-
-func TestPostgresProbeRequiresSnapshotCoherenceAdmissionMigration(t *testing.T) {
-	connection := &fakePostgresConnection{appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7}}
-	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
-		return connection, nil
-	})
-	defer probe.Close()
-
-	current, err := probe.MigrationsCurrent(context.Background())
-	if err != nil {
-		t.Fatalf("MigrationsCurrent() error = %v", err)
-	}
-	if current {
-		t.Fatal("MigrationsCurrent() = true, want migration 8 required")
-	}
-}
-
-func TestPostgresProbeRequiresDoctorInspectionMigration(t *testing.T) {
-	connection := &fakePostgresConnection{appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7, 8}}
-	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
-		return connection, nil
-	})
-	defer probe.Close()
-
-	current, err := probe.MigrationsCurrent(context.Background())
-	if err != nil {
-		t.Fatalf("MigrationsCurrent() error = %v", err)
-	}
-	if current {
-		t.Fatal("MigrationsCurrent() = true, want migration 9 required")
-	}
-}
-
-func TestRequiredMigrationVersionsIncludesModelProviderProvenance(t *testing.T) {
-	connection := &fakePostgresConnection{appliedMigrationVersions: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9}}
-	probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
-		return connection, nil
-	})
-	defer probe.Close()
-
-	current, err := probe.MigrationsCurrent(context.Background())
-	if err != nil {
-		t.Fatalf("MigrationsCurrent() error = %v", err)
-	}
-	if current {
-		t.Fatal("MigrationsCurrent() = true, want migration 10 required")
-	}
-}
-
-func TestRequiredMigrationVersionsIncludesCurrentDocumentAndGoogleDirectory(t *testing.T) {
-	for _, testCase := range []struct {
-		name    string
-		applied []int64
-		missing int64
-	}{
-		{
-			name:    "current document version",
-			applied: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12},
-			missing: 11,
-		},
-		{
-			name:    "Google directory identity",
-			applied: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
-			missing: 12,
-		},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			connection := &fakePostgresConnection{appliedMigrationVersions: testCase.applied}
-			probe := newPostgresProbe("postgres://synthetic", func(context.Context, string) (postgresConnection, error) {
-				return connection, nil
-			})
-			defer probe.Close()
-
-			current, err := probe.MigrationsCurrent(context.Background())
-			if err != nil {
-				t.Fatalf("MigrationsCurrent() error = %v", err)
-			}
-			if current {
-				t.Fatalf("MigrationsCurrent() = true, want migration %d required", testCase.missing)
-			}
-		})
 	}
 }
 
@@ -469,77 +365,6 @@ func (fake *fakeDisclosureProbe) InvocationLogging(ctx context.Context) (Invocat
 		return fake.logging(ctx)
 	}
 	return fake.state, fake.err
-}
-
-type fakePostgresConnection struct {
-	appliedMigrationVersions []int64
-	pingCalls                int
-	queryCalls               int
-	mutationCalls            int
-	lastQuery                string
-}
-
-func (fake *fakePostgresConnection) Ping(context.Context) error {
-	fake.pingCalls++
-	return nil
-}
-
-func (fake *fakePostgresConnection) QueryRow(_ context.Context, query string, arguments ...any) postgresRow {
-	fake.queryCalls++
-	fake.lastQuery = query
-	if len(arguments) == 1 {
-		requiredVersions, ok := arguments[0].([]int64)
-		if !ok {
-			return fakePostgresRow{err: errors.New("unexpected migration query argument")}
-		}
-		current := containsEveryMigration(requiredVersions, fake.appliedMigrationVersions)
-		return fakePostgresRow{current: &current}
-	}
-	return fakePostgresRow{err: errors.New("required migration versions were not supplied")}
-}
-
-func (fake *fakePostgresConnection) Close() {}
-
-func (fake *fakePostgresConnection) ApplyMigrations(context.Context) error {
-	fake.mutationCalls++
-	return nil
-}
-
-type fakePostgresRow struct {
-	current *bool
-	err     error
-}
-
-func (row fakePostgresRow) Scan(destinations ...any) error {
-	if row.err != nil {
-		return row.err
-	}
-	if len(destinations) != 1 {
-		return errors.New("unexpected scan destinations")
-	}
-	switch value := destinations[0].(type) {
-	case *bool:
-		if row.current == nil {
-			return errors.New("unexpected boolean scan destination")
-		}
-		*value = *row.current
-	default:
-		return errors.New("unexpected scan destination")
-	}
-	return nil
-}
-
-func containsEveryMigration(required, applied []int64) bool {
-	appliedSet := make(map[int64]struct{}, len(applied))
-	for _, version := range applied {
-		appliedSet[version] = struct{}{}
-	}
-	for _, version := range required {
-		if _, ok := appliedSet[version]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 type fakeSource struct {

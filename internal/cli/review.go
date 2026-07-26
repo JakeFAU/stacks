@@ -23,16 +23,25 @@ type ReviewCandidate struct {
 	DirectoryProfileID string
 	DisplayName        string
 	MaskedEmail        string
-	Source             string
+	SourceKind         string
+	SourceReference    string
+	DirectorySource    string
 	Confidence         *float64
 	Reason             string
 }
 
+// ReviewEvidence is one exact private citation.
+type ReviewEvidence struct {
+	ID    string
+	Quote string
+}
+
 // ReviewProposal is the private review projection of one resolution proposal.
 type ReviewProposal struct {
-	ID         string
-	Context    string
-	Candidates []ReviewCandidate
+	ID                string
+	Evidence          []ReviewEvidence
+	Candidates        []ReviewCandidate
+	EffectiveDecision *ReviewDecision
 }
 
 // ReviewDecision identifies an immutable review action.
@@ -42,6 +51,7 @@ type ReviewDecision struct {
 	SupersedesID string
 	EntityID     string
 	Outcome      string
+	Authority    string
 }
 
 // CreatePersonInput is the validated user request for a new person entity.
@@ -252,11 +262,11 @@ func renderReviewListProposal(output io.Writer, proposal ReviewProposal) {
 				guess,
 				boundedReviewListText(highestRanked.DisplayName, maximumReviewListDisplayRunes),
 				highestRanked.MaskedEmail,
-				highestRanked.Source,
+				highestRanked.DirectorySource,
 				confidence,
 				alternatives,
 				boundedReviewListText(reason, maximumReviewListReasonRunes),
-				boundedReviewListText(proposal.Context, maximumReviewListContextRunes),
+				boundedReviewListText(reviewProposalContext(proposal), maximumReviewListContextRunes),
 			)
 			return
 		}
@@ -267,7 +277,7 @@ func renderReviewListProposal(output io.Writer, proposal ReviewProposal) {
 		confidence,
 		alternatives,
 		boundedReviewListText(reason, maximumReviewListReasonRunes),
-		boundedReviewListText(proposal.Context, maximumReviewListContextRunes),
+		boundedReviewListText(reviewProposalContext(proposal), maximumReviewListContextRunes),
 	)
 }
 
@@ -327,33 +337,69 @@ func parseAcceptDirectory(args []string) (AcceptDirectoryInput, error) {
 }
 
 func renderProposal(output io.Writer, proposal ReviewProposal) {
-	fmt.Fprintf(output, "proposal %s\ncontext: %s\n", proposal.ID, proposal.Context)
+	fmt.Fprintf(output, "proposal %s\n", proposal.ID)
+	for _, evidence := range proposal.Evidence {
+		fmt.Fprintf(output, "evidence %s: %s\n", evidence.ID, evidence.Quote)
+	}
+	if proposal.EffectiveDecision != nil {
+		fmt.Fprintf(
+			output,
+			"effective decision: %s outcome: %s entity: %s authority: %s\n",
+			proposal.EffectiveDecision.ID,
+			proposal.EffectiveDecision.Outcome,
+			proposal.EffectiveDecision.EntityID,
+			proposal.EffectiveDecision.Authority,
+		)
+	}
 	for _, candidate := range proposal.Candidates {
+		source := ""
+		if candidate.SourceKind != "" || candidate.SourceReference != "" {
+			source = fmt.Sprintf(
+				" source-kind: %s source-ref: %s",
+				candidate.SourceKind,
+				candidate.SourceReference,
+			)
+		}
 		if candidate.DirectoryProfileID != "" {
 			if candidate.Confidence == nil {
-				fmt.Fprintf(output, "directory candidate: %s display: %s email: %s source: %s reason: %s\n",
+				fmt.Fprintf(output, "directory candidate: %s display: %s email: %s source: %s%s reason: %s\n",
 					candidate.DirectoryProfileID,
-					candidate.DisplayName,
+					boundedReviewListText(
+						candidate.DisplayName,
+						maximumReviewListDisplayRunes,
+					),
 					candidate.MaskedEmail,
-					candidate.Source,
+					candidate.DirectorySource,
+					source,
 					candidate.Reason,
 				)
 				continue
 			}
-			fmt.Fprintf(output, "directory candidate: %s display: %s email: %s source: %s confidence: %.6f reason: %s\n",
+			fmt.Fprintf(output, "directory candidate: %s display: %s email: %s source: %s%s confidence: %.6f reason: %s\n",
 				candidate.DirectoryProfileID,
-				candidate.DisplayName,
+				boundedReviewListText(
+					candidate.DisplayName,
+					maximumReviewListDisplayRunes,
+				),
 				candidate.MaskedEmail,
-				candidate.Source,
+				candidate.DirectorySource,
+				source,
 				*candidate.Confidence,
 				candidate.Reason,
 			)
 			continue
 		}
 		if candidate.Confidence == nil {
-			fmt.Fprintf(output, "candidate: %s reason: %s\n", candidate.EntityID, candidate.Reason)
+			fmt.Fprintf(output, "candidate: %s%s reason: %s\n", candidate.EntityID, source, candidate.Reason)
 			continue
 		}
-		fmt.Fprintf(output, "candidate: %s confidence: %.6f reason: %s\n", candidate.EntityID, *candidate.Confidence, candidate.Reason)
+		fmt.Fprintf(output, "candidate: %s%s confidence: %.6f reason: %s\n", candidate.EntityID, source, *candidate.Confidence, candidate.Reason)
 	}
+}
+
+func reviewProposalContext(proposal ReviewProposal) string {
+	if len(proposal.Evidence) > 0 {
+		return proposal.Evidence[0].Quote
+	}
+	return ""
 }

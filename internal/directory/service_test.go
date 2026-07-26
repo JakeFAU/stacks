@@ -13,6 +13,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/JakeFAU/stacks/core/timepoint"
+
 	"stacks/internal/entity"
 	"stacks/internal/observability"
 )
@@ -41,6 +43,47 @@ func TestServiceDisabledPerformsNoRepositoryOrLookupCalls(t *testing.T) {
 	}
 	if lookup.calls != 0 {
 		t.Fatalf("lookup calls = %d, want 0", lookup.calls)
+	}
+}
+
+func TestDirectoryPostgresServiceSuppliesCanonicalPersistenceTimes(t *testing.T) {
+	repository := &fakeDirectoryRepository{
+		work: Workset{Mentions: []PendingMention{pendingEmailMention()}},
+	}
+	lookup := &fakeDirectoryLookup{results: []LookupResult{{
+		Outcome: entity.DirectoryNoMatch,
+	}}}
+	service := newTestDirectoryService(repository, lookup)
+	raw := time.Date(
+		2026,
+		time.July,
+		26,
+		11,
+		0,
+		0,
+		123456789,
+		time.FixedZone("synthetic", -4*60*60),
+	)
+	service.Now = func() time.Time { return raw }
+
+	summary, err := service.Enrich(context.Background(), "run:synthetic")
+	if err != nil {
+		t.Fatalf("Enrich() error = %v", err)
+	}
+	if summary.NoMatch != 1 || len(repository.persisted) != 1 {
+		t.Fatalf("Enrich() summary/persisted = %#v/%#v, want one no-match", summary, repository.persisted)
+	}
+	want := timepoint.Normalize(raw)
+	if repository.loadWorkNow != want ||
+		repository.persisted[0].RecordedAt != want ||
+		!timepoint.IsCanonical(repository.loadWorkNow) ||
+		!timepoint.IsCanonical(repository.persisted[0].RecordedAt) {
+		t.Fatalf(
+			"load/persist times = %v/%v, want canonical %v",
+			repository.loadWorkNow,
+			repository.persisted[0].RecordedAt,
+			want,
+		)
 	}
 }
 
@@ -74,6 +117,7 @@ func TestServiceMissingOptionalLookupIsUnavailable(t *testing.T) {
 func TestServiceVerifyReviewerEmailUsesReviewerEvidenceAndCurrentIdentityPolicy(t *testing.T) {
 	repository := &fakeDirectoryRepository{}
 	profile := matchedDirectoryProfile()
+	profile.ObservedAt = time.Date(2026, time.July, 24, 11, 0, 0, 0, time.UTC)
 	lookup := &fakeDirectoryLookup{results: []LookupResult{{
 		Profiles: []entity.DirectoryProfile{profile},
 	}}}
@@ -138,6 +182,99 @@ func TestServiceVerifyReviewerEmailReturnsBoundedUnavailableWithoutProviderError
 	}
 	if !verification.ValidForEmail("reviewer@corp.example") {
 		t.Fatalf("unavailable reviewer verification = %#v, want complete bounded metadata", verification)
+	}
+}
+
+func TestReviewerVerificationRejectsMalformedNestedMetadata(t *testing.T) {
+	recordedAt := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+	profile := entity.DirectoryProfile{
+		Provider: "google_people", SubjectID: "people/reviewer-validation",
+		Source: entity.DirectorySourceDomainProfile, DisplayName: "Reviewer Person",
+		Emails: []entity.DirectoryEmail{{
+			Value: "reviewer@corp.example", Primary: true,
+		}},
+		ObservedAt: recordedAt.Add(-time.Hour),
+	}
+	valid := ReviewerVerification{
+		Query: entity.DirectoryQuery{
+			Kind: entity.DirectoryQueryEmail, Email: "reviewer@corp.example",
+			EmailEvidence: entity.EmailEvidenceReviewerSupplied,
+		},
+		Lookup: LookupResult{
+			Provider: "google_people", Outcome: entity.DirectoryReview,
+			Profiles: []entity.DirectoryProfile{profile},
+		},
+		Evaluation: entity.DirectoryEvaluation{
+			Outcome:    entity.DirectoryReview,
+			Candidates: []entity.DirectoryProfile{profile},
+		},
+		AttemptCount: 1,
+		RecordedAt:   recordedAt,
+	}
+	if !valid.ValidForEmail("reviewer@corp.example") {
+		t.Fatal("valid reviewer verification was rejected")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ReviewerVerification)
+	}{
+		{
+			name: "valid lookup with malformed evaluation candidate",
+			mutate: func(value *ReviewerVerification) {
+				value.Evaluation.Candidates = append(
+					[]entity.DirectoryProfile(nil),
+					value.Evaluation.Candidates...,
+				)
+				value.Evaluation.Candidates[0].SubjectID = ""
+			},
+		},
+		{
+			name: "evaluation candidate absent from lookup",
+			mutate: func(value *ReviewerVerification) {
+				value.Evaluation.Candidates = append(
+					[]entity.DirectoryProfile(nil),
+					value.Evaluation.Candidates...,
+				)
+				value.Evaluation.Candidates[0].SubjectID = "people/different"
+			},
+		},
+		{
+			name: "lookup observation time is zero",
+			mutate: func(value *ReviewerVerification) {
+				value.Lookup.Profiles = append(
+					[]entity.DirectoryProfile(nil),
+					value.Lookup.Profiles...,
+				)
+				value.Lookup.Profiles[0].ObservedAt = time.Time{}
+			},
+		},
+		{
+			name: "evaluation observation time is noncanonical",
+			mutate: func(value *ReviewerVerification) {
+				value.Evaluation.Candidates = append(
+					[]entity.DirectoryProfile(nil),
+					value.Evaluation.Candidates...,
+				)
+				value.Evaluation.Candidates[0].ObservedAt =
+					value.Evaluation.Candidates[0].ObservedAt.Add(time.Nanosecond)
+			},
+		},
+		{
+			name: "verification recorded time is noncanonical",
+			mutate: func(value *ReviewerVerification) {
+				value.RecordedAt = value.RecordedAt.Add(time.Nanosecond)
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			malformed := valid
+			testCase.mutate(&malformed)
+			if malformed.ValidForEmail("reviewer@corp.example") {
+				t.Fatalf("malformed reviewer verification was accepted: %#v", malformed)
+			}
+		})
 	}
 }
 
@@ -1053,17 +1190,19 @@ type fakeDirectoryRepository struct {
 	afterLoadWork     func()
 	afterLoadIdentity func()
 	beforePersist     func()
+	loadWorkNow       time.Time
 	calls             repositoryCallCounts
 }
 
 func (repository *fakeDirectoryRepository) LoadWork(
-	context.Context,
-	string,
-	time.Time,
-	time.Duration,
-	time.Duration,
+	_ context.Context,
+	_ string,
+	now time.Time,
+	_ time.Duration,
+	_ time.Duration,
 ) (Workset, error) {
 	repository.calls.loadWork++
+	repository.loadWorkNow = now
 	if repository.afterLoadWork != nil {
 		repository.afterLoadWork()
 	}

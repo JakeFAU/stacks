@@ -169,22 +169,6 @@ func TestCompareWindowSummariesRequiresObservationAndEvidenceProvenance(t *testi
 	}
 }
 
-func TestCompareWindowSummariesRejectsLegacyUncitedResolvedFact(t *testing.T) {
-	windowA, windowB := comparisonWindows(t)
-	legacyUncited := temporal.Fact{
-		Key:            "status",
-		Value:          "prototype",
-		ObservationIDs: []observation.ObservationID{"observation-1"},
-		LegacyUncited:  true,
-	}
-	if _, err := temporal.CompareWindowSummaries(
-		temporal.WindowSummary{Selection: windowA, Facts: []temporal.Fact{legacyUncited}},
-		temporal.WindowSummary{Selection: windowB},
-	); err == nil {
-		t.Fatal("CompareWindowSummaries() error = nil, want resolved legacy-uncited fact error")
-	}
-}
-
 func TestCompareWindowSummariesRejectsReversedWindows(t *testing.T) {
 	windowA, windowB := comparisonWindows(t)
 	if _, err := temporal.CompareWindowSummaries(

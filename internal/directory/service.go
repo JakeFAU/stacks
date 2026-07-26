@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/JakeFAU/stacks/core/timepoint"
 	"stacks/internal/entity"
 	"stacks/internal/observability"
 )
@@ -54,12 +55,17 @@ func (verification ReviewerVerification) ValidForEmail(email string) bool {
 		entity.NormalizeEmail(verification.Query.Email) != normalizedEmail ||
 		entity.NormalizeName(verification.Query.Name) != "" ||
 		verification.Query.EmailEvidence != entity.EmailEvidenceReviewerSupplied ||
+		strings.TrimSpace(verification.Lookup.Provider) != reviewerDirectoryProvider ||
 		verification.RecordedAt.IsZero() ||
+		!timepoint.IsCanonical(verification.RecordedAt) ||
 		verification.AttemptCount < 0 ||
 		!boundedDirectoryOutcome(verification.Lookup.Outcome) ||
 		verification.Evaluation.Outcome != verification.Lookup.Outcome ||
 		verification.Lookup.RetryAfter < 0 ||
-		(verification.RetryAfter != nil && verification.RetryAfter.IsZero()) {
+		(verification.RetryAfter != nil &&
+			(verification.RetryAfter.IsZero() ||
+				!timepoint.IsCanonical(*verification.RetryAfter) ||
+				verification.RetryAfter.Before(verification.RecordedAt))) {
 		return false
 	}
 	if retryableDirectoryOutcome(verification.Lookup.Outcome) {
@@ -71,6 +77,22 @@ func (verification ReviewerVerification) ValidForEmail(email string) bool {
 	}
 	for _, profile := range verification.Lookup.Profiles {
 		if !validReviewerDirectoryProfile(profile) {
+			return false
+		}
+	}
+	if verification.Evaluation.Profile != nil {
+		if !validReviewerDirectoryProfile(*verification.Evaluation.Profile) ||
+			!reviewerDirectoryProfileInSet(
+				*verification.Evaluation.Profile,
+				verification.Lookup.Profiles,
+			) {
+			return false
+		}
+	}
+	for _, candidate := range verification.Evaluation.Candidates {
+		if !validReviewerDirectoryProfile(candidate) ||
+			!reviewerDirectoryProfileInSet(candidate, verification.Lookup.Profiles) ||
+			!reviewerDirectoryProfileHasEmail(candidate, normalizedEmail) {
 			return false
 		}
 	}
@@ -127,7 +149,9 @@ func validReviewerDirectoryProfile(profile entity.DirectoryProfile) bool {
 	if strings.TrimSpace(profile.Provider) != reviewerDirectoryProvider ||
 		strings.TrimSpace(profile.SubjectID) == "" ||
 		strings.TrimSpace(profile.DisplayName) == "" ||
-		len(profile.Emails) == 0 {
+		len(profile.Emails) == 0 ||
+		profile.ObservedAt.IsZero() ||
+		!timepoint.IsCanonical(profile.ObservedAt) {
 		return false
 	}
 	switch profile.Source {
@@ -149,6 +173,18 @@ func reviewerDirectoryProfileHasEmail(
 ) bool {
 	for _, candidate := range profile.Emails {
 		if entity.NormalizeEmail(candidate.Value) == email {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewerDirectoryProfileInSet(
+	profile entity.DirectoryProfile,
+	values []entity.DirectoryProfile,
+) bool {
+	for _, value := range values {
+		if sameReviewerDirectoryProfile(profile, value) {
 			return true
 		}
 	}
@@ -224,7 +260,10 @@ func (service *Service) VerifyReviewerEmail(ctx context.Context, email string) (
 		Email:         entity.NormalizeEmail(email),
 		EmailEvidence: entity.EmailEvidenceReviewerSupplied,
 	}
-	verification := ReviewerVerification{Query: query}
+	verification := ReviewerVerification{
+		Query:  query,
+		Lookup: LookupResult{Provider: reviewerDirectoryProvider},
+	}
 	if err := ctx.Err(); err != nil {
 		return ReviewerVerification{}, err
 	}
@@ -238,7 +277,7 @@ func (service *Service) VerifyReviewerEmail(ctx context.Context, email string) (
 		verification.Evaluation.Outcome = entity.DirectoryUnavailable
 		return verification, nil
 	}
-	verification.RecordedAt = service.Now().UTC()
+	verification.RecordedAt = timepoint.Normalize(service.Now())
 	if !service.Policy.LookupEligible(query) {
 		verification.Lookup.Outcome = entity.DirectoryNoMatch
 		verification.Evaluation.Outcome = entity.DirectoryNoMatch
@@ -271,7 +310,10 @@ func (service *Service) VerifyReviewerEmail(ctx context.Context, email string) (
 		return ReviewerVerification{}, cancellationErr
 	}
 	if err != nil {
-		verification.Lookup = LookupResult{Outcome: entity.DirectoryUnavailable}
+		verification.Lookup = LookupResult{
+			Provider: reviewerDirectoryProvider,
+			Outcome:  entity.DirectoryUnavailable,
+		}
 	}
 	if verification.Lookup.Outcome == "" {
 		verification.Evaluation = service.Policy.Evaluate(
@@ -323,7 +365,7 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 		return summary, nil
 	}
 
-	now := service.Now().UTC()
+	now := timepoint.Normalize(service.Now())
 	if err := ctx.Err(); err != nil {
 		return summary, err
 	}
@@ -354,10 +396,13 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 		if !eligible {
 			continue
 		}
-		started := service.Now().UTC()
+		started := timepoint.Normalize(service.Now())
 		summary.Attempted++
 
-		lookup := LookupResult{Outcome: entity.DirectoryNotConfigured}
+		lookup := LookupResult{
+			Provider: reviewerDirectoryProvider,
+			Outcome:  entity.DirectoryNotConfigured,
+		}
 		attemptCount := 0
 		var lookupErr error
 		if service.Lookup != nil {
@@ -375,7 +420,7 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 			}
 			return summary, cancellationErr
 		}
-		recordedAt := service.Now().UTC()
+		recordedAt := timepoint.Normalize(service.Now())
 		evaluation := entity.DirectoryEvaluation{}
 		if lookup.Outcome == "" {
 			evaluation = service.Policy.Evaluate(query, lookup.Profiles, identityState.Snapshots, identityState.Links)
@@ -448,14 +493,23 @@ func (service *Service) search(ctx context.Context, query entity.DirectoryQuery)
 	var result LookupResult
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt - 1, err
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt - 1, err
 		}
 		untrusted, err := service.Lookup.Search(ctx, query)
 		if cancellationErr := directoryCancellation(ctx, err); cancellationErr != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, cancellationErr
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt, cancellationErr
 		}
 		if err != nil {
-			result = LookupResult{Outcome: entity.DirectoryUnavailable}
+			result = LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}
 		} else {
 			result = normalizeLookupResult(untrusted)
 		}
@@ -466,14 +520,23 @@ func (service *Service) search(ctx context.Context, query entity.DirectoryQuery)
 			return result, attempt, nil
 		}
 		if err := ctx.Err(); err != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, err
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt, err
 		}
 		waitErr := service.Wait(ctx, service.retryDelay(result))
 		if cancellationErr := directoryCancellation(ctx, waitErr); cancellationErr != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, cancellationErr
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt, cancellationErr
 		}
 		if waitErr != nil {
-			return LookupResult{Outcome: entity.DirectoryUnavailable}, attempt, nil
+			return LookupResult{
+				Provider: reviewerDirectoryProvider,
+				Outcome:  entity.DirectoryUnavailable,
+			}, attempt, nil
 		}
 	}
 	return result, maxAttempts, nil
@@ -484,12 +547,19 @@ func retryableDirectoryOutcome(outcome entity.DirectoryOutcome) bool {
 }
 
 func normalizeLookupResult(result LookupResult) LookupResult {
+	result.Provider = strings.TrimSpace(result.Provider)
+	if result.Provider == "" {
+		result.Provider = reviewerDirectoryProvider
+	}
 	if result.Outcome == "" {
 		result.RetryAfter = 0
 		return result
 	}
 	if !boundedDirectoryOutcome(result.Outcome) {
-		return LookupResult{Outcome: entity.DirectoryInvalidResponse}
+		return LookupResult{
+			Provider: result.Provider,
+			Outcome:  entity.DirectoryInvalidResponse,
+		}
 	}
 	result.Profiles = nil
 	if !retryableDirectoryOutcome(result.Outcome) {
@@ -604,7 +674,7 @@ func (service *Service) recordDecision(
 	if service.Decisions == nil {
 		return nil
 	}
-	duration := service.Now().UTC().Sub(started)
+	duration := timepoint.Normalize(service.Now()).Sub(started)
 	if duration < 0 {
 		duration = 0
 	}

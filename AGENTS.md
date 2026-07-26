@@ -28,16 +28,24 @@ Do not assume that every step belongs in the same process or abstraction. Introd
 ## Project Structure
 
 ```text
-cmd/stacks/         process entrypoint and dependency wiring
-internal/app/       application lifecycle and orchestration
-internal/config/    environment loading, defaults, and validation
-internal/httpapi/   HTTP handlers, routing, middleware, and transport types
-internal/knowledge/ immutable evidence and temporal observation contracts
-internal/query/     temporal query plans and deterministic retrieval operators
-internal/...        focused application packages added as capabilities emerge
-bin/                local build output; never committed
-db/init/            first-start PostgreSQL role and schema bootstrap
-db/migrations/      ordered, forward-only SQL migrations
+cmd/stacks/                        process entrypoint and dependency composition
+core/                              provider-neutral evidence, identity, observation, and temporal contracts (separate Go module)
+adapters/postgres/                 canonical PostgreSQL repositories and scoped embedded migrations (separate Go module)
+internal/app/                      application lifecycle, command dispatch, and review mapping
+internal/cli/                      operator commands, output, and consumer-owned ports
+internal/config/                   environment loading, defaults, and command-specific validation
+internal/ingest/                   resumable canonical ingestion orchestration
+internal/analysis/                 read-only temporal analysis use case over canonical observations
+internal/directory/                optional directory enrichment orchestration and persistence mapping
+internal/source/                   provider-neutral document source boundary and Drive adapter
+internal/extract/                  structured extraction contracts, validation, and versioned prompts
+internal/doctor/                   read-only dependency and migration readiness checks
+internal/httpapi/                  HTTP handlers, routing, middleware, and transport types
+internal/localdb/                  guarded local Compose database reset
+internal/observability/            Zap and OpenTelemetry lifecycle helpers
+internal/...                       focused provider and application packages added as capabilities emerge
+db/init/                           first-start PostgreSQL role bootstrap only
+bin/                               local build output; never committed
 ```
 
 `cmd/stacks` must remain thin. It may construct dependencies, handle process signals, start the application, and report fatal startup errors. It must not contain business logic.

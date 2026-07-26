@@ -2,8 +2,6 @@ package analysis
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -20,6 +18,131 @@ import (
 	"stacks/internal/observability"
 )
 
+func TestServiceUsesOnlyReadOnlyCanonicalRepository(t *testing.T) {
+	repository := &readOnlyCanonicalRepository{
+		snapshots: []PairSnapshot{{Accepted: true}},
+	}
+	service := testReadOnlyService(repository, &fakeModel{})
+
+	report, err := service.Analyze(
+		context.Background(),
+		"employee:opaque/service",
+		"manager:opaque/service",
+	)
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if report.Status != StatusInsufficientEvidence || repository.loadCalls != 1 {
+		t.Fatalf(
+			"report/load calls = %q/%d, want insufficient/1",
+			report.Status,
+			repository.loadCalls,
+		)
+	}
+}
+
+func TestServiceDoesNotPersistManagerReport(t *testing.T) {
+	repository := &readOnlyCanonicalRepository{
+		snapshots: []PairSnapshot{{Accepted: true}},
+	}
+	service := testReadOnlyService(repository, &fakeModel{})
+
+	first, err := service.Analyze(
+		context.Background(),
+		"employee:opaque/service",
+		"manager:opaque/service",
+	)
+	if err != nil {
+		t.Fatalf("first Analyze() error = %v", err)
+	}
+	second, err := service.Analyze(
+		context.Background(),
+		"employee:opaque/service",
+		"manager:opaque/service",
+	)
+	if err != nil {
+		t.Fatalf("second Analyze() error = %v", err)
+	}
+	if first.Status != StatusInsufficientEvidence ||
+		second.Status != StatusInsufficientEvidence ||
+		repository.loadCalls != 2 {
+		t.Fatalf(
+			"reports/load calls = %q/%q/%d, want on-demand insufficient/insufficient/2",
+			first.Status,
+			second.Status,
+			repository.loadCalls,
+		)
+	}
+}
+
+func TestServiceRepeatedQueryReevaluatesCurrentAuthority(t *testing.T) {
+	repository := &readOnlyCanonicalRepository{
+		snapshots: []PairSnapshot{
+			{Accepted: true},
+			{Accepted: false},
+		},
+	}
+	service := testReadOnlyService(repository, &fakeModel{})
+
+	if _, err := service.Analyze(
+		context.Background(),
+		"employee:opaque/service",
+		"manager:opaque/service",
+	); err != nil {
+		t.Fatalf("first Analyze() error = %v", err)
+	}
+	_, err := service.Analyze(
+		context.Background(),
+		"employee:opaque/service",
+		"manager:opaque/service",
+	)
+	if !errors.Is(err, ErrPairNotAccepted) {
+		t.Fatalf("second Analyze() error = %v, want ErrPairNotAccepted", err)
+	}
+	if repository.loadCalls != 2 {
+		t.Fatalf("load calls = %d, want current authority read per call", repository.loadCalls)
+	}
+}
+
+func TestServicePreservesBoundedAdmissionAndCounterevidence(t *testing.T) {
+	meeting := testMeetingDate(2026, time.July, 8)
+	signal := testSignal(
+		"signal:opaque/counterevidence",
+		&meeting,
+		DirectionStrengthening,
+	)
+	signal.Citations = append(signal.Citations, Citation{
+		ID: "evidence:opaque/counterevidence", Role: CitationContradicting,
+		Quote: "Synthetic counterevidence.",
+	})
+	repository := &readOnlyCanonicalRepository{
+		snapshots: []PairSnapshot{{
+			Accepted: true,
+			Signals:  []Signal{signal},
+		}},
+	}
+	service := testReadOnlyService(repository, &fakeModel{})
+
+	report, err := service.Analyze(
+		context.Background(),
+		"employee:opaque/service",
+		"manager:opaque/service",
+	)
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if report.Status != StatusInsufficientEvidence ||
+		!slices.Equal(
+			signalIDs(report.Counterevidence),
+			[]string{"signal:opaque/counterevidence"},
+		) {
+		t.Fatalf(
+			"report = %#v, want bounded insufficient result with source counterevidence",
+			report,
+		)
+	}
+}
+
 func TestServiceRequiresAcceptedConfiguredPair(t *testing.T) {
 	repository := &fakeRepository{snapshot: PairSnapshot{Accepted: false}}
 	model := &fakeModel{}
@@ -29,8 +152,8 @@ func TestServiceRequiresAcceptedConfiguredPair(t *testing.T) {
 	if !errors.Is(err, ErrPairNotAccepted) {
 		t.Fatalf("Analyze() error = %v, want ErrPairNotAccepted", err)
 	}
-	if model.calls != 0 || repository.completeCalls != 0 {
-		t.Fatalf("model/complete calls = %d/%d, want 0/0", model.calls, repository.completeCalls)
+	if model.calls != 0 {
+		t.Fatalf("model calls = %d, want 0", model.calls)
 	}
 }
 
@@ -47,12 +170,6 @@ func TestServiceReturnsInsufficientWithoutModelForFewerThanTwoDatedMeetings(t *t
 	}
 	if report.Status != StatusInsufficientEvidence || model.calls != 0 {
 		t.Fatalf("report status/model calls = %q/%d, want insufficient/0", report.Status, model.calls)
-	}
-	if repository.completeCalls != 1 {
-		t.Fatalf("complete calls = %d, want 1 durable deterministic report", repository.completeCalls)
-	}
-	if repository.completed.DataMode != "" {
-		t.Fatalf("deterministic completion data mode = %q, want no invocation provenance", repository.completed.DataMode)
 	}
 }
 
@@ -72,39 +189,6 @@ func TestServiceTreatsTwoRevisionsOfOneSourceDocumentAsOneMeeting(t *testing.T) 
 	}
 }
 
-func TestServicePersistsAndCachesAcceptedPairWithNoEligibleSignals(t *testing.T) {
-	repository := &fakeRepository{snapshot: PairSnapshot{Accepted: true}}
-	model := &fakeModel{}
-	service := testService(repository, model)
-
-	first, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("first Analyze() error = %v", err)
-	}
-	if first.Status != StatusInsufficientEvidence || model.calls != 0 || repository.completeCalls != 1 {
-		t.Fatalf("first report/model/complete = %q/%d/%d, want insufficient/0/1", first.Status, model.calls, repository.completeCalls)
-	}
-	repository.cached = first
-	second, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("second Analyze() error = %v", err)
-	}
-	if second.ID != first.ID || model.calls != 0 || repository.completeCalls != 1 {
-		t.Fatalf("cached report/model/complete = %q/%d/%d, want same/0/1", second.ID, model.calls, repository.completeCalls)
-	}
-
-	repository.snapshot = acceptedPairSnapshot()
-	repository.cached = Report{}
-	model.output = analysisOutput(StatusNoMaterialChange, []string{"signal-earlier"}, nil)
-	third, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("third Analyze() error = %v", err)
-	}
-	if third.InputDigest == first.InputDigest || model.calls != 1 {
-		t.Fatalf("accepted signals digest/model calls = %x/%d, want new identity and one model call", third.InputDigest, model.calls)
-	}
-}
-
 func TestServiceRecordsInsufficientEvidenceDecisionWithoutModel(t *testing.T) {
 	snapshot := acceptedPairSnapshot()
 	snapshot.Signals = snapshot.Signals[:1]
@@ -118,115 +202,6 @@ func TestServiceRecordsInsufficientEvidenceDecisionWithoutModel(t *testing.T) {
 	}
 	if len(decisions.observations) != 1 || decisions.observations[0].Outcome != string(StatusInsufficientEvidence) {
 		t.Fatalf("decision observations = %#v, want one bounded insufficient-evidence decision", decisions.observations)
-	}
-}
-
-func TestServicePreservesRetryableStaleInputResult(t *testing.T) {
-	snapshot := acceptedPairSnapshot()
-	snapshot.Signals = snapshot.Signals[:1]
-	repository := &fakeRepository{snapshot: snapshot, completeErr: ErrStaleAnalysisInput}
-	service := testService(repository, &fakeModel{})
-
-	_, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if !errors.Is(err, ErrStaleAnalysisInput) {
-		t.Fatalf("Analyze() error = %v, want retryable stale-input result", err)
-	}
-}
-
-func TestServiceRejectsCachedReportWhenDecisionChangesBetweenLoadAndLookup(t *testing.T) {
-	snapshot := acceptedPairSnapshot()
-	repository := &fakeRepository{
-		snapshot: snapshot,
-		cached: Report{
-			ID: "historical-run", Status: StatusMixedOrConflicting,
-		},
-		findErr: ErrStaleAnalysisInput,
-	}
-	model := &fakeModel{}
-	service := testService(repository, model)
-
-	_, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if !errors.Is(err, ErrStaleAnalysisInput) {
-		t.Fatalf("Analyze() error = %v, want stale cache identity result", err)
-	}
-	if got := referenceIDs(repository.findIdentity.Inputs); !slices.Equal(got, referenceIDs(snapshot.Inputs)) {
-		t.Fatalf("cache identity inputs = %#v, want loaded snapshot inputs", got)
-	}
-	if repository.findIdentity.EmployeeEntityID != testEmployeeID || repository.findIdentity.ManagerEntityID != testManagerID ||
-		repository.findIdentity.PromptVersion != extract.AnalysisPromptVersion || repository.findIdentity.PolicyVersion != AnalysisPolicyVersion ||
-		repository.findIdentity.InputDigest == ([sha256.Size]byte{}) {
-		t.Fatalf("cache identity = %#v, want complete pair, version, and digest identity", repository.findIdentity)
-	}
-	if model.calls != 0 || repository.completeCalls != 0 {
-		t.Fatalf("model/complete calls = %d/%d, want 0/0 after stale cache lookup", model.calls, repository.completeCalls)
-	}
-}
-
-func TestServiceUsesExactOrderedInputDigestAndCachesIdenticalRun(t *testing.T) {
-	repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
-	model := &fakeModel{output: analysisOutput(StatusMixedOrConflicting, []string{"signal-earlier"}, nil)}
-	service := testService(repository, model)
-
-	first, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("first Analyze() error = %v", err)
-	}
-	wantDigest, err := ComputeInputDigest(AnalysisIdentity{
-		EmployeeEntityID: testEmployeeID,
-		ManagerEntityID:  testManagerID,
-		PromptVersion:    extract.AnalysisPromptVersion,
-		PolicyVersion:    AnalysisPolicyVersion,
-		Provider:         modelpolicy.ProviderBedrock,
-		Region:           service.Region,
-		ModelID:          service.ModelID,
-		MaxTokens:        service.MaxTokens,
-		Inputs:           repository.snapshot.Inputs,
-	})
-	if err != nil {
-		t.Fatalf("ComputeInputDigest() error = %v", err)
-	}
-	if repository.completed.Identity.InputDigest != wantDigest {
-		t.Fatalf("persisted input digest = %x, want %x", repository.completed.Identity.InputDigest, wantDigest)
-	}
-	if repository.completed.DataMode != modelpolicy.DataModePersonal {
-		t.Fatalf("model completion data mode = %q, want %q", repository.completed.DataMode, modelpolicy.DataModePersonal)
-	}
-	if got := referenceIDs(repository.completed.Identity.Inputs); !slices.Equal(got, referenceIDs(repository.snapshot.Inputs)) {
-		t.Fatalf("persisted ordered inputs = %#v, want %#v", got, referenceIDs(repository.snapshot.Inputs))
-	}
-
-	repository.cached = first
-	second, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("second Analyze() error = %v", err)
-	}
-	if second.ID != first.ID || model.calls != 1 || repository.completeCalls != 1 {
-		t.Fatalf("cached run = %#v, model/complete calls = %d/%d", second, model.calls, repository.completeCalls)
-	}
-}
-
-func TestServiceReusesBedrockAnalysisAcrossDataModesWithoutNewInvocation(t *testing.T) {
-	repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
-	model := &fakeModel{output: analysisOutput(StatusMixedOrConflicting, []string{"signal-earlier"}, nil)}
-	service := testService(repository, model)
-
-	first, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("first Analyze() error = %v", err)
-	}
-	if repository.completed.DataMode != modelpolicy.DataModePersonal {
-		t.Fatalf("completion data mode = %q, want %q", repository.completed.DataMode, modelpolicy.DataModePersonal)
-	}
-	firstDigest := repository.completed.Identity.InputDigest
-	repository.cached = first
-	service.DataMode = modelpolicy.DataModeRestricted
-
-	second, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("second Analyze() error = %v", err)
-	}
-	if second.ID != first.ID || repository.findIdentity.InputDigest != firstDigest || model.calls != 1 || repository.completeCalls != 1 {
-		t.Fatalf("cached report/digest/model/completion = %q/%x/%d/%d, want same digest and no new disclosure", second.ID, repository.findIdentity.InputDigest, model.calls, repository.completeCalls)
 	}
 }
 
@@ -259,83 +234,14 @@ func TestServiceRejectsProviderRegionPolicyBeforeRepositoryAccess(t *testing.T) 
 			if _, err := service.Analyze(context.Background(), testEmployeeID, testManagerID); err == nil {
 				t.Fatal("Analyze() error = nil, want provider policy rejection")
 			}
-			if repository.loadCalls != 0 || model.calls != 0 || repository.findIdentity.InputDigest != ([sha256.Size]byte{}) {
-				t.Fatalf("load/model/find identity = %d/%d/%#v, want validation before boundaries", repository.loadCalls, model.calls, repository.findIdentity)
+			if repository.loadCalls != 0 || model.calls != 0 {
+				t.Fatalf(
+					"load/model calls = %d/%d, want validation before boundaries",
+					repository.loadCalls,
+					model.calls,
+				)
 			}
 		})
-	}
-}
-
-func TestServiceCorrectionCreatesNewIdentityWithoutRemovingPriorProvenance(t *testing.T) {
-	repository := &fakeRepository{snapshot: acceptedPairSnapshot()}
-	model := &fakeModel{output: analysisOutput(StatusNoMaterialChange, []string{"signal-earlier"}, nil)}
-	service := testService(repository, model)
-
-	first, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("first Analyze() error = %v", err)
-	}
-	firstDigest := repository.completed.Identity.InputDigest
-	firstInputs := append([]InputReference(nil), repository.completed.Identity.Inputs...)
-
-	correctedDigest := sha256.Sum256([]byte("corrected-decision"))
-	repository.snapshot.Inputs[1] = InputReference{Kind: InputResolutionDecision, ID: testCorrectionDecisionID, Digest: correctedDigest}
-	repository.cached = Report{}
-	second, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("corrected Analyze() error = %v", err)
-	}
-	if second.ID == first.ID || repository.completed.Identity.InputDigest == firstDigest {
-		t.Fatal("corrected resolution decision reused prior analysis identity")
-	}
-	if !slices.Equal(referenceIDs(repository.history[0].Identity.Inputs), referenceIDs(firstInputs)) {
-		t.Fatal("prior run input provenance was mutated by correction")
-	}
-}
-
-func TestServicePendingAcceptanceAndCorrectionChangeEligibilityWithoutReingest(t *testing.T) {
-	full := acceptedPairSnapshot()
-	pending := full
-	pending.Signals = nil
-	pending.Inputs = append([]InputReference(nil), full.Inputs[:2]...)
-	repository := &fakeRepository{snapshot: pending}
-	model := &fakeModel{output: analysisOutput(StatusNoMaterialChange, []string{"signal-earlier"}, nil)}
-	service := testService(repository, model)
-
-	pendingReport, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("pending Analyze() error = %v", err)
-	}
-	if pendingReport.Status != StatusInsufficientEvidence || model.calls != 0 {
-		t.Fatalf("pending report/model calls = %q/%d, want insufficient/0", pendingReport.Status, model.calls)
-	}
-
-	repository.snapshot = full
-	acceptedReport, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("accepted Analyze() error = %v", err)
-	}
-	if acceptedReport.Status != StatusMixedOrConflicting || model.calls != 1 || acceptedReport.InputDigest == pendingReport.InputDigest {
-		t.Fatalf("accepted report/model calls = %#v/%d", acceptedReport, model.calls)
-	}
-
-	correctedDigest := sha256.Sum256([]byte("corrected-away-from-pair"))
-	repository.snapshot = PairSnapshot{
-		Accepted: true,
-		Inputs: []InputReference{
-			full.Inputs[0],
-			{Kind: InputResolutionDecision, ID: testCorrectionDecisionID, Digest: correctedDigest},
-		},
-	}
-	correctedReport, err := service.Analyze(context.Background(), testEmployeeID, testManagerID)
-	if err != nil {
-		t.Fatalf("corrected Analyze() error = %v", err)
-	}
-	if correctedReport.Status != StatusInsufficientEvidence || correctedReport.InputDigest == acceptedReport.InputDigest {
-		t.Fatalf("corrected report = %#v, want new insufficient run", correctedReport)
-	}
-	if repository.history[1].Report.InputDigest != acceptedReport.InputDigest || len(repository.history[1].Report.Chronology) != 2 {
-		t.Fatal("accepted run and its original provenance were not retained after correction")
 	}
 }
 
@@ -381,8 +287,9 @@ func TestServiceSendsOnlyValidatedTranscriptBackedSignalsAndPreservesCounterevid
 	if got := signalIDs(report.Counterevidence); !slices.Equal(got, []string{"signal-earlier"}) {
 		t.Fatalf("counterevidence IDs = %#v, want cited model counterevidence", got)
 	}
-	if len(repository.completed.Report.Chronology[0].Citations) == 0 || repository.completed.Report.Chronology[0].Citations[0].Quote == "" {
-		t.Fatal("completed report did not preserve exact citation provenance")
+	if len(report.Chronology[0].Citations) == 0 ||
+		report.Chronology[0].Citations[0].Quote == "" {
+		t.Fatal("on-demand report did not preserve exact citation provenance")
 	}
 }
 
@@ -421,7 +328,7 @@ func TestServiceDowngradesUnsupportedModelDeclineAndRecordsBoundedDecision(t *te
 	}
 }
 
-func TestServiceNeverPersistsModelNarrativeForAnyAdmittedStatus(t *testing.T) {
+func TestServiceNeverUsesModelNarrativeForAnyAdmittedStatus(t *testing.T) {
 	const unsafeNarrative = "The manager secretly distrusts the employee and intends to remove them."
 	tests := []struct {
 		name       string
@@ -457,10 +364,16 @@ func TestServiceNeverPersistsModelNarrativeForAnyAdmittedStatus(t *testing.T) {
 			if report.Status != testCase.status {
 				t.Fatalf("report status = %q, want admitted %q", report.Status, testCase.status)
 			}
-			persisted := repository.completed.Report
-			prose := strings.Join(append(append([]string{persisted.Rationale}, persisted.Limitations...), persisted.Gaps...), " ")
-			if strings.Contains(prose, unsafeNarrative) || strings.TrimSpace(persisted.Rationale) == "" {
-				t.Fatalf("persisted admitted report prose = %q, want nonempty deterministic explanation without model narrative", prose)
+			prose := strings.Join(
+				append(
+					append([]string{report.Rationale}, report.Limitations...),
+					report.Gaps...,
+				),
+				" ",
+			)
+			if strings.Contains(prose, unsafeNarrative) ||
+				strings.TrimSpace(report.Rationale) == "" {
+				t.Fatalf("admitted report prose = %q, want nonempty deterministic explanation without model narrative", prose)
 			}
 		})
 	}
@@ -474,7 +387,6 @@ func TestServicePreservesSourceCounterevidenceInSparseReport(t *testing.T) {
 	unknown.Citations = append(unknown.Citations, Citation{ID: "unknown-counter", Role: CitationContradicting, Quote: "Synthetic unknown-time counterevidence."})
 	repository := &fakeRepository{snapshot: PairSnapshot{
 		Accepted: true,
-		Inputs:   append(append([]InputReference(nil), dated.Inputs...), unknown.Inputs...),
 		Signals:  []Signal{unknown, dated},
 	}}
 	model := &fakeModel{}
@@ -544,7 +456,6 @@ func TestServiceUsesModelDesignatedSourceBackedCounterSignalForAdmittedDecline(t
 	counterDate := testMeetingDate(2026, time.June, 20)
 	counter := testSignal("signal-counter", &counterDate, DirectionStrengthening)
 	snapshot.Signals = append(snapshot.Signals, counter)
-	snapshot.Inputs = append(snapshot.Inputs, counter.Inputs...)
 	repository := &fakeRepository{snapshot: snapshot}
 	model := &fakeModel{output: analysisOutput(
 		StatusPossibleDecline,
@@ -640,206 +551,36 @@ func TestServiceFinishesOneBoundedAnalysisSpanWithExplicitOK(t *testing.T) {
 	}
 }
 
-func TestComputeInputDigestCanonicalizesPairAndInputUUIDs(t *testing.T) {
-	digest := sha256.Sum256([]byte("input"))
-	canonical := AnalysisIdentity{
-		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
-		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Provider: modelpolicy.ProviderBedrock,
-		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
-		Inputs: []InputReference{{Kind: InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd", Digest: digest}},
-	}
-	variant := canonical
-	variant.EmployeeEntityID = strings.ToUpper(canonical.EmployeeEntityID)
-	variant.Inputs = append([]InputReference(nil), canonical.Inputs...)
-	variant.Inputs[0].ID = strings.ToUpper(canonical.Inputs[0].ID)
-
-	first, err := ComputeInputDigest(canonical)
-	if err != nil {
-		t.Fatalf("canonical ComputeInputDigest() error = %v", err)
-	}
-	second, err := ComputeInputDigest(variant)
-	if err != nil {
-		t.Fatalf("variant ComputeInputDigest() error = %v", err)
-	}
-	if first != second {
-		t.Fatal("equivalent UUID spellings produced different analysis identities")
-	}
-}
-
-func TestComputeInputDigestRejectsRepeatedInputIdentity(t *testing.T) {
-	digest := sha256.Sum256([]byte("input"))
-	input := InputReference{Kind: InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd", Digest: digest}
-	_, err := ComputeInputDigest(AnalysisIdentity{
-		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
-		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Provider: modelpolicy.ProviderBedrock,
-		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
-		Inputs: []InputReference{input, input},
-	})
-	if err == nil {
-		t.Fatal("ComputeInputDigest() error = nil, want repeated input identity rejection")
-	}
-}
-
-func TestComputeInputDigestAllowsPairIdentityWithoutSignalInputs(t *testing.T) {
-	first, err := ComputeInputDigest(AnalysisIdentity{
-		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
-		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Provider: modelpolicy.ProviderBedrock,
-		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
-	})
-	if err != nil {
-		t.Fatalf("ComputeInputDigest() error = %v", err)
-	}
-	second, err := ComputeInputDigest(AnalysisIdentity{
-		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
-		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Provider: modelpolicy.ProviderBedrock,
-		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256,
-	})
-	if err != nil {
-		t.Fatalf("repeated ComputeInputDigest() error = %v", err)
-	}
-	if first == ([sha256.Size]byte{}) || first != second {
-		t.Fatalf("empty-input identity = %x/%x, want stable non-zero digest", first, second)
-	}
-}
-
-func TestComputeInputDigestChangesWithMaterialModelConfiguration(t *testing.T) {
-	base := AnalysisIdentity{
-		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
-		PromptVersion: "analyze-v1", PolicyVersion: "policy-v1",
-		Provider: modelpolicy.ProviderBedrock,
-		Region:   "us-east-1", ModelID: "synthetic-model-v1", MaxTokens: 256,
-	}
-	first, err := ComputeInputDigest(base)
-	if err != nil {
-		t.Fatalf("ComputeInputDigest() error = %v", err)
-	}
-	tests := map[string]func(*AnalysisIdentity){
-		"region":     func(identity *AnalysisIdentity) { identity.Region = "us-west-2" },
-		"model ID":   func(identity *AnalysisIdentity) { identity.ModelID = "synthetic-model-v2" },
-		"max tokens": func(identity *AnalysisIdentity) { identity.MaxTokens++ },
-	}
-	for name, mutate := range tests {
-		t.Run(name, func(t *testing.T) {
-			changed := base
-			mutate(&changed)
-			digest, err := ComputeInputDigest(changed)
-			if err != nil {
-				t.Fatalf("ComputeInputDigest() error = %v", err)
-			}
-			if digest == first {
-				t.Fatal("material model configuration reused analysis identity")
-			}
-		})
-	}
-}
-
-func TestComputeInputDigestPreservesBedrockV1Bytes(t *testing.T) {
-	got, err := ComputeInputDigest(AnalysisIdentity{
-		EmployeeEntityID: testEmployeeID,
-		ManagerEntityID:  testManagerID,
-		PromptVersion:    "analyze-v1",
-		PolicyVersion:    AnalysisPolicyVersion,
-		Provider:         modelpolicy.ProviderBedrock,
-		Region:           "us-east-1",
-		ModelID:          "synthetic-model",
-		MaxTokens:        256,
-		Inputs: []InputReference{{
-			Kind: InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd",
-			Digest: sha256.Sum256([]byte("signal-input")),
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hex.EncodeToString(got[:]) != "0e0dabec4a207d0c8803b506d6b7bdee726120ff84f620f7b793d9fa483ff4a7" {
-		t.Fatalf("digest = %x", got)
-	}
-}
-
-func TestComputeInputDigestSeparatesProviders(t *testing.T) {
-	base := AnalysisIdentity{
-		EmployeeEntityID: testEmployeeID, ManagerEntityID: testManagerID,
-		PromptVersion: "analyze-v1", PolicyVersion: AnalysisPolicyVersion,
-		ModelID: "synthetic-model", MaxTokens: 256,
-		Inputs: []InputReference{{Kind: InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd", Digest: sha256.Sum256([]byte("signal-input"))}},
-	}
-	digests := make(map[modelpolicy.Provider][sha256.Size]byte)
-	for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderBedrock, modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
-		identity := base
-		identity.Provider = provider
-		if provider == modelpolicy.ProviderBedrock {
-			identity.Region = "us-east-1"
-		}
-		digest, err := ComputeInputDigest(identity)
-		if err != nil {
-			t.Fatalf("ComputeInputDigest(%q) error = %v", provider, err)
-		}
-		digests[provider] = digest
-	}
-	if digests[modelpolicy.ProviderBedrock] == digests[modelpolicy.ProviderOpenAI] ||
-		digests[modelpolicy.ProviderBedrock] == digests[modelpolicy.ProviderAnthropic] ||
-		digests[modelpolicy.ProviderOpenAI] == digests[modelpolicy.ProviderAnthropic] {
-		t.Fatalf("provider digests collided: %#v", digests)
-	}
-}
-
 func TestAnalysisPolicyVersionChangesForSafeExplanationSemantics(t *testing.T) {
 	if AnalysisPolicyVersion != "manager-confidence-policy-v6" {
-		t.Fatalf("AnalysisPolicyVersion = %q, want snapshot-coherent cache-invalidating policy version", AnalysisPolicyVersion)
+		t.Fatalf("AnalysisPolicyVersion = %q, want current deterministic policy version", AnalysisPolicyVersion)
 	}
 }
 
 const (
-	testEmployeeID           = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-	testManagerID            = "11111111-2222-3333-4444-555555555555"
-	testEmployeeDecisionID   = "00000000-0000-0000-0000-000000000001"
-	testManagerDecisionID    = "00000000-0000-0000-0000-000000000002"
-	testCorrectionDecisionID = "00000000-0000-0000-0000-000000000003"
+	testEmployeeID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	testManagerID  = "11111111-2222-3333-4444-555555555555"
 )
 
 func acceptedPairSnapshot() PairSnapshot {
 	earlier := testMeetingDate(2026, time.June, 3)
 	later := testMeetingDate(2026, time.July, 8)
-	employeeDigest := sha256.Sum256([]byte("employee-decision"))
-	managerDigest := sha256.Sum256([]byte("manager-decision"))
-	snapshot := PairSnapshot{
+	return PairSnapshot{
 		Accepted: true,
-		Inputs: []InputReference{
-			{Kind: InputResolutionDecision, ID: testEmployeeDecisionID, Digest: employeeDigest},
-			{Kind: InputResolutionDecision, ID: testManagerDecisionID, Digest: managerDigest},
-		},
 		Signals: []Signal{
 			testSignal("signal-earlier", &earlier, DirectionStrengthening),
 			testSignal("signal-later", &later, DirectionWeakening),
 		},
 	}
-	for _, signal := range snapshot.Signals {
-		snapshot.Inputs = append(snapshot.Inputs, signal.Inputs...)
-	}
-	return snapshot
 }
 
 func testSignal(id string, validTime *time.Time, direction Direction) Signal {
-	observationDigest := sha256.Sum256([]byte(id + "-observation"))
-	signalDigest := sha256.Sum256([]byte(id + "-signal"))
-	documentDigest := sha256.Sum256([]byte(id + "-document"))
-	tabDigest := sha256.Sum256([]byte(id + "-tab"))
 	return Signal{
 		ID: id, MeetingID: id + "-meeting", ObservationID: id + "-observation", Category: CategoryDelegationAutonomy,
 		Direction: direction, ValidTime: validTime,
 		RecordedAt: time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC),
 		Rationale:  "Synthetic observable interaction rationale.", Confidence: 0.5,
 		Validated: true, TranscriptBacked: true,
-		Inputs: []InputReference{
-			{Kind: InputDocumentVersion, ID: id + "-document", Digest: documentDigest},
-			{Kind: InputDocumentTab, ID: id + "-tab", Digest: tabDigest},
-			{Kind: InputObservation, ID: id + "-observation", Digest: observationDigest},
-			{Kind: InputSignal, ID: id, Digest: signalDigest},
-		},
 		Citations: []Citation{{
 			ID: id + "-citation", ProviderDocumentID: id + "-document-provider",
 			ProviderTabID: id + "-tab-provider", StartOffset: 4, EndOffset: 13,
@@ -886,44 +627,55 @@ func testService(repository *fakeRepository, model *fakeModel) *Service {
 }
 
 type fakeRepository struct {
-	snapshot      PairSnapshot
-	loadCalls     int
-	cached        Report
-	findIdentity  AnalysisIdentity
-	findErr       error
-	completed     Completion
-	history       []Completion
-	completeCalls int
-	completeErr   error
+	snapshot  PairSnapshot
+	loadCalls int
+}
+
+type readOnlyCanonicalRepository struct {
+	snapshots []PairSnapshot
+	loadCalls int
+	err       error
+}
+
+func (repository *readOnlyCanonicalRepository) LoadPairInputs(
+	context.Context,
+	string,
+	string,
+) (PairSnapshot, error) {
+	repository.loadCalls++
+	if repository.err != nil {
+		return PairSnapshot{}, repository.err
+	}
+	if len(repository.snapshots) == 0 {
+		return PairSnapshot{Accepted: true}, nil
+	}
+	snapshot := repository.snapshots[0]
+	repository.snapshots = repository.snapshots[1:]
+	return clonePairSnapshot(snapshot), nil
+}
+
+func testReadOnlyService(
+	repository *readOnlyCanonicalRepository,
+	model *fakeModel,
+) *Service {
+	return &Service{
+		Repository:    repository,
+		Model:         model,
+		PromptVersion: extract.AnalysisPromptVersion,
+		Provider:      modelpolicy.ProviderBedrock,
+		DataMode:      modelpolicy.DataModePersonal,
+		Region:        "us-east-1",
+		ModelID:       "synthetic-model",
+		MaxTokens:     256,
+		Now: func() time.Time {
+			return time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+		},
+	}
 }
 
 func (repository *fakeRepository) LoadPairInputs(context.Context, string, string) (PairSnapshot, error) {
 	repository.loadCalls++
 	return clonePairSnapshot(repository.snapshot), nil
-}
-
-func (repository *fakeRepository) FindCompleted(_ context.Context, identity AnalysisIdentity) (Report, bool, error) {
-	repository.findIdentity = identity
-	repository.findIdentity.Inputs = append([]InputReference(nil), identity.Inputs...)
-	if repository.findErr != nil {
-		return Report{}, false, repository.findErr
-	}
-	if repository.cached.ID != "" && repository.cached.InputDigest == identity.InputDigest {
-		return repository.cached, true, nil
-	}
-	return Report{}, false, nil
-}
-
-func (repository *fakeRepository) CompleteAnalysis(_ context.Context, completion Completion) (Report, error) {
-	repository.completeCalls++
-	if repository.completeErr != nil {
-		return Report{}, repository.completeErr
-	}
-	completion.Report.ID = "run-" + completion.Identity.InputDigestString()
-	completion.Report.InputDigest = completion.Identity.InputDigest
-	repository.completed = completion
-	repository.history = append(repository.history, cloneCompletion(completion))
-	return completion.Report, nil
 }
 
 type fakeModel struct {
@@ -952,14 +704,6 @@ func (recorder *fakeDecisionRecorder) Record(_ context.Context, observation obse
 
 func ptrTime(value time.Time) *time.Time { return &value }
 
-func referenceIDs(inputs []InputReference) []string {
-	ids := make([]string, len(inputs))
-	for index, input := range inputs {
-		ids[index] = input.ID
-	}
-	return ids
-}
-
 func requestSignalIDs(signals []struct {
 	ID string `json:"id"`
 }) []string {
@@ -971,12 +715,6 @@ func requestSignalIDs(signals []struct {
 }
 
 func clonePairSnapshot(snapshot PairSnapshot) PairSnapshot {
-	snapshot.Inputs = append([]InputReference(nil), snapshot.Inputs...)
 	snapshot.Signals = append([]Signal(nil), snapshot.Signals...)
 	return snapshot
-}
-
-func cloneCompletion(completion Completion) Completion {
-	completion.Identity.Inputs = append([]InputReference(nil), completion.Identity.Inputs...)
-	return completion
 }

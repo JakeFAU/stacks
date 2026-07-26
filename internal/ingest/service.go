@@ -15,11 +15,14 @@ import (
 
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/observation"
+	"github.com/JakeFAU/stacks/core/timepoint"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/JakeFAU/stacks/core/admission"
+	coreidentity "github.com/JakeFAU/stacks/core/identity"
 	"stacks/internal/analysis"
 	"stacks/internal/directory"
 	"stacks/internal/entity"
@@ -40,7 +43,6 @@ var ErrFailurePersistence = errors.New("sync failure state persistence failed")
 const (
 	ingestionSpanName                 = "stacks.ingest.sync"
 	ingestionDecisionName             = "ingest_document"
-	interactionPredicate              = "interaction_signal"
 	extractionDerivationDigestVersion = "stacks.extraction-derivation.v5"
 	providerDerivationDigestVersion   = "stacks.extraction-derivation.v6.provider"
 )
@@ -80,20 +82,6 @@ const (
 	FailureBusy          FailureCode = "busy"
 )
 
-// VersionState identifies the durable processing state returned before model
-// work begins. RetryCount counts attempts after the initial attempt.
-type VersionState struct {
-	ID               string
-	DerivationID     string
-	DerivationDigest [sha256.Size]byte
-	RecordedAt       time.Time
-	LeaseOwner       string
-	LeaseExpiresAt   time.Time
-	Status           VersionStatus
-	RetryCount       int
-	FailureCode      FailureCode
-}
-
 // DerivationIdentity names one extraction attempt configuration independently
 // of the immutable source version. Digest is computed from both boundaries.
 type DerivationIdentity struct {
@@ -126,60 +114,6 @@ type MentionRecord struct {
 	ProposedEmail  string
 	Role           string
 	Resolution     entity.Resolution
-}
-
-// ObservationDraft is one inferred interaction observation. Empty entity IDs
-// preserve unresolved identity rather than promoting a guess to graph truth.
-type ObservationDraft struct {
-	ID                observation.ObservationID
-	SubjectEntityID   string
-	ObjectEntityID    string
-	SubjectMentionKey string
-	ObjectMentionKey  string
-	Predicate         observation.Predicate
-	ValidTime         observation.TemporalExtent
-	RecordedAt        time.Time
-	EvidenceKeys      []string
-	SourceConfidence  observation.Confidence
-}
-
-// SignalEvidenceRecord associates one citation with its bounded signal role.
-type SignalEvidenceRecord struct {
-	EvidenceKey string
-	Role        string
-}
-
-// SignalRecord contains the validated, model-derived interaction signal.
-type SignalRecord struct {
-	ID                string
-	ObservationID     string
-	Category          string
-	Direction         string
-	ExtractionModelID string
-	PromptVersion     string
-	Rationale         string
-	Confidence        float64
-	Evidence          []SignalEvidenceRecord
-}
-
-// Completion is the complete atomic write-set for one document version.
-type Completion struct {
-	VersionID    string
-	DerivationID string
-	LeaseOwner   string
-	DataMode     modelpolicy.DataMode
-	Evidence     []EvidenceRecord
-	Mentions     []MentionRecord
-	Observations []ObservationDraft
-	Signals      []SignalRecord
-}
-
-// Repository owns durable processing state and the atomic completion boundary.
-type Repository interface {
-	PrepareVersion(context.Context, evidence.DocumentVersion, DerivationIdentity, modelpolicy.DataMode, time.Duration) (VersionState, error)
-	CompleteVersion(context.Context, Completion) error
-	RecordFailure(context.Context, string, string, VersionStatus, FailureCode) error
-	EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error)
 }
 
 // Resolver admits only accepted identities and otherwise returns reviewable
@@ -230,6 +164,7 @@ type Result struct {
 	RetryCount   int
 	FailureCode  FailureCode
 	Directory    directory.Summary
+	attemptID    string
 	leaseOwner   string
 }
 
@@ -325,7 +260,7 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	}
 	version, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
 		Provider: document.Provider, ProviderDocumentID: document.ID, Title: document.Title,
-		Locator: document.Locator, ProviderVersion: document.Version, ProviderRevision: document.Revision,
+		Locator: document.Locator, ProviderVersion: document.Version,
 		ModifiedAt: document.ModifiedAt, SourceTime: document.MeetingTime,
 		RecordedAt: service.now(), Sections: sections,
 	})
@@ -345,7 +280,9 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if err != nil {
 		return Result{DocumentID: documentID, Outcome: OutcomeFailed, FailureCode: FailureInvalidSource}, nil
 	}
-	state, err := service.Repository.PrepareVersion(ctx, version, derivation, service.DataMode, service.LeaseDuration)
+	state, err := service.Repository.PrepareVersion(ctx, version, SourceRevisionMetadata{
+		ProviderVersion: document.Version, ProviderRevision: document.Revision,
+	}, derivation, service.DataMode, service.LeaseDuration)
 	if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
 		return Result{}, cancellationErr
 	}
@@ -356,8 +293,8 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 		return Result{DocumentID: documentID, Outcome: OutcomeIncomplete, FailureCode: FailureStorage}, nil
 	}
 	result := Result{
-		DocumentID: documentID, VersionID: state.ID, DerivationID: state.DerivationID,
-		RetryCount: state.RetryCount, leaseOwner: state.LeaseOwner,
+		DocumentID: documentID, VersionID: state.VersionID, DerivationID: state.RunID,
+		RetryCount: state.RetryCount, attemptID: state.AttemptID, leaseOwner: state.LeaseOwner,
 	}
 	if state.Status == VersionStatusComplete {
 		result.Outcome = OutcomeUnchanged
@@ -411,7 +348,7 @@ func (service *Service) processDocument(ctx context.Context, listed source.Docum
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusIncomplete, FailureStorage)
 	}
-	completion, err := service.completion(version, state, response, output, snapshots)
+	completion, err := service.completion(version, state, derivation, response, output, snapshots)
 	if err != nil {
 		return service.fail(ctx, result, VersionStatusFailed, FailureInvalidOutput)
 	}
@@ -450,39 +387,94 @@ func (service *Service) enrich(ctx context.Context, result Result) (Result, erro
 func (service *Service) completion(
 	version evidence.DocumentVersion,
 	state VersionState,
+	derivation DerivationIdentity,
 	response extract.Response,
 	output extract.ExtractionOutput,
 	snapshots []entity.EntitySnapshot,
 ) (Completion, error) {
 	completion := Completion{
-		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
-		DataMode: service.DataMode,
+		VersionID: state.VersionID, RunID: state.RunID, AttemptID: state.AttemptID,
+		LeaseOwner: state.LeaseOwner, CompletedAt: service.now(),
 	}
+	runAdmission, err := newInitialAdmission(
+		completion.RunID,
+		admission.TargetExtractionRun,
+		completion.RunID,
+		completion.CompletedAt,
+	)
+	if err != nil {
+		return Completion{}, err
+	}
+	completion.AdmissionDecisions = append(completion.AdmissionDecisions, runAdmission)
+	evidenceIDs := make(map[string]evidence.EvidenceID, len(output.Citations))
 	for _, citation := range output.Citations {
 		span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
 			Document: version, SectionID: citation.TabID, StartOffset: citation.StartOffset,
-			EndOffset: citation.EndOffset, Quote: citation.Quote,
+			EndOffset: citation.EndOffset, Quote: citation.Quote, RecordedAt: state.DocumentRecordedAt,
 		})
 		if err != nil {
 			return Completion{}, err
 		}
 		completion.Evidence = append(completion.Evidence, EvidenceRecord{Key: citation.ID, Span: span})
+		evidenceIDs[citation.ID] = span.ID()
 	}
 
-	resolutions := make(map[string]entity.Resolution, len(output.People))
 	for _, person := range output.People {
 		identity, err := extract.GroundPersonIdentity(person, output.Citations)
 		if err != nil {
 			return Completion{}, err
 		}
 		resolution := service.Resolver.Resolve(entity.Mention{Name: person.Surface}, snapshots)
-		resolutions[person.ID] = resolution
 		completion.Mentions = append(completion.Mentions, MentionRecord{
 			Key: person.ID, EvidenceKey: identity.NameEvidenceCitationID,
 			ProposedEmailEvidenceKey: identity.EmailEvidenceCitationID,
 			Surface:                  person.Surface, NormalizedName: identity.NormalizedName,
 			ProposedEmail: identity.ProposedEmail, Role: person.Role, Resolution: resolution,
 		})
+		mentionID := coreidentity.MentionID(stableCompletionID(completion.RunID, "mention", person.ID))
+		proposalID := coreidentity.ProposalID(stableCompletionID(completion.RunID, "proposal", person.ID))
+		proposalEvidence := []evidence.EvidenceID{evidenceIDs[identity.NameEvidenceCitationID]}
+		if identity.EmailEvidenceCitationID != "" &&
+			identity.EmailEvidenceCitationID != identity.NameEvidenceCitationID {
+			proposalEvidence = append(proposalEvidence, evidenceIDs[identity.EmailEvidenceCitationID])
+		}
+		proposal, err := coreidentity.NewResolutionProposal(coreidentity.ResolutionProposalInput{
+			ID: proposalID, MentionID: mentionID, ReasonCode: resolutionProposalReason,
+			EvidenceIDs: proposalEvidence, RecordedAt: completion.CompletedAt,
+		})
+		if err != nil {
+			return Completion{}, err
+		}
+		completion.Proposals = append(completion.Proposals, proposal)
+		for index, candidate := range resolution.Candidates {
+			value, err := coreidentity.NewResolutionCandidate(coreidentity.ResolutionCandidateInput{
+				ID: coreidentity.CandidateID(stableCompletionID(
+					completion.RunID,
+					"candidate",
+					person.ID+"\x00"+candidate.EntityID,
+				)),
+				ProposalID: proposalID, EntityID: coreidentity.EntityID(candidate.EntityID),
+				Rank: index + 1, Confidence: candidate.Confidence, ReasonCode: candidate.Reason,
+				Source: coreidentity.CandidateSource{
+					Kind: resolutionCandidateSource, Reference: string(mentionID),
+				},
+				RecordedAt: completion.CompletedAt,
+			})
+			if err != nil {
+				return Completion{}, err
+			}
+			completion.Candidates = append(completion.Candidates, value)
+		}
+		mentionAdmission, err := newInitialAdmission(
+			completion.RunID,
+			admission.TargetMention,
+			string(mentionID),
+			completion.CompletedAt,
+		)
+		if err != nil {
+			return Completion{}, err
+		}
+		completion.AdmissionDecisions = append(completion.AdmissionDecisions, mentionAdmission)
 	}
 
 	validStart, err := parseOptionalDate(output.MeetingDate)
@@ -491,48 +483,75 @@ func (service *Service) completion(
 	}
 	validTime := observation.UnknownTime()
 	if validStart != nil {
-		validTime, err = observation.Since(*validStart)
+		validTime, err = observation.AtTime(*validStart)
 		if err != nil {
 			return Completion{}, err
 		}
-	}
-	predicate, err := observation.NewPredicate(interactionPredicate)
-	if err != nil {
-		return Completion{}, err
 	}
 	statements := make(map[string]extract.AttributedStatement, len(output.Statements))
 	for _, statement := range output.Statements {
 		statements[statement.ID] = statement
 	}
 	for _, signal := range output.Signals {
-		observationID := stableDerivationID(state.DerivationDigest, "observation", signal.ID)
-		subject := resolvedEntityID(resolutions[signal.SubjectMentionID])
-		object := resolvedEntityID(resolutions[signal.ObjectMentionID])
-		evidenceKeys := signalEvidenceKeys(signal, statements)
+		observationID := stableDerivationID(derivation.Digest, "observation", signal.ID)
+		predicate, err := analysis.InteractionObservationPredicate(
+			analysis.Category(signal.Category),
+			analysis.Direction(signal.Direction),
+		)
+		if err != nil {
+			return Completion{}, err
+		}
 		sourceConfidence, err := observation.NewUnitIntervalConfidence(signal.Confidence)
 		if err != nil {
 			return Completion{}, err
 		}
-		completion.Observations = append(completion.Observations, ObservationDraft{
-			ID: observation.ObservationID(observationID), SubjectEntityID: subject, ObjectEntityID: object,
-			SubjectMentionKey: signal.SubjectMentionID, ObjectMentionKey: signal.ObjectMentionID,
-			Predicate: predicate, ValidTime: validTime,
-			EvidenceKeys: evidenceKeys, SourceConfidence: sourceConfidence, RecordedAt: state.RecordedAt,
-		})
-		signalEvidence := make([]SignalEvidenceRecord, 0, len(signal.SupportingCitationIDs)+len(signal.ContradictingCitationIDs))
+		evidenceLinks := make([]DraftEvidenceLink, 0, len(signal.StatementIDs)+len(signal.SupportingCitationIDs)+len(signal.ContradictingCitationIDs))
+		supporting := make(map[string]struct{})
+		for _, statementID := range signal.StatementIDs {
+			for _, key := range statements[statementID].CitationIDs {
+				if _, exists := supporting[key]; exists {
+					continue
+				}
+				supporting[key] = struct{}{}
+				evidenceLinks = append(evidenceLinks, DraftEvidenceLink{EvidenceKey: key, Role: observation.EvidenceSupporting})
+			}
+		}
 		for _, key := range signal.SupportingCitationIDs {
-			signalEvidence = append(signalEvidence, SignalEvidenceRecord{EvidenceKey: key, Role: "supporting"})
+			if _, exists := supporting[key]; exists {
+				continue
+			}
+			supporting[key] = struct{}{}
+			evidenceLinks = append(evidenceLinks, DraftEvidenceLink{EvidenceKey: key, Role: observation.EvidenceSupporting})
 		}
 		for _, key := range signal.ContradictingCitationIDs {
-			signalEvidence = append(signalEvidence, SignalEvidenceRecord{EvidenceKey: key, Role: "contradicting"})
+			evidenceLinks = append(evidenceLinks, DraftEvidenceLink{EvidenceKey: key, Role: observation.EvidenceContradicting})
 		}
-		completion.Signals = append(completion.Signals, SignalRecord{
-			ID: stableDerivationID(state.DerivationDigest, "signal", signal.ID), ObservationID: string(observationID),
-			Category: signal.Category, Direction: signal.Direction,
-			ExtractionModelID: response.ModelID, PromptVersion: response.PromptVersion,
-			Rationale:  analysis.ExplainSignal(analysis.Category(signal.Category), analysis.Direction(signal.Direction)),
-			Confidence: signal.Confidence, Evidence: signalEvidence,
+		completion.Observations = append(completion.Observations, CanonicalObservationDraft{
+			ID:        observation.ObservationID(observationID),
+			Subject:   DraftTerm{Kind: observation.TermMention, MentionKey: signal.SubjectMentionID},
+			Predicate: predicate,
+			Object:    DraftTerm{Kind: observation.TermMention, MentionKey: signal.ObjectMentionID},
+			ValidTime: validTime, RecordedAt: completion.CompletedAt,
+			Evidence: evidenceLinks,
+			Derivation: observation.Derivation{
+				Method: extractionMethod, Version: response.PromptVersion, RunID: state.RunID,
+				Model: response.ModelID, PromptVersion: response.PromptVersion,
+			},
+			Status: observation.StatusInferred, Confidence: &sourceConfidence,
 		})
+		observationAdmission, err := newInitialAdmission(
+			completion.RunID,
+			admission.TargetObservation,
+			observationID,
+			completion.CompletedAt,
+		)
+		if err != nil {
+			return Completion{}, err
+		}
+		completion.AdmissionDecisions = append(
+			completion.AdmissionDecisions,
+			observationAdmission,
+		)
 	}
 	return completion, nil
 }
@@ -642,37 +661,8 @@ func modelTabs(tabs []extract.SubmittedTab) []struct {
 	return encoded
 }
 
-func signalEvidenceKeys(signal extract.InteractionSignal, statements map[string]extract.AttributedStatement) []string {
-	seen := make(map[string]struct{})
-	keys := make([]string, 0)
-	appendKey := func(key string) {
-		if _, exists := seen[key]; exists {
-			return
-		}
-		seen[key] = struct{}{}
-		keys = append(keys, key)
-	}
-	for _, statementID := range signal.StatementIDs {
-		for _, key := range statements[statementID].CitationIDs {
-			appendKey(key)
-		}
-	}
-	for _, key := range signal.SupportingCitationIDs {
-		appendKey(key)
-	}
-	for _, key := range signal.ContradictingCitationIDs {
-		appendKey(key)
-	}
-	return keys
-}
-
-func resolvedEntityID(resolution entity.Resolution) string {
-	if resolution.AutoResolved {
-		return resolution.EntityID
-	}
-	return ""
-}
-
+// MeetingDate has already been deterministically grounded against source
+// metadata by extract.ParseAndValidate before completion is constructed.
 func parseOptionalDate(value string) (*time.Time, error) {
 	if value == "" {
 		return nil, nil
@@ -748,7 +738,10 @@ func (service *Service) fail(ctx context.Context, result Result, status VersionS
 		return Result{}, cancellationErr
 	}
 	if result.DerivationID != "" {
-		if err := service.Repository.RecordFailure(ctx, result.DerivationID, result.leaseOwner, status, code); err != nil {
+		if err := service.Repository.RecordFailure(ctx, Failure{
+			RunID: result.DerivationID, AttemptID: result.attemptID, LeaseOwner: result.leaseOwner,
+			Status: status, Code: code, FailedAt: service.now(),
+		}); err != nil {
 			if cancellationErr := boundedCancellation(ctx, err); cancellationErr != nil {
 				return Result{}, cancellationErr
 			}
@@ -839,7 +832,7 @@ func (service *Service) attemptContext(ctx context.Context, state VersionState) 
 }
 
 func (service *Service) now() time.Time {
-	return service.Now().UTC()
+	return timepoint.Normalize(service.Now())
 }
 
 func (service *Service) recordDecision(ctx context.Context, result Result, duration time.Duration) {

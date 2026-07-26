@@ -189,8 +189,8 @@ func TestSyncSkipsExtractionForUnchangedVersion(t *testing.T) {
 	version := documentVersion(t, document)
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
-		ID: "version-unchanged", DerivationID: "derivation-unchanged",
-		DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusComplete,
+		VersionID: "version-unchanged", RunID: "derivation-unchanged",
+		DocumentRecordedAt: recordedAt, Status: VersionStatusComplete,
 	}
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
 	service := testService(document, repository, model)
@@ -257,8 +257,8 @@ func TestSyncEnrichesCompleteDerivationWithoutModelInvocation(t *testing.T) {
 	version := documentVersion(t, document)
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
-		ID: "version-directory-complete", DerivationID: "derivation-directory-complete",
-		DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusComplete,
+		VersionID: "version-directory-complete", RunID: "derivation-directory-complete",
+		DocumentRecordedAt: recordedAt, Status: VersionStatusComplete,
 	}
 	model := &recordingModel{
 		responses: []extract.Response{validEmptyResponse(t)},
@@ -306,8 +306,8 @@ func TestSyncNeverEnrichesFailedCompletionOrBusyDerivation(t *testing.T) {
 				version := documentVersion(t, document)
 				derivation := testDerivationIdentity(t, version)
 				repository.versions[derivationKey(version, derivation)] = VersionState{
-					ID: "version-directory-busy", DerivationID: "derivation-directory-busy",
-					DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusPending,
+					VersionID: "version-directory-busy", RunID: "derivation-directory-busy",
+					DocumentRecordedAt: recordedAt, Status: VersionStatusPending,
 					LeaseOwner: "other-worker",
 				}
 			},
@@ -535,9 +535,6 @@ func TestSyncReusesBedrockDerivationAcrossDataModesWithoutNewInvocation(t *testi
 	if err != nil || first.Completed != 1 {
 		t.Fatalf("first Sync() = (%#v, %v), want one completed derivation", first, err)
 	}
-	if repository.lastCompletion.DataMode != modelpolicy.DataModePersonal {
-		t.Fatalf("completion data mode = %q, want %q", repository.lastCompletion.DataMode, modelpolicy.DataModePersonal)
-	}
 	firstDerivationID := first.Results[0].DerivationID
 	service.DataMode = modelpolicy.DataModeRestricted
 
@@ -592,8 +589,8 @@ func TestSyncReturnsBusyWithoutInvokingModelForActiveDerivationLease(t *testing.
 	version := documentVersion(t, document)
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
-		ID: "version-busy", DerivationID: "derivation-busy", DerivationDigest: derivation.Digest,
-		RecordedAt: recordedAt, Status: VersionStatusPending, LeaseOwner: "other-worker",
+		VersionID: "version-busy", RunID: "derivation-busy",
+		DocumentRecordedAt: recordedAt, Status: VersionStatusPending, LeaseOwner: "other-worker",
 	}
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
 	service := testService(document, repository, model)
@@ -732,6 +729,17 @@ func TestSyncAcceptsViewOnlyDocumentWithoutProviderRevision(t *testing.T) {
 	}
 }
 
+func TestServiceNowNormalizesCanonicalTimestamp(t *testing.T) {
+	instant := time.Date(2026, time.July, 26, 12, 0, 0, 123456789, time.FixedZone("synthetic", -4*60*60))
+	service := Service{Now: func() time.Time { return instant }}
+
+	got := service.now()
+	want := instant.UTC().Truncate(time.Microsecond)
+	if got != want {
+		t.Fatalf("now() = %s, want canonical %s", got, want)
+	}
+}
+
 func TestSyncCreatesNewDerivationWithoutDuplicatingSourceVersionWhenConfigurationChanges(t *testing.T) {
 	document := syntheticDocument("document-config-change", "Leader assigns follow-up.")
 	repository := newMemoryRepository()
@@ -866,7 +874,7 @@ func TestSyncContinuesAndReturnsBoundedErrorWhenFailureStateCannotPersist(t *tes
 		t.Fatalf("summary/model/completion = %#v/%d/%d, want isolated later completion", summary, model.calls, repository.completionCalls)
 	}
 	for _, state := range repository.versions {
-		if state.ID == summary.Results[0].VersionID && state.Status != VersionStatusPending {
+		if state.VersionID == summary.Results[0].VersionID && state.Status != VersionStatusPending {
 			t.Fatalf("unpersisted failure state = %q, want prior pending state", state.Status)
 		}
 	}
@@ -894,9 +902,15 @@ func TestSyncResumesPendingVersionWithoutDuplicates(t *testing.T) {
 	if err != nil || third.Unchanged != 1 {
 		t.Fatalf("third Sync() = (%#v, %v), want unchanged", third, err)
 	}
-	if len(repository.versions) != 1 || repository.persistedEvidence != 1 || repository.persistedMentions != 2 || repository.persistedObservations != 1 || repository.persistedSignals != 1 {
-		t.Fatalf("durable counts = versions:%d evidence:%d mentions:%d observations:%d signals:%d, want 1,1,2,1,1",
-			len(repository.versions), repository.persistedEvidence, repository.persistedMentions, repository.persistedObservations, repository.persistedSignals)
+	if len(repository.versions) != 1 || repository.persistedEvidence != 1 ||
+		repository.persistedMentions != 2 || repository.persistedObservations != 1 {
+		t.Fatalf(
+			"durable counts = versions:%d evidence:%d mentions:%d observations:%d, want 1,1,2,1",
+			len(repository.versions),
+			repository.persistedEvidence,
+			repository.persistedMentions,
+			repository.persistedObservations,
+		)
 	}
 	if model.calls != 2 {
 		t.Fatalf("model calls = %d, want 2", model.calls)
@@ -981,8 +995,8 @@ func TestSyncInheritsListedTitleAndMeetingTimeWhenFetchedTitleIsAbsent(t *testin
 	if len(repository.lastCompletion.Observations) != 1 {
 		t.Fatalf("observations = %#v, want one coherent listed title time", repository.lastCompletion.Observations)
 	}
-	start, hasStart, _, hasEnd := repository.lastCompletion.Observations[0].ValidTime.Bounds()
-	if !hasStart || hasEnd || !start.Equal(listedMeetingTime) {
+	instant, ok := repository.lastCompletion.Observations[0].ValidTime.Instant()
+	if !ok || !instant.Equal(listedMeetingTime) {
 		t.Fatalf("observation valid time = %#v, want coherent listed title time", repository.lastCompletion.Observations)
 	}
 }
@@ -1123,11 +1137,20 @@ func TestSyncResolvesGroundedNameIndependentlyOfModelEmail(t *testing.T) {
 
 	summary, err := service.Sync(context.Background())
 	if err != nil || summary.Completed != 1 {
-		t.Fatalf("Sync() = (%#v, %v), want completed name-only resolution", summary, err)
+		t.Fatalf("Sync() = (%#v, %v), want completed name review candidate", summary, err)
 	}
 	mention := repository.lastCompletion.Mentions[0]
-	if !mention.Resolution.AutoResolved || mention.Resolution.EntityID != "entity-alex" {
-		t.Fatalf("resolution = %#v, want grounded name independently resolved to Alex", mention.Resolution)
+	if mention.Resolution.AutoResolved || mention.Resolution.EntityID != "" {
+		t.Fatalf("resolution = %#v, want grounded name without automatic authority", mention.Resolution)
+	}
+	if len(mention.Resolution.Candidates) != 1 ||
+		mention.Resolution.Candidates[0].EntityID != "entity-alex" ||
+		mention.Resolution.Candidates[0].Confidence != 1 {
+		t.Fatalf("candidates = %#v, want grounded exact-name review candidate for Alex", mention.Resolution.Candidates)
+	}
+	if mention.ProposedEmail != "bob.builder@synthetic.example" ||
+		mention.ProposedEmailEvidenceKey != "citation-shared" {
+		t.Fatalf("proposed email audit = %q/%q, want grounded model proposal preserved", mention.ProposedEmail, mention.ProposedEmailEvidenceKey)
 	}
 }
 
@@ -1145,9 +1168,14 @@ func TestSyncPreservesSignalSubjectAndObjectMentionKeys(t *testing.T) {
 	if len(repository.lastCompletion.Observations) != 1 {
 		t.Fatalf("observations = %d, want 1", len(repository.lastCompletion.Observations))
 	}
-	observation := repository.lastCompletion.Observations[0]
-	if observation.SubjectMentionKey != "mention-leader" || observation.ObjectMentionKey != "mention-report" {
-		t.Fatalf("observation mention keys = %q/%q, want mention-leader/mention-report", observation.SubjectMentionKey, observation.ObjectMentionKey)
+	observationDraft := repository.lastCompletion.Observations[0]
+	if observationDraft.Subject.MentionKey != "mention-leader" ||
+		observationDraft.Object.MentionKey != "mention-report" {
+		t.Fatalf(
+			"observation mention keys = %q/%q, want mention-leader/mention-report",
+			observationDraft.Subject.MentionKey,
+			observationDraft.Object.MentionKey,
+		)
 	}
 }
 
@@ -1324,7 +1352,7 @@ func TestSyncRecordsBoundedIngestionFailureReasonOnDecisionEvent(t *testing.T) {
 	}
 }
 
-func TestCompletionReplacesRawSignalRationaleWithDeterministicExplanation(t *testing.T) {
+func TestCompletionExcludesRawSignalRationaleFromCanonicalObservation(t *testing.T) {
 	const unsafeRationale = "The manager secretly distrusts the employee."
 	const transcript = "Leader assigns follow-up."
 	version := documentVersion(t, syntheticDocument("document-safe-explanation", transcript))
@@ -1348,32 +1376,39 @@ func TestCompletionReplacesRawSignalRationaleWithDeterministicExplanation(t *tes
 			Confidence: 0.8, SupportingCitationIDs: []string{"citation-1"},
 		}},
 	}
-	service := &Service{Resolver: entity.Resolver{}}
+	completedAt := recordedAt.Add(time.Minute)
+	service := &Service{Resolver: entity.Resolver{}, Now: func() time.Time { return completedAt }}
+	derivation := DerivationIdentity{
+		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+		Digest: sha256.Sum256([]byte("synthetic derivation")),
+	}
 
 	completion, err := service.completion(version, VersionState{
-		ID: "version-id", DerivationID: "derivation-id",
-		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), RecordedAt: recordedAt,
-	}, extract.Response{
+		VersionID: "version-id", RunID: "derivation-id", AttemptID: "attempt-id",
+		LeaseOwner: "owner-id", DocumentRecordedAt: version.RecordedAt(),
+	}, derivation, extract.Response{
 		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
 	}, output, nil)
 	if err != nil {
 		t.Fatalf("completion() error = %v", err)
 	}
-	if len(completion.Signals) != 1 || completion.Signals[0].Rationale == unsafeRationale ||
-		!strings.Contains(completion.Signals[0].Rationale, "future responsibility") {
-		t.Fatalf("stored signal rationale = %#v, want deterministic category/direction explanation", completion.Signals)
+	if len(completion.Observations) != 1 ||
+		strings.Contains(string(completion.Observations[0].Predicate), unsafeRationale) {
+		t.Fatalf("canonical observations retained raw model rationale: %#v", completion.Observations)
 	}
 }
 
 func TestCompletionBuildsCanonicalCompatibleObservationDraft(t *testing.T) {
 	const transcript = "Leader assigns follow-up."
 	meetingDate := time.Date(2026, time.July, 25, 0, 0, 0, 0, time.UTC)
-	runRecordedAt := time.Date(2026, time.July, 25, 15, 4, 3, 123456000, time.UTC)
-	version := documentVersion(t, syntheticDocument("document-recorded-at", transcript))
+	completedAt := time.Date(2026, time.July, 25, 15, 4, 3, 123456000, time.UTC)
+	document := syntheticDocument("document-recorded-at", transcript)
+	document.MeetingTime = &meetingDate
+	version := documentVersion(t, document)
 	service := &Service{
 		Resolver: entity.Resolver{},
 		Now: func() time.Time {
-			return time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+			return completedAt
 		},
 	}
 	output := extract.ExtractionOutput{
@@ -1398,10 +1433,14 @@ func TestCompletionBuildsCanonicalCompatibleObservationDraft(t *testing.T) {
 		}},
 	}
 
+	derivation := DerivationIdentity{
+		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
+		Digest: sha256.Sum256([]byte("synthetic derivation")),
+	}
 	completion, err := service.completion(version, VersionState{
-		ID: "version-id", DerivationID: "derivation-id",
-		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), RecordedAt: runRecordedAt,
-	}, extract.Response{
+		VersionID: "version-id", RunID: "derivation-id", AttemptID: "attempt-id",
+		LeaseOwner: "owner-id", DocumentRecordedAt: version.RecordedAt(),
+	}, derivation, extract.Response{
 		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
 	}, output, nil)
 	if err != nil {
@@ -1411,18 +1450,54 @@ func TestCompletionBuildsCanonicalCompatibleObservationDraft(t *testing.T) {
 		t.Fatal("completion observations = none, want recorded interaction")
 	}
 	draft := completion.Observations[0]
-	if draft.Predicate != observation.Predicate(interactionPredicate) {
-		t.Fatalf("draft predicate = %q, want %q", draft.Predicate, interactionPredicate)
+	if draft.Predicate != "stacks.interaction.v1/future_responsibility/strengthening" {
+		t.Fatalf("draft predicate = %q", draft.Predicate)
 	}
-	start, hasStart, _, hasEnd := draft.ValidTime.Bounds()
-	if !hasStart || hasEnd || !start.Equal(meetingDate) {
-		t.Fatalf("draft valid time = %#v, want Since(%v)", draft.ValidTime, meetingDate)
+	instant, ok := draft.ValidTime.Instant()
+	if !ok || !instant.Equal(meetingDate) {
+		t.Fatalf("draft valid time = %#v, want AtTime(%v)", draft.ValidTime, meetingDate)
 	}
-	if !draft.RecordedAt.Equal(runRecordedAt) || draft.RecordedAt.Location() != time.UTC {
-		t.Fatalf("draft RecordedAt = %v, want retry-stable extraction time %v", draft.RecordedAt, runRecordedAt)
+	if !draft.RecordedAt.Equal(completedAt) || draft.RecordedAt.Location() != time.UTC {
+		t.Fatalf("draft RecordedAt = %v, want completion time %v", draft.RecordedAt, completedAt)
 	}
-	if draft.SourceConfidence.Scale() != observation.ConfidenceUnitInterval || draft.SourceConfidence.Value() != 0.8 {
-		t.Fatalf("draft source confidence = %#v, want unit_interval 0.8", draft.SourceConfidence)
+	if draft.Confidence == nil ||
+		draft.Confidence.Scale() != observation.ConfidenceUnitInterval ||
+		draft.Confidence.Value() != 0.8 {
+		t.Fatalf("draft source confidence = %#v, want unit_interval 0.8", draft.Confidence)
+	}
+}
+
+func TestCompletionUsesDocumentFirstRecordedTimeForEvidence(t *testing.T) {
+	const transcript = "Leader assigns follow-up."
+	version := documentVersion(t, syntheticDocument("document-evidence-recorded-at", transcript))
+	documentRecordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 123456000, time.UTC)
+	state := VersionState{
+		VersionID: "version-id", RunID: "derivation-id", AttemptID: "attempt-id",
+		LeaseOwner: "owner-id", DocumentRecordedAt: documentRecordedAt,
+	}
+	derivation := DerivationIdentity{Digest: sha256.Sum256([]byte("synthetic derivation"))}
+	output := extract.ExtractionOutput{Citations: []extract.Citation{{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript,
+	}}}
+
+	service := &Service{Now: func() time.Time { return documentRecordedAt.Add(time.Hour) }}
+	completion, err := service.completion(version, state, derivation, extract.Response{}, output, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(completion.Evidence) != 1 {
+		t.Fatalf("evidence count = %d, want 1", len(completion.Evidence))
+	}
+	if got := completion.Evidence[0].Span.RecordedAt(); got != documentRecordedAt {
+		t.Fatalf("evidence recorded time = %v, want document first recorded time %v", got, documentRecordedAt)
+	}
+	service.Now = func() time.Time { return documentRecordedAt.Add(2 * time.Hour) }
+	retryCompletion, err := service.completion(version, state, derivation, extract.Response{}, output, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retryCompletion.Evidence[0].Span.ID() != completion.Evidence[0].Span.ID() || retryCompletion.Evidence[0].Span.Digest() != completion.Evidence[0].Span.Digest() {
+		t.Fatal("evidence changed across an extraction retry with identical source coordinates")
 	}
 }
 
@@ -1471,7 +1546,7 @@ func documentVersion(t *testing.T, document source.Document) evidence.DocumentVe
 	}
 	version, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
 		Provider: document.Provider, ProviderDocumentID: document.ID, Title: document.Title,
-		Locator: document.Locator, ProviderVersion: document.Version, ProviderRevision: document.Revision,
+		Locator: document.Locator, ProviderVersion: document.Version,
 		ModifiedAt: document.ModifiedAt, SourceTime: document.MeetingTime,
 		RecordedAt: recordedAt, Sections: sections,
 	})
@@ -1666,7 +1741,6 @@ type memoryRepository struct {
 	persistedEvidence     int
 	persistedMentions     int
 	persistedObservations int
-	persistedSignals      int
 	prepareClaims         int
 	lastLeaseExpiresAt    time.Time
 	calls                 *[]string
@@ -1676,7 +1750,14 @@ func newMemoryRepository() *memoryRepository {
 	return &memoryRepository{versions: make(map[string]VersionState), completions: make(map[string]Completion)}
 }
 
-func (repository *memoryRepository) PrepareVersion(_ context.Context, version evidence.DocumentVersion, derivation DerivationIdentity, _ modelpolicy.DataMode, leaseDuration time.Duration) (VersionState, error) {
+func (repository *memoryRepository) PrepareVersion(
+	_ context.Context,
+	version evidence.DocumentVersion,
+	_ SourceRevisionMetadata,
+	derivation DerivationIdentity,
+	_ modelpolicy.DataMode,
+	leaseDuration time.Duration,
+) (VersionState, error) {
 	if repository.calls != nil {
 		*repository.calls = append(*repository.calls, "prepare")
 	}
@@ -1693,9 +1774,10 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version ev
 		repository.prepareClaims++
 		leaseExpiresAt := time.Now().Add(leaseDuration)
 		state = VersionState{
-			ID:               "version-" + version.Digest().String()[:12],
-			DerivationID:     "derivation-" + fmt.Sprintf("%x", derivation.Digest[:6]),
-			DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusPending,
+			VersionID:          "version-" + version.Digest().String()[:12],
+			RunID:              "derivation-" + fmt.Sprintf("%x", derivation.Digest[:6]),
+			AttemptID:          fmt.Sprintf("attempt-%d", repository.prepareClaims),
+			DocumentRecordedAt: version.RecordedAt(), Status: VersionStatusPending,
 			LeaseOwner: fmt.Sprintf("owner-%d", repository.prepareClaims), LeaseExpiresAt: leaseExpiresAt,
 		}
 		repository.lastLeaseExpiresAt = leaseExpiresAt
@@ -1712,6 +1794,7 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version ev
 		state.RetryCount++
 		state.FailureCode = ""
 		state.LeaseOwner = fmt.Sprintf("owner-%d", repository.prepareClaims)
+		state.AttemptID = fmt.Sprintf("attempt-%d", repository.prepareClaims)
 		state.LeaseExpiresAt = leaseExpiresAt
 		repository.lastLeaseExpiresAt = leaseExpiresAt
 	}
@@ -1732,7 +1815,7 @@ func (repository *memoryRepository) CompleteVersion(_ context.Context, completio
 		return errors.New("synthetic completion interruption")
 	}
 	for key, state := range repository.versions {
-		if state.DerivationID == completion.DerivationID {
+		if state.RunID == completion.RunID {
 			if state.LeaseOwner != completion.LeaseOwner {
 				return errors.New("synthetic completion lease is not owned")
 			}
@@ -1749,21 +1832,20 @@ func (repository *memoryRepository) CompleteVersion(_ context.Context, completio
 	repository.persistedEvidence = len(completion.Evidence)
 	repository.persistedMentions = len(completion.Mentions)
 	repository.persistedObservations = len(completion.Observations)
-	repository.persistedSignals = len(completion.Signals)
 	return nil
 }
 
-func (repository *memoryRepository) RecordFailure(_ context.Context, derivationID, leaseOwner string, status VersionStatus, code FailureCode) error {
+func (repository *memoryRepository) RecordFailure(_ context.Context, failure Failure) error {
 	if repository.failureRecordErr != nil {
 		return repository.failureRecordErr
 	}
 	for key, state := range repository.versions {
-		if state.DerivationID == derivationID {
-			if state.LeaseOwner != leaseOwner {
+		if state.RunID == failure.RunID {
+			if state.LeaseOwner != failure.LeaseOwner || state.AttemptID != failure.AttemptID {
 				return errors.New("synthetic failure lease is not owned")
 			}
-			state.Status = status
-			state.FailureCode = code
+			state.Status = failure.Status
+			state.FailureCode = failure.Code
 			state.LeaseOwner = ""
 			state.LeaseExpiresAt = time.Time{}
 			repository.versions[key] = state
@@ -1796,7 +1878,7 @@ func (enricher *recordingIdentityEnricher) Enrich(_ context.Context, derivationI
 	enricher.callsCount++
 	if enricher.repository != nil {
 		for _, state := range enricher.repository.versions {
-			if state.DerivationID == derivationID && state.LeaseOwner != "" {
+			if state.RunID == derivationID && state.LeaseOwner != "" {
 				enricher.ownedLease = true
 			}
 		}
@@ -1833,7 +1915,7 @@ func (repository *completionBackedDirectoryRepository) LoadWork(
 	_ time.Duration,
 ) (directory.Workset, error) {
 	completion := repository.ingestion.lastCompletion
-	if completion.DerivationID != derivationID {
+	if completion.RunID != derivationID {
 		return directory.Workset{}, errors.New("synthetic derivation is not complete")
 	}
 	quotes := make(map[string]string, len(completion.Evidence))
@@ -1992,14 +2074,14 @@ func TestComputeDerivationDigestChangesWithMaterialExtractionConfiguration(t *te
 	}
 }
 
-func TestComputeDerivationDigestPreservesBedrockV5Bytes(t *testing.T) {
+func TestComputeDerivationDigestUsesCanonicalDocumentDigest(t *testing.T) {
 	sections, err := evidenceSections([]source.Tab{{ID: "transcript-tab", Title: "Transcript", Path: []string{"Transcript"}, Role: source.TabRoleTranscript, Text: "Synthetic transcript."}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	version, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
 		Provider: "drive", ProviderDocumentID: "document-compat", Title: "Synthetic Meeting",
-		Locator: "https://example.invalid/document", ProviderVersion: "version-1", ProviderRevision: "revision-1",
+		Locator: "https://example.invalid/document", ProviderVersion: "version-1",
 		ModifiedAt: time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
 		RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
 		Sections:   sections,
@@ -2016,7 +2098,7 @@ func TestComputeDerivationDigestPreservesBedrockV5Bytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hex.EncodeToString(got[:]) != "b000ccd59675147eebe18c0698207b23ab154160413ec40800c09dbb32e266e1" {
+	if hex.EncodeToString(got[:]) != "323c5911d390d049b6f50fce13c8eada6ad8391e38b44b138ecf852991715290" {
 		t.Fatalf("digest = %x", got)
 	}
 }

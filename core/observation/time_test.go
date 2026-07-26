@@ -94,6 +94,20 @@ func TestOpenIntervalsDistinguishUnknownBounds(t *testing.T) {
 	}
 }
 
+func TestUntilNormalizesToUTCMicrosecondPrecision(t *testing.T) {
+	input := time.Date(2026, time.January, 4, 9, 30, 0, 123456789, time.FixedZone("synthetic", -5*60*60))
+	want := time.Date(2026, time.January, 4, 14, 30, 0, 123456000, time.UTC)
+
+	extent, err := observation.Until(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, hasStart, got, hasEnd := extent.Bounds()
+	if hasStart || !hasEnd || got != want {
+		t.Fatalf("Until().Bounds() = (_, %v, %v, %v), want (_, false, %v, true)", hasStart, got, hasEnd, want)
+	}
+}
+
 func TestWithinRepresentsUncertainInstantAndRejectsZeroDuration(t *testing.T) {
 	start := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
 	end := start.AddDate(1, 0, 0)

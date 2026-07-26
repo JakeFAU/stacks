@@ -15,7 +15,7 @@ type EntityView struct {
 	RecordedAt   time.Time
 	Aliases      []string
 	MentionCount int
-	Evidence     []string
+	Evidence     []ReviewEvidence
 }
 
 // EntityStore provides entity projections at the CLI boundary.
@@ -91,6 +91,6 @@ func renderEntity(output io.Writer, entity EntityView) {
 		fmt.Fprintf(output, "alias: %s\n", alias)
 	}
 	for _, evidence := range entity.Evidence {
-		fmt.Fprintf(output, "evidence: %s\n", evidence)
+		fmt.Fprintf(output, "evidence %s: %s\n", evidence.ID, evidence.Quote)
 	}
 }

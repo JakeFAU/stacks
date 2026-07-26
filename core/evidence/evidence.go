@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/JakeFAU/stacks/core/internal/canonicalhash"
+	"github.com/JakeFAU/stacks/core/timepoint"
 )
 
 // EvidenceID is assigned by the ingestion boundary. Retries for the same
@@ -41,6 +44,10 @@ func ParseContentDigest(value string) (ContentDigest, error) {
 
 // String returns the lowercase hexadecimal digest.
 func (digest ContentDigest) String() string { return hex.EncodeToString(digest[:]) }
+
+func contentDigest(encoder *canonicalhash.Encoder) ContentDigest {
+	return ContentDigest(encoder.Sum())
+}
 
 // EvidenceInput contains the values needed to construct immutable evidence.
 type EvidenceInput struct {
@@ -80,7 +87,7 @@ func NewEvidence(input EvidenceInput) (Evidence, error) {
 	source := input.Source
 	source.Provider, source.DocumentID = strings.TrimSpace(source.Provider), strings.TrimSpace(source.DocumentID)
 	source.Version, source.Locator = strings.TrimSpace(source.Version), strings.TrimSpace(source.Locator)
-	return Evidence{id: id, source: source, digest: input.Digest, recordedAt: input.RecordedAt.UTC()}, nil
+	return Evidence{id: id, source: source, digest: input.Digest, recordedAt: timepoint.Normalize(input.RecordedAt)}, nil
 }
 
 // ID returns the stable evidence identifier.

@@ -13,7 +13,9 @@ func TestEntitiesCommandShowsCanonicalEntityAliasesAndEvidence(t *testing.T) {
 		DisplayName: "Synthetic Person",
 		RecordedAt:  time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
 		Aliases:     []string{"synthetic.person@example.test"},
-		Evidence:    []string{"Synthetic evidence context"},
+		Evidence: []ReviewEvidence{{
+			ID: "evidence-1", Quote: "Synthetic evidence context",
+		}},
 	}}
 	var stdout strings.Builder
 	command := EntitiesCommand{Service: &EntityService{Store: store}, Output: &stdout}
@@ -21,7 +23,7 @@ func TestEntitiesCommandShowsCanonicalEntityAliasesAndEvidence(t *testing.T) {
 	if err := command.Run(context.Background(), []string{"show", "person-1"}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	for _, value := range []string{"person-1", "Synthetic Person", "2026-07-21T12:00:00Z", "synthetic.person@example.test", "Synthetic evidence context"} {
+	for _, value := range []string{"person-1", "Synthetic Person", "2026-07-21T12:00:00Z", "synthetic.person@example.test", "evidence-1", "Synthetic evidence context"} {
 		if !strings.Contains(stdout.String(), value) {
 			t.Fatalf("stdout = %q, want %q", stdout.String(), value)
 		}
