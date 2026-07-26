@@ -56,10 +56,11 @@ openssl rand -hex 24
 
 Use the generated values for `STACKS_DB_ADMIN_PASSWORD` and
 `STACKS_DB_APP_PASSWORD`, and put the application password into
-`STACKS_DATABASE_URL`. Set the corpus, Google, AWS, model, and pair values for
-your environment. `.env` is loaded by the application Make targets below;
-the Go process itself reads environment variables and does not parse dotenv
-files.
+`STACKS_DATABASE_URL` and the administrator password into
+`STACKS_MIGRATION_DATABASE_URL`. Set the corpus, Google, AWS, model, and pair
+values for your environment. `.env` is loaded by the application Make targets
+below; the Go process itself reads environment variables and does not parse
+dotenv files.
 
 Google's downloaded OAuth client JSON and Stacks' token JSON must live outside
 the repository at the explicit paths in `STACKS_GOOGLE_OAUTH_CLIENT_FILE` and
@@ -82,8 +83,15 @@ implemented.
 | `STACKS_OTEL_METRIC_EXPORT_INTERVAL` | `10s` | Metric export interval as a Go duration |
 | `STACKS_OTEL_SERVICE_NAME` | `stacks` | OpenTelemetry service name |
 | `STACKS_OTEL_TRACE_SAMPLE_RATIO` | `1` | Parent-based sampling ratio from `0` to `1` |
+| `STACKS_DB_ADMIN_PASSWORD` | no default | Local Compose administrator password; keep only in the ignored `.env` |
+| `STACKS_DB_APP_PASSWORD` | no default | Local Compose application-role password; keep only in the ignored `.env` |
 | `STACKS_DB_PORT` | `5432` | Host port for the local Compose database |
 | `STACKS_DATABASE_URL` | no default | Application PostgreSQL URL; contains the app password and must remain local |
+| `STACKS_MIGRATION_DATABASE_URL` | no default | Schema-capable PostgreSQL URL used only by `db-migrate` and the guarded local reset |
+| `STACKS_DATABASE_SCOPES` | `core` | Comma-separated migration scopes; `core` is required and `directory` is optional |
+| `STACKS_DATABASE_APP_ROLE` | `stacks_app` | Application role that receives manifest-owned least-privilege grants |
+| `STACKS_TEST_DATABASE_URL` | no default | Application-role URL used by PostgreSQL-gated integration tests |
+| `STACKS_TEST_MIGRATION_DATABASE_URL` | no default | Schema-capable URL used to create isolated PostgreSQL integration-test databases |
 | `STACKS_GOOGLE_FOLDER_ID` | no default | One direct-child Drive folder boundary |
 | `STACKS_GOOGLE_OAUTH_CLIENT_FILE` | no default | External installed-app OAuth client JSON path |
 | `STACKS_GOOGLE_OAUTH_TOKEN_FILE` | no default | External owner-only OAuth token JSON path |
@@ -103,6 +111,7 @@ implemented.
 | `STACKS_MODEL_MAX_ATTEMPTS` | `5` | Positive retry-attempt bound, at most `5` |
 | `OPENAI_API_KEY` | no default | Personal-mode OpenAI credential; keep only in the ignored `.env` |
 | `ANTHROPIC_API_KEY` | no default | Personal-mode Anthropic credential; keep only in the ignored `.env` |
+| `AWS_BEARER_TOKEN_BEDROCK` | no default | Optional Bedrock API-key credential understood by the AWS SDK; keep only in the ignored `.env` |
 | `STACKS_AWS_PROFILE` | no default | Optional shared AWS profile; all AWS commands use the default credential chain when unset |
 | `STACKS_AWS_REGION` | no default | Bedrock-only control-plane and runtime region |
 | `STACKS_INGEST_LEASE_DURATION` | `5m` | Positive extraction-claim duration, bounded to at most `1h` |
@@ -112,8 +121,6 @@ implemented.
 | `STACKS_EMPLOYEE_ENTITY_ID` | no default | Accepted employee entity used by `analyze` |
 | `STACKS_MANAGER_ENTITY_ID` | no default | Accepted manager entity used by `analyze` |
 
-`STACKS_DB_ADMIN_PASSWORD` and `STACKS_DB_APP_PASSWORD` are local secrets used
-by Compose and migrations, so they intentionally have no example values.
 `STACKS_TEST_DATABASE_URL` is the credential-bearing application-role input
 used by repository integration tests. `STACKS_TEST_MIGRATION_DATABASE_URL` is
 the schema-capable admin-role input used only by isolated migration
@@ -301,6 +308,32 @@ make db-up
 make db-migrate
 make db-status
 ```
+
+The canonical database has one required `core` scope and one optional
+`directory` scope. Add `directory` to `STACKS_DATABASE_SCOPES` only when
+Workspace directory enrichment is enabled. Manager confidence is a temporary
+query use case over canonical observations; it is not an installation option,
+schema, or migration scope. Google Drive and model providers are runtime
+adapters and are never constructed by database commands.
+
+The local image includes pgvector so later vector work does not require a
+different image, but the canonical core does not install the `vector`
+extension. No vector object is part of the current schema.
+
+`make db-status` reports each known scope independently:
+
+- `absent`: no ledger exists; run `make db-migrate` for a configured scope;
+- `pending`: the ledger is valid but newer embedded migrations remain; run
+  `make db-migrate`;
+- `current`: ledger checksums and the live schema fingerprint match;
+- `checksum_mismatch`: applied migration bytes do not match this build; do not
+  adopt or repair the ledger manually; and
+- `schema_drift`: the ledger is current but an owned database object differs;
+  inspect the local change instead of applying migrations blindly.
+
+Doctor reports the same states through read-only checks. A non-current core
+scope is unhealthy. An absent directory scope is healthy when directory
+enrichment is disabled and actionable when it is enabled.
 
 Then run the explicit workflow:
 
@@ -491,8 +524,10 @@ The deterministic repository checks are:
 ```sh
 make fmt
 make test
+make test-race
 make staticcheck
 make build
+make modules-check
 git diff --check
 ```
 
@@ -501,8 +536,8 @@ With the local database configured and running, also run:
 ```sh
 make db-up
 make db-migrate
-set -a; . ./.env; set +a
-make test-integration
+make db-status
+make test-integration ENV_FILE=.env
 ```
 
 Live validation is separate from those checks. Personal OpenAI and Anthropic
@@ -530,8 +565,19 @@ PostgreSQL reset is:
 make db-reset CONFIRM=delete-local-stacks-postgres
 ```
 
+This is the only transition from the retired proof-of-concept migration chain:
+migrations `00001` through `00012` have no in-place upgrade or row-copy path.
+The command irrecoverably deletes the existing local Compose PostgreSQL data.
+Use it only when that data is disposable.
+
 The reset command accepts only loopback database URLs, rejects ambient Docker
 or Compose redirection, verifies the exact local Stacks PostgreSQL service and
 named volume, removes only that volume, recreates PostgreSQL, and applies the
 embedded canonical migrations. It is not part of normal startup or migration
 workflow.
+
+Plan C does not deploy anything or enable cloud logging. Existing local
+observability remains optional and keeps the privacy rules above. Passing the
+deterministic and local PostgreSQL checks validates only the canonical engine
+and PostgreSQL adapter; it does not validate live Google Drive, Workspace
+Directory, Bedrock, Anthropic, OpenAI, or private-corpus acceptance.

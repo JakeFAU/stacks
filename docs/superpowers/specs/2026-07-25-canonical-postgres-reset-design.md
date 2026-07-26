@@ -1,8 +1,18 @@
 # Canonical PostgreSQL Reset Design
 
 **Date:** 2026-07-25
-**Status:** Approved design
+**Status:** Implemented
 **Scope:** Plan C
+
+**Implementation evidence:** Canonical application cutover commit `04175cb`;
+local PostgreSQL reset/acceptance fix commit `c908e81`. Verification included a
+guarded reset of only the local Stacks PostgreSQL volume, clean embedded
+migration install and repeat no-op, application-role fingerprints and status,
+core-only and configured-directory doctor boundaries, full PostgreSQL
+integration and race gates, deterministic repository gates, both synthetic
+longitudinal scenarios, and an independent whole-branch review. Live Google
+Drive, Workspace Directory, Bedrock, Anthropic, OpenAI, and private-corpus
+acceptance remain unvalidated.
 
 ## Purpose
 
