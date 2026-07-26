@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -15,6 +16,7 @@ const (
 	reviewCreateNameFlagName      = "name"
 	reviewCreateEmailFlagName     = "email"
 	acceptDirectoryEntityFlagName = "entity"
+	invalidCommandSyntaxMessage   = "invalid command syntax"
 )
 
 // CommandName identifies a top-level Stacks application command.
@@ -80,17 +82,23 @@ type Runner struct {
 
 // Run parses args and invokes the selected typed command leaf.
 func (r Runner) Run(ctx context.Context, args []string) error {
-	root := r.newRootCommand()
+	handled := false
+	root := r.newRootCommand(&handled)
 	root.SetArgs(args)
 	root.SetContext(ctx)
 	root.SetIn(r.Input)
 	root.SetOut(r.Output)
 	root.SetErr(r.Error)
-	return root.ExecuteContext(ctx)
+	err := root.ExecuteContext(ctx)
+	if err != nil && !handled {
+		return errors.New(invalidCommandSyntaxMessage)
+	}
+	return err
 }
 
-func (r Runner) newRootCommand() *cobra.Command {
+func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	execute := func(command *cobra.Command, invocation Invocation) error {
+		*handled = true
 		if r.Execute == nil {
 			return fmt.Errorf("%s command is not configured", invocation.Command)
 		}
@@ -101,6 +109,7 @@ func (r Runner) newRootCommand() *cobra.Command {
 			Use:  use,
 			Args: args,
 			RunE: func(command *cobra.Command, values []string) error {
+				*handled = true
 				return execute(command, Invocation{Command: topLevel, Action: action, Arguments: values})
 			},
 		}
@@ -146,6 +155,7 @@ func (r Runner) newRootCommand() *cobra.Command {
 	acceptDirectory := leaf(string(ActionAcceptDirectory)+" <proposal-id> <directory-profile-id>", CommandReview, ActionAcceptDirectory, cobra.ExactArgs(2))
 	acceptDirectory.Flags().String(acceptDirectoryEntityFlagName, "", "existing entity ID")
 	acceptDirectory.RunE = func(command *cobra.Command, values []string) error {
+		*handled = true
 		entityID, err := command.Flags().GetString(acceptDirectoryEntityFlagName)
 		if err != nil {
 			return fmt.Errorf("read %s flag: %w", acceptDirectoryEntityFlagName, err)
@@ -167,6 +177,7 @@ func (r Runner) newRootCommand() *cobra.Command {
 	create.Flags().String(reviewCreateEmailFlagName, "", "new person email")
 	_ = create.MarkFlagRequired(reviewCreateNameFlagName)
 	create.RunE = func(command *cobra.Command, values []string) error {
+		*handled = true
 		name, err := command.Flags().GetString(reviewCreateNameFlagName)
 		if err != nil {
 			return fmt.Errorf("read %s flag: %w", reviewCreateNameFlagName, err)

@@ -130,24 +130,24 @@ func TestRunnerRejectsInvalidLeafArityWithoutExecuting(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"serve", []string{"serve", "unexpected"}, "unknown command"},
-		{"doctor", []string{"doctor", "unexpected"}, "unknown command"},
-		{"sync", []string{"sync", "unexpected"}, "unknown command"},
-		{"analyze", []string{"analyze", "unexpected"}, "unknown command"},
-		{"db migrate", []string{"db-migrate", "unexpected"}, "unknown command"},
-		{"db status", []string{"db-status", "unexpected"}, "unknown command"},
-		{"db reset", []string{"db-reset"}, "accepts"},
-		{"auth google", []string{"auth", "google", "unexpected"}, "unknown command"},
-		{"auth directory", []string{"auth", "google-directory", "unexpected"}, "unknown command"},
-		{"entities list", []string{"entities", "list", "unexpected"}, "unknown command"},
-		{"entities show", []string{"entities", "show"}, "accepts"},
-		{"review list", []string{"review", "list", "unexpected"}, "unknown command"},
-		{"review show", []string{"review", "show"}, "accepts"},
-		{"review accept", []string{"review", "accept", "proposal-1"}, "accepts"},
-		{"review accept directory", []string{"review", "accept-directory", "proposal-1"}, "accepts"},
-		{"review reject", []string{"review", "reject"}, "accepts"},
-		{"review create", []string{"review", "create"}, "accepts"},
-		{"review correct", []string{"review", "correct", "decision-1"}, "accepts"},
+		{"serve", []string{"serve", "unexpected"}, invalidCommandSyntaxMessage},
+		{"doctor", []string{"doctor", "unexpected"}, invalidCommandSyntaxMessage},
+		{"sync", []string{"sync", "unexpected"}, invalidCommandSyntaxMessage},
+		{"analyze", []string{"analyze", "unexpected"}, invalidCommandSyntaxMessage},
+		{"db migrate", []string{"db-migrate", "unexpected"}, invalidCommandSyntaxMessage},
+		{"db status", []string{"db-status", "unexpected"}, invalidCommandSyntaxMessage},
+		{"db reset", []string{"db-reset"}, invalidCommandSyntaxMessage},
+		{"auth google", []string{"auth", "google", "unexpected"}, invalidCommandSyntaxMessage},
+		{"auth directory", []string{"auth", "google-directory", "unexpected"}, invalidCommandSyntaxMessage},
+		{"entities list", []string{"entities", "list", "unexpected"}, invalidCommandSyntaxMessage},
+		{"entities show", []string{"entities", "show"}, invalidCommandSyntaxMessage},
+		{"review list", []string{"review", "list", "unexpected"}, invalidCommandSyntaxMessage},
+		{"review show", []string{"review", "show"}, invalidCommandSyntaxMessage},
+		{"review accept", []string{"review", "accept", "proposal-1"}, invalidCommandSyntaxMessage},
+		{"review accept directory", []string{"review", "accept-directory", "proposal-1"}, invalidCommandSyntaxMessage},
+		{"review reject", []string{"review", "reject"}, invalidCommandSyntaxMessage},
+		{"review create", []string{"review", "create"}, invalidCommandSyntaxMessage},
+		{"review correct", []string{"review", "correct", "decision-1"}, invalidCommandSyntaxMessage},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -163,5 +163,23 @@ func TestRunnerRejectsInvalidLeafArityWithoutExecuting(t *testing.T) {
 				t.Fatalf("Execute calls = %d, want 0", calls)
 			}
 		})
+	}
+}
+
+func TestRunnerDoesNotExposeUnexpectedPositionalInputInSyntaxErrors(t *testing.T) {
+	const privateToken = "synthetic-private-positional-token"
+	var errorOutput strings.Builder
+	err := (Runner{
+		Error: &errorOutput,
+		Execute: func(context.Context, Invocation) error {
+			t.Fatal("Execute must not run for syntax errors")
+			return nil
+		},
+	}).Run(t.Context(), []string{"serve", privateToken})
+	if err == nil {
+		t.Fatal("Run() error = nil, want syntax failure")
+	}
+	if strings.Contains(err.Error(), privateToken) || strings.Contains(errorOutput.String(), privateToken) {
+		t.Fatalf("syntax failure exposed positional input: error=%q stderr=%q", err, errorOutput.String())
 	}
 }
