@@ -11,7 +11,7 @@ import (
 
 func TestCompleteVersionRejectsPaddedLocalIdentifierBeforeOpeningTransaction(t *testing.T) {
 	repository := &IngestionRepository{}
-	err := repository.CompleteVersion(context.Background(), ingest.Completion{
+	err := repository.completeLegacyVersion(context.Background(), legacyIngestionCompletion{
 		VersionID: "11111111-1111-1111-1111-111111111111",
 		DataMode:  modelpolicy.DataModePersonal,
 		Evidence:  []ingest.EvidenceRecord{{Key: " citation-1"}},

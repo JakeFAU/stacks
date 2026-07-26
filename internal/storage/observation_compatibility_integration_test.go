@@ -327,7 +327,7 @@ func createLegacyObservationFixture(t *testing.T, pool *pgxpool.Pool) legacyObse
 		t.Fatalf("put legacy compatibility evidence span: %v", err)
 	}
 	ingestionRepository := NewIngestionRepository(pool)
-	state, err := ingestionRepository.PrepareVersion(ctx, version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
+	state, err := ingestionRepository.prepareLegacyVersion(ctx, version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare legacy compatibility extraction run: %v", err)
 	}

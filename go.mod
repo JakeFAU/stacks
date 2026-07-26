@@ -3,6 +3,8 @@ module stacks
 go 1.26.0
 
 require (
+	github.com/JakeFAU/stacks/adapters/postgres v0.0.0
+	github.com/JakeFAU/stacks/core v0.0.0
 	github.com/anthropics/anthropic-sdk-go v1.59.0
 	github.com/aws/aws-sdk-go-v2 v1.43.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.31
@@ -29,6 +31,10 @@ require (
 	golang.org/x/oauth2 v0.36.0
 	google.golang.org/api v0.289.0
 )
+
+replace github.com/JakeFAU/stacks/adapters/postgres => ./adapters/postgres
+
+replace github.com/JakeFAU/stacks/core => ./core
 
 require (
 	cloud.google.com/go/auth v0.20.0 // indirect

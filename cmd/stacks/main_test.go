@@ -986,12 +986,13 @@ type noOpRuntimeIngestionRepository struct{}
 func (noOpRuntimeIngestionRepository) PrepareVersion(
 	context.Context,
 	evidence.DocumentVersion,
+	ingest.SourceRevisionMetadata,
 	ingest.DerivationIdentity,
 	modelpolicy.DataMode,
 	time.Duration,
 ) (ingest.VersionState, error) {
 	recordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 123456000, time.UTC)
-	return ingest.VersionState{DocumentRecordedAt: recordedAt, RecordedAt: recordedAt}, nil
+	return ingest.VersionState{DocumentRecordedAt: recordedAt}, nil
 }
 
 func (noOpRuntimeIngestionRepository) CompleteVersion(context.Context, ingest.Completion) error {
@@ -1000,10 +1001,7 @@ func (noOpRuntimeIngestionRepository) CompleteVersion(context.Context, ingest.Co
 
 func (noOpRuntimeIngestionRepository) RecordFailure(
 	context.Context,
-	string,
-	string,
-	ingest.VersionStatus,
-	ingest.FailureCode,
+	ingest.Failure,
 ) error {
 	return nil
 }

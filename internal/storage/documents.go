@@ -302,42 +302,42 @@ func NewIngestionRepository(pool *pgxpool.Pool) *IngestionRepository {
 
 // PrepareVersion stores the immutable source version and independently creates
 // or resumes the exact configured extraction derivation.
-func (repository *IngestionRepository) PrepareVersion(ctx context.Context, version evidence.DocumentVersion, derivation ingest.DerivationIdentity, dataMode modelpolicy.DataMode, leaseDuration time.Duration) (ingest.VersionState, error) {
+func (repository *IngestionRepository) prepareLegacyVersion(ctx context.Context, version evidence.DocumentVersion, derivation ingest.DerivationIdentity, dataMode modelpolicy.DataMode, leaseDuration time.Duration) (legacyVersionState, error) {
 	if repository == nil || repository.pool == nil {
-		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: repository is not configured")
+		return legacyVersionState{}, fmt.Errorf("prepare ingestion version: repository is not configured")
 	}
 	if err := validateDocumentSectionOrder(version); err != nil {
-		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: %w", err)
+		return legacyVersionState{}, fmt.Errorf("prepare ingestion version: %w", err)
 	}
 	if err := (modelpolicy.Invocation{Provider: derivation.Provider, DataMode: dataMode, Region: derivation.Region}).Validate(); err != nil {
-		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: model policy is invalid")
+		return legacyVersionState{}, fmt.Errorf("prepare ingestion version: model policy is invalid")
 	}
 	wantDigest, err := ingest.ComputeDerivationDigest(version, derivation)
 	if err != nil || wantDigest != derivation.Digest {
-		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: derivation identity is invalid")
+		return legacyVersionState{}, fmt.Errorf("prepare ingestion version: derivation identity is invalid")
 	}
 	if leaseDuration <= 0 {
-		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: lease duration is invalid")
+		return legacyVersionState{}, fmt.Errorf("prepare ingestion version: lease duration is invalid")
 	}
 	claimOwner := uuid.NewString()
 	transaction, err := repository.pool.Begin(ctx)
 	if err != nil {
-		return ingest.VersionState{}, fmt.Errorf("prepare ingestion version: %w", err)
+		return legacyVersionState{}, fmt.Errorf("prepare ingestion version: %w", err)
 	}
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 
 	documents := &DocumentRepository{query: transaction}
 	stored, _, err := documents.PutDocumentVersion(ctx, version)
 	if err != nil {
-		return ingest.VersionState{}, err
+		return legacyVersionState{}, err
 	}
 	documentRecordedAt, err := documents.documentVersionRecordedAt(ctx, stored.ID)
 	if err != nil {
-		return ingest.VersionState{}, err
+		return legacyVersionState{}, err
 	}
 	claimedAt := time.Now().UTC().Truncate(legacyPostgresTimestampPrecision)
 	leaseExpiresAt := claimedAt.Add(leaseDuration)
-	state := ingest.VersionState{
+	state := legacyVersionState{
 		ID:                 stored.ID,
 		DerivationDigest:   derivation.Digest,
 		DocumentRecordedAt: documentRecordedAt,
@@ -379,13 +379,13 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 			&storedProvider, &storedDataMode, &storedModelID, &storedBedrockRegion, &storedMaxTokens,
 			&storedPromptVersion, &storedSchemaDigest, &storedAdmissible,
 		); err != nil {
-			return ingest.VersionState{}, fmt.Errorf("load ingestion derivation state: %w", err)
+			return legacyVersionState{}, fmt.Errorf("load ingestion derivation state: %w", err)
 		}
 		if storedProvider != string(derivation.Provider) || !modelRegionMatches(derivation.Provider, derivation.Region, storedBedrockRegion) ||
 			storedModelID != derivation.ModelID ||
 			storedMaxTokens != derivation.MaxTokens || storedPromptVersion != derivation.PromptVersion ||
 			string(storedSchemaDigest) != string(derivation.SchemaDigest[:]) {
-			return ingest.VersionState{}, fmt.Errorf("load ingestion derivation state: immutable configuration conflicts")
+			return legacyVersionState{}, fmt.Errorf("load ingestion derivation state: immutable configuration conflicts")
 		}
 		state.RecordedAt = persistedRecordedAt.UTC()
 		state.Status = ingest.VersionStatus(status)
@@ -404,7 +404,7 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 				    lease_owner = $2, lease_expires_at = $3, data_mode = $4
 				WHERE id = $1
 				RETURNING retry_count`, state.DerivationID, claimOwner, leaseExpiresAt, string(dataMode)).Scan(&state.RetryCount); err != nil {
-				return ingest.VersionState{}, fmt.Errorf("resume ingestion derivation: %w", err)
+				return legacyVersionState{}, fmt.Errorf("resume ingestion derivation: %w", err)
 			}
 			state.Status = ingest.VersionStatusPending
 			state.FailureCode = ""
@@ -412,15 +412,15 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 			state.LeaseExpiresAt = leaseExpiresAt
 		}
 	} else {
-		return ingest.VersionState{}, fmt.Errorf("prepare ingestion derivation: %w", err)
+		return legacyVersionState{}, fmt.Errorf("prepare ingestion derivation: %w", err)
 	}
 	if state.Status == ingest.VersionStatusComplete && storedAdmissible {
 		if err := setCurrentDocumentVersion(ctx, transaction, stored.ID); err != nil {
-			return ingest.VersionState{}, err
+			return legacyVersionState{}, err
 		}
 	}
 	if err := transaction.Commit(ctx); err != nil {
-		return ingest.VersionState{}, fmt.Errorf("commit ingestion version preparation: %w", err)
+		return legacyVersionState{}, fmt.Errorf("commit ingestion version preparation: %w", err)
 	}
 	return state, nil
 }
@@ -438,7 +438,7 @@ func (repository *DocumentRepository) documentVersionRecordedAt(ctx context.Cont
 
 // RecordFailure stores only finite processing state and a bounded diagnostic
 // code. It never stores an error string or private model/source text.
-func (repository *IngestionRepository) RecordFailure(ctx context.Context, derivationID, leaseOwner string, status ingest.VersionStatus, code ingest.FailureCode) error {
+func (repository *IngestionRepository) recordLegacyFailure(ctx context.Context, derivationID, leaseOwner string, status ingest.VersionStatus, code ingest.FailureCode) error {
 	if repository == nil || repository.pool == nil {
 		return fmt.Errorf("record ingestion failure: repository is not configured")
 	}
@@ -470,8 +470,8 @@ func (repository *IngestionRepository) RecordFailure(ctx context.Context, deriva
 
 // CompleteVersion commits the entire validated write-set and marks the version
 // complete only after every required durable row has succeeded.
-func (repository *IngestionRepository) CompleteVersion(ctx context.Context, completion ingest.Completion) error {
-	if err := ingest.ValidateForPersistence(completion); err != nil {
+func (repository *IngestionRepository) completeLegacyVersion(ctx context.Context, completion legacyIngestionCompletion) error {
+	if err := validateLegacyForPersistence(completion); err != nil {
 		return fmt.Errorf("complete ingestion version input: %w", err)
 	}
 	if repository == nil || repository.pool == nil {
@@ -583,7 +583,7 @@ func (repository *IngestionRepository) CompleteVersion(ctx context.Context, comp
 	return nil
 }
 
-func validateIngestionRecordedAt(observations []ingest.ObservationDraft, recordedAt time.Time) error {
+func validateIngestionRecordedAt(observations []legacyObservationDraft, recordedAt time.Time) error {
 	for _, draft := range observations {
 		if !draft.RecordedAt.Equal(recordedAt) {
 			return newObservationBoundaryError(
@@ -723,8 +723,8 @@ func persistIngestionGraph(
 	ctx context.Context,
 	transaction pgx.Tx,
 	run owningExtractionRun,
-	observations []ingest.ObservationDraft,
-	signals []ingest.SignalRecord,
+	observations []legacyObservationDraft,
+	signals []legacySignalRecord,
 	evidenceIDs, mentionIDs map[string]string,
 ) error {
 	staged, err := stageCanonicalIngestionWrites(run, observations, signals, evidenceIDs, mentionIDs)
@@ -741,8 +741,8 @@ func persistIngestionGraph(
 
 func stageCanonicalIngestionWrites(
 	run owningExtractionRun,
-	observations []ingest.ObservationDraft,
-	signals []ingest.SignalRecord,
+	observations []legacyObservationDraft,
+	signals []legacySignalRecord,
 	evidenceIDs, mentionIDs map[string]string,
 ) ([]legacyObservationWrite, error) {
 	observationIDs := make(map[string]struct{}, len(observations))
@@ -757,7 +757,7 @@ func stageCanonicalIngestionWrites(
 		observationIDs[identifier] = struct{}{}
 	}
 
-	signalsByObservation := make(map[string]*ingest.SignalRecord, len(signals))
+	signalsByObservation := make(map[string]*legacySignalRecord, len(signals))
 	for index := range signals {
 		signal := &signals[index]
 		observationID, err := canonicalUUID(signal.ObservationID)
@@ -817,8 +817,8 @@ func stageCanonicalIngestionWrites(
 }
 
 func buildCanonicalIngestionObservation(
-	draft ingest.ObservationDraft,
-	signal *ingest.SignalRecord,
+	draft legacyObservationDraft,
+	signal *legacySignalRecord,
 	run owningExtractionRun,
 	evidenceIDs map[string]string,
 	mentionIDs map[string]string,
@@ -913,7 +913,7 @@ func resolveMentionKey(key string, mentionIDs map[string]string) (string, error)
 
 func buildCanonicalIngestionSignal(
 	observationID observation.ObservationID,
-	record *ingest.SignalRecord,
+	record *legacySignalRecord,
 	evidenceIDs map[string]string,
 ) (*legacySignalState, error) {
 	if record == nil {

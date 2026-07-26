@@ -94,18 +94,21 @@ func TestDriveMeetingTitleDatesFlowThroughSyncIntoAnalysisChronology(t *testing.
 	var dated, contentDated []analysis.Signal
 	for index, result := range summary.Results {
 		completion := repository.completions[result.VersionID]
-		if len(completion.Observations) != 1 || len(completion.Signals) != 1 {
-			t.Fatalf("completion %d = %#v, want one observation and signal", index, completion)
+		if len(completion.Observations) != 1 {
+			t.Fatalf("completion %d = %#v, want one canonical observation", index, completion)
 		}
 		observation := completion.Observations[0]
-		signal := completion.Signals[0]
+		category, direction, err := analysis.ParseInteractionObservationPredicate(observation.Predicate)
+		if err != nil {
+			t.Fatalf("completion %d predicate error = %v", index, err)
+		}
 		var validTime *time.Time
-		if start, hasStart, _, _ := observation.ValidTime.Bounds(); hasStart {
-			validTime = &start
+		if instant, ok := observation.ValidTime.Instant(); ok {
+			validTime = &instant
 		}
 		converted := analysis.Signal{
-			ID: signal.ID, MeetingID: result.DocumentID,
-			Category: analysis.Category(signal.Category), Direction: analysis.Direction(signal.Direction),
+			ID: string(observation.ID), MeetingID: result.DocumentID,
+			Category: category, Direction: direction,
 			ValidTime: validTime, Validated: true, TranscriptBacked: true,
 		}
 		if index < 2 {
@@ -216,14 +219,18 @@ type chronologyRepository struct {
 func (repository *chronologyRepository) PrepareVersion(
 	_ context.Context,
 	version evidence.DocumentVersion,
+	_ ingest.SourceRevisionMetadata,
 	derivation ingest.DerivationIdentity,
 	_ modelpolicy.DataMode,
 	leaseDuration time.Duration,
 ) (ingest.VersionState, error) {
 	return ingest.VersionState{
-		ID: "version-" + version.ProviderDocumentID(), DerivationID: "derivation-" + version.ProviderDocumentID(),
-		DerivationDigest: derivation.Digest, DocumentRecordedAt: version.RecordedAt(), RecordedAt: time.Date(2026, time.July, 22, 12, 0, 0, 123456000, time.UTC), LeaseOwner: "owner-" + version.ProviderDocumentID(),
-		LeaseExpiresAt: time.Now().Add(leaseDuration), Status: ingest.VersionStatusPending,
+		VersionID:          "version-" + version.ProviderDocumentID(),
+		RunID:              "derivation-" + version.ProviderDocumentID(),
+		AttemptID:          "attempt-" + version.ProviderDocumentID(),
+		DocumentRecordedAt: version.RecordedAt(),
+		LeaseOwner:         "owner-" + version.ProviderDocumentID(),
+		LeaseExpiresAt:     time.Now().Add(leaseDuration), Status: ingest.VersionStatusPending,
 	}, nil
 }
 
@@ -232,8 +239,8 @@ func (repository *chronologyRepository) CompleteVersion(_ context.Context, compl
 	return nil
 }
 
-func (repository *chronologyRepository) RecordFailure(_ context.Context, derivationID, _ string, _ ingest.VersionStatus, code ingest.FailureCode) error {
-	return fmt.Errorf("unexpected failure for %s: %s", derivationID, code)
+func (repository *chronologyRepository) RecordFailure(_ context.Context, failure ingest.Failure) error {
+	return fmt.Errorf("unexpected failure for %s: %s", failure.RunID, failure.Code)
 }
 
 func (repository *chronologyRepository) EntitySnapshots(context.Context) ([]entity.EntitySnapshot, error) {

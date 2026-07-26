@@ -1960,7 +1960,7 @@ func TestModelProviderProvenancePersistsExtractionLeaseWithoutMutatingCompletedC
 	version := testDocumentVersion(t, testIdentifier("document-provider-provenance"))
 	derivation := testExtractionDerivation(t, version)
 
-	personal, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	personal, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare personal Bedrock extraction: %v", err)
 	}
@@ -1973,14 +1973,14 @@ func TestModelProviderProvenancePersistsExtractionLeaseWithoutMutatingCompletedC
 	if provider != string(modelpolicy.ProviderBedrock) || dataMode != string(modelpolicy.DataModePersonal) || region != derivation.Region {
 		t.Fatalf("personal Bedrock extraction provenance = %q/%q/%q", provider, dataMode, region)
 	}
-	if err := repository.CompleteVersion(ctx, ingest.Completion{
+	if err := repository.completeLegacyVersion(ctx, legacyIngestionCompletion{
 		VersionID: personal.ID, DerivationID: personal.DerivationID, LeaseOwner: personal.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 	}); err != nil {
 		t.Fatalf("complete personal Bedrock extraction: %v", err)
 	}
 
-	restricted, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModeRestricted, 5*time.Minute)
+	restricted, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModeRestricted, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("reuse completed Bedrock extraction in restricted mode: %v", err)
 	}
@@ -2000,10 +2000,10 @@ func TestModelProviderProvenanceSeparatesDirectExtractionCaches(t *testing.T) {
 	repository := NewIngestionRepository(pool)
 	ctx := context.Background()
 	version := testDocumentVersion(t, testIdentifier("document-direct-provider-caches"))
-	states := make(map[modelpolicy.Provider]ingest.VersionState)
+	states := make(map[modelpolicy.Provider]legacyVersionState)
 	for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
 		derivation := testExtractionDerivationForProvider(t, version, provider)
-		state, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+		state, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 		if err != nil {
 			t.Fatalf("prepare %s extraction: %v", provider, err)
 		}
@@ -2031,17 +2031,17 @@ func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	version := testDocumentVersion(t, testIdentifier("document-ingestion-state"))
 	derivation := testExtractionDerivation(t, version)
 
-	first, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	first, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare first ingestion attempt: %v", err)
 	}
 	if first.Status != ingest.VersionStatusPending || first.RetryCount != 0 {
 		t.Fatalf("first state = %#v, want pending retry_count=0", first)
 	}
-	if err := repository.RecordFailure(ctx, first.DerivationID, first.LeaseOwner, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
+	if err := repository.recordLegacyFailure(ctx, first.DerivationID, first.LeaseOwner, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
 		t.Fatalf("record incomplete attempt: %v", err)
 	}
-	second, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModeRestricted, 5*time.Minute)
+	second, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModeRestricted, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare retry: %v", err)
 	}
@@ -2055,13 +2055,13 @@ func TestIngestionRepositoryResumesVersionAndCompletesAtomically(t *testing.T) {
 	if retriedDataMode != string(modelpolicy.DataModeRestricted) {
 		t.Fatalf("retried extraction data mode = %q, want restricted", retriedDataMode)
 	}
-	if err := repository.CompleteVersion(ctx, ingest.Completion{
+	if err := repository.completeLegacyVersion(ctx, legacyIngestionCompletion{
 		VersionID: second.ID, DerivationID: second.DerivationID, LeaseOwner: second.LeaseOwner,
 		DataMode: modelpolicy.DataModeRestricted,
 	}); err != nil {
 		t.Fatalf("complete retry: %v", err)
 	}
-	complete, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	complete, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare completed version: %v", err)
 	}
@@ -2077,7 +2077,7 @@ func TestPrepareVersionReturnsPersistedRecordedAtForEveryState(t *testing.T) {
 	version := testDocumentVersion(t, testIdentifier("document-recorded-at-states"))
 	derivation := testExtractionDerivation(t, version)
 
-	first, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	first, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare initial extraction run: %v", err)
 	}
@@ -2086,7 +2086,7 @@ func TestPrepareVersionReturnsPersistedRecordedAtForEveryState(t *testing.T) {
 		t.Fatalf("load stored extraction recorded time: %v", err)
 	}
 	storedRecordedAt = storedRecordedAt.UTC()
-	assertPersistedRecordedAt := func(name string, state ingest.VersionState) {
+	assertPersistedRecordedAt := func(name string, state legacyVersionState) {
 		t.Helper()
 		if !state.RecordedAt.Equal(storedRecordedAt) ||
 			state.RecordedAt.Location() != time.UTC ||
@@ -2096,7 +2096,7 @@ func TestPrepareVersionReturnsPersistedRecordedAtForEveryState(t *testing.T) {
 	}
 	assertPersistedRecordedAt("initial pending", first)
 
-	busy, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	busy, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare busy extraction run: %v", err)
 	}
@@ -2105,10 +2105,10 @@ func TestPrepareVersionReturnsPersistedRecordedAtForEveryState(t *testing.T) {
 	}
 	assertPersistedRecordedAt("busy", busy)
 
-	if err := repository.RecordFailure(ctx, first.DerivationID, first.LeaseOwner, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
+	if err := repository.recordLegacyFailure(ctx, first.DerivationID, first.LeaseOwner, ingest.VersionStatusIncomplete, ingest.FailureStorage); err != nil {
 		t.Fatalf("record incomplete extraction run: %v", err)
 	}
-	resumed, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	resumed, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare resumed extraction run: %v", err)
 	}
@@ -2117,13 +2117,13 @@ func TestPrepareVersionReturnsPersistedRecordedAtForEveryState(t *testing.T) {
 	}
 	assertPersistedRecordedAt("resumed", resumed)
 
-	if err := repository.CompleteVersion(ctx, ingest.Completion{
+	if err := repository.completeLegacyVersion(ctx, legacyIngestionCompletion{
 		VersionID: resumed.ID, DerivationID: resumed.DerivationID, LeaseOwner: resumed.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 	}); err != nil {
 		t.Fatalf("complete resumed extraction run: %v", err)
 	}
-	complete, err := repository.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	complete, err := repository.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare completed extraction run: %v", err)
 	}
@@ -2139,7 +2139,7 @@ func TestPrepareVersionTruncatesRecordedAtOnceToPostgresPrecision(t *testing.T) 
 	ctx := context.Background()
 	version := testDocumentVersion(t, testIdentifier("document-recorded-at-precision"))
 
-	state, err := repository.PrepareVersion(ctx, version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
+	state, err := repository.prepareLegacyVersion(ctx, version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare extraction run: %v", err)
 	}
@@ -2213,25 +2213,25 @@ func TestIngestionPreservesObservationOriginAndSignalRoles(t *testing.T) {
 	}
 	observationID := observation.ObservationID(uuid.NewString())
 	signalID := uuid.NewString()
-	completion := ingest.Completion{
+	completion := legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal, Evidence: evidenceRecords,
 		Mentions: []ingest.MentionRecord{
 			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
 			{Key: "employee", EvidenceKey: "statement", Surface: "Synthetic Employee", NormalizedName: "synthetic employee", Role: "reference"},
 		},
-		Observations: []ingest.ObservationDraft{{
+		Observations: []legacyObservationDraft{{
 			ID: observationID, SubjectMentionKey: "manager", ObjectMentionKey: "employee",
 			Predicate: predicate, ValidTime: observation.UnknownTime(), RecordedAt: state.RecordedAt,
 			EvidenceKeys:     []string{"statement", "supporting", "contradicting", "shared"},
 			SourceConfidence: sourceConfidence,
 		}},
-		Signals: []ingest.SignalRecord{{
+		Signals: []legacySignalRecord{{
 			ID: signalID, ObservationID: string(observationID),
 			Category: "delegation_autonomy", Direction: "mixed",
 			ExtractionModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
 			Rationale: "Synthetic source-grounded signal.", Confidence: 0.8,
-			Evidence: []ingest.SignalEvidenceRecord{
+			Evidence: []legacySignalEvidenceRecord{
 				{EvidenceKey: "supporting", Role: "supporting"},
 				{EvidenceKey: "shared", Role: "supporting"},
 				{EvidenceKey: "contradicting", Role: "contradicting"},
@@ -2239,7 +2239,7 @@ func TestIngestionPreservesObservationOriginAndSignalRoles(t *testing.T) {
 			},
 		}},
 	}
-	if err := NewIngestionRepository(pool).CompleteVersion(ctx, completion); err != nil {
+	if err := NewIngestionRepository(pool).completeLegacyVersion(ctx, completion); err != nil {
 		t.Fatalf("complete origin-preserving ingestion: %v", err)
 	}
 
@@ -2330,7 +2330,7 @@ func TestIngestionRejectsInadmissibleActiveRunWithoutMutation(t *testing.T) {
 	}
 	before := snapshotCanonicalIngestionCompletion(t, fixture)
 
-	err := fixture.repository.CompleteVersion(ctx, fixture.completion())
+	err := fixture.repository.completeLegacyVersion(ctx, fixture.completion())
 	if !errors.Is(err, ErrObservationCompatibility) {
 		t.Fatalf("complete with inadmissible owning run error = %v, want ErrObservationCompatibility", err)
 	}
@@ -2356,7 +2356,7 @@ func TestIngestionCompletedRetryRejectsRecordedAtMismatchWithoutMutation(t *test
 	retry := fixture.completion()
 	retry.Observations[0].RecordedAt = fixture.state.RecordedAt.Add(time.Microsecond)
 
-	err := fixture.repository.CompleteVersion(ctx, retry)
+	err := fixture.repository.completeLegacyVersion(ctx, retry)
 	if !errors.Is(err, ErrObservationConflict) {
 		t.Fatalf("completed retry with changed recorded time error = %v, want ErrObservationConflict", err)
 	}
@@ -2379,7 +2379,7 @@ func TestCompleteVersionExactCompletedRetryIsReadOnly(t *testing.T) {
 	fixture.complete(t)
 	before := snapshotCompletedRetryWriteSet(t, fixture)
 
-	if err := fixture.repository.CompleteVersion(context.Background(), fixture.completion()); err != nil {
+	if err := fixture.repository.completeLegacyVersion(context.Background(), fixture.completion()); err != nil {
 		t.Fatalf("retry exact completed write-set: %v", err)
 	}
 
@@ -2426,7 +2426,7 @@ func TestCompleteVersionExactRetryToleratesAdditiveIdentityEnrichment(t *testing
 	}
 	before := snapshotCompletedRetryWriteSet(t, fixture)
 
-	if err := fixture.repository.CompleteVersion(ctx, fixture.completion()); err != nil {
+	if err := fixture.repository.completeLegacyVersion(ctx, fixture.completion()); err != nil {
 		t.Fatalf("retry completed write-set after additive identity enrichment: %v", err)
 	}
 
@@ -2457,7 +2457,7 @@ func TestCompleteVersionExactRetryToleratesAdditionalSharedEvidence(t *testing.T
 	}
 	before := snapshotCompletedRetryWriteSet(t, fixture)
 
-	if err := fixture.repository.CompleteVersion(ctx, fixture.completion()); err != nil {
+	if err := fixture.repository.completeLegacyVersion(ctx, fixture.completion()); err != nil {
 		t.Fatalf("retry completed write-set with additional shared evidence: %v", err)
 	}
 
@@ -2472,7 +2472,7 @@ func TestCompleteVersionExactRetryForOrderedMultiSectionVersionIsReadOnly(t *tes
 	ctx := context.Background()
 	version := testMultiSectionIngestionVersion(t, "ordered-multi-section", 0, 1)
 	repository := NewIngestionRepository(pool)
-	state, err := repository.PrepareVersion(
+	state, err := repository.prepareLegacyVersion(
 		ctx,
 		version,
 		testExtractionDerivation(t, version),
@@ -2485,16 +2485,16 @@ func TestCompleteVersionExactRetryForOrderedMultiSectionVersionIsReadOnly(t *tes
 	fixture := canonicalIngestionFixture{
 		pool: pool, repository: repository, state: state, version: version,
 	}
-	completion := ingest.Completion{
+	completion := legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 	}
-	if err := repository.CompleteVersion(ctx, completion); err != nil {
+	if err := repository.completeLegacyVersion(ctx, completion); err != nil {
 		t.Fatalf("complete ordered multi-section version: %v", err)
 	}
 	before := snapshotCompletedRetryWriteSet(t, fixture)
 
-	if err := repository.CompleteVersion(ctx, completion); err != nil {
+	if err := repository.completeLegacyVersion(ctx, completion); err != nil {
 		t.Fatalf("retry ordered multi-section version: %v", err)
 	}
 
@@ -2523,7 +2523,7 @@ func TestPrepareVersionRejectsNonCanonicalSectionOrderBeforeWrites(t *testing.T)
 				testCase.orders...,
 			)
 
-			_, err := NewIngestionRepository(pool).PrepareVersion(
+			_, err := NewIngestionRepository(pool).prepareLegacyVersion(
 				ctx,
 				version,
 				testExtractionDerivation(t, version),
@@ -2568,7 +2568,7 @@ func TestCompleteVersionCompletedOwnerPrecedesVersionMismatch(t *testing.T) {
 			}
 			before := snapshotCompletedRetryWriteSet(t, fixture)
 
-			err := fixture.repository.CompleteVersion(context.Background(), completion)
+			err := fixture.repository.completeLegacyVersion(context.Background(), completion)
 			if !errors.Is(err, ErrObservationConflict) {
 				t.Fatalf("completed owner/version mismatch error = %v, want ErrObservationConflict", err)
 			}
@@ -2595,7 +2595,7 @@ func TestCompleteVersionActiveVersionMismatchBehaviorUnchanged(t *testing.T) {
 	completion.VersionID = uuid.NewString()
 	before := snapshotCanonicalIngestionCompletion(t, fixture)
 
-	err := fixture.repository.CompleteVersion(context.Background(), completion)
+	err := fixture.repository.completeLegacyVersion(context.Background(), completion)
 	if errors.Is(err, ErrObservationConflict) {
 		t.Fatalf("active version mismatch error = %v, unexpectedly became completed conflict", err)
 	}
@@ -2679,7 +2679,7 @@ func TestCompleteVersionRejectsCompletedEvidenceContentCorruption(t *testing.T) 
 			testCase.arrange(t, fixture)
 			before := snapshotCompletedRetryWriteSet(t, fixture)
 
-			err := fixture.repository.CompleteVersion(context.Background(), fixture.completion())
+			err := fixture.repository.completeLegacyVersion(context.Background(), fixture.completion())
 			if !errors.Is(err, ErrObservationConflict) {
 				t.Fatalf("completed content corruption error = %v, want ErrObservationConflict", err)
 			}
@@ -2702,11 +2702,11 @@ func TestCompleteVersionRejectsCompletedEvidenceContentCorruption(t *testing.T) 
 func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
 	testCases := []struct {
 		name    string
-		arrange func(*testing.T, canonicalIngestionFixture, *ingest.Completion)
+		arrange func(*testing.T, canonicalIngestionFixture, *legacyIngestionCompletion)
 	}{
 		{
 			name: "evidence span identity",
-			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				first := completion.Evidence[0].Span
 				completion.Evidence[0].Span = completion.Evidence[1].Span
 				completion.Evidence[1].Span = first
@@ -2715,7 +2715,7 @@ func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
 		},
 		{
 			name: "evidence immutable quote or offsets",
-			arrange: func(t *testing.T, fixture canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				transcript := fixture.evidence[0].Span.Text()
 				changed, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 					Document: fixture.version, SectionID: fixture.evidence[0].Span.SectionID(),
@@ -2729,26 +2729,26 @@ func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
 		},
 		{
 			name: "mention identity key",
-			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				completion.Mentions[0].Role = "reference"
 			},
 		},
 		{
 			name: "mention evidence binding",
-			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				completion.Mentions[0].EvidenceKey = "manager-name"
 				completion.Observations[0].EvidenceKeys = []string{"statement", "manager-name"}
 			},
 		},
 		{
 			name: "completion owned resolution payload",
-			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				completion.Mentions[0].Resolution.Candidates[0].Reason = "changed_synthetic_candidate"
 			},
 		},
 		{
 			name: "observation statement time or confidence",
-			arrange: func(t *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(t *testing.T, _ canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				predicate, err := observation.NewPredicate("support_signal")
 				if err != nil {
 					t.Fatalf("new changed synthetic predicate: %v", err)
@@ -2758,31 +2758,31 @@ func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
 		},
 		{
 			name: "observation origin",
-			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				completion.Observations[0].EvidenceKeys = []string{"employee-name"}
 			},
 		},
 		{
 			name: "signal payload",
-			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				completion.Signals[0].Category = "support_advocacy"
 			},
 		},
 		{
 			name: "signal evidence role or identity",
-			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				completion.Signals[0].Evidence[0].Role = "contradicting"
 			},
 		},
 		{
 			name: "data mode",
-			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(_ *testing.T, _ canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				completion.DataMode = modelpolicy.DataModeRestricted
 			},
 		},
 		{
 			name: "stored extraction run admissibility",
-			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *ingest.Completion) {
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *legacyIngestionCompletion) {
 				if _, err := fixture.pool.Exec(context.Background(), `
 					UPDATE stacks.extraction_runs
 					SET currently_admissible = false
@@ -2793,7 +2793,7 @@ func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
 		},
 		{
 			name: "stored current version association",
-			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *ingest.Completion) {
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *legacyIngestionCompletion) {
 				if _, err := fixture.pool.Exec(context.Background(), `
 					UPDATE stacks.source_documents AS source
 					SET current_document_version_id = NULL
@@ -2816,7 +2816,7 @@ func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
 			testCase.arrange(t, fixture, &completion)
 			before := snapshotCompletedRetryWriteSet(t, fixture)
 
-			err := fixture.repository.CompleteVersion(context.Background(), completion)
+			err := fixture.repository.completeLegacyVersion(context.Background(), completion)
 			if !errors.Is(err, ErrObservationConflict) {
 				t.Fatalf("completed write-set mismatch error = %v, want ErrObservationConflict", err)
 			}
@@ -2844,7 +2844,7 @@ func TestCompleteVersionRejectsCompletedRetryFromDifferentOwner(t *testing.T) {
 	completion.LeaseOwner = uuid.NewString()
 	before := snapshotCompletedRetryWriteSet(t, fixture)
 
-	err := fixture.repository.CompleteVersion(context.Background(), completion)
+	err := fixture.repository.completeLegacyVersion(context.Background(), completion)
 	if !errors.Is(err, ErrObservationConflict) {
 		t.Fatalf("different-owner completed retry error = %v, want ErrObservationConflict", err)
 	}
@@ -2868,14 +2868,14 @@ func TestIngestionCompletionValidationPrecedence(t *testing.T) {
 	testCases := []struct {
 		name      string
 		label     string
-		arrange   func(*testing.T, canonicalIngestionFixture, *ingest.Completion)
+		arrange   func(*testing.T, canonicalIngestionFixture, *legacyIngestionCompletion)
 		wantKind  error
 		wantError func(canonicalIngestionFixture) string
 	}{
 		{
 			name:  "completed wrong owner precedes recorded-time mismatch",
 			label: "precedence-completed-owner",
-			arrange: func(t *testing.T, fixture canonicalIngestionFixture, completion *ingest.Completion) {
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, completion *legacyIngestionCompletion) {
 				t.Helper()
 				fixture.complete(t)
 				completion.LeaseOwner = uuid.NewString()
@@ -2892,7 +2892,7 @@ func TestIngestionCompletionValidationPrecedence(t *testing.T) {
 		{
 			name:  "inadmissible active run precedes recorded-time mismatch",
 			label: "precedence-active-admissibility",
-			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *ingest.Completion) {
+			arrange: func(t *testing.T, fixture canonicalIngestionFixture, _ *legacyIngestionCompletion) {
 				t.Helper()
 				if _, err := fixture.pool.Exec(ctx, `
 					UPDATE stacks.extraction_runs
@@ -2920,7 +2920,7 @@ func TestIngestionCompletionValidationPrecedence(t *testing.T) {
 			completion.Observations[0].RecordedAt = fixture.state.RecordedAt.Add(time.Microsecond)
 			before := snapshotCanonicalIngestionCompletion(t, fixture)
 
-			err := fixture.repository.CompleteVersion(ctx, completion)
+			err := fixture.repository.completeLegacyVersion(ctx, completion)
 			if err == nil {
 				t.Fatal("completion with competing validation failures succeeded")
 			}
@@ -2945,11 +2945,11 @@ func TestIngestionCanonicalConstructionFailureRollsBackWholeCompletion(t *testin
 	providerDocumentID := testIdentifier("canonical-rollback")
 	firstVersion := testIngestionDocumentVersion(t, providerDocumentID, "synthetic-version-1", "Synthetic prior completed version.")
 	repository := NewIngestionRepository(pool)
-	first, err := repository.PrepareVersion(ctx, firstVersion, testExtractionDerivation(t, firstVersion), modelpolicy.DataModePersonal, 5*time.Minute)
+	first, err := repository.prepareLegacyVersion(ctx, firstVersion, testExtractionDerivation(t, firstVersion), modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare prior completed version: %v", err)
 	}
-	if err := repository.CompleteVersion(ctx, ingest.Completion{
+	if err := repository.completeLegacyVersion(ctx, legacyIngestionCompletion{
 		VersionID: first.ID, DerivationID: first.DerivationID, LeaseOwner: first.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 	}); err != nil {
@@ -2968,24 +2968,24 @@ func TestIngestionCanonicalConstructionFailureRollsBackWholeCompletion(t *testin
 	}
 	observationID := observation.ObservationID(uuid.NewString())
 	signalID := uuid.NewString()
-	err = repository.CompleteVersion(ctx, ingest.Completion{
+	err = repository.completeLegacyVersion(ctx, legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal, Evidence: evidenceRecords,
 		Mentions: []ingest.MentionRecord{
 			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
 			{Key: "employee", EvidenceKey: "statement", Surface: "Synthetic Employee", NormalizedName: "synthetic employee", Role: "reference"},
 		},
-		Observations: []ingest.ObservationDraft{{
+		Observations: []legacyObservationDraft{{
 			ID: observationID, SubjectMentionKey: "manager", ObjectMentionKey: "employee",
 			Predicate: "", ValidTime: observation.UnknownTime(), RecordedAt: state.RecordedAt,
 			EvidenceKeys: []string{"statement"}, SourceConfidence: sourceConfidence,
 		}},
-		Signals: []ingest.SignalRecord{{
+		Signals: []legacySignalRecord{{
 			ID: signalID, ObservationID: string(observationID),
 			Category: "delegation_autonomy", Direction: "strengthening",
 			ExtractionModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
 			Rationale: "Synthetic rollback signal.", Confidence: 0.8,
-			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "statement", Role: "supporting"}},
+			Evidence: []legacySignalEvidenceRecord{{EvidenceKey: "statement", Role: "supporting"}},
 		}},
 	})
 	if err == nil {
@@ -3074,11 +3074,11 @@ func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(
 		t.Fatalf("new Bob evidence span: %v", err)
 	}
 	repository := NewIngestionRepository(pool)
-	state, err := repository.PrepareVersion(ctx, version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
+	state, err := repository.prepareLegacyVersion(ctx, version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare unassociated identity derivation: %v", err)
 	}
-	if err := repository.CompleteVersion(ctx, ingest.Completion{
+	if err := repository.completeLegacyVersion(ctx, legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 		Evidence: []ingest.EvidenceRecord{
@@ -3143,7 +3143,7 @@ func TestConcurrentExtractionClaimAllowsOneActiveOwner(t *testing.T) {
 	derivation := testExtractionDerivation(t, version)
 	start := make(chan struct{})
 	type claimResult struct {
-		state ingest.VersionState
+		state legacyVersionState
 		err   error
 	}
 	results := make(chan claimResult, 2)
@@ -3153,7 +3153,7 @@ func TestConcurrentExtractionClaimAllowsOneActiveOwner(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			<-start
-			state, err := NewIngestionRepository(pool).PrepareVersion(context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+			state, err := NewIngestionRepository(pool).prepareLegacyVersion(context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 			results <- claimResult{state: state, err: err}
 		}()
 	}
@@ -3182,20 +3182,20 @@ func TestExtractionCompletionAndFailureRejectNonOwner(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	repository := NewIngestionRepository(pool)
 	version := testDocumentVersion(t, testIdentifier("document-lease-owner"))
-	state, err := repository.PrepareVersion(context.Background(), version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
+	state, err := repository.prepareLegacyVersion(context.Background(), version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("claim extraction derivation: %v", err)
 	}
-	if err := repository.RecordFailure(context.Background(), state.DerivationID, uuid.NewString(), ingest.VersionStatusIncomplete, ingest.FailureStorage); err == nil {
+	if err := repository.recordLegacyFailure(context.Background(), state.DerivationID, uuid.NewString(), ingest.VersionStatusIncomplete, ingest.FailureStorage); err == nil {
 		t.Fatal("non-owner failure update error = nil")
 	}
-	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
+	if err := repository.completeLegacyVersion(context.Background(), legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: uuid.NewString(),
 		DataMode: modelpolicy.DataModePersonal,
 	}); err == nil {
 		t.Fatal("non-owner completion error = nil")
 	}
-	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
+	if err := repository.completeLegacyVersion(context.Background(), legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 	}); err != nil {
@@ -3208,7 +3208,7 @@ func TestExpiredExtractionClaimCanBeRecoveredByNewOwner(t *testing.T) {
 	repository := NewIngestionRepository(pool)
 	version := testDocumentVersion(t, testIdentifier("document-expired-claim"))
 	derivation := testExtractionDerivation(t, version)
-	first, err := repository.PrepareVersion(context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	first, err := repository.prepareLegacyVersion(context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("claim extraction derivation: %v", err)
 	}
@@ -3219,7 +3219,7 @@ func TestExpiredExtractionClaimCanBeRecoveredByNewOwner(t *testing.T) {
 		t.Fatalf("expire synthetic extraction claim: %v", err)
 	}
 
-	recovered, err := repository.PrepareVersion(context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	recovered, err := repository.prepareLegacyVersion(context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("recover expired extraction claim: %v", err)
 	}
@@ -4628,7 +4628,14 @@ type snapshotCoherenceRepository struct {
 	leaseOwner      string
 }
 
-func (repository *snapshotCoherenceRepository) PrepareVersion(ctx context.Context, version knowledge.DocumentVersion, derivation ingest.DerivationIdentity, _ modelpolicy.DataMode, leaseDuration time.Duration) (ingest.VersionState, error) {
+func (repository *snapshotCoherenceRepository) PrepareVersion(
+	ctx context.Context,
+	version knowledge.DocumentVersion,
+	_ ingest.SourceRevisionMetadata,
+	derivation ingest.DerivationIdentity,
+	_ modelpolicy.DataMode,
+	leaseDuration time.Duration,
+) (ingest.VersionState, error) {
 	wantDigest, err := ingest.ComputeDerivationDigest(version, derivation)
 	if err != nil || wantDigest != derivation.Digest || leaseDuration <= 0 {
 		return ingest.VersionState{}, errors.New("snapshot-coherence derivation is invalid")
@@ -4658,14 +4665,18 @@ func (repository *snapshotCoherenceRepository) PrepareVersion(ctx context.Contex
 		return ingest.VersionState{}, err
 	}
 	return ingest.VersionState{
-		ID: repository.versionID, DerivationID: repository.derivationID, DerivationDigest: derivation.Digest,
-		DocumentRecordedAt: version.RecordedAt(), RecordedAt: recordedAt, LeaseOwner: repository.leaseOwner, LeaseExpiresAt: leaseExpiresAt, Status: ingest.VersionStatusPending,
+		VersionID: repository.versionID, RunID: repository.derivationID,
+		AttemptID: repository.derivationID, LeaseOwner: repository.leaseOwner,
+		DocumentRecordedAt: version.RecordedAt(), LeaseExpiresAt: leaseExpiresAt,
+		Status: ingest.VersionStatusPending,
 	}, nil
 }
 
 func (repository *snapshotCoherenceRepository) CompleteVersion(ctx context.Context, completion ingest.Completion) error {
-	if completion.VersionID != repository.versionID || completion.DerivationID != repository.derivationID || completion.LeaseOwner != repository.leaseOwner ||
-		len(completion.Evidence) != 0 || len(completion.Mentions) != 0 || len(completion.Observations) != 0 || len(completion.Signals) != 0 {
+	if completion.VersionID != repository.versionID || completion.RunID != repository.derivationID ||
+		completion.LeaseOwner != repository.leaseOwner ||
+		len(completion.Evidence) != 0 || len(completion.Mentions) != 0 ||
+		len(completion.Observations) != 0 {
 		return errors.New("snapshot-coherence completion is invalid")
 	}
 	result, err := repository.pool.Exec(ctx, "UPDATE "+repository.quotedSchema+`.extraction_runs SET processing_status = 'complete', completed_by_owner = $2, completed_at = $3, lease_owner = NULL, lease_expires_at = NULL WHERE id = $1 AND lease_owner = $2`, repository.derivationID, repository.leaseOwner, time.Now().UTC())
@@ -4678,7 +4689,7 @@ func (repository *snapshotCoherenceRepository) CompleteVersion(ctx context.Conte
 	return nil
 }
 
-func (*snapshotCoherenceRepository) RecordFailure(context.Context, string, string, ingest.VersionStatus, ingest.FailureCode) error {
+func (*snapshotCoherenceRepository) RecordFailure(context.Context, ingest.Failure) error {
 	return errors.New("snapshot-coherence sync unexpectedly failed")
 }
 
@@ -5537,7 +5548,7 @@ func completeVersionedPairSignal(
 		t.Fatalf("new current-version evidence: %v", err)
 	}
 	ingestion := NewIngestionRepository(pool)
-	state, err := ingestion.PrepareVersion(
+	state, err := ingestion.prepareLegacyVersion(
 		ctx,
 		version,
 		testExtractionDerivation(t, version),
@@ -5557,7 +5568,7 @@ func completeVersionedPairSignal(
 		t.Fatalf("construct current-version source confidence: %v", err)
 	}
 	observationID := uuid.NewString()
-	if err := ingestion.CompleteVersion(ctx, ingest.Completion{
+	if err := ingestion.completeLegacyVersion(ctx, legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 		Evidence: []ingest.EvidenceRecord{{Key: "evidence", Span: span}},
@@ -5573,18 +5584,18 @@ func completeVersionedPairSignal(
 				Resolution: entity.Resolution{EntityID: employeeID, AutoResolved: true},
 			},
 		},
-		Observations: []ingest.ObservationDraft{{
+		Observations: []legacyObservationDraft{{
 			ID: observation.ObservationID(observationID), SubjectEntityID: managerID, ObjectEntityID: employeeID,
 			SubjectMentionKey: "manager", ObjectMentionKey: "employee",
 			Predicate: observation.Predicate("interaction_signal"), ValidTime: canonicalValidTime,
 			EvidenceKeys: []string{"evidence"}, SourceConfidence: sourceConfidence, RecordedAt: state.RecordedAt,
 		}},
-		Signals: []ingest.SignalRecord{{
+		Signals: []legacySignalRecord{{
 			ID: uuid.NewString(), ObservationID: observationID,
 			Category: "delegation_autonomy", Direction: "strengthening",
 			ExtractionModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
 			Rationale: "Synthetic source-grounded signal.", Confidence: 0.9,
-			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "evidence", Role: "supporting"}},
+			Evidence: []legacySignalEvidenceRecord{{EvidenceKey: "evidence", Role: "supporting"}},
 		}},
 	}); err != nil {
 		t.Fatalf("complete current-version extraction: %v", err)
@@ -5807,7 +5818,7 @@ func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Ti
 	}
 	ingestion := NewIngestionRepository(pool)
 	derivation := testExtractionDerivation(t, version)
-	state, err := ingestion.PrepareVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
+	state, err := ingestion.prepareLegacyVersion(ctx, version, derivation, modelpolicy.DataModePersonal, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("prepare pair-analysis extraction run: %v", err)
 	}
@@ -5828,7 +5839,7 @@ func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Ti
 	if observation.ID() != canonicalObservation.ID() {
 		t.Fatalf("complete pair observation ID = %q, want %q", observation.ID(), canonicalObservation.ID())
 	}
-	if err := ingestion.CompleteVersion(ctx, ingest.Completion{
+	if err := ingestion.completeLegacyVersion(ctx, legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 	}); err != nil {
@@ -6552,7 +6563,7 @@ func createDirectoryPendingMentionFixtureWithSurfaceEmail(
 		t.Fatalf("new synthetic directory evidence: %v", err)
 	}
 	repository := NewIngestionRepository(pool)
-	state, err := repository.PrepareVersion(
+	state, err := repository.prepareLegacyVersion(
 		context.Background(),
 		version,
 		testExtractionDerivation(t, version),
@@ -6562,7 +6573,7 @@ func createDirectoryPendingMentionFixtureWithSurfaceEmail(
 	if err != nil {
 		t.Fatalf("prepare synthetic directory derivation: %v", err)
 	}
-	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
+	if err := repository.completeLegacyVersion(context.Background(), legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 		Evidence: []ingest.EvidenceRecord{{Key: "identity", Span: span}},
@@ -6667,7 +6678,7 @@ func advanceDirectoryMentionSourceVersion(t *testing.T, pool *pgxpool.Pool, ment
 		t.Fatalf("new synthetic later directory version: %v", err)
 	}
 	repository := NewIngestionRepository(pool)
-	state, err := repository.PrepareVersion(
+	state, err := repository.prepareLegacyVersion(
 		context.Background(),
 		laterVersion,
 		testExtractionDerivation(t, laterVersion),
@@ -6677,7 +6688,7 @@ func advanceDirectoryMentionSourceVersion(t *testing.T, pool *pgxpool.Pool, ment
 	if err != nil {
 		t.Fatalf("prepare synthetic later directory version: %v", err)
 	}
-	if err := repository.CompleteVersion(context.Background(), ingest.Completion{
+	if err := repository.completeLegacyVersion(context.Background(), legacyIngestionCompletion{
 		VersionID: state.ID, DerivationID: state.DerivationID, LeaseOwner: state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal,
 	}); err != nil {
@@ -6941,13 +6952,13 @@ func createSyntheticMentionAndSpan(t *testing.T, pool *pgxpool.Pool) (string, st
 type canonicalIngestionFixture struct {
 	pool       *pgxpool.Pool
 	repository *IngestionRepository
-	state      ingest.VersionState
+	state      legacyVersionState
 	derivation ingest.DerivationIdentity
 	version    knowledge.DocumentVersion
 	evidence   []ingest.EvidenceRecord
 	mentions   []ingest.MentionRecord
-	draft      ingest.ObservationDraft
-	signal     ingest.SignalRecord
+	draft      legacyObservationDraft
+	signal     legacySignalRecord
 }
 
 func newCanonicalIngestionFixture(t *testing.T, pool *pgxpool.Pool, label string) canonicalIngestionFixture {
@@ -6957,7 +6968,7 @@ func newCanonicalIngestionFixture(t *testing.T, pool *pgxpool.Pool, label string
 	version := testIngestionDocumentVersion(t, providerDocumentID, "synthetic-version-1", transcript)
 	derivation := testExtractionDerivation(t, version)
 	repository := NewIngestionRepository(pool)
-	state, err := repository.PrepareVersion(
+	state, err := repository.prepareLegacyVersion(
 		context.Background(), version, derivation, modelpolicy.DataModePersonal, 5*time.Minute,
 	)
 	if err != nil {
@@ -6991,17 +7002,17 @@ func newCanonicalIngestionFixture(t *testing.T, pool *pgxpool.Pool, label string
 			{Key: "manager", EvidenceKey: "statement", Surface: "Synthetic Manager", NormalizedName: "synthetic manager", Role: "speaker"},
 			{Key: "employee", EvidenceKey: "statement", Surface: "Synthetic Employee", NormalizedName: "synthetic employee", Role: "reference"},
 		},
-		draft: ingest.ObservationDraft{
+		draft: legacyObservationDraft{
 			ID: observationID, SubjectMentionKey: "manager", ObjectMentionKey: "employee",
 			Predicate: predicate, ValidTime: validTime, RecordedAt: state.RecordedAt,
 			EvidenceKeys: []string{"statement"}, SourceConfidence: sourceConfidence,
 		},
-		signal: ingest.SignalRecord{
+		signal: legacySignalRecord{
 			ID: uuid.NewString(), ObservationID: string(observationID),
 			Category: "delegation_autonomy", Direction: "strengthening",
 			ExtractionModelID: derivation.ModelID, PromptVersion: derivation.PromptVersion,
 			Rationale: "Synthetic source-grounded signal.", Confidence: 0.8,
-			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "statement", Role: "supporting"}},
+			Evidence: []legacySignalEvidenceRecord{{EvidenceKey: "statement", Role: "supporting"}},
 		},
 	}
 }
@@ -7207,16 +7218,16 @@ func snapshotCompletedRetryWriteSet(t *testing.T, fixture canonicalIngestionFixt
 
 func (fixture canonicalIngestionFixture) complete(t *testing.T) {
 	t.Helper()
-	if err := fixture.repository.CompleteVersion(context.Background(), fixture.completion()); err != nil {
+	if err := fixture.repository.completeLegacyVersion(context.Background(), fixture.completion()); err != nil {
 		t.Fatalf("complete canonical ingestion fixture: %v", err)
 	}
 }
 
-func (fixture canonicalIngestionFixture) completion() ingest.Completion {
-	return ingest.Completion{
+func (fixture canonicalIngestionFixture) completion() legacyIngestionCompletion {
+	return legacyIngestionCompletion{
 		VersionID: fixture.state.ID, DerivationID: fixture.state.DerivationID, LeaseOwner: fixture.state.LeaseOwner,
 		DataMode: modelpolicy.DataModePersonal, Evidence: fixture.evidence, Mentions: fixture.mentions,
-		Observations: []ingest.ObservationDraft{fixture.draft}, Signals: []ingest.SignalRecord{fixture.signal},
+		Observations: []legacyObservationDraft{fixture.draft}, Signals: []legacySignalRecord{fixture.signal},
 	}
 }
 
@@ -7282,10 +7293,10 @@ func prepareIngestionEvidence(
 		key   string
 		quote string
 	},
-) (ingest.VersionState, []ingest.EvidenceRecord) {
+) (legacyVersionState, []ingest.EvidenceRecord) {
 	t.Helper()
 	repository := NewIngestionRepository(pool)
-	state, err := repository.PrepareVersion(
+	state, err := repository.prepareLegacyVersion(
 		context.Background(), version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, 5*time.Minute,
 	)
 	if err != nil {
@@ -7399,7 +7410,7 @@ func testExtractionDerivation(t *testing.T, version knowledge.DocumentVersion) i
 
 func testOwningExtractionRun(t *testing.T, pool *pgxpool.Pool, version knowledge.DocumentVersion) owningExtractionRun {
 	t.Helper()
-	state, err := NewIngestionRepository(pool).PrepareVersion(
+	state, err := NewIngestionRepository(pool).prepareLegacyVersion(
 		context.Background(), version, testExtractionDerivation(t, version), modelpolicy.DataModePersonal, time.Minute,
 	)
 	if err != nil {

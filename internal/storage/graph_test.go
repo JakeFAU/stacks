@@ -9,8 +9,6 @@ import (
 
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/observation"
-
-	"stacks/internal/ingest"
 )
 
 func TestCompleteObservationPreflightRejectsBeforeDatabaseAccess(t *testing.T) {
@@ -274,28 +272,28 @@ func TestStageCanonicalIngestionWritesRejectsDuplicateDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new ingestion confidence: %v", err)
 	}
-	newDraft := func(id observation.ObservationID) ingest.ObservationDraft {
-		return ingest.ObservationDraft{
+	newDraft := func(id observation.ObservationID) legacyObservationDraft {
+		return legacyObservationDraft{
 			ID: id, Predicate: predicate, ValidTime: observation.UnknownTime(),
 			RecordedAt: recordedAt, EvidenceKeys: []string{"citation"},
 			SourceConfidence: confidence,
 		}
 	}
-	newSignal := func(id string, observationID observation.ObservationID) ingest.SignalRecord {
-		return ingest.SignalRecord{
+	newSignal := func(id string, observationID observation.ObservationID) legacySignalRecord {
+		return legacySignalRecord{
 			ID: id, ObservationID: string(observationID),
 			Category: "delegation_autonomy", Direction: "strengthening",
 			ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion,
 			Rationale: "Synthetic staged duplicate.", Confidence: 0.8,
-			Evidence: []ingest.SignalEvidenceRecord{{EvidenceKey: "citation", Role: "supporting"}},
+			Evidence: []legacySignalEvidenceRecord{{EvidenceKey: "citation", Role: "supporting"}},
 		}
 	}
 	firstID := observation.ObservationID("22222222-2222-2222-2222-222222222222")
 	secondID := observation.ObservationID("33333333-3333-3333-3333-333333333333")
 	_, err = stageCanonicalIngestionWrites(
 		run,
-		[]ingest.ObservationDraft{newDraft(firstID), newDraft(secondID)},
-		[]ingest.SignalRecord{
+		[]legacyObservationDraft{newDraft(firstID), newDraft(secondID)},
+		[]legacySignalRecord{
 			newSignal("44444444-4444-4444-4444-444444444444", firstID),
 			newSignal("55555555-5555-5555-5555-555555555555", secondID),
 		},

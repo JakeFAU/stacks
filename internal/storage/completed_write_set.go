@@ -20,7 +20,7 @@ var errCompletedWriteSetMismatch = errors.New("completed ingestion write-set mis
 func compareCompletedWriteSet(
 	ctx context.Context,
 	transaction pgx.Tx,
-	completion ingest.Completion,
+	completion legacyIngestionCompletion,
 	run owningExtractionRun,
 ) error {
 	evidenceIDs, err := loadCompletedEvidenceMap(ctx, transaction, completion)
@@ -69,7 +69,7 @@ func completedWriteSetComparisonError(runID string, err error) error {
 func loadCompletedEvidenceMap(
 	ctx context.Context,
 	transaction pgx.Tx,
-	completion ingest.Completion,
+	completion legacyIngestionCompletion,
 ) (map[string]string, error) {
 	version, err := loadCompletedCanonicalDocumentVersion(ctx, transaction, completion.VersionID)
 	if err != nil {
@@ -439,7 +439,7 @@ func compareCompletedObservations(
 	ctx context.Context,
 	transaction pgx.Tx,
 	run owningExtractionRun,
-	completion ingest.Completion,
+	completion legacyIngestionCompletion,
 	evidenceIDs map[string]string,
 	mentionIDs map[string]string,
 ) error {
@@ -488,7 +488,7 @@ func compareCompletedObservations(
 func compareCompletedRunState(
 	ctx context.Context,
 	transaction pgx.Tx,
-	completion ingest.Completion,
+	completion legacyIngestionCompletion,
 	run owningExtractionRun,
 ) error {
 	var versionID, status, dataMode, modelID, promptVersion string
