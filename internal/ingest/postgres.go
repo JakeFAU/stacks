@@ -25,7 +25,7 @@ const (
 	extractionMethod                   = "model_extraction"
 	canonicalWriteSetDigestVersion     = "stacks.ingest-write-set.v1.canonical"
 	maximumSourceRevisionMetadataRunes = 1024
-	resolutionProposalReason           = "model_extraction"
+	resolutionProposalReason           = extractionMethod
 	resolutionCandidateSource          = "accepted_alias_resolver"
 	admissionReasonValidatedExtraction = "validated_extraction"
 )
@@ -162,13 +162,6 @@ func (repository *PostgresRepository) PrepareVersion(
 			result.FailureCode = FailureBusy
 		case postgres.ExtractionCompleted:
 			result.Status = VersionStatusComplete
-			if err := transaction.SetCurrentDocumentVersion(
-				ctx,
-				put.Ref.SourceDocumentID,
-				put.Ref.VersionID,
-			); err != nil {
-				return err
-			}
 		default:
 			return fmt.Errorf("prepare canonical version: extraction state is invalid")
 		}
@@ -201,8 +194,27 @@ func (repository *PostgresRepository) CompleteVersion(
 		return fmt.Errorf("complete canonical version: %w", err)
 	}
 	writeSetDigest := digestCanonicalWriteSet(completion, resolved)
+	completionInput := postgres.ExtractionCompletionInput{
+		RunID: completion.RunID, AttemptID: completion.AttemptID,
+		Owner: completion.LeaseOwner, CompletedAt: completion.CompletedAt,
+		WriteSetDigestVersion: canonicalWriteSetDigestVersion,
+		WriteSetDigest:        writeSetDigest,
+	}
 
 	err = repository.database.InTransaction(ctx, func(transaction *postgres.Transaction) error {
+		status, err := transaction.CheckExtractionCompletion(
+			ctx,
+			postgres.ExtractionCompletionCheckInput{
+				DocumentVersionID: completion.VersionID,
+				Completion:        completionInput,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		if status == postgres.ExtractionCompleted {
+			return nil
+		}
 		for _, record := range completion.Evidence {
 			if _, err := transaction.PutEvidenceSpan(ctx, record.Span); err != nil {
 				return err
@@ -268,12 +280,7 @@ func (repository *PostgresRepository) CompleteVersion(
 		if err := repository.stage(completionStageCurrentVersion); err != nil {
 			return err
 		}
-		if err := transaction.CompleteExtraction(ctx, postgres.ExtractionCompletionInput{
-			RunID: completion.RunID, AttemptID: completion.AttemptID,
-			Owner: completion.LeaseOwner, CompletedAt: completion.CompletedAt,
-			WriteSetDigestVersion: canonicalWriteSetDigestVersion,
-			WriteSetDigest:        writeSetDigest,
-		}); err != nil {
+		if err := transaction.CompleteExtraction(ctx, completionInput); err != nil {
 			return err
 		}
 		return repository.stage(completionStageExtractionCompletion)

@@ -69,6 +69,13 @@ type ExtractionCompletionInput struct {
 	WriteSetDigest        evidence.ContentDigest
 }
 
+// ExtractionCompletionCheckInput binds a completion to its owning immutable
+// document version before any caller-owned payload writes begin.
+type ExtractionCompletionCheckInput struct {
+	DocumentVersionID string
+	Completion        ExtractionCompletionInput
+}
+
 // ExtractionState describes the attempt a caller owns, the live attempt that
 // made the derivation busy, or the completed durable result.
 type ExtractionState struct {
@@ -177,19 +184,18 @@ func (transaction *Transaction) PrepareExtraction(
 	if err != nil {
 		return ExtractionState{}, wrapExtractionError(ctx, "load extraction run", err)
 	}
-	if !sameExtractionRunInput(storedRun.input, runInput) {
-		return ExtractionState{}, fmt.Errorf(
-			"prepare extraction: immutable run provenance: %w",
-			ErrConflict,
-		)
-	}
-
 	latest, latestErr := loadLatestExtractionAttemptForUpdate(
 		ctx,
 		transaction.transaction,
 		runInput.ID,
 	)
 	if storedRun.state == "completed" {
+		if !sameCompletedExtractionRunInput(storedRun.input, runInput) {
+			return ExtractionState{}, fmt.Errorf(
+				"prepare extraction: immutable completed run provenance: %w",
+				ErrConflict,
+			)
+		}
 		if latestErr != nil {
 			return ExtractionState{}, wrapExtractionError(
 				ctx,
@@ -198,6 +204,12 @@ func (transaction *Transaction) PrepareExtraction(
 			)
 		}
 		return completedExtractionState(storedRun, latest)
+	}
+	if !sameExtractionRunInput(storedRun.input, runInput) {
+		return ExtractionState{}, fmt.Errorf(
+			"prepare extraction: immutable run provenance: %w",
+			ErrConflict,
+		)
 	}
 	if inserted && latestErr == nil {
 		return ExtractionState{}, fmt.Errorf(
@@ -395,6 +407,80 @@ func (transaction *Transaction) RecordExtractionFailure(
 		return fmt.Errorf("record extraction failure: run changed: %w", ErrConflict)
 	}
 	return nil
+}
+
+// CheckExtractionCompletion locks the owning run and latest attempt before
+// caller-owned payload writes. It reports completed only for an exact
+// read-only retry of the stored completion.
+func (transaction *Transaction) CheckExtractionCompletion(
+	ctx context.Context,
+	input ExtractionCompletionCheckInput,
+) (ExtractionStatus, error) {
+	if err := contextRequired(ctx, "check extraction completion"); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(input.DocumentVersionID) == "" {
+		return "", fmt.Errorf("check extraction completion: document version is required")
+	}
+	if err := validateExtractionCompletion(input.Completion); err != nil {
+		return "", fmt.Errorf("check extraction completion: %w", err)
+	}
+	if transaction == nil || transaction.transaction == nil {
+		return "", fmt.Errorf("check extraction completion: transaction is closed")
+	}
+
+	run, err := loadExtractionRunForUpdate(
+		ctx,
+		transaction.transaction,
+		input.Completion.RunID,
+	)
+	if err != nil {
+		return "", wrapExtractionError(
+			ctx,
+			"load extraction run for completion check",
+			err,
+		)
+	}
+	attempt, err := loadLatestExtractionAttemptForUpdate(
+		ctx,
+		transaction.transaction,
+		input.Completion.RunID,
+	)
+	if err != nil {
+		return "", wrapExtractionError(
+			ctx,
+			"load extraction attempt for completion check",
+			err,
+		)
+	}
+	if run.input.DocumentVersionID != input.DocumentVersionID {
+		return "", fmt.Errorf(
+			"check extraction completion: run owns a different document version: %w",
+			ErrConflict,
+		)
+	}
+	if run.state == "completed" {
+		if exactExtractionCompletion(run, attempt, input.Completion) {
+			return ExtractionCompleted, nil
+		}
+		return "", fmt.Errorf(
+			"check extraction completion: completed write set differs: %w",
+			ErrConflict,
+		)
+	}
+	completion := input.Completion
+	if run.state != "active" ||
+		attempt.state != "active" ||
+		attempt.id != completion.AttemptID ||
+		attempt.owner != completion.Owner ||
+		completion.CompletedAt.Before(attempt.claimedAt) ||
+		!completion.CompletedAt.Before(attempt.leaseExpiresAt) {
+		return "", fmt.Errorf(
+			"check extraction completion: attempt is not actively owned: %w",
+			ErrConflict,
+		)
+	}
+	return ExtractionClaimed, nil
 }
 
 // CompleteExtraction stores the caller-supplied versioned canonical write-set
@@ -773,6 +859,11 @@ func loadLatestExtractionAttemptForUpdate(
 }
 
 func sameExtractionRunInput(left, right ExtractionRunInput) bool {
+	return left == right
+}
+
+func sameCompletedExtractionRunInput(left, right ExtractionRunInput) bool {
+	right.DataMode = left.DataMode
 	return left == right
 }
 

@@ -1,10 +1,12 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -81,6 +83,32 @@ func TestCanonicalCompletionRecordsBoundedLeaseAndTransactionOutcome(t *testing.
 		)
 	}
 	assertCanonicalPayloadCounts(t, fixture, 1, 2, 2, 1, 2, 1, 1, 6)
+	resolved, err := resolveCanonicalWriteSet(completion)
+	if err != nil {
+		t.Fatalf("resolve completed write set: %v", err)
+	}
+	wantDigest := digestCanonicalWriteSet(completion, resolved)
+	var digestVersion string
+	var storedDigest []byte
+	if err := fixture.admin.QueryRow(
+		fixture.ctx,
+		`SELECT write_set_digest_version, write_set_digest
+		 FROM stacks_core.extraction_runs
+		 WHERE id = $1`,
+		state.RunID,
+	).Scan(&digestVersion, &storedDigest); err != nil {
+		t.Fatalf("load completed write-set digest: %v", err)
+	}
+	if digestVersion != canonicalWriteSetDigestVersion ||
+		!bytes.Equal(storedDigest, wantDigest[:]) {
+		t.Fatalf(
+			"stored write-set digest = %q/%x, want %q/%x",
+			digestVersion,
+			storedDigest,
+			canonicalWriteSetDigestVersion,
+			wantDigest,
+		)
+	}
 }
 
 func TestCanonicalRollbackMakesEveryCompletionStageInvisible(t *testing.T) {
@@ -208,15 +236,38 @@ func TestCanonicalCompletedRetryIsExactAndCreatesNoAttempt(t *testing.T) {
 	}
 	assertCanonicalPayloadCounts(t, fixture, 1, 2, 2, 1, 2, 1, 1, 6)
 
+	injected := errors.New("completed mismatch reached payload replay")
+	fixture.repository.afterStage = func(completionStage) error {
+		return injected
+	}
 	mismatch := completion
 	mismatch.CompletedAt = mismatch.CompletedAt.Add(time.Second)
-	if err := fixture.repository.CompleteVersion(fixture.ctx, mismatch); err == nil {
-		t.Fatal("semantic mismatch CompleteVersion() error = nil")
+	if err := fixture.repository.CompleteVersion(
+		fixture.ctx,
+		mismatch,
+	); !errors.Is(err, postgres.ErrConflict) || errors.Is(err, injected) {
+		t.Fatalf("semantic mismatch CompleteVersion() error = %v, want early conflict", err)
+	}
+	writeSetMismatch := completion
+	writeSetMismatch.Observations = append(
+		[]CanonicalObservationDraft(nil),
+		completion.Observations...,
+	)
+	writeSetMismatch.Observations[0].Predicate =
+		"stacks.interaction.v1/future_responsibility/weakening"
+	if err := fixture.repository.CompleteVersion(
+		fixture.ctx,
+		writeSetMismatch,
+	); !errors.Is(err, postgres.ErrConflict) || errors.Is(err, injected) {
+		t.Fatalf("write-set mismatch CompleteVersion() error = %v, want early conflict", err)
 	}
 	wrongOwner := completion
 	wrongOwner.LeaseOwner = "other-owner"
-	if err := fixture.repository.CompleteVersion(fixture.ctx, wrongOwner); err == nil {
-		t.Fatal("different owner CompleteVersion() error = nil")
+	if err := fixture.repository.CompleteVersion(
+		fixture.ctx,
+		wrongOwner,
+	); !errors.Is(err, postgres.ErrConflict) || errors.Is(err, injected) {
+		t.Fatalf("different owner CompleteVersion() error = %v, want early conflict", err)
 	}
 }
 
@@ -342,6 +393,284 @@ func TestCanonicalPreparationRejectsSourceMetadataMismatch(t *testing.T) {
 	}
 }
 
+func TestCanonicalCompletionRejectsRunVersionMismatchBeforeWrites(t *testing.T) {
+	testCases := []struct {
+		name      string
+		completed bool
+	}{
+		{name: "active"},
+		{name: "completed", completed: true},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newCanonicalRepositoryFixture(t)
+			version, metadata, derivation := canonicalPreparationInput(t, fixture.now)
+			state, err := fixture.repository.PrepareVersion(
+				fixture.ctx,
+				version,
+				metadata,
+				derivation,
+				"personal",
+				5*time.Minute,
+			)
+			if err != nil {
+				t.Fatalf("PrepareVersion() error = %v", err)
+			}
+			completion := canonicalLiveCompletion(
+				t,
+				version,
+				state,
+				derivation,
+				fixture.now.Add(time.Minute),
+			)
+			if testCase.completed {
+				if err := fixture.repository.CompleteVersion(fixture.ctx, completion); err != nil {
+					t.Fatalf("initial CompleteVersion() error = %v", err)
+				}
+			}
+			successor := putCanonicalSuccessorVersion(t, fixture)
+			completion.VersionID = successor.VersionID
+			before := canonicalDurableSnapshot(t, fixture, state.RunID)
+			injected := errors.New("completion reached a payload stage")
+			fixture.repository.afterStage = func(completionStage) error {
+				return injected
+			}
+
+			err = fixture.repository.CompleteVersion(fixture.ctx, completion)
+			if !errors.Is(err, postgres.ErrConflict) {
+				t.Fatalf("CompleteVersion() error = %v, want PostgreSQL conflict", err)
+			}
+			if errors.Is(err, injected) {
+				t.Fatalf("CompleteVersion() reached a payload stage: %v", err)
+			}
+			after := canonicalDurableSnapshot(t, fixture, state.RunID)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("version mismatch changed durable state:\nbefore=%#v\nafter=%#v", before, after)
+			}
+		})
+	}
+}
+
+func TestCanonicalCompletedRetryAndResumeAreReadOnlyWithNewerCurrentVersion(t *testing.T) {
+	fixture := newCanonicalRepositoryFixture(t)
+	version, metadata, derivation := canonicalPreparationInput(t, fixture.now)
+	state, err := fixture.repository.PrepareVersion(
+		fixture.ctx,
+		version,
+		metadata,
+		derivation,
+		"personal",
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("PrepareVersion() error = %v", err)
+	}
+	completion := canonicalLiveCompletion(t, version, state, derivation, fixture.now.Add(time.Minute))
+	if err := fixture.repository.CompleteVersion(fixture.ctx, completion); err != nil {
+		t.Fatalf("initial CompleteVersion() error = %v", err)
+	}
+	successor := putCanonicalSuccessorVersion(t, fixture)
+	setCanonicalCurrentVersion(t, fixture, successor)
+	before := canonicalDurableSnapshot(t, fixture, state.RunID)
+	injected := errors.New("completed retry replayed payload")
+	fixture.repository.afterStage = func(completionStage) error {
+		return injected
+	}
+
+	if err := fixture.repository.CompleteVersion(fixture.ctx, completion); err != nil {
+		t.Fatalf("exact completed retry error = %v", err)
+	}
+	afterRetry := canonicalDurableSnapshot(t, fixture, state.RunID)
+	if !reflect.DeepEqual(afterRetry, before) {
+		t.Fatalf("exact completed retry changed durable state:\nbefore=%#v\nafter=%#v", before, afterRetry)
+	}
+
+	resumed, err := fixture.repository.PrepareVersion(
+		fixture.ctx,
+		version,
+		metadata,
+		derivation,
+		"personal",
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("completed PrepareVersion() error = %v", err)
+	}
+	if resumed.Status != VersionStatusComplete ||
+		resumed.RunID != state.RunID ||
+		resumed.AttemptID != state.AttemptID {
+		t.Fatalf("completed resume = %#v, want original completed attempt", resumed)
+	}
+	afterResume := canonicalDurableSnapshot(t, fixture, state.RunID)
+	if !reflect.DeepEqual(afterResume, before) {
+		t.Fatalf("completed resume changed durable state:\nbefore=%#v\nafter=%#v", before, afterResume)
+	}
+}
+
+func TestCanonicalCompletedDerivationReusesAcrossDisclosureModes(t *testing.T) {
+	t.Run("completed", func(t *testing.T) {
+		fixture := newCanonicalRepositoryFixture(t)
+		version, metadata, derivation := canonicalPreparationInput(t, fixture.now)
+		state, err := fixture.repository.PrepareVersion(
+			fixture.ctx,
+			version,
+			metadata,
+			derivation,
+			"personal",
+			5*time.Minute,
+		)
+		if err != nil {
+			t.Fatalf("personal PrepareVersion() error = %v", err)
+		}
+		completion := canonicalLiveCompletion(t, version, state, derivation, fixture.now.Add(time.Minute))
+		if err := fixture.repository.CompleteVersion(fixture.ctx, completion); err != nil {
+			t.Fatalf("CompleteVersion() error = %v", err)
+		}
+		before := canonicalDurableSnapshot(t, fixture, state.RunID)
+
+		reused, err := fixture.repository.PrepareVersion(
+			fixture.ctx,
+			version,
+			metadata,
+			derivation,
+			"restricted",
+			5*time.Minute,
+		)
+		if err != nil {
+			t.Fatalf("restricted completed PrepareVersion() error = %v", err)
+		}
+		if reused.Status != VersionStatusComplete ||
+			reused.RunID != state.RunID ||
+			reused.AttemptID != state.AttemptID {
+			t.Fatalf("cross-mode completed reuse = %#v, want original completed attempt", reused)
+		}
+		after := canonicalDurableSnapshot(t, fixture, state.RunID)
+		if !reflect.DeepEqual(after, before) {
+			t.Fatalf("cross-mode completed reuse changed durable state:\nbefore=%#v\nafter=%#v", before, after)
+		}
+		var storedMode string
+		if err := fixture.admin.QueryRow(
+			fixture.ctx,
+			`SELECT data_mode FROM stacks_core.extraction_runs WHERE id = $1`,
+			state.RunID,
+		).Scan(&storedMode); err != nil {
+			t.Fatalf("load completed run data mode: %v", err)
+		}
+		if storedMode != "personal" {
+			t.Fatalf("completed run data mode = %q, want original personal", storedMode)
+		}
+	})
+
+	t.Run("active remains immutable", func(t *testing.T) {
+		fixture := newCanonicalRepositoryFixture(t)
+		version, metadata, derivation := canonicalPreparationInput(t, fixture.now)
+		state, err := fixture.repository.PrepareVersion(
+			fixture.ctx,
+			version,
+			metadata,
+			derivation,
+			"personal",
+			5*time.Minute,
+		)
+		if err != nil {
+			t.Fatalf("personal PrepareVersion() error = %v", err)
+		}
+		before := canonicalDurableSnapshot(t, fixture, state.RunID)
+
+		if _, err := fixture.repository.PrepareVersion(
+			fixture.ctx,
+			version,
+			metadata,
+			derivation,
+			"restricted",
+			5*time.Minute,
+		); !errors.Is(err, postgres.ErrConflict) {
+			t.Fatalf("restricted active PrepareVersion() error = %v, want conflict", err)
+		}
+		after := canonicalDurableSnapshot(t, fixture, state.RunID)
+		if !reflect.DeepEqual(after, before) {
+			t.Fatalf("active cross-mode rejection changed durable state:\nbefore=%#v\nafter=%#v", before, after)
+		}
+	})
+
+	t.Run("new invocation records requested mode", func(t *testing.T) {
+		fixture := newCanonicalRepositoryFixture(t)
+		version, metadata, derivation := canonicalPreparationInput(t, fixture.now)
+		state, err := fixture.repository.PrepareVersion(
+			fixture.ctx,
+			version,
+			metadata,
+			derivation,
+			"restricted",
+			5*time.Minute,
+		)
+		if err != nil {
+			t.Fatalf("restricted PrepareVersion() error = %v", err)
+		}
+		if state.Status != VersionStatusPending {
+			t.Fatalf("restricted new invocation status = %q, want pending", state.Status)
+		}
+		var storedMode string
+		if err := fixture.admin.QueryRow(
+			fixture.ctx,
+			`SELECT data_mode FROM stacks_core.extraction_runs WHERE id = $1`,
+			state.RunID,
+		).Scan(&storedMode); err != nil {
+			t.Fatalf("load new run data mode: %v", err)
+		}
+		if storedMode != "restricted" {
+			t.Fatalf("new run data mode = %q, want restricted", storedMode)
+		}
+	})
+}
+
+func TestCanonicalInvalidGraphWriteSetsLeaveNoRows(t *testing.T) {
+	testCases := canonicalDuplicateGraphCases()
+	testCases = append(testCases, canonicalGraphMutation{
+		name: "orphan alias",
+		mutate: func(completion *Completion) {
+			appendOrphanAlias(t, completion)
+		},
+	})
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newCanonicalRepositoryFixture(t)
+			version, metadata, derivation := canonicalPreparationInput(t, fixture.now)
+			state, err := fixture.repository.PrepareVersion(
+				fixture.ctx,
+				version,
+				metadata,
+				derivation,
+				"personal",
+				5*time.Minute,
+			)
+			if err != nil {
+				t.Fatalf("PrepareVersion() error = %v", err)
+			}
+			completion := canonicalLiveCompletion(
+				t,
+				version,
+				state,
+				derivation,
+				fixture.now.Add(time.Minute),
+			)
+			testCase.mutate(&completion)
+
+			err = fixture.repository.CompleteVersion(fixture.ctx, completion)
+			if err == nil {
+				t.Fatal("CompleteVersion() error = nil, want invalid graph rejection")
+			}
+			assertCanonicalPayloadCounts(t, fixture, 0, 0, 0, 0, 0, 0, 0, 0)
+			snapshot := canonicalDurableSnapshot(t, fixture, state.RunID)
+			if snapshot.runState != "active" ||
+				snapshot.attemptState != "active" ||
+				snapshot.currentVersionID != "" {
+				t.Fatalf("invalid graph lifecycle snapshot = %#v, want active/active/no current", snapshot)
+			}
+		})
+	}
+}
+
 func newCanonicalRepositoryFixture(t testing.TB) canonicalRepositoryFixture {
 	t.Helper()
 	isolated := postgrestest.NewDatabase(t)
@@ -412,6 +741,171 @@ func canonicalPreparationInput(
 	return version, SourceRevisionMetadata{
 		ProviderVersion: document.Version, ProviderRevision: "provider-revision-1",
 	}, derivation
+}
+
+func putCanonicalSuccessorVersion(
+	t *testing.T,
+	fixture canonicalRepositoryFixture,
+) postgres.DocumentVersionRef {
+	t.Helper()
+	document := syntheticDocument(
+		"canonical-postgres-document",
+		"Leader assigns a newer follow-up.",
+	)
+	document.Version = "provider-version-2"
+	document.Revision = "provider-revision-2"
+	document.ModifiedAt = fixture.now.Add(-30 * time.Minute)
+	result, err := fixture.repository.database.PutDocumentVersion(
+		fixture.ctx,
+		documentVersion(t, document),
+	)
+	if err != nil {
+		t.Fatalf("persist canonical successor version: %v", err)
+	}
+	return result.Ref
+}
+
+func setCanonicalCurrentVersion(
+	t *testing.T,
+	fixture canonicalRepositoryFixture,
+	ref postgres.DocumentVersionRef,
+) {
+	t.Helper()
+	if err := fixture.repository.database.InTransaction(
+		fixture.ctx,
+		func(transaction *postgres.Transaction) error {
+			return transaction.SetCurrentDocumentVersion(
+				fixture.ctx,
+				ref.SourceDocumentID,
+				ref.VersionID,
+			)
+		},
+	); err != nil {
+		t.Fatalf("set canonical current version: %v", err)
+	}
+}
+
+type canonicalDurableState struct {
+	runState, attemptState, currentVersionID string
+	runXmin, attemptXmin, sourceXmin         string
+	attemptCount                             int
+	payloadXmins                             map[string]string
+}
+
+func canonicalDurableSnapshot(
+	t *testing.T,
+	fixture canonicalRepositoryFixture,
+	runID string,
+) canonicalDurableState {
+	t.Helper()
+	var snapshot canonicalDurableState
+	var currentVersionID *string
+	if err := fixture.admin.QueryRow(fixture.ctx, `
+		SELECT
+			run.state,
+			run.xmin::text,
+			attempt.state,
+			attempt.xmin::text,
+			source.current_version_id,
+			source.xmin::text,
+			(
+				SELECT count(*)
+				FROM stacks_core.extraction_attempts AS counted
+				WHERE counted.run_id = run.id
+			)
+		FROM stacks_core.extraction_runs AS run
+		JOIN stacks_core.document_versions AS version
+		  ON version.id = run.document_version_id
+		JOIN stacks_core.source_documents AS source
+		  ON source.id = version.source_document_id
+		JOIN LATERAL (
+			SELECT state, xmin
+			FROM stacks_core.extraction_attempts
+			WHERE run_id = run.id
+			ORDER BY attempt_number DESC
+			LIMIT 1
+		) AS attempt ON true
+		WHERE run.id = $1`,
+		runID,
+	).Scan(
+		&snapshot.runState,
+		&snapshot.runXmin,
+		&snapshot.attemptState,
+		&snapshot.attemptXmin,
+		&currentVersionID,
+		&snapshot.sourceXmin,
+		&snapshot.attemptCount,
+	); err != nil {
+		t.Fatalf("snapshot canonical lifecycle: %v", err)
+	}
+	if currentVersionID != nil {
+		snapshot.currentVersionID = *currentVersionID
+	}
+	queries := map[string]string{
+		"evidence": `
+			SELECT coalesce(string_agg(xmin::text, ',' ORDER BY id), '')
+			FROM stacks_core.evidence_spans`,
+		"mentions": `
+			SELECT coalesce(string_agg(xmin::text, ',' ORDER BY id), '')
+			FROM stacks_core.mentions`,
+		"proposals": `
+			SELECT coalesce(string_agg(xmin::text, ',' ORDER BY id), '')
+			FROM stacks_core.resolution_proposals`,
+		"proposal_evidence": `
+			SELECT coalesce(
+				string_agg(
+					xmin::text,
+					','
+					ORDER BY proposal_id, evidence_id
+				),
+				''
+			)
+			FROM stacks_core.resolution_proposal_evidence`,
+		"candidates": `
+			SELECT coalesce(string_agg(xmin::text, ',' ORDER BY id), '')
+			FROM stacks_core.resolution_candidates`,
+		"decisions": `
+			SELECT coalesce(string_agg(xmin::text, ',' ORDER BY id), '')
+			FROM stacks_core.resolution_decisions`,
+		"aliases": `
+			SELECT coalesce(string_agg(xmin::text, ',' ORDER BY id), '')
+			FROM stacks_core.entity_alias_assertions`,
+		"observations": `
+			SELECT coalesce(string_agg(xmin::text, ',' ORDER BY id), '')
+			FROM stacks_core.observations`,
+		"observation_evidence": `
+			SELECT coalesce(
+				string_agg(
+					xmin::text,
+					','
+					ORDER BY observation_id, evidence_id, role
+				),
+				''
+			)
+			FROM stacks_core.observation_evidence`,
+		"admission_targets": `
+			SELECT coalesce(
+				string_agg(
+					xmin::text,
+					','
+					ORDER BY target_kind, target_id
+				),
+				''
+			)
+			FROM stacks_core.admission_targets`,
+		"admission_decisions": `
+			SELECT coalesce(string_agg(xmin::text, ',' ORDER BY id), '')
+			FROM stacks_core.admission_decisions`,
+	}
+	snapshot.payloadXmins = make(map[string]string, len(queries))
+	for name, query := range queries {
+		var value string
+		if err := fixture.admin.QueryRow(fixture.ctx, query).Scan(&value); err != nil {
+			t.Fatalf("snapshot canonical %s xmin: %v", name, err)
+		}
+		snapshot.payloadXmins[name] = value
+	}
+	return snapshot
 }
 
 func canonicalLiveCompletion(

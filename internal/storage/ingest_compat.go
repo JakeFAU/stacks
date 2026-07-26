@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"strings"
 	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
@@ -73,37 +72,6 @@ type legacyVersionState struct {
 	Status             ingest.VersionStatus
 	RetryCount         int
 	FailureCode        ingest.FailureCode
-}
-
-func validateLegacyForPersistence(completion legacyIngestionCompletion) error {
-	if !completion.DataMode.ValidForNewRun() {
-		return ingest.ErrPersistenceReference
-	}
-	for _, record := range completion.Evidence {
-		if !legacyLocalIdentifier(record.Key) {
-			return ingest.ErrPersistenceReference
-		}
-	}
-	for _, record := range completion.Mentions {
-		if !legacyLocalIdentifier(record.Key) || !legacyLocalIdentifier(record.EvidenceKey) {
-			return ingest.ErrPersistenceReference
-		}
-	}
-	for _, record := range completion.Observations {
-		if !legacyLocalIdentifier(string(record.ID)) {
-			return ingest.ErrPersistenceReference
-		}
-	}
-	for _, record := range completion.Signals {
-		if !legacyLocalIdentifier(record.ID) || !legacyLocalIdentifier(record.ObservationID) {
-			return ingest.ErrPersistenceReference
-		}
-	}
-	return nil
-}
-
-func legacyLocalIdentifier(identifier string) bool {
-	return identifier != "" && strings.TrimSpace(identifier) == identifier
 }
 
 func (*IngestionRepository) PrepareVersion(

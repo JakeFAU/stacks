@@ -534,7 +534,7 @@ func (service *Service) completion(
 			ValidTime: validTime, RecordedAt: completion.CompletedAt,
 			Evidence: evidenceLinks,
 			Derivation: observation.Derivation{
-				Method: "model_extraction", Version: response.PromptVersion, RunID: state.RunID,
+				Method: extractionMethod, Version: response.PromptVersion, RunID: state.RunID,
 				Model: response.ModelID, PromptVersion: response.PromptVersion,
 			},
 			Status: observation.StatusInferred, Confidence: &sourceConfidence,

@@ -42,7 +42,77 @@ func ValidateForPersistence(completion Completion) error {
 	if err != nil {
 		return err
 	}
+	if err := validateCanonicalGraphIdentities(completion); err != nil {
+		return err
+	}
 	return validateObservationReferences(completion.Observations, evidenceIdentities, mentionKeys)
+}
+
+func validateCanonicalGraphIdentities(completion Completion) error {
+	if err := validateUniqueCanonicalIDs(
+		len(completion.Proposals),
+		func(index int) string {
+			return string(completion.Proposals[index].ID())
+		},
+	); err != nil {
+		return err
+	}
+	if err := validateUniqueCanonicalIDs(
+		len(completion.Candidates),
+		func(index int) string {
+			return string(completion.Candidates[index].ID())
+		},
+	); err != nil {
+		return err
+	}
+	decisionIDs := make(map[string]struct{}, len(completion.Decisions))
+	for _, decision := range completion.Decisions {
+		id := string(decision.ID())
+		if !canonicalLocalIdentifier(id) {
+			return ErrPersistenceReference
+		}
+		if _, exists := decisionIDs[id]; exists {
+			return ErrPersistenceCollision
+		}
+		decisionIDs[id] = struct{}{}
+	}
+	aliasIDs := make(map[string]struct{}, len(completion.AliasAssertions))
+	for _, assertion := range completion.AliasAssertions {
+		id := string(assertion.ID())
+		decisionID := string(assertion.DecisionID())
+		if !canonicalLocalIdentifier(id) ||
+			!canonicalLocalIdentifier(decisionID) {
+			return ErrPersistenceReference
+		}
+		if _, exists := decisionIDs[decisionID]; !exists {
+			return ErrPersistenceReference
+		}
+		if _, exists := aliasIDs[id]; exists {
+			return ErrPersistenceCollision
+		}
+		aliasIDs[id] = struct{}{}
+	}
+	return validateUniqueCanonicalIDs(
+		len(completion.AdmissionDecisions),
+		func(index int) string {
+			return completion.AdmissionDecisions[index].ID()
+		},
+	)
+}
+
+func validateUniqueCanonicalIDs(count int, identifier func(int) string) error {
+	seen := make(map[string]struct{}, count)
+	for index := range count {
+		id := identifier(index)
+		if !canonicalLocalIdentifier(id) {
+			return ErrPersistenceReference
+		}
+		if _, exists := seen[id]; exists {
+			return ErrPersistenceCollision
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
 }
 
 func validateEvidenceIdentities(records []EvidenceRecord) (map[string][sha256.Size]byte, error) {

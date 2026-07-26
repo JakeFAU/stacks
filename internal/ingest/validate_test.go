@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/observation"
 )
 
@@ -36,6 +37,128 @@ func TestValidateForPersistenceAcceptsCanonicalDraft(t *testing.T) {
 	if err := ValidateForPersistence(validationCompletion(t)); err != nil {
 		t.Fatalf("ValidateForPersistence() error = %v", err)
 	}
+}
+
+func TestValidateForPersistenceRejectsDuplicateCanonicalGraphIDs(t *testing.T) {
+	for _, testCase := range canonicalDuplicateGraphCases() {
+		t.Run(testCase.name, func(t *testing.T) {
+			completion := validationFullCompletion(t)
+			testCase.mutate(&completion)
+
+			if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceCollision) {
+				t.Fatalf("ValidateForPersistence() error = %v, want collision", err)
+			}
+		})
+	}
+}
+
+func TestValidateForPersistenceRejectsAliasForDecisionOutsideWriteSet(t *testing.T) {
+	completion := validationFullCompletion(t)
+	appendOrphanAlias(t, &completion)
+
+	if err := ValidateForPersistence(completion); !errors.Is(err, ErrPersistenceReference) {
+		t.Fatalf("ValidateForPersistence() error = %v, want reference rejection", err)
+	}
+}
+
+type canonicalGraphMutation struct {
+	name   string
+	mutate func(*Completion)
+}
+
+func canonicalDuplicateGraphCases() []canonicalGraphMutation {
+	return []canonicalGraphMutation{
+		{
+			name: "evidence key",
+			mutate: func(completion *Completion) {
+				completion.Evidence = append(completion.Evidence, completion.Evidence[0])
+			},
+		},
+		{
+			name: "evidence durable ID",
+			mutate: func(completion *Completion) {
+				duplicate := completion.Evidence[0]
+				duplicate.Key = "different-evidence-key"
+				completion.Evidence = append(completion.Evidence, duplicate)
+			},
+		},
+		{
+			name: "mention",
+			mutate: func(completion *Completion) {
+				completion.Mentions = append(completion.Mentions, completion.Mentions[0])
+			},
+		},
+		{
+			name: "proposal",
+			mutate: func(completion *Completion) {
+				completion.Proposals = append(completion.Proposals, completion.Proposals[0])
+			},
+		},
+		{
+			name: "candidate",
+			mutate: func(completion *Completion) {
+				completion.Candidates = append(completion.Candidates, completion.Candidates[0])
+			},
+		},
+		{
+			name: "decision",
+			mutate: func(completion *Completion) {
+				completion.Decisions = append(completion.Decisions, completion.Decisions[0])
+			},
+		},
+		{
+			name: "alias",
+			mutate: func(completion *Completion) {
+				completion.AliasAssertions = append(
+					completion.AliasAssertions,
+					completion.AliasAssertions[0],
+				)
+			},
+		},
+		{
+			name: "observation",
+			mutate: func(completion *Completion) {
+				completion.Observations = append(
+					completion.Observations,
+					completion.Observations[0],
+				)
+			},
+		},
+		{
+			name: "admission decision",
+			mutate: func(completion *Completion) {
+				completion.AdmissionDecisions = append(
+					completion.AdmissionDecisions,
+					completion.AdmissionDecisions[0],
+				)
+			},
+		},
+	}
+}
+
+func appendOrphanAlias(t *testing.T, completion *Completion) {
+	t.Helper()
+	orphan, err := identity.NewAliasAssertion(identity.AliasAssertionInput{
+		ID: "alias-orphan", DecisionID: "decision-outside-write-set",
+		EntityID: completion.Decisions[0].EntityID(),
+		Alias: identity.Alias{
+			Type: identity.AliasTypeName, Value: "Synthetic Orphan",
+		},
+		RecordedAt: completion.CompletedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion.AliasAssertions = append(completion.AliasAssertions, orphan)
+}
+
+func validationFullCompletion(t *testing.T) Completion {
+	t.Helper()
+	version, _, derivation := canonicalPreparationInput(t, validationRecordedAt)
+	return canonicalLiveCompletion(t, version, VersionState{
+		VersionID: "version-1", RunID: "run-1", AttemptID: "attempt-1",
+		LeaseOwner: "owner-1", DocumentRecordedAt: version.RecordedAt(),
+	}, derivation, validationRecordedAt)
 }
 
 func validationCompletion(t *testing.T) Completion {
