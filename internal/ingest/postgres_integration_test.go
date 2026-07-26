@@ -1015,24 +1015,24 @@ func canonicalLiveCompletion(
 	}
 	proposalID := completion.Proposals[0].ID()
 	candidate, err := identity.NewResolutionCandidate(identity.ResolutionCandidateInput{
-		ID: "candidate-automatic", ProposalID: proposalID, EntityID: "entity-automatic",
-		Rank: 1, Confidence: 1, ReasonCode: "unique_exact_work_email",
+		ID: "candidate-reviewer-primary", ProposalID: proposalID, EntityID: "entity-automatic",
+		Rank: 1, Confidence: 1, ReasonCode: "name_similarity",
 		Source: identity.CandidateSource{
-			Kind: "synthetic_exact_email", Reference: "synthetic-candidate",
+			Kind: "synthetic_name", Reference: "synthetic-candidate",
 		},
 		RecordedAt: completedAt,
 	})
 	if err != nil {
-		t.Fatalf("construct automatic candidate: %v", err)
+		t.Fatalf("construct primary reviewer candidate: %v", err)
 	}
 	decision, err := identity.NewResolutionDecision(identity.ResolutionDecisionInput{
-		ID: "decision-automatic", ProposalID: proposalID,
+		ID: "decision-reviewer-primary", ProposalID: proposalID,
 		Outcome: identity.DecisionAccepted, EntityID: "entity-automatic",
-		Authority: identity.AuthorityAutomatic, ReasonCode: "unique_exact_work_email",
+		Authority: identity.AuthorityReviewer, ReasonCode: "reviewer_confirmed_identity",
 		RecordedAt: completedAt,
 	})
 	if err != nil {
-		t.Fatalf("construct automatic decision: %v", err)
+		t.Fatalf("construct primary reviewer decision: %v", err)
 	}
 	reviewerDecision, err := identity.NewResolutionDecision(identity.ResolutionDecisionInput{
 		ID: "decision-reviewer", ProposalID: completion.Proposals[1].ID(),

@@ -2,6 +2,7 @@
 package coremigrations
 
 import (
+	"crypto/sha256"
 	"embed"
 
 	"github.com/JakeFAU/stacks/adapters/postgres/migration"
@@ -16,6 +17,13 @@ const (
 	extractionVersion = 3
 )
 
+var expectedFingerprint = [sha256.Size]byte{
+	0x08, 0xe2, 0x62, 0xb3, 0x72, 0x4b, 0x3c, 0x36,
+	0x67, 0xbe, 0x98, 0xff, 0x0c, 0x4b, 0x61, 0x91,
+	0x89, 0x81, 0xf3, 0xd1, 0xf4, 0x4a, 0x30, 0xf5,
+	0x73, 0xc5, 0x0a, 0xff, 0x19, 0xfd, 0x31, 0x1d,
+}
+
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
@@ -24,6 +32,7 @@ func Manifest() (migration.Manifest, error) {
 	return migration.LoadManifest(
 		migration.Scope("core"),
 		coreLedger,
+		expectedFingerprint,
 		migrationFiles,
 		[]migration.File{
 			{

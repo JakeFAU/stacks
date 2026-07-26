@@ -77,13 +77,16 @@ var unsupportedModelEnvironmentNames = []string{
 type Command string
 
 const (
-	CommandServe    Command = "serve"
-	CommandAuth     Command = "auth"
-	CommandDoctor   Command = "doctor"
-	CommandSync     Command = "sync"
-	CommandEntities Command = "entities"
-	CommandReview   Command = "review"
-	CommandAnalyze  Command = "analyze"
+	CommandServe     Command = "serve"
+	CommandAuth      Command = "auth"
+	CommandDoctor    Command = "doctor"
+	CommandSync      Command = "sync"
+	CommandEntities  Command = "entities"
+	CommandReview    Command = "review"
+	CommandAnalyze   Command = "analyze"
+	CommandDBMigrate Command = "db-migrate"
+	CommandDBStatus  Command = "db-status"
+	CommandDBReset   Command = "db-reset"
 )
 
 // ModelSettings holds the explicitly selected model invocation boundary and
@@ -146,7 +149,7 @@ type PoCSettings struct {
 // requires no PoC configuration, preserving the existing no-argument server.
 func (settings PoCSettings) Validate(command Command) error {
 	switch command {
-	case CommandServe, "":
+	case CommandServe, CommandDBMigrate, CommandDBStatus, CommandDBReset, "":
 		return nil
 	case CommandAuth:
 		return nil

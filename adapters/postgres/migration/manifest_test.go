@@ -15,6 +15,7 @@ func TestManifestHashesExactEmbeddedBytes(t *testing.T) {
 	manifest, err := LoadManifest(
 		"core",
 		"core_version",
+		sha256.Sum256([]byte("expected core fingerprint")),
 		fstest.MapFS{path: &fstest.MapFile{Data: []byte(sql)}},
 		[]File{{Version: 1, Name: "baseline", Path: path}},
 		[]string{"stacks_core"},
@@ -136,6 +137,16 @@ func TestManifestRejectsBlankSQL(t *testing.T) {
 	manifest.Migrations[0].SQL = " \n\t"
 	if err := manifest.Validate(); err == nil || !strings.Contains(err.Error(), "blank SQL") {
 		t.Fatalf("Manifest.Validate() error = %v, want blank SQL rejection", err)
+	}
+}
+
+func TestFingerprintManifestRejectsZeroExpectedFingerprint(t *testing.T) {
+	t.Parallel()
+
+	manifest := validManifest("core", "core_version")
+	manifest.ExpectedFingerprint = [sha256.Size]byte{}
+	if err := manifest.Validate(); err == nil || !strings.Contains(err.Error(), "fingerprint") {
+		t.Fatalf("Manifest.Validate() error = %v, want missing fingerprint rejection", err)
 	}
 }
 
@@ -764,8 +775,9 @@ func TestManifestSetAcceptsCanonicalCoreOwnership(t *testing.T) {
 
 func validManifest(scope Scope, ledger string) Manifest {
 	return Manifest{
-		Scope:  scope,
-		Ledger: ledger,
+		Scope:               scope,
+		Ledger:              ledger,
+		ExpectedFingerprint: sha256.Sum256([]byte("expected:" + string(scope) + ":" + ledger)),
 		Migrations: []Migration{{
 			Version:  1,
 			Name:     "baseline",

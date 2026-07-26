@@ -1,8 +1,7 @@
 STATICCHECK_VERSION := 2026.1
-GOOSE_VERSION := v3.27.1
 ENV_FILE ?= .env
 
-.PHONY: analyze auth-google auth-google-directory build db-down db-migrate db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up review run staticcheck sync test test-integration test-race
+.PHONY: analyze auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up review run staticcheck sync test test-integration test-race
 
 analyze:
 	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the PoC" >&2; exit 1)
@@ -31,19 +30,15 @@ db-down:
 
 db-migrate:
 	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and set both passwords" >&2; exit 1)
-	@set -a; . "$(ENV_FILE)"; set +a; \
-		PGPASSWORD="$${STACKS_DB_ADMIN_PASSWORD}" \
-		go run github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION) \
-		-dir db/migrations postgres \
-		"host=127.0.0.1 port=$${STACKS_DB_PORT:-5432} user=stacks_admin dbname=stacks sslmode=disable" up
+	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks db-migrate
+
+db-reset:
+	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and set both passwords" >&2; exit 1)
+	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks db-reset "$(CONFIRM)"
 
 db-status:
 	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and set both passwords" >&2; exit 1)
-	@set -a; . "$(ENV_FILE)"; set +a; \
-		PGPASSWORD="$${STACKS_DB_ADMIN_PASSWORD}" \
-		go run github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION) \
-		-dir db/migrations postgres \
-		"host=127.0.0.1 port=$${STACKS_DB_PORT:-5432} user=stacks_admin dbname=stacks sslmode=disable" status
+	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks db-status
 
 db-up:
 	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and set both passwords" >&2; exit 1)
@@ -94,15 +89,13 @@ test-race:
 	done
 
 test-integration:
-	@test -n "$$STACKS_TEST_DATABASE_URL" || (echo "STACKS_TEST_DATABASE_URL is required" >&2; exit 1)
-	@test -n "$$STACKS_TEST_MIGRATION_DATABASE_URL" || (echo "STACKS_TEST_MIGRATION_DATABASE_URL is required" >&2; exit 1)
-	(cd adapters/postgres && \
-		STACKS_TEST_DATABASE_URL="$$STACKS_TEST_DATABASE_URL" \
-		STACKS_TEST_MIGRATION_DATABASE_URL="$$STACKS_TEST_MIGRATION_DATABASE_URL" \
-		GOWORK=off go test ./... -count=1)
-	STACKS_TEST_DATABASE_URL="$$STACKS_TEST_DATABASE_URL" \
-		STACKS_TEST_MIGRATION_DATABASE_URL="$$STACKS_TEST_MIGRATION_DATABASE_URL" \
-		go test ./internal/storage ./internal/doctor
+	@test -n "$(ENV_FILE)" || (echo "ENV_FILE is required" >&2; exit 1)
+	@test -f "$(ENV_FILE)" || (echo "ENV_FILE does not exist" >&2; exit 1)
+	@set -a; . "$(ENV_FILE)"; set +a; \
+		test -n "$$STACKS_TEST_DATABASE_URL" || (echo "STACKS_TEST_DATABASE_URL is required" >&2; exit 1); \
+		test -n "$$STACKS_TEST_MIGRATION_DATABASE_URL" || (echo "STACKS_TEST_MIGRATION_DATABASE_URL is required" >&2; exit 1); \
+		(cd adapters/postgres && GOWORK=off go test ./... -count=1) && \
+		go test ./internal/ingest ./internal/directory ./internal/analysis ./internal/doctor -count=1
 
 staticcheck:
 	@sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' modules.txt | while IFS= read -r module; do \

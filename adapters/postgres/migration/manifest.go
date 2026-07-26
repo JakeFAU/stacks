@@ -76,6 +76,7 @@ type OwnedObject struct {
 type Manifest struct {
 	Scope                   Scope
 	Ledger                  string
+	ExpectedFingerprint     [sha256.Size]byte
 	Migrations              []Migration
 	OwnedSchemaTrees        []string
 	OwnedObjects            []OwnedObject
@@ -123,6 +124,7 @@ const (
 func LoadManifest(
 	scope Scope,
 	ledger string,
+	expectedFingerprint [sha256.Size]byte,
 	files fs.FS,
 	entries []File,
 	ownedSchemaTrees []string,
@@ -163,6 +165,7 @@ func LoadManifest(
 	manifest := Manifest{
 		Scope:                   scope,
 		Ledger:                  ledger,
+		ExpectedFingerprint:     expectedFingerprint,
 		Migrations:              append([]Migration(nil), migrations...),
 		OwnedSchemaTrees:        append([]string(nil), ownedSchemaTrees...),
 		OwnedObjects:            append([]OwnedObject(nil), ownedObjects...),
@@ -183,6 +186,9 @@ func (manifest Manifest) Validate() error {
 	}
 	if err := validateIdentifier("ledger", manifest.Ledger); err != nil {
 		return err
+	}
+	if manifest.ExpectedFingerprint == [sha256.Size]byte{} {
+		return fmt.Errorf("manifest %q expected fingerprint is required", manifest.Scope)
 	}
 	if len(manifest.Migrations) == 0 {
 		return fmt.Errorf("manifest %q has no migrations", manifest.Scope)

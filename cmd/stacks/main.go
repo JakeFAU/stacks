@@ -13,8 +13,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/smithy-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+
+	"github.com/JakeFAU/stacks/adapters/postgres/coremigrations"
+	"github.com/JakeFAU/stacks/adapters/postgres/directorymigrations"
+	"github.com/JakeFAU/stacks/adapters/postgres/migration"
 
 	"stacks/internal/analysis"
 	"stacks/internal/app"
@@ -26,6 +32,7 @@ import (
 	"stacks/internal/extract"
 	"stacks/internal/googledirectory"
 	"stacks/internal/ingest"
+	"stacks/internal/localdb"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
@@ -115,18 +122,22 @@ type doctorDatabase interface {
 }
 
 type pocCommandRuntime struct {
-	newDriveAuthorizer     func(string, string, io.Writer) cli.GoogleAuthorizer
-	newDirectoryAuthorizer func(string, string, io.Writer) cli.GoogleAuthorizer
-	newDoctorDatabase      func(string) doctorDatabase
-	newDoctorGoogle        func(config.PoCSettings) doctor.Google
-	newDoctorDirectory     func(config.GoogleDirectorySettings) doctor.DirectoryProbe
-	newDoctorProviderProbe func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
-	newSource              func(context.Context, config.PoCSettings) (source.Source, error)
-	newDirectoryLookup     func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error)
-	openSyncRepositories   func(context.Context, string, bool) (ingest.Repository, directory.Repository, func(), error)
-	openReviewRepositories func(context.Context, string, bool) (*storage.EntityRepository, directory.Repository, func(), error)
-	openAnalysisRepository func(context.Context, string) (analysis.Repository, func(), error)
-	newModel               func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error)
+	newDriveAuthorizer      func(string, string, io.Writer) cli.GoogleAuthorizer
+	newDirectoryAuthorizer  func(string, string, io.Writer) cli.GoogleAuthorizer
+	newDoctorDatabase       func(string) doctorDatabase
+	newScopedDoctorDatabase func(string, []migration.Scope) doctorDatabase
+	newDoctorGoogle         func(config.PoCSettings) doctor.Google
+	newDoctorDirectory      func(config.GoogleDirectorySettings) doctor.DirectoryProbe
+	newDoctorProviderProbe  func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
+	newSource               func(context.Context, config.PoCSettings) (source.Source, error)
+	newDirectoryLookup      func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error)
+	openSyncRepositories    func(context.Context, string, bool) (ingest.Repository, directory.Repository, func(), error)
+	openReviewRepositories  func(context.Context, string, bool) (*storage.EntityRepository, directory.Repository, func(), error)
+	openAnalysisRepository  func(context.Context, string) (analysis.Repository, func(), error)
+	newModel                func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error)
+	newMigrationApplier     func(config.DatabaseSettings) cli.MigrationApplier
+	newMigrationInspector   func(config.DatabaseSettings) cli.MigrationInspector
+	newDatabaseResetter     func(config.DatabaseSettings) cli.DatabaseResetter
 }
 
 func defaultPoCCommandRuntime() pocCommandRuntime {
@@ -139,6 +150,9 @@ func defaultPoCCommandRuntime() pocCommandRuntime {
 		},
 		newDoctorDatabase: func(databaseURL string) doctorDatabase {
 			return doctor.NewPostgresProbe(databaseURL)
+		},
+		newScopedDoctorDatabase: func(databaseURL string, scopes []migration.Scope) doctorDatabase {
+			return doctor.NewPostgresProbeWithScopes(databaseURL, scopes)
 		},
 		newDoctorGoogle: func(settings config.PoCSettings) doctor.Google {
 			return doctor.NewGoogleProbe(
@@ -198,6 +212,19 @@ func defaultPoCCommandRuntime() pocCommandRuntime {
 			return storage.NewAnalysisRepository(pool), pool.Close, nil
 		},
 		newModel: newModelWithContext,
+		newMigrationApplier: func(settings config.DatabaseSettings) cli.MigrationApplier {
+			return embeddedMigrationApplier{settings: settings}
+		},
+		newMigrationInspector: func(settings config.DatabaseSettings) cli.MigrationInspector {
+			return embeddedMigrationInspector{settings: settings}
+		},
+		newDatabaseResetter: func(settings config.DatabaseSettings) cli.DatabaseResetter {
+			return localdb.Resetter{
+				DatabaseURLs: []string{settings.URL, settings.MigrationURL},
+				Runner:       localdb.ExecRunner{},
+				Migrator:     embeddedMigrationApplier{settings: settings},
+			}
+		},
 	}
 }
 
@@ -211,6 +238,48 @@ func pocCommandProviderWithRuntime(
 	runtime pocCommandRuntime,
 ) (map[string]cli.Command, error) {
 	return map[string]cli.Command{
+		string(config.CommandDBMigrate): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			return runDatabaseCommand(ctx, tracer, "database.migrate", func(ctx context.Context) error {
+				if err := settings.Validate(config.CommandDBMigrate); err != nil {
+					return err
+				}
+				if runtime.newMigrationApplier == nil {
+					return errors.New("db-migrate command dependencies are not configured")
+				}
+				return (cli.DBMigrateCommand{
+					Migrator: runtime.newMigrationApplier(settings.Database),
+					Output:   stdout,
+				}).Run(ctx, args)
+			})
+		}),
+		string(config.CommandDBStatus): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			return runDatabaseCommand(ctx, tracer, "database.status", func(ctx context.Context) error {
+				if err := settings.Validate(config.CommandDBStatus); err != nil {
+					return err
+				}
+				if runtime.newMigrationInspector == nil {
+					return errors.New("db-status command dependencies are not configured")
+				}
+				return (cli.DBStatusCommand{
+					Inspector: runtime.newMigrationInspector(settings.Database),
+					Output:    stdout,
+				}).Run(ctx, args)
+			})
+		}),
+		string(config.CommandDBReset): cli.CommandFunc(func(ctx context.Context, args []string) error {
+			return runDatabaseCommand(ctx, tracer, "database.reset", func(ctx context.Context) error {
+				if err := settings.Validate(config.CommandDBReset); err != nil {
+					return err
+				}
+				if runtime.newDatabaseResetter == nil {
+					return errors.New("db-reset command dependencies are not configured")
+				}
+				return (cli.DBResetCommand{
+					Resetter: runtime.newDatabaseResetter(settings.Database),
+					Output:   stdout,
+				}).Run(ctx, args)
+			})
+		}),
 		string(config.CommandAuth): cli.CommandFunc(func(ctx context.Context, args []string) error {
 			if len(args) != 1 {
 				return (cli.AuthCommand{}).Run(ctx, args)
@@ -251,6 +320,12 @@ func pocCommandProviderWithRuntime(
 				return errors.New("doctor command dependencies are not configured")
 			}
 			database := runtime.newDoctorDatabase(settings.PoC.DatabaseURL)
+			if runtime.newScopedDoctorDatabase != nil {
+				database = runtime.newScopedDoctorDatabase(
+					settings.PoC.DatabaseURL,
+					configuredMigrationScopes(settings.Database.Scopes),
+				)
+			}
 			defer database.Close()
 			model, disclosure, err := runtime.newDoctorProviderProbe(settings.PoC.Model)
 			if err != nil {
@@ -428,6 +503,109 @@ func pocCommandProviderWithRuntime(
 			}).Run(ctx, args)
 		}),
 	}, nil
+}
+
+func runDatabaseCommand(
+	ctx context.Context,
+	tracer trace.Tracer,
+	name string,
+	run func(context.Context) error,
+) (runErr error) {
+	if tracer == nil {
+		return run(ctx)
+	}
+	ctx, span := tracer.Start(ctx, name)
+	defer func() {
+		outcome := "success"
+		if runErr != nil {
+			outcome = "failure"
+			span.SetStatus(codes.Error, "database operation failed")
+		} else {
+			span.SetStatus(codes.Ok, "")
+		}
+		span.SetAttributes(attribute.String("stacks.outcome", outcome))
+		span.End()
+	}()
+	return run(ctx)
+}
+
+type embeddedMigrationApplier struct {
+	settings config.DatabaseSettings
+}
+
+func (applier embeddedMigrationApplier) Apply(
+	ctx context.Context,
+) (migration.ApplyResult, error) {
+	manifests, err := selectedMigrationManifests(applier.settings.Scopes)
+	if err != nil {
+		return migration.ApplyResult{}, err
+	}
+	return (migration.Migrator{
+		DatabaseURL:     applier.settings.MigrationURL,
+		ApplicationRole: applier.settings.ApplicationRole,
+		Manifests:       manifests,
+	}).Apply(ctx)
+}
+
+type embeddedMigrationInspector struct {
+	settings config.DatabaseSettings
+}
+
+func (inspector embeddedMigrationInspector) Status(
+	ctx context.Context,
+) ([]migration.ScopeStatus, error) {
+	manifests, err := knownMigrationManifests()
+	if err != nil {
+		return nil, err
+	}
+	return (migration.Inspector{
+		DatabaseURL: inspector.settings.URL,
+		Manifests:   manifests,
+		Configured:  configuredMigrationScopes(inspector.settings.Scopes),
+	}).Status(ctx)
+}
+
+func selectedMigrationManifests(
+	scopes []config.DatabaseScope,
+) ([]migration.Manifest, error) {
+	known, err := knownMigrationManifests()
+	if err != nil {
+		return nil, err
+	}
+	selected := make(map[migration.Scope]bool, len(scopes))
+	for _, scope := range configuredMigrationScopes(scopes) {
+		selected[scope] = true
+	}
+	result := make([]migration.Manifest, 0, len(selected))
+	for _, manifest := range known {
+		if selected[manifest.Scope] {
+			result = append(result, manifest)
+		}
+	}
+	return result, nil
+}
+
+func knownMigrationManifests() ([]migration.Manifest, error) {
+	core, err := coremigrations.Manifest()
+	if err != nil {
+		return nil, err
+	}
+	directoryManifest, err := directorymigrations.Manifest()
+	if err != nil {
+		return nil, err
+	}
+	return []migration.Manifest{core, directoryManifest}, nil
+}
+
+func configuredMigrationScopes(scopes []config.DatabaseScope) []migration.Scope {
+	if len(scopes) == 0 {
+		return []migration.Scope{"core"}
+	}
+	result := make([]migration.Scope, len(scopes))
+	for index, scope := range scopes {
+		result[index] = migration.Scope(scope)
+	}
+	return result
 }
 
 func requireRestrictedDisclosure(ctx context.Context, settings config.ModelSettings, runtime pocCommandRuntime) error {

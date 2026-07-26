@@ -16,6 +16,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/oauth2"
 
+	"github.com/JakeFAU/stacks/adapters/postgres/coremigrations"
+	"github.com/JakeFAU/stacks/adapters/postgres/directorymigrations"
+	"github.com/JakeFAU/stacks/adapters/postgres/migration"
+
 	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 	"stacks/internal/source/drive"
@@ -102,17 +106,48 @@ type PostgresProbe struct {
 	databaseURL string
 	open        postgresFactory
 	connection  postgresConnection
+	inspector   migrationInspector
+	manifestErr error
+}
+
+type migrationInspector interface {
+	Status(context.Context) ([]migration.ScopeStatus, error)
 }
 
 // NewPostgresProbe constructs a probe without opening a connection.
 func NewPostgresProbe(databaseURL string) *PostgresProbe {
-	return newPostgresProbe(databaseURL, func(ctx context.Context, databaseURL string) (postgresConnection, error) {
+	return NewPostgresProbeWithScopes(databaseURL, []migration.Scope{"core"})
+}
+
+// NewPostgresProbeWithScopes constructs a read-only status probe for both
+// known manifests and an explicit configured-scope selection.
+func NewPostgresProbeWithScopes(
+	databaseURL string,
+	configured []migration.Scope,
+) *PostgresProbe {
+	probe := newPostgresProbe(databaseURL, func(ctx context.Context, databaseURL string) (postgresConnection, error) {
 		pool, err := pgxpool.New(ctx, databaseURL)
 		if err != nil {
 			return nil, err
 		}
 		return pgxPoolConnection{pool: pool}, nil
 	})
+	core, err := coremigrations.Manifest()
+	if err != nil {
+		probe.manifestErr = err
+		return probe
+	}
+	directory, err := directorymigrations.Manifest()
+	if err != nil {
+		probe.manifestErr = err
+		return probe
+	}
+	probe.inspector = migration.Inspector{
+		DatabaseURL: databaseURL,
+		Manifests:   []migration.Manifest{core, directory},
+		Configured:  append([]migration.Scope(nil), configured...),
+	}
+	return probe
 }
 
 func newPostgresProbe(databaseURL string, open postgresFactory) *PostgresProbe {
@@ -143,6 +178,19 @@ func (probe *PostgresProbe) MigrationsCurrent(ctx context.Context) (bool, error)
 		return false, fmt.Errorf("inspect PostgreSQL migrations: %w", err)
 	}
 	return current, nil
+}
+
+// MigrationStatus inspects both known scoped manifests without writing.
+func (probe *PostgresProbe) MigrationStatus(
+	ctx context.Context,
+) ([]migration.ScopeStatus, error) {
+	if probe.manifestErr != nil {
+		return nil, fmt.Errorf("load PostgreSQL migration manifests: %w", probe.manifestErr)
+	}
+	if probe.inspector == nil {
+		return nil, fmt.Errorf("PostgreSQL migration inspector is not configured")
+	}
+	return probe.inspector.Status(ctx)
 }
 
 func requiredMigrationVersions() []int64 {

@@ -31,6 +31,11 @@ const (
 	OTelMetricIntervalEnvironmentVariable   = "STACKS_OTEL_METRIC_EXPORT_INTERVAL"
 	OTelServiceNameEnvironmentVariable      = "STACKS_OTEL_SERVICE_NAME"
 	OTelTraceSampleRatioEnvironmentVariable = "STACKS_OTEL_TRACE_SAMPLE_RATIO"
+	MigrationDatabaseURLEnvironmentVariable = "STACKS_MIGRATION_DATABASE_URL"
+	DatabaseScopesEnvironmentVariable       = "STACKS_DATABASE_SCOPES"
+	DatabaseAppRoleEnvironmentVariable      = "STACKS_DATABASE_APP_ROLE"
+	defaultDatabaseScopes                   = "core"
+	defaultDatabaseAppRole                  = "stacks_app"
 )
 
 // Settings contains validated runtime configuration.
@@ -39,7 +44,25 @@ type Settings struct {
 	ReadHeaderTimeout time.Duration
 	LogLevel          string
 	Telemetry         TelemetrySettings
+	Database          DatabaseSettings
 	PoC               PoCSettings
+}
+
+// DatabaseScope identifies one selected embedded PostgreSQL migration scope.
+type DatabaseScope string
+
+const (
+	DatabaseScopeCore      DatabaseScope = "core"
+	DatabaseScopeDirectory DatabaseScope = "directory"
+)
+
+// DatabaseSettings separates least-privileged runtime inspection from
+// schema-capable migration administration.
+type DatabaseSettings struct {
+	URL             string
+	MigrationURL    string
+	Scopes          []DatabaseScope
+	ApplicationRole string
 }
 
 // TelemetrySettings controls OTLP export. Telemetry remains optional so the
@@ -159,6 +182,10 @@ func Load() (Settings, error) {
 	if googleDirectoryMaxAttempts > defaultGoogleDirectoryMaxAttempts {
 		return Settings{}, fmt.Errorf("%s must be between 1 and %d", GoogleDirectoryMaxAttemptsEnvironmentVariable, defaultGoogleDirectoryMaxAttempts)
 	}
+	databaseScopes, err := databaseScopesEnvironment()
+	if err != nil {
+		return Settings{}, err
+	}
 
 	return Settings{
 		HTTPAddress:       net.JoinHostPort(host, strconv.Itoa(port)),
@@ -171,6 +198,12 @@ func Load() (Settings, error) {
 			MetricExportInterval: metricExportInterval,
 			ServiceName:          environmentOrDefault(OTelServiceNameEnvironmentVariable, defaultOTelServiceName),
 			TraceSampleRatio:     traceSampleRatio,
+		},
+		Database: DatabaseSettings{
+			URL:             os.Getenv(DatabaseURLEnvironmentVariable),
+			MigrationURL:    os.Getenv(MigrationDatabaseURLEnvironmentVariable),
+			Scopes:          databaseScopes,
+			ApplicationRole: environmentOrDefault(DatabaseAppRoleEnvironmentVariable, defaultDatabaseAppRole),
 		},
 		PoC: PoCSettings{
 			DatabaseURL:           os.Getenv(DatabaseURLEnvironmentVariable),
@@ -208,6 +241,121 @@ func Load() (Settings, error) {
 			ManagerEntityID:         os.Getenv(ManagerEntityIDEnvironmentVariable),
 		},
 	}, nil
+}
+
+// Validate applies command-specific database and application validation before
+// any connection or provider dependency can be constructed.
+func (settings Settings) Validate(command Command) error {
+	if err := settings.Database.validate(command, settings.PoC.Directory.Enabled); err != nil {
+		return err
+	}
+	return settings.PoC.Validate(command)
+}
+
+func (settings DatabaseSettings) validate(command Command, directoryEnabled bool) error {
+	scopes := settings.Scopes
+	if len(scopes) == 0 {
+		scopes = []DatabaseScope{DatabaseScopeCore}
+	}
+	if err := validateDatabaseScopes(scopes); err != nil {
+		return err
+	}
+	if directoryEnabled && !containsDatabaseScope(scopes, DatabaseScopeDirectory) {
+		return fmt.Errorf(
+			"%s must include %q when %s is enabled",
+			DatabaseScopesEnvironmentVariable,
+			DatabaseScopeDirectory,
+			GoogleDirectoryEnabledEnvironmentVariable,
+		)
+	}
+	switch command {
+	case CommandDBStatus:
+		return validateExactRequired(command, DatabaseURLEnvironmentVariable, settings.URL)
+	case CommandDBMigrate, CommandDBReset:
+		if command == CommandDBReset {
+			if err := validateExactRequired(
+				command,
+				DatabaseURLEnvironmentVariable,
+				settings.URL,
+			); err != nil {
+				return err
+			}
+		}
+		if err := validateExactRequired(
+			command,
+			MigrationDatabaseURLEnvironmentVariable,
+			settings.MigrationURL,
+		); err != nil {
+			return err
+		}
+		if !validDatabaseIdentifier(settings.ApplicationRole) {
+			return fmt.Errorf("%s must be a safe PostgreSQL identifier for %s", DatabaseAppRoleEnvironmentVariable, command)
+		}
+	}
+	return nil
+}
+
+func validDatabaseIdentifier(value string) bool {
+	if value == "" || value != strings.TrimSpace(value) {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'a' && character <= 'z') ||
+			character == '_' ||
+			(index > 0 && character >= '0' && character <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func databaseScopesEnvironment() ([]DatabaseScope, error) {
+	raw := environmentOrDefault(DatabaseScopesEnvironmentVariable, defaultDatabaseScopes)
+	parts := strings.Split(raw, ",")
+	scopes := make([]DatabaseScope, 0, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			return nil, fmt.Errorf("%s must contain nonblank comma-separated scopes", DatabaseScopesEnvironmentVariable)
+		}
+		scopes = append(scopes, DatabaseScope(value))
+	}
+	if err := validateDatabaseScopes(scopes); err != nil {
+		return nil, err
+	}
+	return scopes, nil
+}
+
+func validateDatabaseScopes(scopes []DatabaseScope) error {
+	seen := make(map[DatabaseScope]struct{}, len(scopes))
+	coreCount := 0
+	for _, scope := range scopes {
+		switch scope {
+		case DatabaseScopeCore:
+			coreCount++
+		case DatabaseScopeDirectory:
+		default:
+			return fmt.Errorf("%s contains unknown scope %q", DatabaseScopesEnvironmentVariable, scope)
+		}
+		if _, duplicate := seen[scope]; duplicate {
+			return fmt.Errorf("%s contains duplicate scope %q", DatabaseScopesEnvironmentVariable, scope)
+		}
+		seen[scope] = struct{}{}
+	}
+	if coreCount != 1 {
+		return fmt.Errorf("%s must contain %q exactly once", DatabaseScopesEnvironmentVariable, DatabaseScopeCore)
+	}
+	return nil
+}
+
+func containsDatabaseScope(scopes []DatabaseScope, wanted DatabaseScope) bool {
+	for _, scope := range scopes {
+		if scope == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func environmentOrDefault(name, fallback string) string {

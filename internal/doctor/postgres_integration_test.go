@@ -2,40 +2,97 @@ package doctor
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
+
+	"github.com/JakeFAU/stacks/adapters/postgres/coremigrations"
+	"github.com/JakeFAU/stacks/adapters/postgres/directorymigrations"
+	"github.com/JakeFAU/stacks/adapters/postgres/migration"
+	"github.com/JakeFAU/stacks/adapters/postgres/postgrestest"
 )
 
-const postgresIntegrationTimeout = 10 * time.Second
+const postgresIntegrationTimeout = 20 * time.Second
 
-func TestPostgresProbeReportsCurrentMigrations(t *testing.T) {
-	databaseURL := os.Getenv("STACKS_TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("STACKS_TEST_DATABASE_URL is not set")
-	}
-
+func TestPostgresProbeReportsCoreOnlyMigrationStatus(t *testing.T) {
+	database := postgrestest.NewDatabase(t)
+	core, directory := testMigrationManifests(t)
 	ctx, cancel := context.WithTimeout(context.Background(), postgresIntegrationTimeout)
 	defer cancel()
-	probe := NewPostgresProbe(databaseURL)
+	if _, err := (migration.Migrator{
+		DatabaseURL:     database.AdminURL(),
+		ApplicationRole: "stacks_app",
+		Manifests:       []migration.Manifest{core},
+	}).Apply(ctx); err != nil {
+		t.Fatalf("install core manifest: %v", err)
+	}
+	probe := NewPostgresProbeWithScopes(database.ApplicationURL(), []migration.Scope{"core"})
 	defer probe.Close()
-
 	if err := probe.Ping(ctx); err != nil {
 		t.Fatalf("Ping() error = %v", err)
 	}
-	current, err := probe.MigrationsCurrent(ctx)
+	statuses, err := probe.MigrationStatus(ctx)
 	if err != nil {
-		t.Fatalf("MigrationsCurrent() error = %v", err)
+		t.Fatalf("MigrationStatus() error = %v", err)
 	}
-	if !current {
-		t.Fatal("MigrationsCurrent() = false, want true")
-	}
+	assertMigrationStatus(t, statuses, "core", migration.StateCurrent, true)
+	assertMigrationStatus(t, statuses, "directory", migration.StateAbsent, false)
+	_ = directory
+}
 
-	var directoryMigrationsApplied bool
-	if err := probe.connection.QueryRow(ctx, migrationSetQuery, []int64{11, 12}).Scan(&directoryMigrationsApplied); err != nil {
-		t.Fatalf("inspect current-document and directory migrations: %v", err)
+func TestPostgresProbeReportsConfiguredDirectoryMigrationStatus(t *testing.T) {
+	database := postgrestest.NewDatabase(t)
+	core, directory := testMigrationManifests(t)
+	ctx, cancel := context.WithTimeout(context.Background(), postgresIntegrationTimeout)
+	defer cancel()
+	if _, err := (migration.Migrator{
+		DatabaseURL:     database.AdminURL(),
+		ApplicationRole: "stacks_app",
+		Manifests:       []migration.Manifest{core, directory},
+	}).Apply(ctx); err != nil {
+		t.Fatalf("install core and directory manifests: %v", err)
 	}
-	if !directoryMigrationsApplied {
-		t.Fatal("migration versions 11 and 12 are not both applied")
+	probe := NewPostgresProbeWithScopes(
+		database.ApplicationURL(),
+		[]migration.Scope{"core", "directory"},
+	)
+	defer probe.Close()
+	statuses, err := probe.MigrationStatus(ctx)
+	if err != nil {
+		t.Fatalf("MigrationStatus() error = %v", err)
 	}
+	assertMigrationStatus(t, statuses, "core", migration.StateCurrent, true)
+	assertMigrationStatus(t, statuses, "directory", migration.StateCurrent, true)
+}
+
+func testMigrationManifests(t *testing.T) (migration.Manifest, migration.Manifest) {
+	t.Helper()
+	core, err := coremigrations.Manifest()
+	if err != nil {
+		t.Fatalf("load core manifest: %v", err)
+	}
+	directory, err := directorymigrations.Manifest()
+	if err != nil {
+		t.Fatalf("load directory manifest: %v", err)
+	}
+	return core, directory
+}
+
+func assertMigrationStatus(
+	t *testing.T,
+	statuses []migration.ScopeStatus,
+	scope migration.Scope,
+	state migration.State,
+	configured bool,
+) {
+	t.Helper()
+	for _, status := range statuses {
+		if status.Scope == scope {
+			if status.State != state || status.Configured != configured {
+				t.Fatalf("scope %q status = %#v, want state=%q configured=%t",
+					scope, status, state, configured)
+			}
+			return
+		}
+	}
+	t.Fatalf("scope %q status is missing", scope)
 }

@@ -51,7 +51,7 @@ func Execute(
 	if len(args) > 0 {
 		command = config.Command(args[0])
 	}
-	if err := settings.PoC.Validate(command); err != nil {
+	if err := settings.Validate(command); err != nil {
 		return err
 	}
 
@@ -60,7 +60,15 @@ func Execute(
 			return runtime.Serve(ctx, settings)
 		}),
 	}}
-	if command == config.CommandAuth || command == config.CommandDoctor || command == config.CommandSync || command == config.CommandEntities || command == config.CommandReview || command == config.CommandAnalyze {
+	if command == config.CommandAuth ||
+		command == config.CommandDoctor ||
+		command == config.CommandSync ||
+		command == config.CommandEntities ||
+		command == config.CommandReview ||
+		command == config.CommandAnalyze ||
+		command == config.CommandDBMigrate ||
+		command == config.CommandDBStatus ||
+		command == config.CommandDBReset {
 		if commandProvider == nil {
 			return fmt.Errorf("%s command is not configured", command)
 		}

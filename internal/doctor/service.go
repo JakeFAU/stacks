@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/JakeFAU/stacks/adapters/postgres/migration"
+
 	"stacks/internal/modelpolicy"
 	"stacks/internal/source"
 )
@@ -16,16 +18,18 @@ import (
 type CheckName string
 
 const (
-	CheckDatabaseConnectivity   CheckName = "database.connectivity"
-	CheckDatabaseMigrations     CheckName = "database.migrations"
-	CheckGoogleAuthorization    CheckName = "google.authorization"
-	CheckGoogleFolder           CheckName = "google.folder"
-	CheckGoogleTabs             CheckName = "google.tabs"
-	CheckDirectoryConfiguration CheckName = "directory.configuration"
-	CheckDirectoryAuthorization CheckName = "directory.authorization"
-	CheckModelCredentials       CheckName = "model.credentials"
-	CheckModelAvailability      CheckName = "model.availability"
-	CheckModelDisclosure        CheckName = "model.disclosure"
+	CheckDatabaseConnectivity        CheckName = "database.connectivity"
+	CheckDatabaseMigrations          CheckName = "database.migrations"
+	CheckDatabaseMigrationsCore      CheckName = "database.migrations.core"
+	CheckDatabaseMigrationsDirectory CheckName = "database.migrations.directory"
+	CheckGoogleAuthorization         CheckName = "google.authorization"
+	CheckGoogleFolder                CheckName = "google.folder"
+	CheckGoogleTabs                  CheckName = "google.tabs"
+	CheckDirectoryConfiguration      CheckName = "directory.configuration"
+	CheckDirectoryAuthorization      CheckName = "directory.authorization"
+	CheckModelCredentials            CheckName = "model.credentials"
+	CheckModelAvailability           CheckName = "model.availability"
+	CheckModelDisclosure             CheckName = "model.disclosure"
 )
 
 // Status is the bounded outcome vocabulary rendered by the doctor command.
@@ -78,7 +82,14 @@ func (report Report) Healthy() bool {
 // Database exposes only read-only connectivity and migration inspection.
 type Database interface {
 	Ping(context.Context) error
+}
+
+type legacyMigrationDatabase interface {
 	MigrationsCurrent(context.Context) (bool, error)
+}
+
+type scopedMigrationDatabase interface {
+	MigrationStatus(context.Context) ([]migration.ScopeStatus, error)
 }
 
 // Google exposes only authorization validation and bounded source inspection.
@@ -134,7 +145,8 @@ func (service Service) Check(ctx context.Context) Report {
 	if service.Database == nil {
 		report.Checks = append(report.Checks,
 			failed(CheckDatabaseConnectivity, "PostgreSQL check is not configured", "configure STACKS_DATABASE_URL"),
-			failed(CheckDatabaseMigrations, "not checked because PostgreSQL is unavailable", "restore PostgreSQL connectivity"),
+			failed(CheckDatabaseMigrationsCore, "not checked because PostgreSQL is unavailable", "restore PostgreSQL connectivity"),
+			failed(CheckDatabaseMigrationsDirectory, "not checked because PostgreSQL is unavailable", "restore PostgreSQL connectivity"),
 		)
 	} else {
 		err := service.Database.Ping(ctx)
@@ -144,20 +156,41 @@ func (service Service) Check(ctx context.Context) Report {
 		if err != nil {
 			report.Checks = append(report.Checks,
 				failed(CheckDatabaseConnectivity, "PostgreSQL is unavailable", "verify STACKS_DATABASE_URL and start PostgreSQL"),
-				failed(CheckDatabaseMigrations, "not checked because PostgreSQL is unavailable", "restore PostgreSQL connectivity"),
+				failed(CheckDatabaseMigrationsCore, "not checked because PostgreSQL is unavailable", "restore PostgreSQL connectivity"),
+				failed(CheckDatabaseMigrationsDirectory, "not checked because PostgreSQL is unavailable", "restore PostgreSQL connectivity"),
 			)
 		} else {
 			report.Checks = append(report.Checks, ok(CheckDatabaseConnectivity, "PostgreSQL is reachable"))
-			current, err := service.Database.MigrationsCurrent(ctx)
-			if stop(&report, ctx, CheckDatabaseMigrations, err) {
-				return report
-			}
-			if err != nil {
-				report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migration state could not be inspected", "run `make db-migrate`"))
-			} else if !current {
-				report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migrations are pending", "run `make db-migrate`"))
+			if scoped, found := service.Database.(scopedMigrationDatabase); found {
+				statuses, err := scoped.MigrationStatus(ctx)
+				if stop(&report, ctx, CheckDatabaseMigrationsCore, err) {
+					return report
+				}
+				if err != nil {
+					report.Checks = append(report.Checks,
+						failed(CheckDatabaseMigrationsCore, "core migration state could not be inspected", "run `make db-status`"),
+						failed(CheckDatabaseMigrationsDirectory, "directory migration state could not be inspected", "run `make db-status`"),
+					)
+				} else {
+					report.Checks = append(report.Checks, migrationChecks(statuses)...)
+				}
+			} else if legacy, found := service.Database.(legacyMigrationDatabase); found {
+				current, err := legacy.MigrationsCurrent(ctx)
+				if stop(&report, ctx, CheckDatabaseMigrations, err) {
+					return report
+				}
+				if err != nil {
+					report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migration state could not be inspected", "run `make db-migrate`"))
+				} else if !current {
+					report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migrations are pending", "run `make db-migrate`"))
+				} else {
+					report.Checks = append(report.Checks, ok(CheckDatabaseMigrations, "database migrations are current"))
+				}
 			} else {
-				report.Checks = append(report.Checks, ok(CheckDatabaseMigrations, "database migrations are current"))
+				report.Checks = append(report.Checks,
+					failed(CheckDatabaseMigrationsCore, "core migration check is not configured", "configure migration inspection"),
+					failed(CheckDatabaseMigrationsDirectory, "directory migration check is not configured", "configure migration inspection"),
+				)
 			}
 		}
 	}
@@ -290,6 +323,61 @@ func (service Service) Check(ctx context.Context) Report {
 	}
 	report.Checks = append(report.Checks, restrictedDisclosureCheck(disclosureState, disclosureErr))
 	return report
+}
+
+func migrationChecks(statuses []migration.ScopeStatus) []Check {
+	byScope := make(map[migration.Scope]migration.ScopeStatus, len(statuses))
+	for _, status := range statuses {
+		byScope[status.Scope] = status
+	}
+	core, coreFound := byScope["core"]
+	directory, directoryFound := byScope["directory"]
+	checks := make([]Check, 0, 2)
+	if !coreFound {
+		checks = append(checks, failed(
+			CheckDatabaseMigrationsCore,
+			"core migration status is missing",
+			"run `make db-status`",
+		))
+	} else if core.State != migration.StateCurrent {
+		checks = append(checks, failed(
+			CheckDatabaseMigrationsCore,
+			fmt.Sprintf("core migrations are %s", core.State),
+			"run `make db-status` and `make db-migrate`",
+		))
+	} else {
+		checks = append(checks, ok(CheckDatabaseMigrationsCore, "core migrations are current"))
+	}
+	if !directoryFound {
+		checks = append(checks, failed(
+			CheckDatabaseMigrationsDirectory,
+			"directory migration status is missing",
+			"run `make db-status`",
+		))
+	} else if !directory.Configured && directory.State == migration.StateAbsent {
+		checks = append(checks, ok(
+			CheckDatabaseMigrationsDirectory,
+			"directory migrations are not configured",
+		))
+	} else if directory.State == migration.StateCurrent {
+		checks = append(checks, ok(
+			CheckDatabaseMigrationsDirectory,
+			"directory migrations are current",
+		))
+	} else if directory.Configured {
+		checks = append(checks, failed(
+			CheckDatabaseMigrationsDirectory,
+			fmt.Sprintf("directory migrations are %s", directory.State),
+			"run `make db-status` and `make db-migrate`",
+		))
+	} else {
+		checks = append(checks, warning(
+			CheckDatabaseMigrationsDirectory,
+			fmt.Sprintf("unconfigured directory migrations are %s", directory.State),
+			"run `make db-status`",
+		))
+	}
+	return checks
 }
 
 func directoryConfigurationCheck(enabled bool) Check {

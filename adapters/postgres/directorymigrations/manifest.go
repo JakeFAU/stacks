@@ -2,6 +2,7 @@
 package directorymigrations
 
 import (
+	"crypto/sha256"
 	"embed"
 
 	"github.com/JakeFAU/stacks/adapters/postgres/migration"
@@ -14,6 +15,13 @@ const (
 	directoryVersion = 1
 )
 
+var expectedFingerprint = [sha256.Size]byte{
+	0x18, 0x8a, 0xc3, 0xf2, 0xd1, 0x7a, 0xca, 0x77,
+	0xe9, 0xd8, 0xd5, 0x6f, 0x0c, 0xd8, 0x84, 0x4b,
+	0x7e, 0x38, 0xc6, 0x9e, 0x7e, 0x66, 0x18, 0xc3,
+	0xd6, 0x59, 0x59, 0x67, 0xdf, 0x68, 0xf2, 0x23,
+}
+
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
@@ -22,6 +30,7 @@ func Manifest() (migration.Manifest, error) {
 	return migration.LoadManifest(
 		migration.Scope("directory"),
 		directoryLedger,
+		expectedFingerprint,
 		migrationFiles,
 		[]migration.File{{
 			Version: directoryVersion,
