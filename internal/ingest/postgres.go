@@ -213,6 +213,9 @@ func (repository *PostgresRepository) CompleteVersion(
 			return err
 		}
 		if status == postgres.ExtractionCompleted {
+			// A completed canonical write set is an exact no-op. Optional
+			// directory evidence and later reviewer authority are additive and
+			// must not be replayed, reset, or interpreted by ingestion.
 			return nil
 		}
 		for _, record := range completion.Evidence {

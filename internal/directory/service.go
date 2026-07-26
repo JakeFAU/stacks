@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/JakeFAU/stacks/core/timepoint"
 	"stacks/internal/entity"
 	"stacks/internal/observability"
 )
@@ -238,7 +239,7 @@ func (service *Service) VerifyReviewerEmail(ctx context.Context, email string) (
 		verification.Evaluation.Outcome = entity.DirectoryUnavailable
 		return verification, nil
 	}
-	verification.RecordedAt = service.Now().UTC()
+	verification.RecordedAt = timepoint.Normalize(service.Now())
 	if !service.Policy.LookupEligible(query) {
 		verification.Lookup.Outcome = entity.DirectoryNoMatch
 		verification.Evaluation.Outcome = entity.DirectoryNoMatch
@@ -323,7 +324,7 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 		return summary, nil
 	}
 
-	now := service.Now().UTC()
+	now := timepoint.Normalize(service.Now())
 	if err := ctx.Err(); err != nil {
 		return summary, err
 	}
@@ -354,7 +355,7 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 		if !eligible {
 			continue
 		}
-		started := service.Now().UTC()
+		started := timepoint.Normalize(service.Now())
 		summary.Attempted++
 
 		lookup := LookupResult{Outcome: entity.DirectoryNotConfigured}
@@ -375,7 +376,7 @@ func (service *Service) Enrich(ctx context.Context, derivationID string) (summar
 			}
 			return summary, cancellationErr
 		}
-		recordedAt := service.Now().UTC()
+		recordedAt := timepoint.Normalize(service.Now())
 		evaluation := entity.DirectoryEvaluation{}
 		if lookup.Outcome == "" {
 			evaluation = service.Policy.Evaluate(query, lookup.Profiles, identityState.Snapshots, identityState.Links)
@@ -604,7 +605,7 @@ func (service *Service) recordDecision(
 	if service.Decisions == nil {
 		return nil
 	}
-	duration := service.Now().UTC().Sub(started)
+	duration := timepoint.Normalize(service.Now()).Sub(started)
 	if duration < 0 {
 		duration = 0
 	}

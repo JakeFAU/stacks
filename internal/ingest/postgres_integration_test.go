@@ -12,6 +12,7 @@ import (
 
 	postgres "github.com/JakeFAU/stacks/adapters/postgres"
 	"github.com/JakeFAU/stacks/adapters/postgres/coremigrations"
+	"github.com/JakeFAU/stacks/adapters/postgres/directorymigrations"
 	"github.com/JakeFAU/stacks/adapters/postgres/migration"
 	"github.com/JakeFAU/stacks/adapters/postgres/postgrestest"
 	"github.com/JakeFAU/stacks/core/admission"
@@ -29,6 +30,7 @@ type canonicalRepositoryFixture struct {
 	ctx        context.Context
 	repository *PostgresRepository
 	admin      *pgx.Conn
+	isolated   postgrestest.Database
 	now        time.Time
 }
 
@@ -331,37 +333,104 @@ func TestCanonicalCompletedRetryPreservesAdditiveIdentityAndDirectoryState(t *te
 	); err != nil {
 		t.Fatalf("append later identity authority: %v", err)
 	}
-	if _, err := fixture.admin.Exec(fixture.ctx, `
-		CREATE SCHEMA synthetic_optional_directory;
-		CREATE TABLE synthetic_optional_directory.state (
-			id text PRIMARY KEY,
-			value text NOT NULL
-		);
-		INSERT INTO synthetic_optional_directory.state (id, value)
-		VALUES ('directory-state', 'present')`); err != nil {
+	coreManifest, err := coremigrations.Manifest()
+	if err != nil {
+		t.Fatalf("coremigrations.Manifest() error = %v", err)
+	}
+	directoryManifest, err := directorymigrations.Manifest()
+	if err != nil {
+		t.Fatalf("directorymigrations.Manifest() error = %v", err)
+	}
+	applicationConfig, err := pgx.ParseConfig(fixture.isolated.ApplicationURL())
+	if err != nil {
+		t.Fatalf("parse application database URL: %v", err)
+	}
+	if _, err := (migration.Migrator{
+		DatabaseURL:     fixture.isolated.AdminURL(),
+		ApplicationRole: applicationConfig.User,
+		Manifests:       []migration.Manifest{coreManifest, directoryManifest},
+	}).Apply(fixture.ctx); err != nil {
+		t.Fatalf("install optional directory schema: %v", err)
+	}
+	mention := completion.Mentions[0]
+	profile := postgres.DirectoryProfile{
+		Provider:    "synthetic_directory",
+		SubjectID:   "profiles/additive-state",
+		Source:      postgres.DirectorySourceDomainProfile,
+		DisplayName: "Synthetic Directory State",
+		Emails: []postgres.DirectoryEmail{{
+			Value:   "additive.state@example.test",
+			Primary: true,
+		}},
+		ObservedAt: fixture.now.Add(2 * time.Minute),
+	}
+	if _, err := (postgres.DirectoryStore{
+		Database: fixture.repository.database,
+	}).Persist(fixture.ctx, postgres.DirectoryPersistInput{
+		Mention: postgres.DirectoryPendingMention{
+			MentionID:      string(completion.Proposals[0].MentionID()),
+			ProposalID:     string(completion.Proposals[0].ID()),
+			Surface:        mention.Surface,
+			NormalizedName: mention.NormalizedName,
+		},
+		Query: postgres.DirectoryQuery{
+			Kind:          postgres.DirectoryQueryName,
+			Name:          mention.NormalizedName,
+			EmailEvidence: postgres.DirectoryEmailEvidenceNone,
+		},
+		Lookup: postgres.DirectoryLookupResult{
+			Outcome:  postgres.DirectoryOutcomeReview,
+			Profiles: []postgres.DirectoryProfile{profile},
+		},
+		Evaluation: postgres.DirectoryEvaluation{
+			Outcome:    postgres.DirectoryOutcomeReview,
+			Candidates: []postgres.DirectoryProfile{profile},
+		},
+		AttemptCount: 1,
+		RecordedAt:   fixture.now.Add(3 * time.Minute),
+	}); err != nil {
 		t.Fatalf("seed additive directory state: %v", err)
 	}
 
 	if err := fixture.repository.CompleteVersion(fixture.ctx, completion); err != nil {
 		t.Fatalf("exact retry after additive state error = %v", err)
 	}
-	var correctedDecisions, correctedAliases, directoryRows int
+	var correctedDecisions, correctedAliases int
+	var directoryProfiles, directorySnapshots, directoryAttempts, directoryLinks int
 	if err := fixture.admin.QueryRow(fixture.ctx, `
 		SELECT
 			(SELECT count(*) FROM stacks_core.resolution_decisions WHERE id = $1),
 			(SELECT count(*) FROM stacks_core.entity_alias_assertions WHERE id = $2),
-			(SELECT count(*) FROM synthetic_optional_directory.state WHERE id = 'directory-state')`,
+			(SELECT count(*) FROM stacks_directory.profiles),
+			(SELECT count(*) FROM stacks_directory.snapshots),
+			(SELECT count(*) FROM stacks_directory.lookup_attempts),
+			(SELECT count(*) FROM stacks_directory.entity_links)`,
 		correctedDecision.ID(),
 		correctedAlias.ID(),
-	).Scan(&correctedDecisions, &correctedAliases, &directoryRows); err != nil {
+	).Scan(
+		&correctedDecisions,
+		&correctedAliases,
+		&directoryProfiles,
+		&directorySnapshots,
+		&directoryAttempts,
+		&directoryLinks,
+	); err != nil {
 		t.Fatalf("inspect additive state after exact retry: %v", err)
 	}
-	if correctedDecisions != 1 || correctedAliases != 1 || directoryRows != 1 {
+	if correctedDecisions != 1 ||
+		correctedAliases != 1 ||
+		directoryProfiles != 1 ||
+		directorySnapshots != 1 ||
+		directoryAttempts != 1 ||
+		directoryLinks != 1 {
 		t.Fatalf(
-			"additive state counts = decisions:%d aliases:%d directory:%d, want 1/1/1",
+			"additive state counts = decisions:%d aliases:%d directory:%d/%d/%d/%d, want 1/1/1/1/1/1",
 			correctedDecisions,
 			correctedAliases,
-			directoryRows,
+			directoryProfiles,
+			directorySnapshots,
+			directoryAttempts,
+			directoryLinks,
 		)
 	}
 }
@@ -724,7 +793,13 @@ func newCanonicalRepositoryFixture(t testing.TB) canonicalRepositoryFixture {
 	}); err != nil {
 		t.Fatalf("persist automatic identity fixture: %v", err)
 	}
-	return canonicalRepositoryFixture{ctx: ctx, repository: repository, admin: admin, now: now}
+	return canonicalRepositoryFixture{
+		ctx:        ctx,
+		repository: repository,
+		admin:      admin,
+		isolated:   isolated,
+		now:        now,
+	}
 }
 
 func canonicalPreparationInput(
