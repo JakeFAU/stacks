@@ -67,6 +67,13 @@ func (repository *GraphRepository) CompleteObservation(
 	if err != nil {
 		return observation.Observation{}, nil, newLegacyUUIDPreflightError(value.ID())
 	}
+	if origin == nil {
+		return observation.Observation{}, nil, newObservationBoundaryError(
+			ErrObservationCompatibility,
+			reasonObservationOriginMismatch,
+			canonicalObservationID,
+		)
+	}
 	state, err := canonicalSignalState(boundaryObservationID, signal, signalEvidence)
 	if err != nil {
 		return observation.Observation{}, nil, err

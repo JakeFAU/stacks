@@ -6269,6 +6269,47 @@ func TestCompleteObservationPreservesOriginRelativeSignalEvidence(t *testing.T) 
 	}
 }
 
+func TestCompleteObservationPreservesExplicitEmptyOriginForSignalOnlyEvidence(t *testing.T) {
+	pool := openIntegrationDatabase(t)
+	ctx := context.Background()
+	graph := NewGraphRepository(pool)
+	_, signalOnlyID := createSyntheticMentionAndSpan(t, pool)
+	run := testOwningExtractionRun(t, pool, testDocumentVersion(t, testIdentifier("document-explicit-empty-origin")))
+	value := testCanonicalObservationWithLinks(t, run, uuid.NewString(), "", "", "", "", "interacted_with", observation.UnknownTime(), []observation.EvidenceLink{
+		{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting},
+	}, nil)
+	signal := &SignalInput{
+		ID: uuid.NewString(), ObservationID: string(value.ID()), Category: "delegation_autonomy", Direction: "strengthening",
+		ExtractionModelID: run.ModelID, PromptVersion: run.PromptVersion, Confidence: 0.8,
+	}
+	signalEvidence := []SignalEvidenceInput{{EvidenceSpanID: signalOnlyID, Role: "supporting"}}
+	origin := []knowledge.EvidenceID{}
+
+	if _, _, err := graph.CompleteObservation(ctx, value, origin, signal, signalEvidence); err != nil {
+		t.Fatalf("complete signal-only observation: %v", err)
+	}
+	if _, _, err := graph.CompleteObservation(ctx, value, origin, signal, signalEvidence); err != nil {
+		t.Fatalf("retry signal-only observation: %v", err)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.observation_evidence WHERE observation_id = $1`, string(value.ID())); got != 0 {
+		t.Fatalf("observation evidence rows = %d, want 0", got)
+	}
+	if got := countRows(t, pool, `SELECT count(*) FROM stacks.signal_evidence WHERE signal_id = $1`, signal.ID); got != 1 {
+		t.Fatalf("signal evidence rows = %d, want 1", got)
+	}
+	loaded, err := loadLegacyObservation(ctx, pool, string(value.ID()))
+	if err != nil {
+		t.Fatalf("load signal-only observation: %v", err)
+	}
+	if loaded.Compatibility.observationEvidenceOrigin == nil || len(loaded.Compatibility.observationEvidenceOrigin) != 0 {
+		t.Fatalf("private origin = %#v, want explicit empty set", loaded.Compatibility.observationEvidenceOrigin)
+	}
+	wantLinks := []observation.EvidenceLink{{EvidenceID: knowledge.EvidenceID(signalOnlyID), Role: observation.EvidenceSupporting}}
+	if !sameEvidenceLinks(loaded.Observation.EvidenceLinks(), wantLinks) {
+		t.Fatalf("canonical evidence = %#v, want signal-only link %#v", loaded.Observation.EvidenceLinks(), wantLinks)
+	}
+}
+
 func sameSignalEvidence(left, right []SignalEvidenceInput) bool {
 	if len(left) != len(right) {
 		return false

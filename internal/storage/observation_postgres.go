@@ -223,7 +223,7 @@ func loadObservationEvidenceOrigin(
 		)
 	}
 	defer rows.Close()
-	var origin []evidence.EvidenceID
+	origin := make([]evidence.EvidenceID, 0)
 	for rows.Next() {
 		var evidenceID string
 		if err := rows.Scan(&evidenceID); err != nil {

@@ -76,6 +76,23 @@ func TestCompleteObservationPreflightRejectsBeforeDatabaseAccess(t *testing.T) {
 			},
 			want: ErrObservationCompatibility,
 		},
+		{
+			name: "observation_requires_explicit_origin",
+			invoke: func(t *testing.T) error {
+				value := codecActiveObservation(t, nil)
+				return completeWithoutDatabase(t, repository, value, nil, nil, nil)
+			},
+			want: ErrObservationCompatibility,
+		},
+		{
+			name: "signal_requires_explicit_observation_origin",
+			invoke: func(t *testing.T) error {
+				value := codecActiveObservation(t, nil)
+				signal := codecActiveSignal()
+				return completeWithoutDatabase(t, repository, value, nil, &signal.Input, signal.Evidence)
+			},
+			want: ErrObservationCompatibility,
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			err := testCase.invoke(t)
