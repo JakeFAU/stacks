@@ -37,7 +37,7 @@ func TestExecuteRoutesDBMigrateAndDBStatusThroughLazyCommandProvider(t *testing.
 					return nil
 				})}, nil
 			})
-			err := Execute(
+			err := executeWithSettings(
 				t.Context(),
 				[]string{string(command)},
 				settings,

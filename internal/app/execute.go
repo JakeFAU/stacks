@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -36,40 +37,86 @@ func (fn RuntimeFunc) Serve(ctx context.Context, settings config.Settings) error
 	return fn(ctx, settings)
 }
 
-// Execute validates the selected command's configuration and dispatches it.
-// stdout and stderr are accepted here so later CLI commands can write only to
-// their explicit process boundary.
+// Execute parses one invocation, loads and validates its selected settings
+// target, and bootstraps only executable application commands.
 func Execute(
 	ctx context.Context,
 	args []string,
-	settings config.Settings,
-	runtime Runtime,
-	commandProvider CommandProvider,
+	loader SettingsLoader,
+	bootstrap Bootstrap,
 	stdout, stderr io.Writer,
 ) error {
 	runner := cli.Runner{
 		Input: nil, Output: stdout, Error: stderr,
 		Execute: func(ctx context.Context, invocation cli.Invocation) error {
-			command := config.Command(invocation.Command)
-			if err := settings.Validate(command); err != nil {
-				return err
+			if loader == nil {
+				return fmt.Errorf("settings loader is not configured")
 			}
-			if command == config.CommandServe {
-				return runtime.Serve(ctx, settings)
-			}
-			if commandProvider == nil {
-				return fmt.Errorf("%s command is not configured", command)
-			}
-			commands, err := commandProvider.Commands(ctx, settings, stdout, stderr)
+			settings, err := loader.Load(config.LoadOptions{ConfigFile: invocation.ConfigFile})
 			if err != nil {
 				return err
 			}
-			selected, ok := commands[string(command)]
-			if !ok || selected == nil {
-				return fmt.Errorf("%s command is not configured", command)
+			target, err := targetForInvocation(invocation)
+			if err != nil {
+				return err
 			}
-			return selected.Run(ctx, invocation)
+			if err := validateInvocation(settings, target); err != nil {
+				return err
+			}
+			if invocation.Command == cli.CommandConfig {
+				return cli.ConfigValidateCommand{Output: stdout}.Run(ctx, invocation)
+			}
+			if bootstrap == nil {
+				return fmt.Errorf("runtime bootstrap is not configured")
+			}
+			dependencies, err := bootstrap.Start(ctx, settings)
+			if err != nil {
+				return err
+			}
+			runError := dispatch(ctx, invocation, settings, dependencies, stdout, stderr)
+			shutdownError := shutdownExecution(ctx, dependencies.Shutdown)
+			return errors.Join(runError, shutdownError)
 		},
 	}
 	return runner.Run(ctx, args)
+}
+
+func dispatch(
+	ctx context.Context,
+	invocation cli.Invocation,
+	settings config.Settings,
+	dependencies ExecutionDependencies,
+	stdout, stderr io.Writer,
+) error {
+	command := config.Command(invocation.Command)
+	if command == config.CommandServe {
+		if dependencies.Runtime == nil {
+			return fmt.Errorf("%s runtime is not configured", command)
+		}
+		return dependencies.Runtime.Serve(ctx, settings)
+	}
+	if dependencies.CommandProvider == nil {
+		return fmt.Errorf("%s command is not configured", command)
+	}
+	commands, err := dependencies.CommandProvider.Commands(ctx, settings, stdout, stderr)
+	if err != nil {
+		return err
+	}
+	selected, ok := commands[string(command)]
+	if !ok || selected == nil {
+		return fmt.Errorf("%s command is not configured", command)
+	}
+	return selected.Run(ctx, invocation)
+}
+
+func shutdownExecution(ctx context.Context, shutdown func(context.Context) error) error {
+	if shutdown == nil {
+		return fmt.Errorf("runtime shutdown is not configured")
+	}
+	shutdownContext, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		runtimeShutdownTimeout,
+	)
+	defer cancel()
+	return shutdown(shutdownContext)
 }

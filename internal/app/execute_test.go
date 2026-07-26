@@ -33,7 +33,7 @@ func TestExecuteHelpAndSyntaxFailuresDoNotConstructCommands(t *testing.T) {
 				providerCalls++
 				return nil, errors.New("provider must not be constructed")
 			})
-			err := Execute(t.Context(), testCase.args, config.Settings{},
+			err := executeWithSettings(t.Context(), testCase.args, config.Settings{},
 				RuntimeFunc(func(context.Context, config.Settings) error {
 					return errors.New("serve must not run")
 				}),
@@ -59,7 +59,7 @@ func TestExecuteServesWithoutApplicationSettings(t *testing.T) {
 		return nil
 	})
 
-	err := Execute(context.Background(), nil, config.Settings{}, runtime, nil, io.Discard, io.Discard)
+	err := executeWithSettings(context.Background(), nil, config.Settings{}, runtime, nil, io.Discard, io.Discard)
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -92,7 +92,7 @@ func TestExecuteRoutesEntityAndReviewCommandsWithRemainingArguments(t *testing.T
 				})}, nil
 			})
 
-			err := Execute(context.Background(), testCase.arguments, settings,
+			err := executeWithSettings(context.Background(), testCase.arguments, settings,
 				RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
 				provider, io.Discard, io.Discard)
 			if err != nil {
@@ -118,7 +118,7 @@ func TestExecuteRoutesGoogleAuthWithRemainingArguments(t *testing.T) {
 		})}, nil
 	})
 
-	err := Execute(context.Background(), []string{"auth", "google"}, settings,
+	err := executeWithSettings(context.Background(), []string{"auth", "google"}, settings,
 		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
 		provider, io.Discard, io.Discard)
 	if err != nil {
@@ -158,7 +158,7 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 		})}, nil
 	})
 
-	err := Execute(context.Background(), []string{"sync"}, settings,
+	err := executeWithSettings(context.Background(), []string{"sync"}, settings,
 		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
 		provider, io.Discard, io.Discard)
 	if err != nil {
@@ -194,7 +194,7 @@ func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
 		})}, nil
 	})
 
-	err := Execute(context.Background(), []string{"doctor"}, settings,
+	err := executeWithSettings(context.Background(), []string{"doctor"}, settings,
 		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
 		provider, io.Discard, io.Discard)
 	if err != nil {
@@ -229,7 +229,7 @@ func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
 		})}, nil
 	})
 
-	err := Execute(context.Background(), []string{"analyze"}, settings,
+	err := executeWithSettings(context.Background(), []string{"analyze"}, settings,
 		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
 		provider, io.Discard, io.Discard)
 	if err != nil {
@@ -272,7 +272,7 @@ func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *
 				return nil, fmt.Errorf("provider must not be constructed")
 			})
 
-			err := Execute(context.Background(), testCase.arguments, config.Settings{
+			err := executeWithSettings(context.Background(), testCase.arguments, config.Settings{
 				Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
 				Application: testCase.settings,
 			},
@@ -308,4 +308,22 @@ func validAnalyzeSettingsForExecute(extractionVersion, analysisVersion string) c
 	settings.ManagerConfidence.EmployeeEntityID = "employee-id"
 	settings.ManagerConfidence.ManagerEntityID = "manager-id"
 	return settings
+}
+
+func executeWithSettings(
+	ctx context.Context,
+	args []string,
+	settings config.Settings,
+	runtime Runtime,
+	commandProvider CommandProvider,
+	stdout, stderr io.Writer,
+) error {
+	return Execute(
+		ctx,
+		args,
+		settingsLoader(settings),
+		commandBootstrap(runtime, commandProvider),
+		stdout,
+		stderr,
+	)
 }
