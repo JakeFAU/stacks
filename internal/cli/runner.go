@@ -13,6 +13,7 @@ import (
 
 const (
 	rootCommandUse                = "stacks"
+	configFlagName                = "config"
 	reviewCreateNameFlagName      = "name"
 	reviewCreateEmailFlagName     = "email"
 	acceptDirectoryEntityFlagName = "entity"
@@ -24,6 +25,7 @@ type CommandName string
 
 const (
 	CommandServe     CommandName = "serve"
+	CommandConfig    CommandName = "config"
 	CommandAuth      CommandName = "auth"
 	CommandDoctor    CommandName = "doctor"
 	CommandSync      CommandName = "sync"
@@ -39,6 +41,7 @@ const (
 type Action string
 
 const (
+	ActionValidate            Action = "validate"
 	ActionAuthGoogle          Action = "google"
 	ActionAuthGoogleDirectory Action = "google-directory"
 	ActionList                Action = "list"
@@ -52,11 +55,13 @@ const (
 
 // Invocation is the validated, provider-neutral CLI input for one application command.
 type Invocation struct {
-	Command         CommandName
-	Action          Action
-	Arguments       []string
-	CreatePerson    *CreatePersonInput
-	AcceptDirectory *AcceptDirectoryInput
+	Command          CommandName
+	Action           Action
+	Arguments        []string
+	ConfigFile       *string
+	ConfigValidation *ConfigValidationInput
+	CreatePerson     *CreatePersonInput
+	AcceptDirectory  *AcceptDirectoryInput
 }
 
 // Command executes a typed application invocation.
@@ -99,6 +104,17 @@ func (r Runner) Run(ctx context.Context, args []string) error {
 func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	execute := func(command *cobra.Command, invocation Invocation) error {
 		*handled = true
+		if command.Flags().Changed(configFlagName) {
+			configFile, err := command.Flags().GetString(configFlagName)
+			if err != nil {
+				return fmt.Errorf("read %s flag: %w", configFlagName, err)
+			}
+			if strings.TrimSpace(configFile) == "" {
+				return fmt.Errorf("--%s requires a configuration file", configFlagName)
+			}
+			copied := configFile
+			invocation.ConfigFile = &copied
+		}
 		if r.Execute == nil {
 			return fmt.Errorf("%s command is not configured", invocation.Command)
 		}
@@ -125,6 +141,7 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 			return execute(command, Invocation{Command: CommandServe})
 		},
 	}
+	root.PersistentFlags().String(configFlagName, "", "configuration file")
 
 	serve := leaf(string(CommandServe), CommandServe, "", cobra.NoArgs)
 	root.AddCommand(serve)
@@ -134,6 +151,53 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	root.AddCommand(leaf(string(CommandDBMigrate), CommandDBMigrate, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandDBStatus), CommandDBStatus, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandDBReset)+" <confirmation>", CommandDBReset, "", cobra.ExactArgs(1)))
+
+	invalidGroup := func(use string) *cobra.Command {
+		return &cobra.Command{
+			Use:  use,
+			Args: cobra.NoArgs,
+			RunE: func(*cobra.Command, []string) error {
+				return errors.New(invalidCommandSyntaxMessage)
+			},
+		}
+	}
+	configValidationLeaf := func(use string, target CommandName, targetAction Action) *cobra.Command {
+		return &cobra.Command{
+			Use:  use,
+			Args: cobra.NoArgs,
+			RunE: func(command *cobra.Command, _ []string) error {
+				return execute(command, Invocation{
+					Command: CommandConfig,
+					Action:  ActionValidate,
+					ConfigValidation: &ConfigValidationInput{
+						Command: target,
+						Action:  targetAction,
+					},
+				})
+			},
+		}
+	}
+	config := invalidGroup(string(CommandConfig))
+	validate := invalidGroup(string(ActionValidate))
+	for _, target := range []CommandName{
+		CommandServe,
+		CommandDoctor,
+		CommandSync,
+		CommandEntities,
+		CommandReview,
+		CommandAnalyze,
+		CommandDBMigrate,
+		CommandDBStatus,
+		CommandDBReset,
+	} {
+		validate.AddCommand(configValidationLeaf(string(target), target, ""))
+	}
+	configAuth := invalidGroup(string(CommandAuth))
+	configAuth.AddCommand(configValidationLeaf(string(ActionAuthGoogle), CommandAuth, ActionAuthGoogle))
+	configAuth.AddCommand(configValidationLeaf(string(ActionAuthGoogleDirectory), CommandAuth, ActionAuthGoogleDirectory))
+	validate.AddCommand(configAuth)
+	config.AddCommand(validate)
+	root.AddCommand(config)
 
 	auth := &cobra.Command{Use: string(CommandAuth)}
 	auth.AddCommand(leaf(string(ActionAuthGoogle), CommandAuth, ActionAuthGoogle, cobra.NoArgs))
