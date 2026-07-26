@@ -1353,7 +1353,7 @@ func TestDirectoryReviewerEmailProviderConflictMakesNoWrites(t *testing.T) {
 	}
 }
 
-func TestDirectoryReviewLifecycleUniqueNameResolvesThenDuplicateIsAmbiguous(t *testing.T) {
+func TestDirectoryReviewLifecycleNameAliasesRemainReviewCandidates(t *testing.T) {
 	pool := openIntegrationDatabase(t)
 	ctx := context.Background()
 	repository := NewEntityRepository(pool)
@@ -1389,12 +1389,17 @@ func TestDirectoryReviewLifecycleUniqueNameResolvesThenDuplicateIsAmbiguous(t *t
 	if err != nil {
 		t.Fatalf("load first lifecycle snapshots: %v", err)
 	}
-	resolved := (entity.Resolver{}).Resolve(
+	uniqueName := (entity.Resolver{}).Resolve(
 		entity.Mention{Name: firstMention.Surface},
 		snapshots,
 	)
-	if !resolved.AutoResolved || resolved.EntityID != firstEntity.ID {
-		t.Fatalf("unique accepted name resolution = %#v, want entity %q", resolved, firstEntity.ID)
+	if uniqueName.AutoResolved || uniqueName.EntityID != "" {
+		t.Fatalf("unique accepted name resolution = %#v, want review candidate", uniqueName)
+	}
+	if len(uniqueName.Candidates) == 0 ||
+		uniqueName.Candidates[0].EntityID != firstEntity.ID ||
+		uniqueName.Candidates[0].Confidence != 1 {
+		t.Fatalf("unique accepted name top candidate = %#v, want rank 1 entity %q", uniqueName.Candidates[:min(1, len(uniqueName.Candidates))], firstEntity.ID)
 	}
 
 	_, secondMention := createDirectoryPendingMentionFixtureWithSurfaceEmail(
@@ -1435,6 +1440,15 @@ func TestDirectoryReviewLifecycleUniqueNameResolvesThenDuplicateIsAmbiguous(t *t
 	)
 	if ambiguous.AutoResolved || ambiguous.EntityID != "" {
 		t.Fatalf("duplicate accepted name resolution = %#v, want ambiguity", ambiguous)
+	}
+	wantCandidateIDs := []string{firstEntity.ID, secondEntity.ID}
+	sort.Strings(wantCandidateIDs)
+	if len(ambiguous.Candidates) < 2 ||
+		ambiguous.Candidates[0].EntityID != wantCandidateIDs[0] ||
+		ambiguous.Candidates[1].EntityID != wantCandidateIDs[1] ||
+		ambiguous.Candidates[0].Confidence != 1 ||
+		ambiguous.Candidates[1].Confidence != 1 {
+		t.Fatalf("duplicate accepted name top candidates = %#v, want deterministic entity-ID ranks %#v", ambiguous.Candidates[:min(2, len(ambiguous.Candidates))], wantCandidateIDs)
 	}
 	assertSnapshotAlias(
 		t,

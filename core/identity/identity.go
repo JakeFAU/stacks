@@ -9,6 +9,25 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
+// EntityID identifies a canonical entity without imposing a provider-specific
+// identifier format.
+type EntityID string
+
+// MentionID identifies an immutable source-grounded mention.
+type MentionID string
+
+// ProposalID identifies an immutable identity-resolution proposal.
+type ProposalID string
+
+// CandidateID identifies an immutable candidate within a proposal.
+type CandidateID string
+
+// DecisionID identifies an immutable identity-resolution authority decision.
+type DecisionID string
+
+// AliasAssertionID identifies an immutable accepted-alias assertion.
+type AliasAssertionID string
+
 // Kind identifies the category of a canonical entity. Additional kinds can be
 // added without changing the durable entity contract.
 type Kind string

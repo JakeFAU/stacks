@@ -1123,11 +1123,20 @@ func TestSyncResolvesGroundedNameIndependentlyOfModelEmail(t *testing.T) {
 
 	summary, err := service.Sync(context.Background())
 	if err != nil || summary.Completed != 1 {
-		t.Fatalf("Sync() = (%#v, %v), want completed name-only resolution", summary, err)
+		t.Fatalf("Sync() = (%#v, %v), want completed name review candidate", summary, err)
 	}
 	mention := repository.lastCompletion.Mentions[0]
-	if !mention.Resolution.AutoResolved || mention.Resolution.EntityID != "entity-alex" {
-		t.Fatalf("resolution = %#v, want grounded name independently resolved to Alex", mention.Resolution)
+	if mention.Resolution.AutoResolved || mention.Resolution.EntityID != "" {
+		t.Fatalf("resolution = %#v, want grounded name without automatic authority", mention.Resolution)
+	}
+	if len(mention.Resolution.Candidates) != 1 ||
+		mention.Resolution.Candidates[0].EntityID != "entity-alex" ||
+		mention.Resolution.Candidates[0].Confidence != 1 {
+		t.Fatalf("candidates = %#v, want grounded exact-name review candidate for Alex", mention.Resolution.Candidates)
+	}
+	if mention.ProposedEmail != "bob.builder@synthetic.example" ||
+		mention.ProposedEmailEvidenceKey != "citation-shared" {
+		t.Fatalf("proposed email audit = %q/%q, want grounded model proposal preserved", mention.ProposedEmail, mention.ProposedEmailEvidenceKey)
 	}
 }
 
