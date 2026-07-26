@@ -12,6 +12,7 @@ const (
 	migrationSchema  = "stacks_migrations"
 	coreLedger       = "core_version"
 	documentsVersion = 1
+	identityVersion  = 2
 )
 
 //go:embed migrations/*.sql
@@ -23,11 +24,18 @@ func Manifest() (migration.Manifest, error) {
 		migration.Scope("core"),
 		coreLedger,
 		migrationFiles,
-		[]migration.File{{
-			Version: documentsVersion,
-			Name:    "documents_evidence",
-			Path:    "migrations/00001_documents_evidence.sql",
-		}},
+		[]migration.File{
+			{
+				Version: documentsVersion,
+				Name:    "documents_evidence",
+				Path:    "migrations/00001_documents_evidence.sql",
+			},
+			{
+				Version: identityVersion,
+				Name:    "identity_admission",
+				Path:    "migrations/00002_identity_admission.sql",
+			},
+		},
 		[]string{coreSchema},
 		[]migration.OwnedObject{
 			{
@@ -62,6 +70,15 @@ func Manifest() (migration.Manifest, error) {
 			immutableTableGrant("source_revision_observations"),
 			immutableTableGrant("document_sections"),
 			immutableTableGrant("evidence_spans"),
+			immutableTableGrant("entities"),
+			immutableTableGrant("mentions"),
+			immutableTableGrant("resolution_proposals"),
+			immutableTableGrant("resolution_proposal_evidence"),
+			immutableTableGrant("resolution_candidates"),
+			immutableTableGrant("resolution_decisions"),
+			immutableTableGrant("entity_alias_assertions"),
+			immutableTableGrant("admission_targets"),
+			immutableTableGrant("admission_decisions"),
 			{
 				Schema:     migrationSchema,
 				Table:      coreLedger,

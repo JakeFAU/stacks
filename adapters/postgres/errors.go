@@ -9,4 +9,7 @@ var (
 	// ErrConflict identifies an immutable logical identity whose stored payload
 	// differs from the canonical value supplied by the caller.
 	ErrConflict = errors.New("PostgreSQL immutable identity conflict")
+
+	// ErrNotFound identifies a requested canonical value that is absent.
+	ErrNotFound = errors.New("PostgreSQL canonical value not found")
 )
