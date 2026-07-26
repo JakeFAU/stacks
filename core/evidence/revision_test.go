@@ -35,3 +35,40 @@ func TestSourceRevisionDigestSeparatesProviderRevisionFromContentVersion(t *test
 		t.Fatal("source-revision identity included recorded time or digest omitted it")
 	}
 }
+
+func TestSourceRevisionExposesExactCanonicalPersistenceFields(t *testing.T) {
+	documentDigest := evidence.DigestContent([]byte("synthetic immutable document"))
+	recordedAt := time.Date(
+		2026,
+		time.July,
+		21,
+		8,
+		30,
+		0,
+		123456789,
+		time.FixedZone("synthetic", -4*60*60),
+	)
+	got, err := evidence.NewSourceRevisionObservation(evidence.SourceRevisionObservationInput{
+		Provider:              " drive ",
+		ProviderDocumentID:    " document-opaque ",
+		DocumentDigestVersion: " document-digest-v1 ",
+		DocumentDigest:        documentDigest,
+		ProviderVersion:       " provider-version-opaque ",
+		ProviderRevision:      "",
+		FirstRecordedAt:       recordedAt,
+	})
+	if err != nil {
+		t.Fatalf("NewSourceRevisionObservation() error = %v", err)
+	}
+
+	wantRecordedAt := time.Date(2026, time.July, 21, 12, 30, 0, 123456000, time.UTC)
+	if got.Provider() != "drive" ||
+		got.ProviderDocumentID() != "document-opaque" ||
+		got.DocumentDigestVersion() != "document-digest-v1" ||
+		got.DocumentDigest() != documentDigest ||
+		got.ProviderVersion() != "provider-version-opaque" ||
+		got.ProviderRevision() != "" ||
+		got.FirstRecordedAt() != wantRecordedAt {
+		t.Fatalf("source revision accessors did not preserve exact canonical fields")
+	}
+}

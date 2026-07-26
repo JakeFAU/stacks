@@ -79,6 +79,30 @@ func NewSourceRevisionObservation(input SourceRevisionObservationInput) (SourceR
 // FirstRecordedAt returns when Stacks first durably recorded this content version.
 func (value SourceRevisionObservation) FirstRecordedAt() time.Time { return value.firstRecordedAt }
 
+// Provider returns the source provider for this revision observation.
+func (value SourceRevisionObservation) Provider() string { return value.provider }
+
+// ProviderDocumentID returns the provider-scoped source document identifier.
+func (value SourceRevisionObservation) ProviderDocumentID() string {
+	return value.providerDocumentID
+}
+
+// DocumentDigestVersion returns the stable content digest encoding version.
+func (value SourceRevisionObservation) DocumentDigestVersion() string {
+	return value.documentDigestVersion
+}
+
+// DocumentDigest returns the exact stable content digest.
+func (value SourceRevisionObservation) DocumentDigest() ContentDigest {
+	return value.documentDigest
+}
+
+// ProviderVersion returns the required provider content version.
+func (value SourceRevisionObservation) ProviderVersion() string { return value.providerVersion }
+
+// ProviderRevision returns the optional provider revision marker.
+func (value SourceRevisionObservation) ProviderRevision() string { return value.providerRevision }
+
 // ID returns the source-revision identity without recorded-time provenance.
 func (value SourceRevisionObservation) ID() string { return value.id }
 
