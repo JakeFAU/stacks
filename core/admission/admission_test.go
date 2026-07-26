@@ -1,11 +1,32 @@
 package admission_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/JakeFAU/stacks/core/admission"
 )
+
+func TestAdmissionReasonCodeEnforcesUnicodeRuneBoundary(t *testing.T) {
+	input := admission.DecisionInput{
+		ID:         "admission-1",
+		TargetKind: admission.TargetObservation,
+		TargetID:   "observation-1",
+		Outcome:    admission.Quarantined,
+		Authority:  admission.AuthorityPolicy,
+		RecordedAt: time.Date(2026, time.July, 25, 12, 30, 0, 0, time.UTC),
+	}
+	input.ReasonCode = strings.Repeat("界", 128)
+	if _, err := admission.NewDecision(input); err != nil {
+		t.Fatalf("NewDecision(128 runes) error = %v", err)
+	}
+
+	input.ReasonCode = strings.Repeat("界", 129)
+	if _, err := admission.NewDecision(input); err == nil {
+		t.Fatal("NewDecision(129 runes) error = nil, want bounded reason rejected")
+	}
+}
 
 func TestAdmissionAuthorityRequiresBoundedLocalShape(t *testing.T) {
 	recordedAt := time.Date(2026, time.July, 25, 12, 30, 0, 0, time.UTC)

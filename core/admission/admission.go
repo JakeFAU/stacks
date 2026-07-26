@@ -8,6 +8,7 @@ import (
 
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/internal/canonicalhash"
+	"github.com/JakeFAU/stacks/core/internal/reasoncode"
 	"github.com/JakeFAU/stacks/core/timepoint"
 )
 
@@ -90,8 +91,9 @@ func NewDecision(input DecisionInput) (Decision, error) {
 	if !input.Outcome.valid() {
 		return Decision{}, fmt.Errorf("admission outcome is invalid")
 	}
-	if strings.TrimSpace(input.ReasonCode) == "" {
-		return Decision{}, fmt.Errorf("admission reason code is required")
+	reasonCode, err := reasoncode.Validate(input.ReasonCode)
+	if err != nil {
+		return Decision{}, fmt.Errorf("admission decision: %w", err)
 	}
 	if !input.Authority.valid() {
 		return Decision{}, fmt.Errorf("admission authority is invalid")
@@ -108,7 +110,7 @@ func NewDecision(input DecisionInput) (Decision, error) {
 		targetKind:   input.TargetKind,
 		targetID:     targetID,
 		outcome:      input.Outcome,
-		reasonCode:   input.ReasonCode,
+		reasonCode:   reasonCode,
 		authority:    input.Authority,
 		recordedAt:   timepoint.Normalize(input.RecordedAt),
 		supersedesID: supersedesID,

@@ -8,6 +8,7 @@ import (
 
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/internal/canonicalhash"
+	"github.com/JakeFAU/stacks/core/internal/reasoncode"
 	"github.com/JakeFAU/stacks/core/timepoint"
 )
 
@@ -200,8 +201,9 @@ func NewResolutionProposal(input ResolutionProposalInput) (ResolutionProposal, e
 	if err != nil {
 		return ResolutionProposal{}, err
 	}
-	if err := validateReasonCode(input.ReasonCode, "resolution proposal"); err != nil {
-		return ResolutionProposal{}, err
+	reasonCode, err := reasoncode.Validate(input.ReasonCode)
+	if err != nil {
+		return ResolutionProposal{}, fmt.Errorf("resolution proposal: %w", err)
 	}
 	if len(input.EvidenceIDs) == 0 {
 		return ResolutionProposal{}, fmt.Errorf("resolution proposal evidence is required")
@@ -225,7 +227,7 @@ func NewResolutionProposal(input ResolutionProposalInput) (ResolutionProposal, e
 	return ResolutionProposal{
 		id:          id,
 		mentionID:   mentionID,
-		reasonCode:  input.ReasonCode,
+		reasonCode:  reasonCode,
 		evidenceIDs: evidenceIDs,
 		recordedAt:  timepoint.Normalize(input.RecordedAt),
 	}, nil
@@ -299,8 +301,9 @@ func NewResolutionCandidate(input ResolutionCandidateInput) (ResolutionCandidate
 		input.Confidence < 0 || input.Confidence > 1 {
 		return ResolutionCandidate{}, fmt.Errorf("resolution candidate confidence must be finite and within the unit interval")
 	}
-	if err := validateReasonCode(input.ReasonCode, "resolution candidate"); err != nil {
-		return ResolutionCandidate{}, err
+	reasonCode, err := reasoncode.Validate(input.ReasonCode)
+	if err != nil {
+		return ResolutionCandidate{}, fmt.Errorf("resolution candidate: %w", err)
 	}
 	source := CandidateSource{
 		Kind:      strings.TrimSpace(input.Source.Kind),
@@ -318,7 +321,7 @@ func NewResolutionCandidate(input ResolutionCandidateInput) (ResolutionCandidate
 		entityID:   entityID,
 		rank:       input.Rank,
 		confidence: input.Confidence,
-		reasonCode: input.ReasonCode,
+		reasonCode: reasonCode,
 		source:     source,
 		recordedAt: timepoint.Normalize(input.RecordedAt),
 	}, nil
@@ -416,8 +419,9 @@ func NewResolutionDecision(input ResolutionDecisionInput) (ResolutionDecision, e
 	if input.Authority != AuthorityAutomatic && input.Authority != AuthorityReviewer {
 		return ResolutionDecision{}, fmt.Errorf("resolution decision authority is invalid")
 	}
-	if err := validateReasonCode(input.ReasonCode, "resolution decision"); err != nil {
-		return ResolutionDecision{}, err
+	reasonCode, err := reasoncode.Validate(input.ReasonCode)
+	if err != nil {
+		return ResolutionDecision{}, fmt.Errorf("resolution decision: %w", err)
 	}
 	if input.RecordedAt.IsZero() {
 		return ResolutionDecision{}, fmt.Errorf("resolution decision recorded time is required")
@@ -432,7 +436,7 @@ func NewResolutionDecision(input ResolutionDecisionInput) (ResolutionDecision, e
 		outcome:      input.Outcome,
 		entityID:     entityID,
 		authority:    input.Authority,
-		reasonCode:   input.ReasonCode,
+		reasonCode:   reasonCode,
 		recordedAt:   timepoint.Normalize(input.RecordedAt),
 		supersedesID: supersedesID,
 	}
@@ -600,11 +604,4 @@ func requiredEvidenceID(value evidence.EvidenceID, field string) (evidence.Evide
 		return "", fmt.Errorf("%s is required", field)
 	}
 	return result, nil
-}
-
-func validateReasonCode(value, owner string) error {
-	if strings.TrimSpace(value) == "" {
-		return fmt.Errorf("%s reason code is required", owner)
-	}
-	return nil
 }

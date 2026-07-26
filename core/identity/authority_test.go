@@ -2,6 +2,7 @@ package identity_test
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +10,64 @@ import (
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/identity"
 )
+
+func TestIdentityReasonCodesEnforceUnicodeRuneBoundary(t *testing.T) {
+	recordedAt := time.Date(2026, time.July, 25, 12, 30, 0, 0, time.UTC)
+	validReason := strings.Repeat("界", 128)
+	tooLongReason := strings.Repeat("界", 129)
+
+	tests := []struct {
+		name      string
+		construct func(string) error
+	}{
+		{name: "proposal", construct: func(reason string) error {
+			_, err := identity.NewResolutionProposal(identity.ResolutionProposalInput{
+				ID:          "proposal-1",
+				MentionID:   "mention-1",
+				ReasonCode:  reason,
+				EvidenceIDs: []evidence.EvidenceID{"evidence-1"},
+				RecordedAt:  recordedAt,
+			})
+			return err
+		}},
+		{name: "candidate", construct: func(reason string) error {
+			_, err := identity.NewResolutionCandidate(identity.ResolutionCandidateInput{
+				ID:         "candidate-1",
+				ProposalID: "proposal-1",
+				EntityID:   "entity-1",
+				Rank:       1,
+				Confidence: 0.5,
+				ReasonCode: reason,
+				Source:     identity.CandidateSource{Kind: "accepted_alias", Reference: "alias-1"},
+				RecordedAt: recordedAt,
+			})
+			return err
+		}},
+		{name: "decision", construct: func(reason string) error {
+			_, err := identity.NewResolutionDecision(identity.ResolutionDecisionInput{
+				ID:         "decision-1",
+				ProposalID: "proposal-1",
+				Outcome:    identity.DecisionRejected,
+				Authority:  identity.AuthorityReviewer,
+				ReasonCode: reason,
+				RecordedAt: recordedAt,
+			})
+			return err
+		}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name+"/128_runes", func(t *testing.T) {
+			if err := testCase.construct(validReason); err != nil {
+				t.Fatalf("constructor error = %v, want 128-rune reason accepted", err)
+			}
+		})
+		t.Run(testCase.name+"/129_runes", func(t *testing.T) {
+			if err := testCase.construct(tooLongReason); err == nil {
+				t.Fatal("constructor error = nil, want 129-rune reason rejected")
+			}
+		})
+	}
+}
 
 func TestIdentityAuthorityRejectsMalformedLocalShape(t *testing.T) {
 	recordedAt := time.Date(2026, time.July, 25, 12, 30, 0, 0, time.UTC)
