@@ -58,17 +58,18 @@ func rankCandidates(normalizedName string, snapshots []EntitySnapshot) []Candida
 	if normalizedName == "" || strings.Contains(normalizedName, "@") {
 		return nil
 	}
+	mentionTokens := strings.Fields(normalizedName)
 	candidates := make(map[string]Candidate)
 	for _, snapshot := range snapshots {
 		if snapshot.Kind != KindPerson || snapshot.ID == "" {
 			continue
 		}
-		confidence, reason := nameConfidence(normalizedName, NormalizeName(snapshot.DisplayName))
+		confidence, reason := nameConfidence(normalizedName, mentionTokens, NormalizeName(snapshot.DisplayName))
 		for _, alias := range snapshot.Aliases {
 			if alias.Type != AliasTypeName {
 				continue
 			}
-			aliasConfidence, aliasReason := nameConfidence(normalizedName, NormalizeName(alias.Value))
+			aliasConfidence, aliasReason := nameConfidence(normalizedName, mentionTokens, NormalizeName(alias.Value))
 			if aliasConfidence > confidence {
 				confidence, reason = aliasConfidence, "accepted alias "+aliasReason
 			}
@@ -92,14 +93,13 @@ func rankCandidates(normalizedName string, snapshots []EntitySnapshot) []Candida
 	return ranked
 }
 
-func nameConfidence(mention, candidate string) (float64, string) {
+func nameConfidence(mention string, mentionTokens []string, candidate string) (float64, string) {
 	if candidate == "" {
 		return 0, ""
 	}
 	if mention == candidate {
 		return 1, "exact name match"
 	}
-	mentionTokens := strings.Fields(mention)
 	candidateTokens := strings.Fields(candidate)
 	if len(mentionTokens) == 0 || len(candidateTokens) == 0 {
 		return 0, ""
