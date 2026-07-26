@@ -85,6 +85,24 @@ func TestAnalyzeCommandRejectsArguments(t *testing.T) {
 	}
 }
 
+func TestAnalyzeCommandPassesOpaqueEntityIDsUnchanged(t *testing.T) {
+	var output bytes.Buffer
+	service := &fakeAnalyzer{
+		report: analysis.Report{Status: analysis.StatusInsufficientEvidence},
+	}
+	command := AnalyzeCommand{
+		Service: service, EmployeeID: "employee:opaque/7", ManagerID: "manager:opaque/9",
+		Output: &output,
+	}
+
+	if err := command.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if service.employeeID != "employee:opaque/7" || service.managerID != "manager:opaque/9" {
+		t.Fatalf("configured pair = %q/%q, want opaque IDs unchanged", service.employeeID, service.managerID)
+	}
+}
+
 func reportSignal(id string, meeting time.Time, direction analysis.Direction, role analysis.CitationRole) analysis.Signal {
 	return analysis.Signal{
 		ID: id, Category: analysis.CategoryDelegationAutonomy, Direction: direction,

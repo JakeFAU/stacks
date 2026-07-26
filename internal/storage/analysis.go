@@ -70,12 +70,12 @@ type AnalysisRepository struct {
 
 type effectivePairDecision struct {
 	EntityID string
-	Input    analysisdomain.InputReference
+	Input    legacyInputReference
 }
 
 type analysisSnapshot interface {
-	LoadPairIdentity(context.Context, string, string) (analysisdomain.PairSnapshot, error)
-	LoadPairSignals(context.Context, string, string, analysisdomain.PairSnapshot) (analysisdomain.PairSnapshot, error)
+	LoadPairIdentity(context.Context, string, string) (legacyPairSnapshot, error)
+	LoadPairSignals(context.Context, string, string, legacyPairSnapshot) (legacyPairSnapshot, error)
 	Commit(context.Context) error
 	Rollback(context.Context) error
 }
@@ -85,8 +85,8 @@ type postgresAnalysisSnapshot struct {
 }
 
 type completedAnalysisLookup interface {
-	ValidateEffectivePairDecisions(context.Context, analysisdomain.AnalysisIdentity) error
-	FindCompleted(context.Context, analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error)
+	ValidateEffectivePairDecisions(context.Context, legacyAnalysisIdentity) error
+	FindCompleted(context.Context, legacyAnalysisIdentity) (legacyReport, bool, error)
 	Commit(context.Context) error
 	Rollback(context.Context) error
 }
@@ -123,41 +123,52 @@ func NewAnalysisRepository(pool *pgxpool.Pool) *AnalysisRepository {
 // effective accepted decisions. Pending guesses never become eligible, and a
 // correction changes eligibility without rewriting the immutable observation.
 func (repository *AnalysisRepository) LoadPairInputs(ctx context.Context, employeeID, managerID string) (analysisdomain.PairSnapshot, error) {
+	snapshot, err := repository.loadLegacyPairInputs(ctx, employeeID, managerID)
+	if err != nil {
+		return analysisdomain.PairSnapshot{}, err
+	}
+	return analysisdomain.PairSnapshot{
+		Accepted: snapshot.Accepted,
+		Signals:  snapshot.Signals,
+	}, nil
+}
+
+func (repository *AnalysisRepository) loadLegacyPairInputs(ctx context.Context, employeeID, managerID string) (legacyPairSnapshot, error) {
 	if repository == nil || repository.beginSnapshot == nil {
-		return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: repository is not configured")
+		return legacyPairSnapshot{}, fmt.Errorf("load pair analysis inputs: repository is not configured")
 	}
 	employeeID, err := canonicalUUID(employeeID)
 	if err != nil {
-		return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: employee entity ID is invalid")
+		return legacyPairSnapshot{}, fmt.Errorf("load pair analysis inputs: employee entity ID is invalid")
 	}
 	managerID, err = canonicalUUID(managerID)
 	if err != nil || employeeID == managerID {
-		return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: manager entity ID is invalid")
+		return legacyPairSnapshot{}, fmt.Errorf("load pair analysis inputs: manager entity ID is invalid")
 	}
 	transaction, err := repository.beginSnapshot(ctx, pgx.TxOptions{
 		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
 	})
 	if err != nil {
-		return analysisdomain.PairSnapshot{}, boundedAnalysisError("start pair analysis snapshot", err)
+		return legacyPairSnapshot{}, boundedAnalysisError("start pair analysis snapshot", err)
 	}
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 	snapshot, err := transaction.LoadPairIdentity(ctx, employeeID, managerID)
 	if err != nil {
-		return analysisdomain.PairSnapshot{}, boundedAnalysisError("load pair identity snapshot", err)
+		return legacyPairSnapshot{}, boundedAnalysisError("load pair identity snapshot", err)
 	}
 	if snapshot.Accepted {
 		snapshot, err = transaction.LoadPairSignals(ctx, employeeID, managerID, snapshot)
 		if err != nil {
-			return analysisdomain.PairSnapshot{}, boundedAnalysisError("load pair analysis signals", err)
+			return legacyPairSnapshot{}, boundedAnalysisError("load pair analysis signals", err)
 		}
 	}
 	if err := transaction.Commit(ctx); err != nil {
-		return analysisdomain.PairSnapshot{}, boundedAnalysisError("commit pair analysis snapshot", err)
+		return legacyPairSnapshot{}, boundedAnalysisError("commit pair analysis snapshot", err)
 	}
 	return snapshot, nil
 }
 
-func (snapshot *postgresAnalysisSnapshot) LoadPairIdentity(ctx context.Context, employeeID, managerID string) (analysisdomain.PairSnapshot, error) {
+func (snapshot *postgresAnalysisSnapshot) LoadPairIdentity(ctx context.Context, employeeID, managerID string) (legacyPairSnapshot, error) {
 	decisionRows, err := snapshot.transaction.Query(ctx, `
 		SELECT decision.entity_id::text, decision.id::text, decision.digest
 		FROM stacks.resolution_decisions AS decision
@@ -180,7 +191,7 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairIdentity(ctx context.Context, 
 		ORDER BY CASE WHEN decision.entity_id = $1::uuid THEN 0 ELSE 1 END,
 		         decision.id`, employeeID, []string{employeeID, managerID})
 	if err != nil {
-		return analysisdomain.PairSnapshot{}, fmt.Errorf("query configured pair identity decisions: %w", err)
+		return legacyPairSnapshot{}, fmt.Errorf("query configured pair identity decisions: %w", err)
 	}
 	var decisions []effectivePairDecision
 	for decisionRows.Next() {
@@ -188,28 +199,28 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairIdentity(ctx context.Context, 
 		var decisionDigest []byte
 		if err := decisionRows.Scan(&entityID, &decisionID, &decisionDigest); err != nil {
 			decisionRows.Close()
-			return analysisdomain.PairSnapshot{}, fmt.Errorf("scan configured pair identity decision: %w", err)
+			return legacyPairSnapshot{}, fmt.Errorf("scan configured pair identity decision: %w", err)
 		}
 		decisions = append(decisions, effectivePairDecision{
 			EntityID: entityID,
-			Input: analysisdomain.InputReference{
-				Kind: analysisdomain.InputResolutionDecision, ID: decisionID, Digest: digestArray(decisionDigest),
+			Input: legacyInputReference{
+				Kind: legacyInputResolutionDecision, ID: decisionID, Digest: digestArray(decisionDigest),
 			},
 		})
 	}
 	if err := decisionRows.Err(); err != nil {
 		decisionRows.Close()
-		return analysisdomain.PairSnapshot{}, fmt.Errorf("iterate configured pair identity decisions: %w", err)
+		return legacyPairSnapshot{}, fmt.Errorf("iterate configured pair identity decisions: %w", err)
 	}
 	decisionRows.Close()
 	pair, err := pairIdentitySnapshot(employeeID, managerID, decisions)
 	if err != nil {
-		return analysisdomain.PairSnapshot{}, err
+		return legacyPairSnapshot{}, err
 	}
 	return pair, nil
 }
 
-func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, employeeID, managerID string, pair analysisdomain.PairSnapshot) (analysisdomain.PairSnapshot, error) {
+func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, employeeID, managerID string, pair legacyPairSnapshot) (legacyPairSnapshot, error) {
 	rows, err := snapshot.transaction.Query(ctx, `
 		WITH effective_decisions AS (
 			SELECT proposal.mention_id, decision.id, decision.entity_id, decision.digest
@@ -328,7 +339,7 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 		         signal_evidence.role,
 		         evidence.id`, employeeID, managerID)
 	if err != nil {
-		return analysisdomain.PairSnapshot{}, fmt.Errorf("query pair analysis signals: %w", err)
+		return legacyPairSnapshot{}, fmt.Errorf("query pair analysis signals: %w", err)
 	}
 	defer rows.Close()
 
@@ -362,22 +373,22 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 			&provider, &providerDocumentID, &providerTabID, &tabRole, &evidenceID,
 			&startOffset, &endOffset, &quote, &evidenceRole,
 		); err != nil {
-			return analysisdomain.PairSnapshot{}, fmt.Errorf("scan pair analysis signal: %w", err)
+			return legacyPairSnapshot{}, fmt.Errorf("scan pair analysis signal: %w", err)
 		}
 		if current == nil || current.ID != signalID {
 			meetingInput, err := meetingInputReference(meetingID)
 			if err != nil {
-				return analysisdomain.PairSnapshot{}, err
+				return legacyPairSnapshot{}, err
 			}
 			signalInputRefs, err := analysisInputReferences(
-				analysisdomain.InputReference{Kind: analysisdomain.InputResolutionDecision, ID: subjectDecisionID, Digest: digestArray(subjectDecisionDigest)},
-				analysisdomain.InputReference{Kind: analysisdomain.InputResolutionDecision, ID: objectDecisionID, Digest: digestArray(objectDecisionDigest)},
+				legacyInputReference{Kind: legacyInputResolutionDecision, ID: subjectDecisionID, Digest: digestArray(subjectDecisionDigest)},
+				legacyInputReference{Kind: legacyInputResolutionDecision, ID: objectDecisionID, Digest: digestArray(objectDecisionDigest)},
 				meetingInput,
-				analysisdomain.InputReference{Kind: analysisdomain.InputObservation, ID: observationID, Digest: digestArray(observationDigest)},
-				analysisdomain.InputReference{Kind: analysisdomain.InputSignal, ID: signalID, Digest: digestArray(signalDigest)},
+				legacyInputReference{Kind: legacyInputObservation, ID: observationID, Digest: digestArray(observationDigest)},
+				legacyInputReference{Kind: legacyInputSignal, ID: signalID, Digest: digestArray(signalDigest)},
 			)
 			if err != nil {
-				return analysisdomain.PairSnapshot{}, err
+				return legacyPairSnapshot{}, err
 			}
 			pair.Signals = append(pair.Signals, analysisdomain.Signal{
 				ID: signalID, MeetingID: meetingInput.ID, ObservationID: observationID,
@@ -385,27 +396,26 @@ func (snapshot *postgresAnalysisSnapshot) LoadPairSignals(ctx context.Context, e
 				ValidTime: validTime, RecordedAt: recordedAt.UTC(),
 				Rationale:  analysisdomain.ExplainSignal(analysisdomain.Category(category), analysisdomain.Direction(direction)),
 				Confidence: confidence, Validated: true, TranscriptBacked: true,
-				Inputs: signalInputRefs,
 			})
 			current = &pair.Signals[len(pair.Signals)-1]
 			for _, input := range signalInputRefs {
 				appendAnalysisInput(&pair.Inputs, inputSeen, input)
 			}
 		}
-		documentInput := analysisdomain.InputReference{Kind: analysisdomain.InputDocumentVersion, ID: documentVersionID, Digest: digestArray(documentDigest)}
-		tabInput := analysisdomain.InputReference{Kind: analysisdomain.InputDocumentTab, ID: documentTabID, Digest: digestArray(tabDigest)}
-		current.Inputs = appendUniqueInput(current.Inputs, documentInput, tabInput)
+		documentInput := legacyInputReference{Kind: legacyInputDocumentVersion, ID: documentVersionID, Digest: digestArray(documentDigest)}
+		tabInput := legacyInputReference{Kind: legacyInputDocumentTab, ID: documentTabID, Digest: digestArray(tabDigest)}
 		appendAnalysisInput(&pair.Inputs, inputSeen, documentInput)
 		appendAnalysisInput(&pair.Inputs, inputSeen, tabInput)
 		current.Citations = append(current.Citations, analysisdomain.Citation{
 			ID: evidenceID, ProviderDocumentID: providerDocumentID, ProviderTabID: providerTabID,
 			StartOffset: startOffset, EndOffset: endOffset, Quote: quote,
 			Role: analysisdomain.CitationRole(evidenceRole), Transcript: tabRole == "transcript",
-			Locator: driveTabLocator(provider, providerDocumentID, providerTabID),
+			SectionRole: tabRole,
+			Locator:     driveTabLocator(provider, providerDocumentID, providerTabID),
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return analysisdomain.PairSnapshot{}, fmt.Errorf("iterate pair analysis signals: %w", err)
+		return legacyPairSnapshot{}, fmt.Errorf("iterate pair analysis signals: %w", err)
 	}
 	return pair, nil
 }
@@ -418,11 +428,11 @@ func (snapshot *postgresAnalysisSnapshot) Rollback(ctx context.Context) error {
 	return snapshot.transaction.Rollback(ctx)
 }
 
-func (lookup *postgresCompletedAnalysisLookup) ValidateEffectivePairDecisions(ctx context.Context, identity analysisdomain.AnalysisIdentity) error {
+func (lookup *postgresCompletedAnalysisLookup) ValidateEffectivePairDecisions(ctx context.Context, identity legacyAnalysisIdentity) error {
 	return validateEffectivePairDecisions(ctx, lookup.transaction, identity)
 }
 
-func (lookup *postgresCompletedAnalysisLookup) FindCompleted(ctx context.Context, identity analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error) {
+func (lookup *postgresCompletedAnalysisLookup) FindCompleted(ctx context.Context, identity legacyAnalysisIdentity) (legacyReport, bool, error) {
 	return findCompletedAnalysis(ctx, lookup.transaction, identity)
 }
 
@@ -446,23 +456,23 @@ func boundedAnalysisError(operation string, cause error) error {
 	return boundedAnalysisOperationError{operation: operation, cause: cause}
 }
 
-func pairIdentitySnapshot(employeeID, managerID string, decisions []effectivePairDecision) (analysisdomain.PairSnapshot, error) {
-	snapshot := analysisdomain.PairSnapshot{}
+func pairIdentitySnapshot(employeeID, managerID string, decisions []effectivePairDecision) (legacyPairSnapshot, error) {
+	snapshot := legacyPairSnapshot{}
 	seenInputs := make(map[string]struct{}, len(decisions))
 	var employeeAccepted, managerAccepted bool
 	for index, decision := range decisions {
 		if decision.EntityID != employeeID && decision.EntityID != managerID {
-			return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: identity decision %d belongs to an unexpected entity", index)
+			return legacyPairSnapshot{}, fmt.Errorf("load pair analysis inputs: identity decision %d belongs to an unexpected entity", index)
 		}
-		if decision.Input.Kind != analysisdomain.InputResolutionDecision || decision.Input.Digest == ([sha256.Size]byte{}) {
-			return analysisdomain.PairSnapshot{}, fmt.Errorf("load pair analysis inputs: identity decision %d is invalid", index)
+		if decision.Input.Kind != legacyInputResolutionDecision || decision.Input.Digest == ([sha256.Size]byte{}) {
+			return legacyPairSnapshot{}, fmt.Errorf("load pair analysis inputs: identity decision %d is invalid", index)
 		}
 		employeeAccepted = employeeAccepted || decision.EntityID == employeeID
 		managerAccepted = managerAccepted || decision.EntityID == managerID
 		appendAnalysisInput(&snapshot.Inputs, seenInputs, decision.Input)
 	}
 	if !employeeAccepted || !managerAccepted {
-		return analysisdomain.PairSnapshot{Accepted: false}, nil
+		return legacyPairSnapshot{Accepted: false}, nil
 	}
 	snapshot.Accepted = true
 	return snapshot, nil
@@ -471,69 +481,69 @@ func pairIdentitySnapshot(employeeID, managerID string, decisions []effectivePai
 // FindCompleted loads a completed report only while its accepted pair decisions
 // remain current. Historical rows remain durable but are not returned for a
 // stale snapshot identity.
-func (repository *AnalysisRepository) FindCompleted(ctx context.Context, identity analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error) {
+func (repository *AnalysisRepository) FindCompleted(ctx context.Context, identity legacyAnalysisIdentity) (legacyReport, bool, error) {
 	if repository == nil || repository.beginCompletedLookup == nil {
-		return analysisdomain.Report{}, false, fmt.Errorf("find completed analysis: repository is not configured")
+		return legacyReport{}, false, fmt.Errorf("find completed analysis: repository is not configured")
 	}
-	wantDigest, err := analysisdomain.ComputeInputDigest(identity)
+	wantDigest, err := computeLegacyInputDigest(identity)
 	if err != nil || wantDigest != identity.InputDigest {
-		return analysisdomain.Report{}, false, fmt.Errorf("find completed analysis: input digest is invalid")
+		return legacyReport{}, false, fmt.Errorf("find completed analysis: input digest is invalid")
 	}
 	transaction, err := repository.beginCompletedLookup(ctx)
 	if err != nil {
-		return analysisdomain.Report{}, false, boundedAnalysisError("start completed analysis lookup", err)
+		return legacyReport{}, false, boundedAnalysisError("start completed analysis lookup", err)
 	}
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 	if err := transaction.ValidateEffectivePairDecisions(ctx, identity); err != nil {
-		return analysisdomain.Report{}, false, err
+		return legacyReport{}, false, err
 	}
 	report, found, err := transaction.FindCompleted(ctx, identity)
 	if err != nil {
-		return analysisdomain.Report{}, false, boundedAnalysisError("load completed analysis", err)
+		return legacyReport{}, false, boundedAnalysisError("load completed analysis", err)
 	}
 	if err := transaction.Commit(ctx); err != nil {
-		return analysisdomain.Report{}, false, boundedAnalysisError("commit completed analysis lookup", err)
+		return legacyReport{}, false, boundedAnalysisError("commit completed analysis lookup", err)
 	}
 	return report, found, nil
 }
 
 // CompleteAnalysis persists one bounded report and its ordered provenance.
 // Prompts and raw model output are deliberately not accepted by this method.
-func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, completion analysisdomain.Completion) (analysisdomain.Report, error) {
+func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, completion legacyCompletion) (legacyReport, error) {
 	if repository == nil || repository.pool == nil {
-		return analysisdomain.Report{}, fmt.Errorf("complete pair analysis: repository is not configured")
+		return legacyReport{}, fmt.Errorf("complete pair analysis: repository is not configured")
 	}
-	wantDigest, err := analysisdomain.ComputeInputDigest(completion.Identity)
+	wantDigest, err := computeLegacyInputDigest(completion.Identity)
 	if err != nil || wantDigest != completion.Identity.InputDigest {
-		return analysisdomain.Report{}, fmt.Errorf("complete pair analysis: input digest is invalid")
+		return legacyReport{}, fmt.Errorf("complete pair analysis: input digest is invalid")
 	}
 	if err := validateCompletedReport(completion.Report, completion.Identity); err != nil {
-		return analysisdomain.Report{}, err
+		return legacyReport{}, err
 	}
 	provenance, err := analysisCompletionProvenance(completion)
 	if err != nil {
-		return analysisdomain.Report{}, err
+		return legacyReport{}, err
 	}
 	completion.Report.InputDigest = wantDigest
 	completion.Report.ID = uuid.NewSHA1(uuid.NameSpaceOID, wantDigest[:]).String()
 	reportJSON, err := json.Marshal(completion.Report)
 	if err != nil {
-		return analysisdomain.Report{}, fmt.Errorf("complete pair analysis: encode report")
+		return legacyReport{}, fmt.Errorf("complete pair analysis: encode report")
 	}
 	transaction, err := repository.pool.Begin(ctx)
 	if err != nil {
-		return analysisdomain.Report{}, fmt.Errorf("start pair analysis transaction: %w", err)
+		return legacyReport{}, fmt.Errorf("start pair analysis transaction: %w", err)
 	}
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 	if err := validateEffectivePairDecisions(ctx, transaction, completion.Identity); err != nil {
-		return analysisdomain.Report{}, err
+		return legacyReport{}, err
 	}
 	for position, input := range completion.Identity.Inputs {
-		if input.Kind == analysisdomain.InputResolutionDecision {
+		if input.Kind == legacyInputResolutionDecision {
 			continue
 		}
 		if err := validatePersistedDomainAnalysisInput(ctx, transaction, input); err != nil {
-			return analysisdomain.Report{}, fmt.Errorf("validate analysis input %d: %w", position, err)
+			return legacyReport{}, fmt.Errorf("validate analysis input %d: %w", position, err)
 		}
 	}
 	result, err := transaction.Exec(ctx, `
@@ -549,18 +559,18 @@ func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, comp
 		completion.Report.RecordedAt, completion.Report.Rationale, string(completion.Report.Status),
 		provenance.provider, provenance.dataMode, provenance.region, provenance.modelID, provenance.maxTokens, reportJSON)
 	if err != nil {
-		return analysisdomain.Report{}, fmt.Errorf("persist pair analysis: %w", err)
+		return legacyReport{}, fmt.Errorf("persist pair analysis: %w", err)
 	}
 	if result.RowsAffected() == 0 {
 		report, found, err := findCompletedAnalysis(ctx, transaction, completion.Identity)
 		if err != nil {
-			return analysisdomain.Report{}, err
+			return legacyReport{}, err
 		}
 		if !found {
-			return analysisdomain.Report{}, fmt.Errorf("load repeated pair analysis: completed row is missing")
+			return legacyReport{}, fmt.Errorf("load repeated pair analysis: completed row is missing")
 		}
 		if err := transaction.Commit(ctx); err != nil {
-			return analysisdomain.Report{}, fmt.Errorf("commit repeated pair analysis: %w", err)
+			return legacyReport{}, fmt.Errorf("commit repeated pair analysis: %w", err)
 		}
 		return report, nil
 	}
@@ -568,11 +578,11 @@ func (repository *AnalysisRepository) CompleteAnalysis(ctx context.Context, comp
 		if _, err := transaction.Exec(ctx, `
 			INSERT INTO stacks.analysis_inputs (analysis_run_id, input_kind, input_id, input_digest, position)
 			VALUES ($1, $2, $3::uuid, $4, $5)`, completion.Report.ID, string(input.Kind), input.ID, input.Digest[:], position); err != nil {
-			return analysisdomain.Report{}, fmt.Errorf("persist pair analysis input %d: %w", position, err)
+			return legacyReport{}, fmt.Errorf("persist pair analysis input %d: %w", position, err)
 		}
 	}
 	if err := transaction.Commit(ctx); err != nil {
-		return analysisdomain.Report{}, fmt.Errorf("commit pair analysis: %w", err)
+		return legacyReport{}, fmt.Errorf("commit pair analysis: %w", err)
 	}
 	return completion.Report, nil
 }
@@ -796,24 +806,24 @@ func validAnalysisInputKind(kind AnalysisInputKind) bool {
 	}
 }
 
-func meetingInputReference(sourceDocumentID string) (analysisdomain.InputReference, error) {
+func meetingInputReference(sourceDocumentID string) (legacyInputReference, error) {
 	canonicalID, err := canonicalUUID(sourceDocumentID)
 	if err != nil {
-		return analysisdomain.InputReference{}, fmt.Errorf("load pair analysis inputs: source document ID is invalid")
+		return legacyInputReference{}, fmt.Errorf("load pair analysis inputs: source document ID is invalid")
 	}
 	hasher := sha256.New()
 	writeAnalysisDigestString(hasher, meetingDigestScope)
 	writeAnalysisDigestString(hasher, canonicalID)
 	var digest [sha256.Size]byte
 	copy(digest[:], hasher.Sum(nil))
-	return analysisdomain.InputReference{Kind: analysisdomain.InputSourceDocument, ID: canonicalID, Digest: digest}, nil
+	return legacyInputReference{Kind: legacyInputSourceDocument, ID: canonicalID, Digest: digest}, nil
 }
 
 type completedAnalysisQueryer interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalysisQueryer, identity analysisdomain.AnalysisIdentity) error {
+func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalysisQueryer, identity legacyAnalysisIdentity) error {
 	employeeID, err := canonicalUUID(identity.EmployeeEntityID)
 	if err != nil {
 		return fmt.Errorf("validate current resolution decisions: configured pair is invalid")
@@ -824,7 +834,7 @@ func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalys
 	}
 	var employeeAccepted, managerAccepted bool
 	for _, input := range identity.Inputs {
-		if input.Kind != analysisdomain.InputResolutionDecision {
+		if input.Kind != legacyInputResolutionDecision {
 			continue
 		}
 		var storedDigest []byte
@@ -848,24 +858,24 @@ func validateEffectivePairDecisions(ctx context.Context, queryer completedAnalys
 			  ))
 			FOR SHARE OF decision`, input.ID).Scan(&storedDigest, &entityID)
 		if err == pgx.ErrNoRows {
-			return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)
+			return fmt.Errorf("validate current resolution decisions: %w", errLegacyStaleAnalysisInput)
 		}
 		if err != nil {
 			return boundedAnalysisError("validate current resolution decisions", err)
 		}
 		if string(storedDigest) != string(input.Digest[:]) || (entityID != employeeID && entityID != managerID) {
-			return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)
+			return fmt.Errorf("validate current resolution decisions: %w", errLegacyStaleAnalysisInput)
 		}
 		employeeAccepted = employeeAccepted || entityID == employeeID
 		managerAccepted = managerAccepted || entityID == managerID
 	}
 	if !employeeAccepted || !managerAccepted {
-		return fmt.Errorf("validate current resolution decisions: %w", analysisdomain.ErrStaleAnalysisInput)
+		return fmt.Errorf("validate current resolution decisions: %w", errLegacyStaleAnalysisInput)
 	}
 	return nil
 }
 
-func findCompletedAnalysis(ctx context.Context, queryer completedAnalysisQueryer, identity analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error) {
+func findCompletedAnalysis(ctx context.Context, queryer completedAnalysisQueryer, identity legacyAnalysisIdentity) (legacyReport, bool, error) {
 	var reportID string
 	var reportJSON []byte
 	var provider, dataMode, region, modelID *string
@@ -878,30 +888,30 @@ func findCompletedAnalysis(ctx context.Context, queryer completedAnalysisQueryer
 		&reportID, &reportJSON, &provider, &dataMode, &region, &modelID, &maxTokens,
 	)
 	if err == pgx.ErrNoRows {
-		return analysisdomain.Report{}, false, nil
+		return legacyReport{}, false, nil
 	}
 	if err != nil {
-		return analysisdomain.Report{}, false, fmt.Errorf("load completed pair analysis: %w", err)
+		return legacyReport{}, false, fmt.Errorf("load completed pair analysis: %w", err)
 	}
-	var report analysisdomain.Report
+	var report legacyReport
 	if err := json.Unmarshal(reportJSON, &report); err != nil {
-		return analysisdomain.Report{}, false, fmt.Errorf("load completed pair analysis: stored report is invalid")
+		return legacyReport{}, false, fmt.Errorf("load completed pair analysis: stored report is invalid")
 	}
 	if report.ID != reportID || report.InputDigest != identity.InputDigest {
-		return analysisdomain.Report{}, false, fmt.Errorf("load completed pair analysis: stored report identity conflicts")
+		return legacyReport{}, false, fmt.Errorf("load completed pair analysis: stored report identity conflicts")
 	}
 	if !storedAnalysisProvenanceMatches(identity, analysisModelProvenance{
 		provider: provider, dataMode: dataMode, region: region, modelID: modelID, maxTokens: maxTokens,
 	}) {
-		return analysisdomain.Report{}, false, fmt.Errorf("load completed pair analysis: stored model provenance conflicts")
+		return legacyReport{}, false, fmt.Errorf("load completed pair analysis: stored model provenance conflicts")
 	}
 	if err := validateCompletedReport(report, identity); err != nil {
-		return analysisdomain.Report{}, false, fmt.Errorf("load completed pair analysis: stored report metadata is invalid")
+		return legacyReport{}, false, fmt.Errorf("load completed pair analysis: stored report metadata is invalid")
 	}
 	return report, true, nil
 }
 
-func validateCompletedReport(report analysisdomain.Report, identity analysisdomain.AnalysisIdentity) error {
+func validateCompletedReport(report legacyReport, identity legacyAnalysisIdentity) error {
 	if report.RecordedAt.IsZero() || strings.TrimSpace(report.ModelID) == "" || strings.TrimSpace(report.ModelID) != report.ModelID ||
 		report.MaxTokens <= 0 || strings.TrimSpace(report.PromptVersion) == "" || strings.TrimSpace(report.PolicyVersion) == "" {
 		return fmt.Errorf("complete pair analysis: report metadata is invalid")
@@ -927,7 +937,7 @@ type analysisModelProvenance struct {
 	maxTokens *int
 }
 
-func analysisCompletionProvenance(completion analysisdomain.Completion) (analysisModelProvenance, error) {
+func analysisCompletionProvenance(completion legacyCompletion) (analysisModelProvenance, error) {
 	if completion.DataMode == "" {
 		return analysisModelProvenance{}, nil
 	}
@@ -949,7 +959,7 @@ func analysisCompletionProvenance(completion analysisdomain.Completion) (analysi
 	}, nil
 }
 
-func storedAnalysisProvenanceMatches(identity analysisdomain.AnalysisIdentity, stored analysisModelProvenance) bool {
+func storedAnalysisProvenanceMatches(identity legacyAnalysisIdentity, stored analysisModelProvenance) bool {
 	if stored.provider == nil && stored.dataMode == nil && stored.region == nil && stored.modelID == nil && stored.maxTokens == nil {
 		return true
 	}
@@ -966,7 +976,7 @@ func storedAnalysisProvenanceMatches(identity analysisdomain.AnalysisIdentity, s
 		*stored.modelID == identity.ModelID && *stored.maxTokens == identity.MaxTokens
 }
 
-func validatePersistedDomainAnalysisInput(ctx context.Context, transaction pgx.Tx, input analysisdomain.InputReference) error {
+func validatePersistedDomainAnalysisInput(ctx context.Context, transaction pgx.Tx, input legacyInputReference) error {
 	return validatePersistedAnalysisInput(ctx, transaction, AnalysisInputReference{
 		Kind: AnalysisInputKind(input.Kind), ID: input.ID, Digest: input.Digest[:],
 	})
@@ -978,38 +988,22 @@ func digestArray(value []byte) [sha256.Size]byte {
 	return digest
 }
 
-func analysisInputReferences(inputs ...analysisdomain.InputReference) ([]analysisdomain.InputReference, error) {
+func analysisInputReferences(inputs ...legacyInputReference) ([]legacyInputReference, error) {
 	for _, input := range inputs {
 		if input.Digest == ([sha256.Size]byte{}) {
 			return nil, fmt.Errorf("load pair analysis inputs: persisted digest is invalid")
 		}
 	}
-	return append([]analysisdomain.InputReference(nil), inputs...), nil
+	return append([]legacyInputReference(nil), inputs...), nil
 }
 
-func appendAnalysisInput(inputs *[]analysisdomain.InputReference, seen map[string]struct{}, input analysisdomain.InputReference) {
+func appendAnalysisInput(inputs *[]legacyInputReference, seen map[string]struct{}, input legacyInputReference) {
 	key := string(input.Kind) + "\x00" + input.ID
 	if _, exists := seen[key]; exists {
 		return
 	}
 	seen[key] = struct{}{}
 	*inputs = append(*inputs, input)
-}
-
-func appendUniqueInput(inputs []analysisdomain.InputReference, candidates ...analysisdomain.InputReference) []analysisdomain.InputReference {
-	seen := make(map[string]struct{}, len(inputs)+len(candidates))
-	for _, input := range inputs {
-		seen[string(input.Kind)+"\x00"+input.ID] = struct{}{}
-	}
-	for _, candidate := range candidates {
-		key := string(candidate.Kind) + "\x00" + candidate.ID
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		inputs = append(inputs, candidate)
-	}
-	return inputs
 }
 
 func driveTabLocator(provider, documentID, tabID string) string {

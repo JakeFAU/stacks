@@ -3,18 +3,13 @@ package analysis
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -26,12 +21,10 @@ import (
 
 const (
 	// AnalysisPolicyVersion changes whenever deterministic admission semantics
-	// change, ensuring old completed runs remain distinguishable.
+	// change, keeping generated report policy explicit.
 	AnalysisPolicyVersion = "manager-confidence-policy-v6"
 	analysisSpanName      = "stacks.analysis.pair"
 	analysisDecisionName  = "pair_analysis"
-	temporalDigestScope   = "stacks.temporal-pair-analysis.v1"
-	providerDigestScope   = "stacks.pair-analysis-input.v2.provider"
 )
 
 var (
@@ -40,61 +33,16 @@ var (
 	// ErrInvalidModelOutput is deliberately bounded because raw model output can
 	// contain private source-derived material.
 	ErrInvalidModelOutput = errors.New("analysis model output is invalid")
-	// ErrStaleAnalysisInput indicates that an accepted identity decision changed
-	// after analysis inputs were loaded. Callers may safely retry from a fresh
-	// pair snapshot.
-	ErrStaleAnalysisInput = errors.New("analysis inputs are stale; retry with a fresh snapshot")
 )
-
-// InputKind is a durable provenance class included in completed-run identity.
-type InputKind string
-
-const (
-	InputDocumentVersion    InputKind = "document_version"
-	InputSourceDocument     InputKind = "source_document"
-	InputDocumentTab        InputKind = "document_tab"
-	InputObservation        InputKind = "observation"
-	InputSignal             InputKind = "signal"
-	InputResolutionDecision InputKind = "resolution_decision"
-)
-
-// InputReference identifies one immutable analysis input and its exact digest.
-type InputReference struct {
-	Kind   InputKind
-	ID     string
-	Digest [sha256.Size]byte
-}
 
 // PairSnapshot is the repository projection for one configured pair.
 type PairSnapshot struct {
 	Accepted bool
-	Inputs   []InputReference
 	Signals  []Signal
-}
-
-// AnalysisIdentity is the stable identity of one completed analysis.
-type AnalysisIdentity struct {
-	EmployeeEntityID string
-	ManagerEntityID  string
-	PromptVersion    string
-	PolicyVersion    string
-	Provider         modelpolicy.Provider
-	Region           string
-	ModelID          string
-	MaxTokens        int
-	Inputs           []InputReference
-	InputDigest      [sha256.Size]byte
-}
-
-// InputDigestString returns the compact stable completed-run identity.
-func (identity AnalysisIdentity) InputDigestString() string {
-	return hex.EncodeToString(identity.InputDigest[:])
 }
 
 // Report is a cited, bounded synthesis of observable interaction signals.
 type Report struct {
-	ID              string
-	InputDigest     [sha256.Size]byte
 	Status          ReportStatus
 	Rationale       string
 	Limitations     []string
@@ -110,20 +58,9 @@ type Report struct {
 	PolicyVersion   string
 }
 
-// Completion is the complete durable analysis payload. Raw prompts and model
-// output are intentionally absent.
-type Completion struct {
-	Identity AnalysisIdentity
-	Report   Report
-	DataMode modelpolicy.DataMode
-}
-
-// Repository retrieves eligible pair inputs, validates cache identities, and
-// atomically deduplicates completed runs by InputDigest.
+// Repository loads one current canonical snapshot on demand.
 type Repository interface {
 	LoadPairInputs(context.Context, string, string) (PairSnapshot, error)
-	FindCompleted(context.Context, AnalysisIdentity) (Report, bool, error)
-	CompleteAnalysis(context.Context, Completion) (Report, error)
 }
 
 // DecisionRecorder records one bounded decision on the owning analysis span.
@@ -146,8 +83,8 @@ type Service struct {
 	Now           func() time.Time
 }
 
-// Analyze returns a cached report for identical inputs or completes one new
-// analysis while retaining exact immutable input provenance.
+// Analyze loads current canonical authority and evidence once, then returns one
+// bounded on-demand report without persisting a manager-specific cache.
 func (service *Service) Analyze(ctx context.Context, employeeID, managerID string) (report Report, resultErr error) {
 	if err := service.validate(employeeID, managerID); err != nil {
 		return Report{}, err
@@ -176,27 +113,6 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 	}
 	eligible := eligibleSignals(snapshot.Signals)
 	chronology := OrderSignals(eligible)
-	identity := AnalysisIdentity{
-		EmployeeEntityID: strings.TrimSpace(employeeID),
-		ManagerEntityID:  strings.TrimSpace(managerID),
-		PromptVersion:    service.PromptVersion,
-		PolicyVersion:    AnalysisPolicyVersion,
-		Provider:         service.Provider,
-		Region:           service.Region,
-		ModelID:          service.ModelID,
-		MaxTokens:        service.MaxTokens,
-		Inputs:           append([]InputReference(nil), snapshot.Inputs...),
-	}
-	identity.InputDigest, err = ComputeInputDigest(identity)
-	if err != nil {
-		return Report{}, err
-	}
-	if cached, found, err := service.Repository.FindCompleted(ctx, identity); err != nil {
-		return Report{}, fmt.Errorf("load completed analysis: %w", err)
-	} else if found {
-		service.recordDecision(ctx, cached.Status, len(cached.Chronology), len(cached.Counterevidence), service.now().Sub(started))
-		return cached, nil
-	}
 
 	report = service.baseReport(chronology)
 	if distinctMeetingCount(chronology.Dated) < 2 {
@@ -204,7 +120,7 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 		report.Rationale = "At least two distinct dated meetings are required before a directional comparison can be synthesized."
 		report.Gaps = append(report.Gaps, "Fewer than two distinct meetings have known source-valid dates.")
 		service.recordDecision(ctx, report.Status, len(chronology.Dated), 0, service.now().Sub(started))
-		return service.complete(ctx, identity, report, service.now(), "")
+		return report, nil
 	}
 
 	proposal, response, err := service.synthesize(ctx, chronology.Dated)
@@ -224,7 +140,7 @@ func (service *Service) Analyze(ctx context.Context, employeeID, managerID strin
 	report.ModelID = response.ModelID
 	report.RecordedAt = service.now()
 	service.recordDecision(ctx, report.Status, len(chronology.Dated), len(proposal.SupportingSignalIDs), service.now().Sub(started))
-	return service.complete(ctx, identity, report, report.RecordedAt, service.DataMode)
+	return report, nil
 }
 
 func (service *Service) baseReport(chronology Chronology) Report {
@@ -456,107 +372,6 @@ func validDirection(direction Direction) bool {
 	default:
 		return false
 	}
-}
-
-// ComputeInputDigest derives a stable identity from the canonical pair,
-// ordered immutable inputs, and active prompt/policy versions.
-func ComputeInputDigest(identity AnalysisIdentity) ([sha256.Size]byte, error) {
-	if strings.TrimSpace(identity.EmployeeEntityID) == "" || strings.TrimSpace(identity.ManagerEntityID) == "" ||
-		strings.TrimSpace(identity.PromptVersion) == "" || strings.TrimSpace(identity.PolicyVersion) == "" ||
-		strings.TrimSpace(identity.ModelID) == "" || identity.MaxTokens <= 0 {
-		return [sha256.Size]byte{}, fmt.Errorf("analysis identity fields are required")
-	}
-	if err := (modelpolicy.Invocation{
-		Provider: identity.Provider,
-		DataMode: modelpolicy.DataModePersonal,
-		Region:   identity.Region,
-	}).Validate(); err != nil {
-		return [sha256.Size]byte{}, fmt.Errorf("analysis identity provider policy is invalid")
-	}
-	employeeID, err := uuid.Parse(strings.TrimSpace(identity.EmployeeEntityID))
-	if err != nil {
-		return [sha256.Size]byte{}, fmt.Errorf("analysis employee entity ID is invalid")
-	}
-	managerID, err := uuid.Parse(strings.TrimSpace(identity.ManagerEntityID))
-	if err != nil || employeeID == managerID {
-		return [sha256.Size]byte{}, fmt.Errorf("analysis manager entity ID is invalid")
-	}
-	hasher := sha256.New()
-	digestScope := providerDigestScope
-	if identity.Provider == modelpolicy.ProviderBedrock {
-		digestScope = temporalDigestScope
-	}
-	writeDigestString(hasher, digestScope)
-	writeDigestString(hasher, employeeID.String())
-	writeDigestString(hasher, managerID.String())
-	writeDigestString(hasher, strings.TrimSpace(identity.PromptVersion))
-	writeDigestString(hasher, strings.TrimSpace(identity.PolicyVersion))
-	writeDigestString(hasher, strings.TrimSpace(identity.Region))
-	if identity.Provider != modelpolicy.ProviderBedrock {
-		writeDigestString(hasher, string(identity.Provider))
-	}
-	writeDigestString(hasher, strings.TrimSpace(identity.ModelID))
-	writeDigestLength(hasher, uint64(identity.MaxTokens))
-	writeDigestLength(hasher, uint64(len(identity.Inputs)))
-	seenInputs := make(map[string]struct{}, len(identity.Inputs))
-	for index, input := range identity.Inputs {
-		if !validInputKind(input.Kind) || strings.TrimSpace(input.ID) == "" || input.Digest == ([sha256.Size]byte{}) {
-			return [sha256.Size]byte{}, fmt.Errorf("analysis identity input %d is invalid", index)
-		}
-		writeDigestString(hasher, string(input.Kind))
-		inputID := strings.TrimSpace(input.ID)
-		if parsed, err := uuid.Parse(inputID); err == nil {
-			inputID = parsed.String()
-		}
-		inputKey := string(input.Kind) + "\x00" + inputID
-		if _, exists := seenInputs[inputKey]; exists {
-			return [sha256.Size]byte{}, fmt.Errorf("analysis identity input %d is repeated", index)
-		}
-		seenInputs[inputKey] = struct{}{}
-		writeDigestString(hasher, inputID)
-		writeDigestBytes(hasher, input.Digest[:])
-	}
-	var digest [sha256.Size]byte
-	copy(digest[:], hasher.Sum(nil))
-	return digest, nil
-}
-
-func validInputKind(kind InputKind) bool {
-	switch kind {
-	case InputDocumentVersion, InputSourceDocument, InputDocumentTab, InputObservation, InputSignal, InputResolutionDecision:
-		return true
-	default:
-		return false
-	}
-}
-
-func writeDigestString(hasher hash.Hash, value string) { writeDigestBytes(hasher, []byte(value)) }
-
-func writeDigestBytes(hasher hash.Hash, value []byte) {
-	writeDigestLength(hasher, uint64(len(value)))
-	_, _ = hasher.Write(value)
-}
-
-func writeDigestLength(hasher hash.Hash, length uint64) {
-	var encoded [8]byte
-	binary.BigEndian.PutUint64(encoded[:], length)
-	_, _ = hasher.Write(encoded[:])
-}
-
-func (service *Service) complete(
-	ctx context.Context,
-	identity AnalysisIdentity,
-	report Report,
-	recordedAt time.Time,
-	dataMode modelpolicy.DataMode,
-) (Report, error) {
-	report.InputDigest = identity.InputDigest
-	report.RecordedAt = recordedAt.UTC()
-	completed, err := service.Repository.CompleteAnalysis(ctx, Completion{Identity: identity, Report: report, DataMode: dataMode})
-	if err != nil {
-		return Report{}, fmt.Errorf("complete pair analysis: %w", err)
-	}
-	return completed, nil
 }
 
 func (service *Service) validate(employeeID, managerID string) error {

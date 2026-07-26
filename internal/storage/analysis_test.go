@@ -139,7 +139,7 @@ func TestLegacyAndTemporalAnalysisDigestsUseSeparateNamespaces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComputeAnalysisDigest() error = %v", err)
 	}
-	temporal, err := analysisdomain.ComputeInputDigest(analysisdomain.AnalysisIdentity{
+	temporal, err := computeLegacyInputDigest(legacyAnalysisIdentity{
 		EmployeeEntityID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
 		PromptVersion:    "analyze-v1",
@@ -148,8 +148,8 @@ func TestLegacyAndTemporalAnalysisDigestsUseSeparateNamespaces(t *testing.T) {
 		Region:           "us-east-1",
 		ModelID:          "synthetic-model",
 		MaxTokens:        256,
-		Inputs: []analysisdomain.InputReference{{
-			Kind: analysisdomain.InputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd", Digest: inputDigest,
+		Inputs: []legacyInputReference{{
+			Kind: legacyInputSignal, ID: "99999999-aaaa-bbbb-cccc-dddddddddddd", Digest: inputDigest,
 		}},
 	})
 	if err != nil {
@@ -173,7 +173,7 @@ func TestMeetingInputReferenceUsesCanonicalSourceDocumentIdentity(t *testing.T) 
 	if err != nil {
 		t.Fatalf("other meetingInputReference() error = %v", err)
 	}
-	if canonical.Kind != analysisdomain.InputSourceDocument || canonical.ID != "99999999-aaaa-bbbb-cccc-dddddddddddd" {
+	if canonical.Kind != legacyInputSourceDocument || canonical.ID != "99999999-aaaa-bbbb-cccc-dddddddddddd" {
 		t.Fatalf("meeting input = %#v, want canonical source-document reference", canonical)
 	}
 	if canonical != variant {
@@ -191,14 +191,14 @@ func TestPairIdentitySnapshotRequiresEffectiveDecisionForEachConfiguredEntity(t 
 	managerDigest := sha256.Sum256([]byte("manager-decision"))
 	employeeDecision := effectivePairDecision{
 		EntityID: employeeID,
-		Input: analysisdomain.InputReference{
-			Kind: analysisdomain.InputResolutionDecision, ID: "00000000-0000-0000-0000-000000000001", Digest: employeeDigest,
+		Input: legacyInputReference{
+			Kind: legacyInputResolutionDecision, ID: "00000000-0000-0000-0000-000000000001", Digest: employeeDigest,
 		},
 	}
 	managerDecision := effectivePairDecision{
 		EntityID: managerID,
-		Input: analysisdomain.InputReference{
-			Kind: analysisdomain.InputResolutionDecision, ID: "00000000-0000-0000-0000-000000000002", Digest: managerDigest,
+		Input: legacyInputReference{
+			Kind: legacyInputResolutionDecision, ID: "00000000-0000-0000-0000-000000000002", Digest: managerDigest,
 		},
 	}
 
@@ -226,8 +226,8 @@ func TestPairIdentitySnapshotRequiresEffectiveDecisionForEachConfiguredEntity(t 
 
 func TestLoadPairInputsUsesOneRepeatableReadOnlySnapshot(t *testing.T) {
 	transaction := &fakeAnalysisSnapshot{
-		identity: analysisdomain.PairSnapshot{Accepted: true},
-		signals: analysisdomain.PairSnapshot{
+		identity: legacyPairSnapshot{Accepted: true},
+		signals: legacyPairSnapshot{
 			Accepted: true,
 			Signals:  []analysisdomain.Signal{{ID: "signal-1"}},
 		},
@@ -259,7 +259,7 @@ func TestLoadPairInputsUsesOneRepeatableReadOnlySnapshot(t *testing.T) {
 }
 
 func TestLoadPairInputsDoesNotReadSignalsForPendingPair(t *testing.T) {
-	transaction := &fakeAnalysisSnapshot{identity: analysisdomain.PairSnapshot{Accepted: false}}
+	transaction := &fakeAnalysisSnapshot{identity: legacyPairSnapshot{Accepted: false}}
 	repository := &AnalysisRepository{
 		beginSnapshot: func(context.Context, pgx.TxOptions) (analysisSnapshot, error) {
 			return transaction, nil
@@ -280,7 +280,7 @@ func TestLoadPairInputsDoesNotReadSignalsForPendingPair(t *testing.T) {
 
 func TestLoadPairInputsRollsBackSnapshotWhenSignalReadFails(t *testing.T) {
 	transaction := &fakeAnalysisSnapshot{
-		identity:  analysisdomain.PairSnapshot{Accepted: true},
+		identity:  legacyPairSnapshot{Accepted: true},
 		signalErr: errors.New("synthetic query failure with private source material"),
 	}
 	repository := &AnalysisRepository{
@@ -304,7 +304,7 @@ func TestLoadPairInputsRollsBackSnapshotWhenSignalReadFails(t *testing.T) {
 func TestFindCompletedValidatesIdentityAndReadsCacheInOneTransaction(t *testing.T) {
 	identity := testCurrentAnalysisIdentity(t)
 	transaction := &fakeCompletedAnalysisLookup{
-		report: analysisdomain.Report{ID: "cached-run", InputDigest: identity.InputDigest},
+		report: legacyReport{ID: "cached-run", InputDigest: identity.InputDigest},
 		found:  true,
 	}
 	repository := &AnalysisRepository{
@@ -331,7 +331,7 @@ func TestFindCompletedValidatesIdentityAndReadsCacheInOneTransaction(t *testing.
 
 func TestFindCompletedReturnsStaleBeforeHistoricalCacheLookup(t *testing.T) {
 	identity := testCurrentAnalysisIdentity(t)
-	transaction := &fakeCompletedAnalysisLookup{validateErr: analysisdomain.ErrStaleAnalysisInput}
+	transaction := &fakeCompletedAnalysisLookup{validateErr: errLegacyStaleAnalysisInput}
 	repository := &AnalysisRepository{
 		beginCompletedLookup: func(context.Context) (completedAnalysisLookup, error) {
 			return transaction, nil
@@ -339,7 +339,7 @@ func TestFindCompletedReturnsStaleBeforeHistoricalCacheLookup(t *testing.T) {
 	}
 
 	_, found, err := repository.FindCompleted(context.Background(), identity)
-	if !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) {
+	if !errors.Is(err, errLegacyStaleAnalysisInput) {
 		t.Fatalf("FindCompleted() error = %v, want retryable stale-input result", err)
 	}
 	if found || !slices.Equal(transaction.calls, []string{"validate", "rollback"}) {
@@ -350,17 +350,17 @@ func TestFindCompletedReturnsStaleBeforeHistoricalCacheLookup(t *testing.T) {
 func TestValidateEffectivePairDecisionsRejectsCorrectedInput(t *testing.T) {
 	digest := sha256.Sum256([]byte("superseded-decision"))
 	queryer := fakeDecisionQueryer{rows: map[string]fakeDecisionRecord{}}
-	identity := analysisdomain.AnalysisIdentity{
+	identity := legacyAnalysisIdentity{
 		EmployeeEntityID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
-		Inputs: []analysisdomain.InputReference{{
-			Kind: analysisdomain.InputResolutionDecision,
+		Inputs: []legacyInputReference{{
+			Kind: legacyInputResolutionDecision,
 			ID:   "00000000-0000-0000-0000-000000000001", Digest: digest,
 		}},
 	}
 
 	err := validateEffectivePairDecisions(context.Background(), &queryer, identity)
-	if !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) {
+	if !errors.Is(err, errLegacyStaleAnalysisInput) {
 		t.Fatalf("validateEffectivePairDecisions() error = %v, want stale-input error", err)
 	}
 	if strings.Contains(err.Error(), identity.Inputs[0].ID) {
@@ -374,16 +374,16 @@ func TestValidateEffectivePairDecisionsRejectsDecisionOutsideConfiguredPair(t *t
 	queryer := fakeDecisionQueryer{rows: map[string]fakeDecisionRecord{
 		decisionID: {digest: digest[:], entityID: "99999999-aaaa-bbbb-cccc-dddddddddddd"},
 	}}
-	identity := analysisdomain.AnalysisIdentity{
+	identity := legacyAnalysisIdentity{
 		EmployeeEntityID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
-		Inputs: []analysisdomain.InputReference{{
-			Kind: analysisdomain.InputResolutionDecision, ID: decisionID, Digest: digest,
+		Inputs: []legacyInputReference{{
+			Kind: legacyInputResolutionDecision, ID: decisionID, Digest: digest,
 		}},
 	}
 
 	err := validateEffectivePairDecisions(context.Background(), &queryer, identity)
-	if !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) {
+	if !errors.Is(err, errLegacyStaleAnalysisInput) {
 		t.Fatalf("validateEffectivePairDecisions() error = %v, want stale-input error", err)
 	}
 }
@@ -394,16 +394,16 @@ func TestValidateEffectivePairDecisionsRequiresCurrentDecisionForBothEntities(t 
 	queryer := fakeDecisionQueryer{rows: map[string]fakeDecisionRecord{
 		employeeDecisionID: {digest: employeeDigest[:], entityID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
 	}}
-	identity := analysisdomain.AnalysisIdentity{
+	identity := legacyAnalysisIdentity{
 		EmployeeEntityID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
-		Inputs: []analysisdomain.InputReference{{
-			Kind: analysisdomain.InputResolutionDecision, ID: employeeDecisionID, Digest: employeeDigest,
+		Inputs: []legacyInputReference{{
+			Kind: legacyInputResolutionDecision, ID: employeeDecisionID, Digest: employeeDigest,
 		}},
 	}
 
 	err := validateEffectivePairDecisions(context.Background(), &queryer, identity)
-	if !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) {
+	if !errors.Is(err, errLegacyStaleAnalysisInput) {
 		t.Fatalf("validateEffectivePairDecisions() error = %v, want missing-manager stale-input error", err)
 	}
 }
@@ -417,12 +417,12 @@ func TestValidateEffectivePairDecisionsLocksAndAcceptsCurrentPair(t *testing.T) 
 		employeeDecisionID: {digest: employeeDigest[:], entityID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
 		managerDecisionID:  {digest: managerDigest[:], entityID: "11111111-2222-3333-4444-555555555555"},
 	}}
-	identity := analysisdomain.AnalysisIdentity{
+	identity := legacyAnalysisIdentity{
 		EmployeeEntityID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
-		Inputs: []analysisdomain.InputReference{
-			{Kind: analysisdomain.InputResolutionDecision, ID: employeeDecisionID, Digest: employeeDigest},
-			{Kind: analysisdomain.InputResolutionDecision, ID: managerDecisionID, Digest: managerDigest},
+		Inputs: []legacyInputReference{
+			{Kind: legacyInputResolutionDecision, ID: employeeDecisionID, Digest: employeeDigest},
+			{Kind: legacyInputResolutionDecision, ID: managerDecisionID, Digest: managerDigest},
 		},
 	}
 
@@ -445,15 +445,15 @@ func TestValidateEffectivePairDecisionsLocksAndAcceptsCurrentPair(t *testing.T) 
 }
 
 type fakeAnalysisSnapshot struct {
-	identity  analysisdomain.PairSnapshot
-	signals   analysisdomain.PairSnapshot
+	identity  legacyPairSnapshot
+	signals   legacyPairSnapshot
 	signalErr error
 	calls     []string
 }
 
 type fakeCompletedAnalysisLookup struct {
-	identity    analysisdomain.AnalysisIdentity
-	report      analysisdomain.Report
+	identity    legacyAnalysisIdentity
+	report      legacyReport
 	found       bool
 	validateErr error
 	calls       []string
@@ -489,12 +489,12 @@ func (row fakeDecisionRow) Scan(destinations ...any) error {
 	return nil
 }
 
-func (snapshot *fakeAnalysisSnapshot) LoadPairIdentity(context.Context, string, string) (analysisdomain.PairSnapshot, error) {
+func (snapshot *fakeAnalysisSnapshot) LoadPairIdentity(context.Context, string, string) (legacyPairSnapshot, error) {
 	snapshot.calls = append(snapshot.calls, "identity")
 	return snapshot.identity, nil
 }
 
-func (snapshot *fakeAnalysisSnapshot) LoadPairSignals(context.Context, string, string, analysisdomain.PairSnapshot) (analysisdomain.PairSnapshot, error) {
+func (snapshot *fakeAnalysisSnapshot) LoadPairSignals(context.Context, string, string, legacyPairSnapshot) (legacyPairSnapshot, error) {
 	snapshot.calls = append(snapshot.calls, "signals")
 	return snapshot.signals, snapshot.signalErr
 }
@@ -509,14 +509,14 @@ func (snapshot *fakeAnalysisSnapshot) Rollback(context.Context) error {
 	return nil
 }
 
-func (lookup *fakeCompletedAnalysisLookup) ValidateEffectivePairDecisions(_ context.Context, identity analysisdomain.AnalysisIdentity) error {
+func (lookup *fakeCompletedAnalysisLookup) ValidateEffectivePairDecisions(_ context.Context, identity legacyAnalysisIdentity) error {
 	lookup.calls = append(lookup.calls, "validate")
 	lookup.identity = identity
-	lookup.identity.Inputs = append([]analysisdomain.InputReference(nil), identity.Inputs...)
+	lookup.identity.Inputs = append([]legacyInputReference(nil), identity.Inputs...)
 	return lookup.validateErr
 }
 
-func (lookup *fakeCompletedAnalysisLookup) FindCompleted(context.Context, analysisdomain.AnalysisIdentity) (analysisdomain.Report, bool, error) {
+func (lookup *fakeCompletedAnalysisLookup) FindCompleted(context.Context, legacyAnalysisIdentity) (legacyReport, bool, error) {
 	lookup.calls = append(lookup.calls, "find")
 	return lookup.report, lookup.found, nil
 }
@@ -531,11 +531,11 @@ func (lookup *fakeCompletedAnalysisLookup) Rollback(context.Context) error {
 	return nil
 }
 
-func testCurrentAnalysisIdentity(t *testing.T) analysisdomain.AnalysisIdentity {
+func testCurrentAnalysisIdentity(t *testing.T) legacyAnalysisIdentity {
 	t.Helper()
 	employeeDigest := sha256.Sum256([]byte("employee-decision"))
 	managerDigest := sha256.Sum256([]byte("manager-decision"))
-	identity := analysisdomain.AnalysisIdentity{
+	identity := legacyAnalysisIdentity{
 		EmployeeEntityID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 		ManagerEntityID:  "11111111-2222-3333-4444-555555555555",
 		PromptVersion:    "analyze-test-v1",
@@ -544,20 +544,20 @@ func testCurrentAnalysisIdentity(t *testing.T) analysisdomain.AnalysisIdentity {
 		Region:           "us-east-1",
 		ModelID:          "synthetic-model",
 		MaxTokens:        256,
-		Inputs: []analysisdomain.InputReference{
-			{Kind: analysisdomain.InputResolutionDecision, ID: "00000000-0000-0000-0000-000000000001", Digest: employeeDigest},
-			{Kind: analysisdomain.InputResolutionDecision, ID: "00000000-0000-0000-0000-000000000002", Digest: managerDigest},
+		Inputs: []legacyInputReference{
+			{Kind: legacyInputResolutionDecision, ID: "00000000-0000-0000-0000-000000000001", Digest: employeeDigest},
+			{Kind: legacyInputResolutionDecision, ID: "00000000-0000-0000-0000-000000000002", Digest: managerDigest},
 		},
 	}
 	var err error
-	identity.InputDigest, err = analysisdomain.ComputeInputDigest(identity)
+	identity.InputDigest, err = computeLegacyInputDigest(identity)
 	if err != nil {
 		t.Fatalf("ComputeInputDigest() error = %v", err)
 	}
 	return identity
 }
 
-func referenceIDsForStorageTest(inputs []analysisdomain.InputReference) []string {
+func referenceIDsForStorageTest(inputs []legacyInputReference) []string {
 	ids := make([]string, 0, len(inputs))
 	for _, input := range inputs {
 		ids = append(ids, input.ID)

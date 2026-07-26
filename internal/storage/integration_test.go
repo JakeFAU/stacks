@@ -5371,18 +5371,18 @@ func TestModelProviderProvenancePersistsAnalysisCompletionAndDeduplicatesAcrossM
 	}
 	acceptSyntheticIdentity(t, pool, employee.ID)
 	acceptSyntheticIdentity(t, pool, manager.ID)
-	pair, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	pair, err := repository.loadLegacyPairInputs(ctx, employee.ID, manager.ID)
 	if err != nil || !pair.Accepted {
 		t.Fatalf("load accepted provider pair = (%#v, %v)", pair, err)
 	}
 
-	identity := analysisdomain.AnalysisIdentity{
+	identity := legacyAnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
 		PromptVersion: "analyze-provider-v1", PolicyVersion: "policy-provider-v1",
 		Provider: modelpolicy.ProviderBedrock, Region: "us-east-1",
 		ModelID: "synthetic-model", MaxTokens: 256, Inputs: pair.Inputs,
 	}
-	identity.InputDigest, err = analysisdomain.ComputeInputDigest(identity)
+	identity.InputDigest, err = computeLegacyInputDigest(identity)
 	if err != nil {
 		t.Fatalf("compute provider analysis identity: %v", err)
 	}
@@ -5392,14 +5392,14 @@ func TestModelProviderProvenancePersistsAnalysisCompletionAndDeduplicatesAcrossM
 		ModelID:    identity.ModelID, Region: identity.Region, MaxTokens: identity.MaxTokens,
 		PromptVersion: identity.PromptVersion, PolicyVersion: identity.PolicyVersion,
 	}
-	personal, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
-		Identity: identity, Report: report, DataMode: modelpolicy.DataModePersonal,
+	personal, err := repository.CompleteAnalysis(ctx, legacyCompletion{
+		Identity: identity, Report: legacyReport{Report: report}, DataMode: modelpolicy.DataModePersonal,
 	})
 	if err != nil {
 		t.Fatalf("complete personal Bedrock analysis: %v", err)
 	}
-	restricted, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
-		Identity: identity, Report: report, DataMode: modelpolicy.DataModeRestricted,
+	restricted, err := repository.CompleteAnalysis(ctx, legacyCompletion{
+		Identity: identity, Report: legacyReport{Report: report}, DataMode: modelpolicy.DataModeRestricted,
 	})
 	if err != nil {
 		t.Fatalf("deduplicate restricted Bedrock analysis: %v", err)
@@ -5421,14 +5421,14 @@ func TestModelProviderProvenancePersistsAnalysisCompletionAndDeduplicatesAcrossM
 	directIdentity := identity
 	directIdentity.Provider = modelpolicy.ProviderOpenAI
 	directIdentity.Region = ""
-	directIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(directIdentity)
+	directIdentity.InputDigest, err = computeLegacyInputDigest(directIdentity)
 	if err != nil {
 		t.Fatalf("compute OpenAI analysis identity: %v", err)
 	}
 	directReport := report
 	directReport.Region = ""
-	direct, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
-		Identity: directIdentity, Report: directReport, DataMode: modelpolicy.DataModePersonal,
+	direct, err := repository.CompleteAnalysis(ctx, legacyCompletion{
+		Identity: directIdentity, Report: legacyReport{Report: directReport}, DataMode: modelpolicy.DataModePersonal,
 	})
 	if err != nil {
 		t.Fatalf("complete OpenAI analysis: %v", err)
@@ -5446,14 +5446,14 @@ func TestModelProviderProvenancePersistsAnalysisCompletionAndDeduplicatesAcrossM
 
 	deterministicIdentity := directIdentity
 	deterministicIdentity.PromptVersion = "analyze-deterministic-v1"
-	deterministicIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(deterministicIdentity)
+	deterministicIdentity.InputDigest, err = computeLegacyInputDigest(deterministicIdentity)
 	if err != nil {
 		t.Fatalf("compute deterministic analysis identity: %v", err)
 	}
 	deterministicReport := directReport
 	deterministicReport.PromptVersion = deterministicIdentity.PromptVersion
-	deterministic, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
-		Identity: deterministicIdentity, Report: deterministicReport,
+	deterministic, err := repository.CompleteAnalysis(ctx, legacyCompletion{
+		Identity: deterministicIdentity, Report: legacyReport{Report: deterministicReport},
 	})
 	if err != nil {
 		t.Fatalf("complete deterministic non-model analysis: %v", err)
@@ -5621,7 +5621,7 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 		t.Fatalf("create replacement manager: %v", err)
 	}
 
-	pending, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	pending, err := repository.loadLegacyPairInputs(ctx, employee.ID, manager.ID)
 	if err != nil {
 		t.Fatalf("load pending pair inputs: %v", err)
 	}
@@ -5631,27 +5631,27 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 
 	acceptSyntheticIdentity(t, pool, employee.ID)
 	acceptSyntheticIdentity(t, pool, manager.ID)
-	acceptedEmpty, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	acceptedEmpty, err := repository.loadLegacyPairInputs(ctx, employee.ID, manager.ID)
 	if err != nil {
 		t.Fatalf("load accepted empty pair inputs: %v", err)
 	}
-	if !acceptedEmpty.Accepted || len(acceptedEmpty.Signals) != 0 || countInputKind(acceptedEmpty.Inputs, analysisdomain.InputResolutionDecision) != 2 {
+	if !acceptedEmpty.Accepted || len(acceptedEmpty.Signals) != 0 || countInputKind(acceptedEmpty.Inputs, legacyInputResolutionDecision) != 2 {
 		t.Fatalf("accepted empty pair snapshot = %#v, want two audited identity inputs and no signals", acceptedEmpty)
 	}
-	emptyIdentity := analysisdomain.AnalysisIdentity{
+	emptyIdentity := legacyAnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
 		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
 		Provider: modelpolicy.ProviderBedrock,
 		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: acceptedEmpty.Inputs,
 	}
-	emptyIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(emptyIdentity)
+	emptyIdentity.InputDigest, err = computeLegacyInputDigest(emptyIdentity)
 	if err != nil {
 		t.Fatalf("compute accepted empty analysis identity: %v", err)
 	}
 
 	firstSubject, firstObject := createPendingPairSignal(t, pool, time.Date(2026, time.June, 3, 0, 0, 0, 0, time.UTC), "strengthening")
 	secondSubject, secondObject := createPendingPairSignal(t, pool, time.Date(2026, time.July, 8, 0, 0, 0, 0, time.UTC), "weakening")
-	acceptedWithPendingSignals, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	acceptedWithPendingSignals, err := repository.loadLegacyPairInputs(ctx, employee.ID, manager.ID)
 	if err != nil {
 		t.Fatalf("load accepted pair with pending signals: %v", err)
 	}
@@ -5672,40 +5672,40 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 			t.Fatalf("accept pair mention: %v", err)
 		}
 	}
-	accepted, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	accepted, err := repository.loadLegacyPairInputs(ctx, employee.ID, manager.ID)
 	if err != nil {
 		t.Fatalf("load accepted pair inputs: %v", err)
 	}
-	if len(accepted.Signals) != 2 || countInputKind(accepted.Inputs, analysisdomain.InputResolutionDecision) != 6 ||
-		countInputKind(accepted.Inputs, analysisdomain.InputSourceDocument) != 2 {
+	if len(accepted.Signals) != 2 || countInputKind(accepted.Inputs, legacyInputResolutionDecision) != 6 ||
+		countInputKind(accepted.Inputs, legacyInputSourceDocument) != 2 {
 		t.Fatalf("accepted pair signals/decision/meeting inputs = %d/%d/%d, want 2/6/2",
-			len(accepted.Signals), countInputKind(accepted.Inputs, analysisdomain.InputResolutionDecision), countInputKind(accepted.Inputs, analysisdomain.InputSourceDocument))
+			len(accepted.Signals), countInputKind(accepted.Inputs, legacyInputResolutionDecision), countInputKind(accepted.Inputs, legacyInputSourceDocument))
 	}
 	if accepted.Signals[0].MeetingID == "" || accepted.Signals[0].MeetingID == accepted.Signals[1].MeetingID {
 		t.Fatalf("meeting IDs = %q/%q, want stable distinct source-document identities", accepted.Signals[0].MeetingID, accepted.Signals[1].MeetingID)
 	}
-	acceptedIdentity := analysisdomain.AnalysisIdentity{
+	acceptedIdentity := legacyAnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
 		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
 		Provider: modelpolicy.ProviderBedrock,
 		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: accepted.Inputs,
 	}
-	acceptedIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(acceptedIdentity)
+	acceptedIdentity.InputDigest, err = computeLegacyInputDigest(acceptedIdentity)
 	if err != nil {
 		t.Fatalf("compute accepted analysis identity: %v", err)
 	}
 	if acceptedIdentity.InputDigest == emptyIdentity.InputDigest {
 		t.Fatal("later accepted signals reused the accepted-empty pair identity")
 	}
-	acceptedCompletion := analysisdomain.Completion{
+	acceptedCompletion := legacyCompletion{
 		Identity: acceptedIdentity,
 		DataMode: modelpolicy.DataModePersonal,
-		Report: analysisdomain.Report{
+		Report: legacyReport{Report: analysisdomain.Report{
 			Status: analysisdomain.StatusMixedOrConflicting, Rationale: "Synthetic bounded report.",
 			Chronology: accepted.Signals, RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
 			ModelID: "synthetic-model", Region: "us-east-1", MaxTokens: 256,
 			PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
-		},
+		}},
 	}
 	acceptedReport, err := repository.CompleteAnalysis(ctx, acceptedCompletion)
 	if err != nil {
@@ -5714,40 +5714,40 @@ func TestPairAnalysisEligibilityFollowsEffectiveMentionDecisionsWithoutReingest(
 	if _, err := entities.CorrectDecision(ctx, firstManagerDecision.ID, ResolutionDecisionInput{Outcome: ResolutionOutcomeAccepted, EntityID: replacement.ID}); err != nil {
 		t.Fatalf("correct first manager mention between load and completion: %v", err)
 	}
-	if _, found, err := repository.FindCompleted(ctx, acceptedIdentity); !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) || found {
+	if _, found, err := repository.FindCompleted(ctx, acceptedIdentity); !errors.Is(err, errLegacyStaleAnalysisInput) || found {
 		t.Fatalf("find stale cached pair analysis = (found %t, error %v), want retryable stale-input result", found, err)
 	}
-	if _, err := repository.CompleteAnalysis(ctx, acceptedCompletion); !errors.Is(err, analysisdomain.ErrStaleAnalysisInput) {
+	if _, err := repository.CompleteAnalysis(ctx, acceptedCompletion); !errors.Is(err, errLegacyStaleAnalysisInput) {
 		t.Fatalf("complete stale pair analysis error = %v, want retryable stale-input error", err)
 	}
-	corrected, err := repository.LoadPairInputs(ctx, employee.ID, manager.ID)
+	corrected, err := repository.loadLegacyPairInputs(ctx, employee.ID, manager.ID)
 	if err != nil {
 		t.Fatalf("load corrected pair inputs: %v", err)
 	}
 	if len(corrected.Signals) != 1 || len(corrected.Inputs) >= len(accepted.Inputs) {
 		t.Fatalf("corrected pair signals/inputs = %d/%d, want one signal and reduced current provenance", len(corrected.Signals), len(corrected.Inputs))
 	}
-	correctedIdentity := analysisdomain.AnalysisIdentity{
+	correctedIdentity := legacyAnalysisIdentity{
 		EmployeeEntityID: employee.ID, ManagerEntityID: manager.ID,
 		PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
 		Provider: modelpolicy.ProviderBedrock,
 		Region:   "us-east-1", ModelID: "synthetic-model", MaxTokens: 256, Inputs: corrected.Inputs,
 	}
-	correctedIdentity.InputDigest, err = analysisdomain.ComputeInputDigest(correctedIdentity)
+	correctedIdentity.InputDigest, err = computeLegacyInputDigest(correctedIdentity)
 	if err != nil {
 		t.Fatalf("compute corrected analysis identity: %v", err)
 	}
 	if correctedIdentity.InputDigest == acceptedIdentity.InputDigest {
 		t.Fatal("identity correction did not change completed analysis digest")
 	}
-	if _, err := repository.CompleteAnalysis(ctx, analysisdomain.Completion{
+	if _, err := repository.CompleteAnalysis(ctx, legacyCompletion{
 		Identity: correctedIdentity,
-		Report: analysisdomain.Report{
+		Report: legacyReport{Report: analysisdomain.Report{
 			Status: analysisdomain.StatusInsufficientEvidence, Rationale: "Synthetic insufficient report.",
 			Chronology: corrected.Signals, RecordedAt: time.Date(2026, time.July, 21, 13, 0, 0, 0, time.UTC),
 			ModelID: "synthetic-model", Region: "us-east-1", MaxTokens: 256,
 			PromptVersion: "analyze-test-v1", PolicyVersion: "policy-test-v1",
-		},
+		}},
 	}); err != nil {
 		t.Fatalf("complete corrected pair analysis: %v", err)
 	}
@@ -5848,7 +5848,7 @@ func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Ti
 	return managerProposal.ID, employeeProposal.ID
 }
 
-func countInputKind(inputs []analysisdomain.InputReference, kind analysisdomain.InputKind) int {
+func countInputKind(inputs []legacyInputReference, kind legacyInputKind) int {
 	count := 0
 	for _, input := range inputs {
 		if input.Kind == kind {

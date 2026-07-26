@@ -1,6 +1,8 @@
 package postgres_test
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -102,7 +104,14 @@ func TestObservationQueryResolvesCurrentIdentityAndAdmission(t *testing.T) {
 		); err != nil {
 			return err
 		}
-		return transaction.AppendResolutionDecision(fixture.ctx, secondDecision, nil)
+		if err := transaction.AppendResolutionDecision(
+			fixture.ctx,
+			secondDecision,
+			nil,
+		); err != nil {
+			return err
+		}
+		return nil
 	}); err != nil {
 		t.Fatalf("persist relationship identity authority: %v", err)
 	}
@@ -326,5 +335,243 @@ func TestObservationQueryResolvesCurrentIdentityAndAdmission(t *testing.T) {
 			record.SectionRole == "" {
 			t.Fatalf("incomplete generic evidence provenance = %#v", record)
 		}
+	}
+}
+
+func TestRelationshipSnapshotUsesCurrentAcceptedAuthorityAndCorrectionWithoutIdentityAdmission(t *testing.T) {
+	fixture := newObservationRepositoryFixture(t)
+	manager := canonicalEntity(
+		t,
+		"entity:opaque/snapshot-manager",
+		"Synthetic Manager",
+	)
+	employee := canonicalEntity(
+		t,
+		"entity:opaque/snapshot-employee",
+		"Synthetic Employee",
+	)
+	correctedManager := canonicalEntity(
+		t,
+		"entity:opaque/snapshot-corrected-manager",
+		"Synthetic Corrected Manager",
+	)
+	managerMention := canonicalMention(
+		t,
+		"mention:opaque/snapshot-manager",
+		fixture.evidence[0],
+		"Synthetic Manager",
+		"",
+	)
+	employeeMention := canonicalMention(
+		t,
+		"mention:opaque/snapshot-employee",
+		fixture.evidence[1],
+		"Synthetic Employee",
+		"",
+	)
+	managerProposal := canonicalProposal(
+		t,
+		"proposal:opaque/snapshot-manager",
+		managerMention.ID(),
+		fixture.evidence[0],
+	)
+	employeeProposal := canonicalProposal(
+		t,
+		"proposal:opaque/snapshot-employee",
+		employeeMention.ID(),
+		fixture.evidence[1],
+	)
+	managerDecision := canonicalResolutionDecision(
+		t,
+		"decision:opaque/snapshot-manager",
+		managerProposal.ID(),
+		identity.DecisionAccepted,
+		manager.ID(),
+		identity.AuthorityReviewer,
+		"",
+		observationRecordedAt.Add(time.Minute),
+	)
+	employeeDecision := canonicalResolutionDecision(
+		t,
+		"decision:opaque/snapshot-employee",
+		employeeProposal.ID(),
+		identity.DecisionAccepted,
+		employee.ID(),
+		identity.AuthorityReviewer,
+		"",
+		observationRecordedAt.Add(time.Minute),
+	)
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *postgres.Transaction) error {
+			for _, entity := range []identity.Entity{
+				manager,
+				employee,
+				correctedManager,
+			} {
+				if _, err := transaction.PutEntity(fixture.ctx, entity); err != nil {
+					return err
+				}
+			}
+			for _, mention := range []identity.MentionRecord{
+				managerMention,
+				employeeMention,
+			} {
+				if _, err := transaction.PutMention(fixture.ctx, mention); err != nil {
+					return err
+				}
+			}
+			for _, proposal := range []identity.ResolutionProposal{
+				managerProposal,
+				employeeProposal,
+			} {
+				if _, err := transaction.PutResolutionProposal(
+					fixture.ctx,
+					proposal,
+				); err != nil {
+					return err
+				}
+			}
+			for _, decision := range []identity.ResolutionDecision{
+				managerDecision,
+				employeeDecision,
+			} {
+				if err := transaction.AppendResolutionDecision(
+					fixture.ctx,
+					decision,
+					nil,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("persist snapshot identity authority: %v", err)
+	}
+
+	managerTerm, err := observation.NewMentionTerm(string(managerMention.ID()))
+	if err != nil {
+		t.Fatalf("observation.NewMentionTerm(manager) error = %v", err)
+	}
+	employeeTerm, err := observation.NewMentionTerm(string(employeeMention.ID()))
+	if err != nil {
+		t.Fatalf("observation.NewMentionTerm(employee) error = %v", err)
+	}
+	value := canonicalObservation(
+		t,
+		"observation:opaque/relationship-snapshot",
+		managerTerm,
+		"collaboration.supports",
+		employeeTerm,
+		observation.UnknownTime(),
+		observationRecordedAt.Add(3*time.Minute),
+		observation.StatusObserved,
+		[]observation.EvidenceLink{supportingLink(fixture.evidence[0])},
+		nil,
+		fixture.run.ID,
+	)
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *postgres.Transaction) error {
+			if _, err := transaction.PutObservation(fixture.ctx, value); err != nil {
+				return err
+			}
+			return transaction.AppendAdmissionDecision(
+				fixture.ctx,
+				canonicalAdmissionDecision(
+					t,
+					"admission:opaque/relationship-snapshot",
+					admission.TargetObservation,
+					string(value.ID()),
+					admission.Admitted,
+					admission.AuthorityPolicy,
+					"",
+					observationRecordedAt.Add(4*time.Minute),
+				),
+			)
+		},
+	); err != nil {
+		t.Fatalf("persist admitted relationship observation: %v", err)
+	}
+
+	snapshot, err := fixture.database.LoadRelationshipSnapshot(
+		fixture.ctx,
+		manager.ID(),
+		employee.ID(),
+	)
+	if err != nil {
+		t.Fatalf("LoadRelationshipSnapshot() error = %v", err)
+	}
+	if !snapshot.SubjectAccepted ||
+		!snapshot.ObjectAccepted ||
+		len(snapshot.Observations) != 1 ||
+		snapshot.Observations[0].Observation.ID() != value.ID() {
+		t.Fatalf("initial snapshot = %#v", snapshot)
+	}
+
+	correction := canonicalResolutionDecision(
+		t,
+		"decision:opaque/snapshot-manager-correction",
+		managerProposal.ID(),
+		identity.DecisionAccepted,
+		correctedManager.ID(),
+		identity.AuthorityReviewer,
+		managerDecision.ID(),
+		observationRecordedAt.Add(5*time.Minute),
+	)
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *postgres.Transaction) error {
+			return transaction.AppendResolutionDecision(
+				fixture.ctx,
+				correction,
+				nil,
+			)
+		},
+	); err != nil {
+		t.Fatalf("persist identity correction: %v", err)
+	}
+
+	original, err := fixture.database.LoadRelationshipSnapshot(
+		fixture.ctx,
+		manager.ID(),
+		employee.ID(),
+	)
+	if err != nil {
+		t.Fatalf("LoadRelationshipSnapshot(original after correction) error = %v", err)
+	}
+	if original.SubjectAccepted || !original.ObjectAccepted ||
+		len(original.Observations) != 0 {
+		t.Fatalf("original snapshot after correction = %#v", original)
+	}
+	corrected, err := fixture.database.LoadRelationshipSnapshot(
+		fixture.ctx,
+		correctedManager.ID(),
+		employee.ID(),
+	)
+	if err != nil {
+		t.Fatalf("LoadRelationshipSnapshot(corrected pair) error = %v", err)
+	}
+	if !corrected.SubjectAccepted ||
+		!corrected.ObjectAccepted ||
+		len(corrected.Observations) != 1 ||
+		corrected.Observations[0].Observation.ID() != value.ID() {
+		t.Fatalf("corrected snapshot = %#v", corrected)
+	}
+}
+
+func TestRelationshipSnapshotPreservesCancellation(t *testing.T) {
+	fixture := newObservationRepositoryFixture(t)
+	ctx, cancel := context.WithCancel(fixture.ctx)
+	cancel()
+
+	_, err := fixture.database.LoadRelationshipSnapshot(
+		ctx,
+		"entity:opaque/canceled-subject",
+		"entity:opaque/canceled-object",
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoadRelationshipSnapshot() error = %v, want context.Canceled", err)
 	}
 }
