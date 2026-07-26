@@ -21,6 +21,7 @@ type runnerCall struct {
 
 type fakeRunner struct {
 	outputs map[string][]byte
+	errors  map[string]error
 	calls   []runnerCall
 }
 
@@ -38,16 +39,17 @@ func (runner *fakeRunner) Run(
 	if !ok {
 		return nil, fmt.Errorf("unexpected synthetic command")
 	}
-	return append([]byte(nil), output...), nil
+	return append([]byte(nil), output...), runner.errors[key]
 }
 
 type fakeMigrator struct {
 	calls int
+	err   error
 }
 
 func (migrator *fakeMigrator) Apply(context.Context) (migration.ApplyResult, error) {
 	migrator.calls++
-	return migration.ApplyResult{}, nil
+	return migration.ApplyResult{}, migrator.err
 }
 
 func TestResetRejectsWrongConfirmationBeforeInspectionOrMutation(t *testing.T) {
@@ -67,6 +69,109 @@ func TestResetRejectsWrongConfirmationBeforeInspectionOrMutation(t *testing.T) {
 	}
 }
 
+func TestResetRejectsAmbientDockerAndComposeRedirectorsBeforeInspection(t *testing.T) {
+	for _, variable := range []string{
+		"DOCKER_HOST",
+		"DOCKER_CONTEXT",
+		"COMPOSE_FILE",
+		"COMPOSE_PROJECT_NAME",
+	} {
+		variable := variable
+		t.Run(variable, func(t *testing.T) {
+			t.Setenv(variable, "synthetic-redirect")
+			runner := &fakeRunner{}
+			err := validResetter(runner, &fakeMigrator{}).Reset(
+				t.Context(),
+				ConfirmationToken,
+				&strings.Builder{},
+			)
+			if err == nil {
+				t.Fatal("Resetter.Reset() error = nil, want ambient redirector rejection")
+			}
+			if len(runner.calls) != 0 {
+				t.Fatalf("runner calls = %#v, want none before ambient validation", runner.calls)
+			}
+		})
+	}
+}
+
+func TestResetPassesValidatedLocalContextAndPinnedComposeTargetToEveryDockerCommand(t *testing.T) {
+	runner := successfulResetRunner(validLiveContainerInspection())
+	if err := validResetter(runner, &fakeMigrator{}).Reset(
+		t.Context(),
+		ConfirmationToken,
+		&strings.Builder{},
+	); err != nil {
+		t.Fatalf("Resetter.Reset() error = %v", err)
+	}
+	for _, call := range runner.calls {
+		if call.name != "docker" || len(call.args) < 2 {
+			continue
+		}
+		if call.args[0] == "context" && call.args[1] == "show" {
+			continue
+		}
+		if !containsArgPair(call.args, "--context", "default") {
+			t.Fatalf("Docker call did not pin validated context: %#v", call)
+		}
+		if containsArg(call.args, "compose") &&
+			(!containsArgPair(call.args, "--file", "compose.yaml") ||
+				!containsArgPair(call.args, "--project-name", "stacks")) {
+			t.Fatalf("Compose call did not pin file and project: %#v", call)
+		}
+	}
+}
+
+func TestResetRejectsRemoteDockerContextBeforeMutation(t *testing.T) {
+	runner := inspectionRunner(
+		validComposeConfig(),
+		"container-one\n",
+		validContainerLabels(),
+		validVolumeInspection(),
+	)
+	runner.outputs["docker context show"] = []byte("remote\n")
+	runner.outputs["docker --context remote context inspect remote --format {{json .Endpoints.docker.Host}}"] = []byte(`"ssh://remote.example"`)
+	err := validResetter(runner, &fakeMigrator{}).Reset(
+		t.Context(),
+		ConfirmationToken,
+		&strings.Builder{},
+	)
+	if err == nil {
+		t.Fatal("Resetter.Reset() error = nil, want remote Docker context rejection")
+	}
+	assertNoResetMutation(t, runner.calls)
+}
+
+func TestResetRejectsLivePostgresMountMismatchBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name       string
+		inspection string
+	}{
+		{name: "absent", inspection: liveContainerInspection(nil)},
+		{name: "bind", inspection: liveContainerInspection([]liveMountFixture{{Type: "bind", Source: "/synthetic", Destination: "/var/lib/postgresql"}})},
+		{name: "wrong volume", inspection: liveContainerInspection([]liveMountFixture{{Type: "volume", Name: "other_postgres_data", Destination: "/var/lib/postgresql"}})},
+		{name: "ambiguous", inspection: liveContainerInspection([]liveMountFixture{
+			{Type: "volume", Name: "stacks_postgres_data", Destination: "/var/lib/postgresql"},
+			{Type: "volume", Name: "other_postgres_data", Destination: "/var/lib/postgresql"},
+		})},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			runner := successfulResetRunner(test.inspection)
+			err := validResetter(runner, &fakeMigrator{}).Reset(
+				t.Context(),
+				ConfirmationToken,
+				&strings.Builder{},
+			)
+			if err == nil {
+				t.Fatal("Resetter.Reset() error = nil, want live mount rejection")
+			}
+			assertNoResetMutation(t, runner.calls)
+		})
+	}
+}
+
 func TestResetRejectsEveryNonLoopbackDatabaseURLBeforeInspectionOrMutation(t *testing.T) {
 	t.Parallel()
 
@@ -77,6 +182,10 @@ func TestResetRejectsEveryNonLoopbackDatabaseURLBeforeInspectionOrMutation(t *te
 		{name: "application URL", urls: []string{"postgres://app:secret@database.example/stacks", testMigrationURL}},
 		{name: "migration URL", urls: []string{testAppURL, "postgres://admin:secret@192.0.2.10/stacks"}},
 		{name: "missing host", urls: []string{"postgres:///stacks", testMigrationURL}},
+		{name: "query host override", urls: []string{"postgres://app:secret@127.0.0.1/stacks?host=database.example", testMigrationURL}},
+		{name: "remote fallback host", urls: []string{"host=127.0.0.1,database.example user=app password=secret dbname=stacks", testMigrationURL}},
+		{name: "service redirector", urls: []string{"postgres://app:secret@127.0.0.1/stacks?service=remote", testMigrationURL}},
+		{name: "servicefile redirector", urls: []string{"postgres://app:secret@127.0.0.1/stacks?servicefile=/synthetic/config", testMigrationURL}},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
@@ -203,10 +312,10 @@ func TestResetMutatesOnlyVerifiedPostgresServiceAndVolumeThenMigrates(t *testing
 		validVolumeInspection(),
 	)
 	for _, key := range []string{
-		"docker compose stop postgres",
-		"docker compose rm -f postgres",
-		"docker volume rm stacks_postgres_data",
-		"docker compose up -d --wait postgres",
+		"docker --context default compose --file compose.yaml --project-name stacks stop postgres",
+		"docker --context default compose --file compose.yaml --project-name stacks rm -f postgres",
+		"docker --context default volume rm stacks_postgres_data",
+		"docker --context default compose --file compose.yaml --project-name stacks up -d --wait postgres",
 	} {
 		runner.outputs[key] = nil
 	}
@@ -232,10 +341,10 @@ func TestResetMutatesOnlyVerifiedPostgresServiceAndVolumeThenMigrates(t *testing
 		}
 	}
 	wantMutations := []string{
-		"docker compose stop postgres",
-		"docker compose rm -f postgres",
-		"docker volume rm stacks_postgres_data",
-		"docker compose up -d --wait postgres",
+		"docker --context default compose --file compose.yaml --project-name stacks stop postgres",
+		"docker --context default compose --file compose.yaml --project-name stacks rm -f postgres",
+		"docker --context default volume rm stacks_postgres_data",
+		"docker --context default compose --file compose.yaml --project-name stacks up -d --wait postgres",
 	}
 	var gotMutations []string
 	for _, call := range runner.calls {
@@ -268,10 +377,10 @@ func TestResetAcceptsComposeVolumeKeyAsNormalizedMountSource(t *testing.T) {
 		validVolumeInspection(),
 	)
 	for _, key := range []string{
-		"docker compose stop postgres",
-		"docker compose rm -f postgres",
-		"docker volume rm stacks_postgres_data",
-		"docker compose up -d --wait postgres",
+		"docker --context default compose --file compose.yaml --project-name stacks stop postgres",
+		"docker --context default compose --file compose.yaml --project-name stacks rm -f postgres",
+		"docker --context default volume rm stacks_postgres_data",
+		"docker --context default compose --file compose.yaml --project-name stacks up -d --wait postgres",
 	} {
 		runner.outputs[key] = nil
 	}
@@ -281,6 +390,70 @@ func TestResetAcceptsComposeVolumeKeyAsNormalizedMountSource(t *testing.T) {
 		&strings.Builder{},
 	); err != nil {
 		t.Fatalf("Resetter.Reset() error = %v", err)
+	}
+}
+
+func TestResetReturnsBoundedOperationSpecificErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		failureKey string
+		migrate    bool
+		wantError  string
+	}{
+		{
+			name:       "stop",
+			failureKey: "docker --context default compose --file compose.yaml --project-name stacks stop postgres",
+			wantError:  "reset local PostgreSQL: stop operation failed",
+		},
+		{
+			name:       "container removal",
+			failureKey: "docker --context default compose --file compose.yaml --project-name stacks rm -f postgres",
+			wantError:  "reset local PostgreSQL: container removal operation failed",
+		},
+		{
+			name:       "volume removal",
+			failureKey: "docker --context default volume rm stacks_postgres_data",
+			wantError:  "reset local PostgreSQL: volume removal operation failed",
+		},
+		{
+			name:       "recreate and wait",
+			failureKey: "docker --context default compose --file compose.yaml --project-name stacks up -d --wait postgres",
+			wantError:  "reset local PostgreSQL: recreate and wait operation failed",
+		},
+		{
+			name:      "migrate",
+			migrate:   true,
+			wantError: "reset local PostgreSQL: migrate operation failed",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			runner := successfulResetRunner(validLiveContainerInspection())
+			migrator := &fakeMigrator{}
+			sensitiveFailure := fmt.Errorf("synthetic secret output /private/path")
+			if test.migrate {
+				migrator.err = sensitiveFailure
+			} else {
+				runner.errors = map[string]error{test.failureKey: sensitiveFailure}
+			}
+			err := validResetter(runner, migrator).Reset(
+				t.Context(),
+				ConfirmationToken,
+				&strings.Builder{},
+			)
+			if err == nil {
+				t.Fatal("Resetter.Reset() error = nil, want operation failure")
+			}
+			if got := err.Error(); got != test.wantError {
+				t.Fatalf("Resetter.Reset() error = %q, want %q", got, test.wantError)
+			}
+			for _, forbidden := range []string{"synthetic", "secret", "/private/path"} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Fatalf("operation error exposed sensitive detail: %q", err)
+				}
+			}
+		})
 	}
 }
 
@@ -298,12 +471,88 @@ func inspectionRunner(
 	containerLabels string,
 	volumeInspection string,
 ) *fakeRunner {
+	liveInspection := fmt.Sprintf(
+		`{"Config":{"Labels":%s},"Mounts":[{"Type":"volume","Name":"stacks_postgres_data","Destination":"/var/lib/postgresql"}]}`,
+		containerLabels,
+	)
 	return &fakeRunner{outputs: map[string][]byte{
-		"docker compose config --format json":                            []byte(configJSON),
-		"docker compose ps -q postgres":                                  []byte(psOutput),
-		"docker inspect --format {{json .Config.Labels}} container-one":  []byte(containerLabels),
-		"docker volume inspect --format {{json .}} stacks_postgres_data": []byte(volumeInspection),
+		"docker context show": []byte("default\n"),
+		"docker --context default context inspect default --format {{json .Endpoints.docker.Host}}":       []byte(`"unix:///var/run/docker.sock"`),
+		"docker --context default compose --file compose.yaml --project-name stacks config --format json": []byte(configJSON),
+		"docker --context default compose --file compose.yaml --project-name stacks ps -q postgres":       []byte(psOutput),
+		"docker --context default inspect --format {{json .}} container-one":                              []byte(liveInspection),
+		"docker --context default volume inspect --format {{json .}} stacks_postgres_data":                []byte(volumeInspection),
 	}}
+}
+
+func successfulResetRunner(containerInspection string) *fakeRunner {
+	runner := inspectionRunner(
+		validComposeConfig(),
+		"container-one\n",
+		validContainerLabels(),
+		validVolumeInspection(),
+	)
+	runner.outputs["docker --context default inspect --format {{json .}} container-one"] = []byte(containerInspection)
+	for _, key := range []string{
+		"docker --context default compose --file compose.yaml --project-name stacks stop postgres",
+		"docker --context default compose --file compose.yaml --project-name stacks rm -f postgres",
+		"docker --context default volume rm stacks_postgres_data",
+		"docker --context default compose --file compose.yaml --project-name stacks up -d --wait postgres",
+	} {
+		runner.outputs[key] = nil
+	}
+	return runner
+}
+
+type liveMountFixture struct {
+	Type        string
+	Name        string
+	Source      string
+	Destination string
+}
+
+func validLiveContainerInspection() string {
+	return liveContainerInspection([]liveMountFixture{{
+		Type:        "volume",
+		Name:        "stacks_postgres_data",
+		Destination: "/var/lib/postgresql",
+	}})
+}
+
+func liveContainerInspection(mounts []liveMountFixture) string {
+	parts := make([]string, 0, len(mounts))
+	for _, mount := range mounts {
+		parts = append(parts, fmt.Sprintf(
+			`{"Type":%q,"Name":%q,"Source":%q,"Destination":%q}`,
+			mount.Type,
+			mount.Name,
+			mount.Source,
+			mount.Destination,
+		))
+	}
+	return fmt.Sprintf(
+		`{"Config":{"Labels":%s},"Mounts":[%s]}`,
+		validContainerLabels(),
+		strings.Join(parts, ","),
+	)
+}
+
+func containsArg(arguments []string, wanted string) bool {
+	for _, argument := range arguments {
+		if argument == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func containsArgPair(arguments []string, key, value string) bool {
+	for index := 0; index+1 < len(arguments); index++ {
+		if arguments[index] == key && arguments[index+1] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func validComposeConfig() string {
@@ -344,13 +593,21 @@ func assertNoResetMutation(t *testing.T, calls []runnerCall) {
 }
 
 func isResetMutation(call runnerCall) bool {
-	if call.name == "docker" && len(call.args) > 1 &&
-		call.args[0] == "compose" {
-		switch call.args[1] {
-		case "stop", "rm", "up", "down":
+	if call.name != "docker" {
+		return false
+	}
+	for index, argument := range call.args {
+		if argument == "compose" {
+			for _, candidate := range call.args[index+1:] {
+				switch candidate {
+				case "stop", "rm", "up", "down":
+					return true
+				}
+			}
+		}
+		if argument == "volume" && index+1 < len(call.args) && call.args[index+1] == "rm" {
 			return true
 		}
 	}
-	return call.name == "docker" && len(call.args) > 1 &&
-		call.args[0] == "volume" && call.args[1] == "rm"
+	return false
 }

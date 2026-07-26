@@ -94,6 +94,7 @@ test-integration:
 	@set -a; . "$(ENV_FILE)"; set +a; \
 		test -n "$$STACKS_TEST_DATABASE_URL" || (echo "STACKS_TEST_DATABASE_URL is required" >&2; exit 1); \
 		test -n "$$STACKS_TEST_MIGRATION_DATABASE_URL" || (echo "STACKS_TEST_MIGRATION_DATABASE_URL is required" >&2; exit 1); \
+		(cd adapters/postgres && GOWORK=off go run ./cmd/validate-test-database) && \
 		(cd adapters/postgres && GOWORK=off go test ./... -count=1) && \
 		go test ./internal/ingest ./internal/directory ./internal/analysis ./internal/doctor -count=1
 

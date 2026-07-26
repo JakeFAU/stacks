@@ -65,11 +65,14 @@ const (
 
 // OwnedObject identifies one exact object owned by a migration scope. Parent
 // is set only for triggers and contains the owning table name.
+// FunctionSignature is the canonical identity-argument list including
+// parentheses and is set only for functions.
 type OwnedObject struct {
-	Kind   ObjectKind
-	Schema string
-	Parent string
-	Name   string
+	Kind              ObjectKind
+	Schema            string
+	Parent            string
+	Name              string
+	FunctionSignature string
 }
 
 // Manifest describes one independently versioned migration scope.
@@ -100,7 +103,7 @@ var (
 		},
 		{
 			kind:    ObjectFunction,
-			pattern: regexp.MustCompile(`(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\s*\(`),
+			pattern: regexp.MustCompile(`(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\s*\(([^)]*)\)`),
 		},
 		{
 			kind:    ObjectTrigger,
@@ -511,6 +514,9 @@ func validateOwnedObject(object OwnedObject) error {
 		return nil
 	}
 	if object.Kind == ObjectTrigger {
+		if object.FunctionSignature != "" {
+			return fmt.Errorf("trigger object function signature must be blank")
+		}
 		if err := validateIdentifier("parent", object.Parent); err != nil {
 			return err
 		}
@@ -518,6 +524,19 @@ func validateOwnedObject(object OwnedObject) error {
 	}
 	if object.Parent != "" {
 		return fmt.Errorf("%s object parent must be blank", object.Kind)
+	}
+	if object.Kind == ObjectFunction {
+		if len(object.FunctionSignature) < 2 ||
+			object.FunctionSignature[0] != '(' ||
+			object.FunctionSignature[len(object.FunctionSignature)-1] != ')' ||
+			strings.TrimSpace(object.FunctionSignature) != object.FunctionSignature ||
+			strings.ContainsAny(object.FunctionSignature, "\x00\r\n") {
+			return fmt.Errorf("function object canonical signature is required")
+		}
+		return nil
+	}
+	if object.FunctionSignature != "" {
+		return fmt.Errorf("%s object function signature must be blank", object.Kind)
 	}
 	return nil
 }
@@ -690,7 +709,7 @@ func (ownership ownershipSet) owns(object OwnedObject) bool {
 }
 
 func (object OwnedObject) key() string {
-	return object.Schema + "\x00" + string(object.Kind) + "\x00" + object.Parent + "\x00" + object.Name
+	return object.Schema + "\x00" + string(object.Kind) + "\x00" + object.Parent + "\x00" + object.Name + "\x00" + object.FunctionSignature
 }
 
 func (object OwnedObject) description() string {
@@ -699,6 +718,8 @@ func (object OwnedObject) description() string {
 		return "schema " + object.Schema
 	case ObjectTrigger:
 		return "trigger " + object.Schema + "." + object.Parent + "." + object.Name
+	case ObjectFunction:
+		return "function " + object.Schema + "." + object.Name
 	default:
 		return string(object.Kind) + " " + object.Schema + "." + object.Name
 	}
@@ -715,9 +736,16 @@ func createdObjects(sql string) []OwnedObject {
 				objects = append(objects, OwnedObject{
 					Kind: ObjectSchema, Schema: schema, Name: schema,
 				})
-			case ObjectTable, ObjectFunction:
+			case ObjectTable:
 				objects = append(objects, OwnedObject{
 					Kind: createPattern.kind, Schema: strings.ToLower(match[1]), Name: strings.ToLower(match[2]),
+				})
+			case ObjectFunction:
+				objects = append(objects, OwnedObject{
+					Kind:              ObjectFunction,
+					Schema:            strings.ToLower(match[1]),
+					Name:              strings.ToLower(match[2]),
+					FunctionSignature: "(" + strings.TrimSpace(strings.ToLower(match[3])) + ")",
 				})
 			case ObjectTrigger:
 				objects = append(objects, OwnedObject{

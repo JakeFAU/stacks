@@ -227,7 +227,11 @@ func readCatalog(
 		        namespace.nspname,
 		        relation.relname,
 		        index_relation.relname,
-		        pg_catalog.pg_get_indexdef(index_record.indexrelid, 0, false)
+		        concat(
+		            'valid=', index_record.indisvalid,
+		            '|ready=', index_record.indisready,
+		            '|definition=', pg_catalog.pg_get_indexdef(index_record.indexrelid, 0, false)
+		        )
 		   FROM pg_catalog.pg_index AS index_record
 		   JOIN pg_catalog.pg_class AS relation ON relation.oid = index_record.indrelid
 		   JOIN pg_catalog.pg_class AS index_relation ON index_relation.oid = index_record.indexrelid
@@ -245,6 +249,10 @@ func readCatalog(
 	}
 
 	functionSchemas, functionNames := splitExactObjects(exactFunctions)
+	functionSignatures := make([]string, len(exactFunctions))
+	for index, object := range exactFunctions {
+		functionSignatures[index] = object.FunctionSignature
+	}
 	if err := queryCatalogObjects(
 		ctx,
 		connection,
@@ -265,10 +273,14 @@ func readCatalog(
 		   FROM pg_catalog.pg_proc AS procedure
 		   JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
 		  WHERE namespace.nspname = ANY($1::text[])
-		     OR (namespace.nspname, procedure.proname) IN (
-		            SELECT * FROM unnest($2::text[], $3::text[])
+		     OR (
+		            namespace.nspname,
+		            procedure.proname,
+		            concat('(', pg_catalog.pg_get_function_identity_arguments(procedure.oid), ')')
+		        ) IN (
+		            SELECT * FROM unnest($2::text[], $3::text[], $4::text[])
 		        )`,
-		[]any{treeSchemas, functionSchemas, functionNames},
+		[]any{treeSchemas, functionSchemas, functionNames, functionSignatures},
 		add,
 	); err != nil {
 		return nil, fmt.Errorf("read owned PostgreSQL functions: %w", err)

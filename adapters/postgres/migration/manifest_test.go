@@ -150,6 +150,20 @@ func TestFingerprintManifestRejectsZeroExpectedFingerprint(t *testing.T) {
 	}
 }
 
+func TestManifestRejectsExactFunctionWithoutCanonicalSignature(t *testing.T) {
+	t.Parallel()
+
+	manifest := validManifest("synthetic", "synthetic_version")
+	manifest.OwnedObjects = []OwnedObject{{
+		Kind:   ObjectFunction,
+		Schema: "synthetic_exact",
+		Name:   "normalize",
+	}}
+	if err := manifest.Validate(); err == nil {
+		t.Fatal("Manifest.Validate() error = nil, want ambiguous exact function ownership rejection")
+	}
+}
+
 func TestManifestRejectsInvalidMigrationOrderingAndIdentity(t *testing.T) {
 	t.Parallel()
 

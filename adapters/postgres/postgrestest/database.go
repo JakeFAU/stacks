@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JakeFAU/stacks/adapters/postgres/pgconfig"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -47,22 +48,15 @@ func NewDatabase(t testing.TB) Database {
 		t.Skipf("%s is not set", applicationDatabaseURLEnvironment)
 	}
 
-	adminConfig, err := pgx.ParseConfig(baseAdminURL)
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	adminConfig, applicationConfig, err := validateEnvironment(ctx)
 	if err != nil {
-		t.Fatalf("parse migration database configuration: %v", err)
-	}
-	applicationConfig, err := pgx.ParseConfig(baseApplicationURL)
-	if err != nil {
-		t.Fatalf("parse application database configuration: %v", err)
-	}
-	if adminConfig.Host != applicationConfig.Host || adminConfig.Port != applicationConfig.Port {
-		t.Fatal("migration and application test URLs must address the same PostgreSQL server")
+		t.Fatalf("validate PostgreSQL test environment: %v", err)
 	}
 
 	name := randomDatabaseName(t)
 	quotedName := pgx.Identifier{name}.Sanitize()
-	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-	defer cancel()
 	connection, err := pgx.ConnectConfig(ctx, adminConfig)
 	if err != nil {
 		t.Fatalf("connect to migration test server: %v", err)
@@ -102,6 +96,103 @@ func NewDatabase(t testing.TB) Database {
 	database.adminURL = databaseURL(t, baseAdminURL, name)
 	database.applicationURL = databaseURL(t, baseApplicationURL, name)
 	return database
+}
+
+// ValidateEnvironment performs the bounded read-only endpoint and role checks
+// required before any integration package may create a temporary database.
+func ValidateEnvironment(ctx context.Context) error {
+	_, _, err := validateEnvironment(ctx)
+	return err
+}
+
+func validateEnvironment(
+	ctx context.Context,
+) (*pgx.ConnConfig, *pgx.ConnConfig, error) {
+	if ctx == nil {
+		return nil, nil, fmt.Errorf("context is required")
+	}
+	baseAdminURL := os.Getenv(migrationDatabaseURLEnvironment)
+	baseApplicationURL := os.Getenv(applicationDatabaseURLEnvironment)
+	adminConfig, err := pgconfig.ParseLocal(baseAdminURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("migration connection configuration is unsafe")
+	}
+	applicationConfig, err := pgconfig.ParseLocal(baseApplicationURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("application connection configuration is unsafe")
+	}
+	if adminConfig.Host != applicationConfig.Host ||
+		adminConfig.Port != applicationConfig.Port {
+		return nil, nil, fmt.Errorf("test connections must address one local PostgreSQL server")
+	}
+	if _, err := rewrittenDatabaseURL(baseAdminURL, "synthetic_validation"); err != nil {
+		return nil, nil, fmt.Errorf("migration connection must be an explicit PostgreSQL URL")
+	}
+	if _, err := rewrittenDatabaseURL(baseApplicationURL, "synthetic_validation"); err != nil {
+		return nil, nil, fmt.Errorf("application connection must be an explicit PostgreSQL URL")
+	}
+	if adminConfig.User == applicationConfig.User {
+		return nil, nil, fmt.Errorf("test application and migration principals must be distinct")
+	}
+	adminRole, err := inspectRole(ctx, adminConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("inspect migration test principal")
+	}
+	applicationRole, err := inspectRole(ctx, applicationConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("inspect application test principal")
+	}
+	if err := validateRoleAttributes(adminRole, applicationRole); err != nil {
+		return nil, nil, err
+	}
+	return adminConfig, applicationConfig, nil
+}
+
+func validateRoleAttributes(adminRole, applicationRole roleAttributes) error {
+	if adminRole.name == applicationRole.name {
+		return fmt.Errorf("test application and migration principals must be distinct")
+	}
+	if applicationRole.superuser ||
+		applicationRole.createDatabase ||
+		applicationRole.createRole {
+		return fmt.Errorf("application test principal has administrative privilege")
+	}
+	if !adminRole.superuser && !adminRole.createDatabase {
+		return fmt.Errorf("migration test principal cannot create temporary databases")
+	}
+	return nil
+}
+
+type roleAttributes struct {
+	name           string
+	superuser      bool
+	createDatabase bool
+	createRole     bool
+}
+
+func inspectRole(
+	ctx context.Context,
+	config *pgx.ConnConfig,
+) (roleAttributes, error) {
+	connection, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		return roleAttributes{}, err
+	}
+	defer func() {
+		_ = connection.Close(context.Background())
+	}()
+	var attributes roleAttributes
+	err = connection.QueryRow(ctx, `
+		SELECT rolname, rolsuper, rolcreatedb, rolcreaterole
+		  FROM pg_catalog.pg_roles
+		 WHERE rolname = current_user
+	`).Scan(
+		&attributes.name,
+		&attributes.superuser,
+		&attributes.createDatabase,
+		&attributes.createRole,
+	)
+	return attributes, err
 }
 
 // Name returns the internally generated temporary database name.
@@ -164,14 +255,22 @@ func randomDatabaseName(t testing.TB) string {
 func databaseURL(t testing.TB, baseURL, databaseName string) string {
 	t.Helper()
 
+	result, err := rewrittenDatabaseURL(baseURL, databaseName)
+	if err != nil {
+		t.Fatal("PostgreSQL test database URL must be an explicit postgres URL")
+	}
+	return result
+}
+
+func rewrittenDatabaseURL(baseURL, databaseName string) (string, error) {
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
-		t.Fatalf("parse PostgreSQL test database URL: %v", err)
+		return "", err
 	}
 	if parsed.Host == "" ||
 		(parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") ||
 		strings.TrimSpace(databaseName) == "" {
-		t.Fatal("PostgreSQL test database URL must be an explicit postgres URL")
+		return "", fmt.Errorf("explicit PostgreSQL URL is required")
 	}
 	parsed.Path = "/" + databaseName
 	parsed.RawPath = ""
@@ -179,5 +278,5 @@ func databaseURL(t testing.TB, baseURL, databaseName string) string {
 	query.Del("database")
 	query.Del("dbname")
 	parsed.RawQuery = query.Encode()
-	return parsed.String()
+	return parsed.String(), nil
 }
