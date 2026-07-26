@@ -355,6 +355,17 @@ tree for each execution, and keep Cobra types out of `core`,
 `adapters/postgres`, providers, storage, and domain contracts. Do not use the
 `cobra-cli` generator or package-global command state.
 
+Viper is the intentional exception for the root application's configuration
+source merging. Keep `github.com/spf13/viper` inside `internal/config`, use a
+fresh instance per load, bind supported environment variables explicitly, and
+keep Viper types out of `core`, `adapters/postgres`, providers, storage,
+application, and domain contracts. Do not use package-global Viper state,
+`AutomaticEnv`, search paths, remote providers, watchers, or reload callbacks.
+
+`go.yaml.in/yaml/v3` is the narrow strict-decoding companion inside
+`internal/config`. It may inspect configuration syntax but must not define
+settings, precedence, defaults, or validation policy.
+
 A new dependency should justify its:
 
 * operational value,

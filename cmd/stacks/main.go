@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
@@ -43,10 +44,27 @@ import (
 )
 
 const (
-	observabilityShutdownTimeout      = 10 * time.Second
 	awsAccessDeniedErrorCode          = "AccessDenied"
 	awsAccessDeniedExceptionErrorCode = "AccessDeniedException"
 	googleDirectoryMaximumResults     = 25
+)
+
+type executionObservability interface {
+	Logger() *zap.Logger
+	TracerProvider() trace.TracerProvider
+	MeterProvider() metric.MeterProvider
+	DecisionRecorder() (*observability.DecisionRecorder, error)
+	Shutdown(context.Context) error
+}
+
+var (
+	newObservabilityRuntime = func(
+		ctx context.Context,
+		settings config.Settings,
+	) (executionObservability, error) {
+		return observability.New(ctx, settings)
+	}
+	composeCommands = commandProvider
 )
 
 func main() {
@@ -55,55 +73,68 @@ func main() {
 		panic(err)
 	}
 
-	settings, err := config.Load()
-	if err != nil {
-		bootstrapLogger.Error("load configuration", zap.Error(err))
-		os.Exit(1)
-	}
-
-	runtime, err := observability.New(context.Background(), settings)
-	if err != nil {
-		bootstrapLogger.Error("initialize observability", zap.Error(err))
-		os.Exit(1)
-	}
-	logger := runtime.Logger()
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	runErr := app.Execute(
 		ctx,
 		os.Args[1:],
-		settings,
-		app.RuntimeFunc(func(ctx context.Context, settings config.Settings) error {
-			return app.Run(ctx, settings, logger, runtime.TracerProvider(), runtime.MeterProvider())
-		}),
-		app.CommandProviderFunc(func(ctx context.Context, settings config.Settings, stdout, stderr io.Writer) (map[string]cli.Command, error) {
-			decisions, err := runtime.DecisionRecorder()
-			if err != nil {
-				return nil, err
-			}
-			invocations, err := modeltelemetry.NewMetricsRecorder(runtime.MeterProvider().Meter("stacks"))
-			if err != nil {
-				return nil, err
-			}
-			return commandProvider(ctx, settings, stdout, stderr, runtime.TracerProvider().Tracer("stacks"), decisions, invocations)
-		}),
+		app.SettingsLoaderFunc(config.LoadWithOptions),
+		app.BootstrapFunc(newExecutionDependencies),
 		os.Stdout,
 		os.Stderr,
 	)
 	if runErr != nil {
-		logger.Error("run stacks", zap.Error(runErr))
-	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), observabilityShutdownTimeout)
-	shutdownErr := runtime.Shutdown(shutdownCtx)
-	cancel()
-	if shutdownErr != nil {
-		bootstrapLogger.Error("shut down observability", zap.Error(shutdownErr))
-	}
-	if runErr != nil || shutdownErr != nil {
+		bootstrapLogger.Error("run stacks", zap.Error(runErr))
 		os.Exit(1)
 	}
+}
+
+func newExecutionDependencies(
+	ctx context.Context,
+	settings config.Settings,
+) (app.ExecutionDependencies, error) {
+	runtime, err := newObservabilityRuntime(ctx, settings)
+	if err != nil {
+		return app.ExecutionDependencies{}, err
+	}
+	return app.ExecutionDependencies{
+		Runtime: app.RuntimeFunc(func(ctx context.Context, settings config.Settings) error {
+			return app.Run(
+				ctx,
+				settings,
+				runtime.Logger(),
+				runtime.TracerProvider(),
+				runtime.MeterProvider(),
+			)
+		}),
+		CommandProvider: app.CommandProviderFunc(func(
+			ctx context.Context,
+			settings config.Settings,
+			stdout, stderr io.Writer,
+		) (map[string]cli.Command, error) {
+			decisions, err := runtime.DecisionRecorder()
+			if err != nil {
+				return nil, err
+			}
+			invocations, err := modeltelemetry.NewMetricsRecorder(
+				runtime.MeterProvider().Meter("stacks"),
+			)
+			if err != nil {
+				return nil, err
+			}
+			return composeCommands(
+				ctx,
+				settings,
+				stdout,
+				stderr,
+				runtime.TracerProvider().Tracer("stacks"),
+				decisions,
+				invocations,
+			)
+		}),
+		Shutdown: runtime.Shutdown,
+	}, nil
 }
 
 func commandProvider(

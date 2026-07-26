@@ -33,6 +33,130 @@ func TestRunnerDefaultsToServeAndSupportsExplicitServe(t *testing.T) {
 	}
 }
 
+func TestRunnerCarriesExplicitConfigBeforeAndAfterCommand(t *testing.T) {
+	for _, args := range [][]string{
+		{"--config", "/synthetic/stacks.yaml", "sync"},
+		{"sync", "--config", "/synthetic/stacks.yaml"},
+	} {
+		var got Invocation
+		err := (Runner{Execute: func(_ context.Context, invocation Invocation) error {
+			got = invocation
+			return nil
+		}}).Run(t.Context(), args)
+		if err != nil {
+			t.Fatalf("Run(%q) error = %v", args, err)
+		}
+		if got.ConfigFile == nil || *got.ConfigFile != "/synthetic/stacks.yaml" {
+			t.Fatalf("ConfigFile = %#v", got.ConfigFile)
+		}
+	}
+}
+
+func TestRunnerDistinguishesOmittedAndBlankConfig(t *testing.T) {
+	var omitted Invocation
+	if err := (Runner{Execute: func(_ context.Context, invocation Invocation) error {
+		omitted = invocation
+		return nil
+	}}).Run(t.Context(), []string{"serve"}); err != nil {
+		t.Fatal(err)
+	}
+	if omitted.ConfigFile != nil {
+		t.Fatalf("omitted ConfigFile = %#v, want nil", omitted.ConfigFile)
+	}
+
+	for _, value := range []string{"", " \t "} {
+		calls := 0
+		err := (Runner{Execute: func(context.Context, Invocation) error {
+			calls++
+			return nil
+		}}).Run(t.Context(), []string{"--config", value, "serve"})
+		if err == nil || err.Error() != invalidCommandSyntaxMessage || calls != 0 {
+			t.Fatalf("config %q error/calls = %v/%d, want %q/0", value, err, calls, invalidCommandSyntaxMessage)
+		}
+	}
+}
+
+func TestRunnerClearsConfigBetweenExecutions(t *testing.T) {
+	var invocations []Invocation
+	runner := Runner{Execute: func(_ context.Context, invocation Invocation) error {
+		invocations = append(invocations, invocation)
+		return nil
+	}}
+	if err := runner.Run(t.Context(), []string{"--config", "/synthetic/first.yaml", "sync"}); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	if err := runner.Run(t.Context(), []string{"sync"}); err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+	if len(invocations) != 2 || invocations[0].ConfigFile == nil || *invocations[0].ConfigFile != "/synthetic/first.yaml" || invocations[1].ConfigFile != nil {
+		t.Fatalf("invocations = %#v, want independent config selections", invocations)
+	}
+}
+
+func TestRunnerParsesConfigValidationTargets(t *testing.T) {
+	tests := []struct {
+		args        []string
+		wantCommand CommandName
+		wantAction  Action
+	}{
+		{[]string{"config", "validate", "serve"}, CommandServe, ""},
+		{[]string{"config", "validate", "doctor"}, CommandDoctor, ""},
+		{[]string{"config", "validate", "sync"}, CommandSync, ""},
+		{[]string{"config", "validate", "entities"}, CommandEntities, ""},
+		{[]string{"config", "validate", "review"}, CommandReview, ""},
+		{[]string{"config", "validate", "analyze"}, CommandAnalyze, ""},
+		{[]string{"config", "validate", "db-migrate"}, CommandDBMigrate, ""},
+		{[]string{"config", "validate", "db-status"}, CommandDBStatus, ""},
+		{[]string{"config", "validate", "db-reset"}, CommandDBReset, ""},
+		{[]string{"config", "validate", "auth", "google"}, CommandAuth, ActionAuthGoogle},
+		{[]string{"config", "validate", "auth", "google-directory"}, CommandAuth, ActionAuthGoogleDirectory},
+	}
+	for _, testCase := range tests {
+		t.Run(strings.Join(testCase.args, " "), func(t *testing.T) {
+			var got Invocation
+			err := (Runner{Execute: func(_ context.Context, invocation Invocation) error {
+				got = invocation
+				return nil
+			}}).Run(t.Context(), testCase.args)
+			if err != nil {
+				t.Fatalf("Run(%q) error = %v", testCase.args, err)
+			}
+			if got.Command != CommandConfig || got.Action != ActionValidate ||
+				got.ConfigValidation == nil ||
+				got.ConfigValidation.Command != testCase.wantCommand ||
+				got.ConfigValidation.Action != testCase.wantAction {
+				t.Fatalf("Run(%q) invocation = %#v", testCase.args, got)
+			}
+		})
+	}
+}
+
+func TestRunnerRejectsInvalidConfigValidationTargetsWithoutPrivateInput(t *testing.T) {
+	const privateInput = "synthetic-private-config-target"
+	for _, args := range [][]string{
+		{"config", "validate"},
+		{"config", "validate", "serve", "unexpected"},
+		{"config", "validate", "auth"},
+		{"config", "validate", privateInput},
+	} {
+		var errorOutput strings.Builder
+		calls := 0
+		err := (Runner{
+			Error: &errorOutput,
+			Execute: func(context.Context, Invocation) error {
+				calls++
+				return nil
+			},
+		}).Run(t.Context(), args)
+		if err == nil || calls != 0 {
+			t.Fatalf("Run(%q) error/calls = %v/%d", args, err, calls)
+		}
+		if strings.Contains(err.Error(), privateInput) || strings.Contains(errorOutput.String(), privateInput) {
+			t.Fatalf("Run(%q) exposed private input: error=%q stderr=%q", args, err, errorOutput.String())
+		}
+	}
+}
+
 func TestRunnerHelpDoesNotExecuteApplicationCommand(t *testing.T) {
 	var output strings.Builder
 	calls := 0

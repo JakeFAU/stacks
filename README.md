@@ -55,6 +55,13 @@ is an auxiliary transport command, not an application or provider command.
 ```text
 stacks
 ├── serve
+├── config
+│   └── validate
+│       ├── serve | doctor | sync | entities | review | analyze
+│       ├── db-migrate | db-status | db-reset
+│       └── auth
+│           ├── google
+│           └── google-directory
 ├── auth
 │   ├── google
 │   └── google-directory
@@ -104,6 +111,133 @@ the repository at the explicit paths in `STACKS_GOOGLE_OAUTH_CLIENT_FILE` and
 loopback flow with read-only Drive and Docs scopes and writes the token with
 owner-only permissions. No service-account or domain-wide-delegation flow is
 implemented.
+
+### Explicit configuration files
+
+Non-secret settings may be stored in one explicitly selected YAML or JSON file.
+Stacks accepts `.yaml`, `.yml`, and `.json` extensions, case-insensitively. It
+does not discover configuration in the working directory, home directory, or
+XDG locations: pass the path with the persistent root flag, before or after a
+subcommand:
+
+```sh
+go run ./cmd/stacks --config config.example.yaml config validate serve
+go run ./cmd/stacks config validate serve --config config.example.json
+```
+
+Omitting `--config` uses named defaults plus non-empty environment values.
+Passing `--config` explicitly with an empty or whitespace-only value is invalid;
+it is not an alias for omission.
+
+The precedence order, highest first, is an explicitly changed operational
+command flag, a non-empty explicitly bound environment variable, the selected
+file, then a named Go default. `--config` selects a source rather than
+overriding an operational setting; the current CLI has no operational setting
+flag. Empty environment variables are absent. In files, an empty string uses
+the default for a defaulted string and remains unset for optional or required
+strings. Surrounding whitespace is preserved, and an empty array remains an
+explicit value.
+
+Files are decoded strictly. The root must be one object, and unknown or
+duplicate keys, `null`, wrong scalar/object/array shapes, non-string list
+members, additional documents or values, and unrepresentable typed values are
+errors. YAML aliases, anchors, and merge keys are also rejected. Stacks reads
+the explicitly selected file once and does not parse dotenv files, search for
+alternatives, use remote configuration, watch or reload files, or provide
+`config explain`.
+
+The checked-in [`config.example.yaml`](./config.example.yaml) and
+[`config.example.json`](./config.example.json) contain the complete equivalent
+file schema with synthetic values:
+
+| File key | Type | Optional environment override |
+| --- | --- | --- |
+| `http.host` | string | `STACKS_HTTP_HOST` |
+| `http.port` | integer | `STACKS_HTTP_PORT` |
+| `http.read_header_timeout_seconds` | integer | `STACKS_READ_HEADER_TIMEOUT_SECONDS` |
+| `log.level` | string | `STACKS_LOG_LEVEL` |
+| `telemetry.enabled` | boolean | `STACKS_OTEL_ENABLED` |
+| `telemetry.endpoint` | string | `STACKS_OTEL_ENDPOINT` |
+| `telemetry.insecure` | boolean | `STACKS_OTEL_INSECURE` |
+| `telemetry.metric_export_interval` | duration string | `STACKS_OTEL_METRIC_EXPORT_INTERVAL` |
+| `telemetry.service_name` | string | `STACKS_OTEL_SERVICE_NAME` |
+| `telemetry.trace_sample_ratio` | number | `STACKS_OTEL_TRACE_SAMPLE_RATIO` |
+| `database.scopes` | array of strings | `STACKS_DATABASE_SCOPES` |
+| `database.application_role` | string | `STACKS_DATABASE_APP_ROLE` |
+| `google.folder_id` | string | `STACKS_GOOGLE_FOLDER_ID` |
+| `google.oauth_client_file` | string path | `STACKS_GOOGLE_OAUTH_CLIENT_FILE` |
+| `google.oauth_token_file` | string path | `STACKS_GOOGLE_OAUTH_TOKEN_FILE` |
+| `google.transcript_titles` | array of strings | `STACKS_TRANSCRIPT_TITLES` |
+| `google.notes_titles` | array of strings | `STACKS_NOTES_TITLES` |
+| `directory.enabled` | boolean | `STACKS_GOOGLE_DIRECTORY_ENABLED` |
+| `directory.oauth_client_file` | string path | `STACKS_GOOGLE_DIRECTORY_OAUTH_CLIENT_FILE` |
+| `directory.oauth_token_file` | string path | `STACKS_GOOGLE_DIRECTORY_OAUTH_TOKEN_FILE` |
+| `directory.email_domains` | array of strings | `STACKS_GOOGLE_DIRECTORY_EMAIL_DOMAINS` |
+| `directory.freshness` | duration string | `STACKS_GOOGLE_DIRECTORY_FRESHNESS` |
+| `directory.retry_after` | duration string | `STACKS_GOOGLE_DIRECTORY_RETRY_AFTER` |
+| `directory.max_attempts` | integer | `STACKS_GOOGLE_DIRECTORY_MAX_ATTEMPTS` |
+| `model.data_mode` | string | `STACKS_DATA_MODE` |
+| `model.provider` | string | `STACKS_MODEL_PROVIDER` |
+| `model.id` | string | `STACKS_MODEL_ID` |
+| `model.max_output_tokens` | integer | `STACKS_MODEL_MAX_OUTPUT_TOKENS` |
+| `model.max_attempts` | integer | `STACKS_MODEL_MAX_ATTEMPTS` |
+| `model.aws_profile` | string | `STACKS_AWS_PROFILE` |
+| `model.aws_region` | string | `STACKS_AWS_REGION` |
+| `ingestion.lease_duration` | duration string | `STACKS_INGEST_LEASE_DURATION` |
+| `ingestion.attempt_timeout` | duration string | `STACKS_INGEST_ATTEMPT_TIMEOUT` |
+| `extraction.prompt_version` | string | `STACKS_EXTRACTION_PROMPT_VERSION` |
+| `analysis.prompt_version` | string | `STACKS_ANALYSIS_PROMPT_VERSION` |
+
+OAuth client and token paths are file-eligible, but the credential files and
+their contents are not. Keep real configuration files uncommitted, store OAuth
+material outside the repository with owner-readable permissions, and use only
+safe placeholders in shared examples.
+
+These inputs remain environment-only:
+
+| Input | Boundary |
+| --- | --- |
+| `STACKS_DATABASE_URL`, `STACKS_MIGRATION_DATABASE_URL` | Credential-bearing runtime and migration database URLs |
+| `STACKS_DB_ADMIN_PASSWORD`, `STACKS_DB_APP_PASSWORD` | Local Compose database credentials |
+| `STACKS_DB_PORT` | Local Compose host-port input |
+| `STACKS_TEST_DATABASE_URL`, `STACKS_TEST_MIGRATION_DATABASE_URL` | PostgreSQL integration-test credentials |
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Direct model-provider credentials |
+| AWS default-chain credentials, including `AWS_BEARER_TOKEN_BEDROCK` | AWS SDK credential boundary |
+| `STACKS_EMPLOYEE_ENTITY_ID`, `STACKS_MANAGER_ENTITY_ID` | Temporary `analyze` action inputs, not installation configuration |
+
+The following unsupported legacy provider environment variables are
+environment-only rejection signals, not supported inputs. Any non-empty value
+makes configuration loading fail:
+
+- `STACKS_BEDROCK_MODEL_ID`
+- `STACKS_BEDROCK_MAX_TOKENS`
+- `STACKS_BEDROCK_MAX_ATTEMPTS`
+- `OPENAI_BASE_URL`
+- `OPENAI_ORG_ID`
+- `OPENAI_PROJECT_ID`
+- `ANTHROPIC_BASE_URL`
+- `ANTHROPIC_AUTH_TOKEN`
+- `ANTHROPIC_PROFILE`
+
+Any secret-looking, action-input, or unsupported legacy provider name in a
+configuration file is an unknown key and fails closed.
+
+`config validate` loads and validates the same target-specific settings used by
+execution without initializing observability or constructing PostgreSQL,
+Drive, Directory, AWS, Anthropic, OpenAI, or model clients:
+
+```sh
+stacks --config /absolute/path/stacks.yaml config validate serve
+stacks --config /absolute/path/stacks.yaml config validate auth google
+stacks --config /absolute/path/stacks.yaml config validate auth google-directory
+```
+
+The first form validates an application target. Other application targets are
+`doctor`, `sync`, `entities`, `review`, `analyze`, `db-migrate`, `db-status`,
+and `db-reset`. Successful validation confirms syntax and settings only. Use
+`doctor` for read-only live dependency readiness and the separately approved
+acceptance workflows below for network access, provider quota, corpus behavior,
+and model quality.
 
 ### Environment variables
 
