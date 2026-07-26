@@ -300,6 +300,28 @@ func TestAggregateWindowDistinguishesTransitionFromConflict(t *testing.T) {
 	}
 }
 
+func TestAggregateWindowTreatsInstantAtIntervalStartAsConflict(t *testing.T) {
+	selection := aggregationWindow(t)
+	intervalStart := time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC)
+	interval := mustDuring(t, intervalStart, intervalStart.AddDate(0, 1, 0))
+	instant, err := observation.AtTime(intervalStart)
+	if err != nil {
+		t.Fatalf("observation.AtTime() error = %v", err)
+	}
+	recordedAt := intervalStart.Add(time.Hour)
+
+	summary, err := temporal.AggregateWindow(selection, temporal.CurrentKnowledge(), []temporal.StateCandidate{
+		stateCandidate(t, "status", "active", "observation-interval", supporting("evidence-interval"), interval, recordedAt, observation.StatusObserved),
+		stateCandidate(t, "status", "paused", "observation-instant", supporting("evidence-instant"), instant, recordedAt, observation.StatusObserved),
+	})
+	if err != nil {
+		t.Fatalf("AggregateWindow() error = %v", err)
+	}
+	if len(summary.Unresolved) != 1 || summary.Unresolved[0].Reason != temporal.UnresolvedConflict {
+		t.Errorf("Unresolved = %v, want instant at inclusive interval start classified as conflict", summary.Unresolved)
+	}
+}
+
 func TestAggregateWindowPreservesTemporalUncertainty(t *testing.T) {
 	selection := aggregationWindow(t)
 	recordedAt := time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC)
