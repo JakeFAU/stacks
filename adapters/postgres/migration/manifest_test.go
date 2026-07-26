@@ -266,6 +266,77 @@ func TestGrantRejectsUnsupportedOrContradictoryPrivileges(t *testing.T) {
 	}
 }
 
+func TestGrantRejectsLedgerWritePrivileges(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		table      string
+		privileges []Privilege
+		columns    []string
+	}{
+		{
+			name:       "insert",
+			privileges: []Privilege{PrivilegeSelect, PrivilegeInsert},
+		},
+		{
+			name:       "update",
+			privileges: []Privilege{PrivilegeSelect, PrivilegeUpdate},
+			columns:    []string{"name"},
+		},
+		{
+			name:       "update columns without update",
+			privileges: []Privilege{PrivilegeSelect},
+			columns:    []string{"name"},
+		},
+		{
+			name:       "other ledger",
+			table:      "directory_version",
+			privileges: []Privilege{PrivilegeSelect},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			manifest := coreManifestForSet()
+			table := test.table
+			if table == "" {
+				table = "core_version"
+			}
+			manifest.ApplicationTableGrants = []TableGrant{{
+				Schema:        "stacks_migrations",
+				Table:         table,
+				Privileges:    test.privileges,
+				UpdateColumns: test.columns,
+			}}
+
+			err := manifest.Validate()
+			if err == nil {
+				t.Fatal("Manifest.Validate() error = nil, want ledger write-grant rejection")
+			}
+			if !strings.Contains(err.Error(), "ledger") ||
+				!strings.Contains(err.Error(), "SELECT") {
+				t.Fatalf("Manifest.Validate() error = %q, want ledger SELECT-only context", err)
+			}
+		})
+	}
+}
+
+func TestGrantRequiresLedgerSelectInspection(t *testing.T) {
+	t.Parallel()
+
+	manifest := coreManifestForSet()
+	manifest.ApplicationTableGrants = nil
+	err := ValidateManifestSet([]Manifest{manifest})
+	if err == nil {
+		t.Fatal("ValidateManifestSet() error = nil, want missing ledger SELECT rejection")
+	}
+	if !strings.Contains(err.Error(), "ledger") || !strings.Contains(err.Error(), "SELECT") {
+		t.Fatalf("ValidateManifestSet() error = %q, want required ledger SELECT context", err)
+	}
+}
+
 func TestOwnershipRejectsDuplicateClaimsAcrossScopes(t *testing.T) {
 	t.Parallel()
 
@@ -387,6 +458,10 @@ func TestOwnershipAcceptsCompleteCoreAndDirectoryScopesAtIndependentVersionOne(t
 		{Kind: ObjectSchema, Schema: "stacks_migrations", Name: "stacks_migrations"},
 		{Kind: ObjectTable, Schema: "stacks_migrations", Name: "core_version"},
 	}
+	core.ApplicationTableGrants = []TableGrant{{
+		Schema: "stacks_migrations", Table: "core_version",
+		Privileges: []Privilege{PrivilegeSelect},
+	}}
 
 	directory := validManifest("directory", "directory_version")
 	setMigrationSQL(&directory.Migrations[0], `
@@ -397,6 +472,10 @@ func TestOwnershipAcceptsCompleteCoreAndDirectoryScopesAtIndependentVersionOne(t
 	directory.OwnedSchemaTrees = []string{"stacks_directory"}
 	directory.OwnedObjects = []OwnedObject{{
 		Kind: ObjectTable, Schema: "stacks_migrations", Name: "directory_version",
+	}}
+	directory.ApplicationTableGrants = []TableGrant{{
+		Schema: "stacks_migrations", Table: "directory_version",
+		Privileges: []Privilege{PrivilegeSelect},
 	}}
 
 	if err := ValidateManifestSet([]Manifest{core, directory}); err != nil {
@@ -446,6 +525,132 @@ func TestOwnershipRejectsMissingLedgerOrSharedSchemaOwner(t *testing.T) {
 	}
 }
 
+func TestManifestSetRequiresCoreFirstOwnedScopes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		manifests     []Manifest
+		wantSubstring string
+	}{
+		{
+			name:          "nonempty",
+			wantSubstring: "core",
+		},
+		{
+			name:          "directory only",
+			manifests:     []Manifest{directoryManifestForSet()},
+			wantSubstring: "core",
+		},
+		{
+			name: "reverse order",
+			manifests: []Manifest{
+				directoryManifestForSet(),
+				coreManifestForSet(),
+			},
+			wantSubstring: "first",
+		},
+		{
+			name: "wrong core ledger",
+			manifests: []Manifest{func() Manifest {
+				manifest := coreManifestForSet()
+				manifest.Ledger = "wrong_version"
+				manifest.OwnedObjects[1].Name = "wrong_version"
+				manifest.ApplicationTableGrants[0].Table = "wrong_version"
+				return manifest
+			}()},
+			wantSubstring: "core_version",
+		},
+		{
+			name: "wrong directory ledger",
+			manifests: []Manifest{
+				coreManifestForSet(),
+				func() Manifest {
+					manifest := directoryManifestForSet()
+					manifest.Ledger = "wrong_version"
+					manifest.OwnedObjects[0].Name = "wrong_version"
+					manifest.ApplicationTableGrants[0].Table = "wrong_version"
+					return manifest
+				}(),
+			},
+			wantSubstring: "directory_version",
+		},
+		{
+			name: "directory owns shared schema",
+			manifests: []Manifest{
+				func() Manifest {
+					manifest := coreManifestForSet()
+					manifest.OwnedObjects = manifest.OwnedObjects[1:]
+					return manifest
+				}(),
+				func() Manifest {
+					manifest := directoryManifestForSet()
+					manifest.OwnedObjects = append(manifest.OwnedObjects, OwnedObject{
+						Kind: ObjectSchema, Schema: "stacks_migrations", Name: "stacks_migrations",
+					})
+					return manifest
+				}(),
+			},
+			wantSubstring: "core",
+		},
+		{
+			name: "unexpected directory schema tree",
+			manifests: []Manifest{
+				coreManifestForSet(),
+				func() Manifest {
+					manifest := directoryManifestForSet()
+					manifest.OwnedSchemaTrees = append(
+						manifest.OwnedSchemaTrees,
+						"stacks_directory_extra",
+					)
+					return manifest
+				}(),
+			},
+			wantSubstring: "directory",
+		},
+		{
+			name: "unexpected directory exact object",
+			manifests: []Manifest{
+				coreManifestForSet(),
+				func() Manifest {
+					manifest := directoryManifestForSet()
+					manifest.OwnedObjects = append(manifest.OwnedObjects, OwnedObject{
+						Kind: ObjectTable, Schema: "stacks_other", Name: "unexpected",
+					})
+					return manifest
+				}(),
+			},
+			wantSubstring: "directory",
+		},
+		{
+			name: "unexpected scope",
+			manifests: []Manifest{
+				coreManifestForSet(),
+				func() Manifest {
+					manifest := directoryManifestForSet()
+					manifest.Scope = "plugin"
+					return manifest
+				}(),
+			},
+			wantSubstring: "scope",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			err := ValidateManifestSet(test.manifests)
+			if err == nil {
+				t.Fatal("ValidateManifestSet() error = nil, want core-first scope rejection")
+			}
+			if !strings.Contains(err.Error(), test.wantSubstring) {
+				t.Fatalf("ValidateManifestSet() error = %q, want substring %q", err, test.wantSubstring)
+			}
+		})
+	}
+}
+
 func validManifest(scope Scope, ledger string) Manifest {
 	return Manifest{
 		Scope:  scope,
@@ -468,4 +673,31 @@ func testMigration(version int64, name, sql string) Migration {
 	migration := Migration{Version: version, Name: name}
 	setMigrationSQL(&migration, sql)
 	return migration
+}
+
+func coreManifestForSet() Manifest {
+	manifest := validManifest("core", "core_version")
+	manifest.OwnedSchemaTrees = []string{"stacks_core"}
+	manifest.OwnedObjects = []OwnedObject{
+		{Kind: ObjectSchema, Schema: "stacks_migrations", Name: "stacks_migrations"},
+		{Kind: ObjectTable, Schema: "stacks_migrations", Name: "core_version"},
+	}
+	manifest.ApplicationTableGrants = []TableGrant{{
+		Schema: "stacks_migrations", Table: "core_version",
+		Privileges: []Privilege{PrivilegeSelect},
+	}}
+	return manifest
+}
+
+func directoryManifestForSet() Manifest {
+	manifest := validManifest("directory", "directory_version")
+	manifest.OwnedSchemaTrees = []string{"stacks_directory"}
+	manifest.OwnedObjects = []OwnedObject{{
+		Kind: ObjectTable, Schema: "stacks_migrations", Name: "directory_version",
+	}}
+	manifest.ApplicationTableGrants = []TableGrant{{
+		Schema: "stacks_migrations", Table: "directory_version",
+		Privileges: []Privilege{PrivilegeSelect},
+	}}
+	return manifest
 }

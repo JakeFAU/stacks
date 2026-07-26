@@ -14,9 +14,8 @@ import (
 )
 
 const (
-	migrationSchemaName = "stacks_migrations"
-	advisoryLockName    = "github.com/JakeFAU/stacks/postgres-migrations/v1"
-	lockCleanupTimeout  = 5 * time.Second
+	advisoryLockName   = "github.com/JakeFAU/stacks/postgres-migrations/v1"
+	lockCleanupTimeout = 5 * time.Second
 )
 
 // ErrAppliedMigrationMismatch means an applied ledger record does not match
@@ -132,12 +131,15 @@ func (migrator Migrator) Apply(ctx context.Context) (result ApplyResult, applyEr
 	for _, plan := range plans {
 		scopeResult := &result.Scopes[plan.resultOffset]
 		for _, migration := range plan.pending {
+			finalMigration := migration.Version ==
+				plan.manifest.Migrations[len(plan.manifest.Migrations)-1].Version
 			if err := applyMigration(
 				ctx,
 				connection,
 				migrator.ApplicationRole,
 				plan.manifest,
 				migration,
+				finalMigration,
 			); err != nil {
 				return result, wrapContextError(
 					ctx,
@@ -224,6 +226,7 @@ func applyMigration(
 	applicationRole string,
 	manifest Manifest,
 	migration Migration,
+	finalMigration bool,
 ) error {
 	return pgx.BeginFunc(ctx, connection, func(transaction pgx.Tx) error {
 		if _, err := transaction.Exec(
@@ -239,6 +242,7 @@ func applyMigration(
 			applicationRole,
 			manifest.ApplicationSchemaGrants,
 			manifest.ApplicationTableGrants,
+			finalMigration,
 		); err != nil {
 			return err
 		}
@@ -260,9 +264,20 @@ func applyApplicationGrants(
 	applicationRole string,
 	schemaGrants []SchemaGrant,
 	tableGrants []TableGrant,
+	finalMigration bool,
 ) error {
 	role := pgx.Identifier{applicationRole}.Sanitize()
 	for _, grant := range schemaGrants {
+		exists, err := schemaExists(ctx, transaction, grant.Schema)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			if finalMigration {
+				return fmt.Errorf("declared application grant schema %q does not exist", grant.Schema)
+			}
+			continue
+		}
 		privileges := make([]string, len(grant.Privileges))
 		for index, privilege := range grant.Privileges {
 			privileges[index] = string(privilege)
@@ -274,6 +289,40 @@ func applyApplicationGrants(
 		}
 	}
 	for _, grant := range tableGrants {
+		exists, err := tableExists(ctx, transaction, grant.Schema, grant.Table)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			if finalMigration {
+				return fmt.Errorf(
+					"declared application grant table %q.%q does not exist",
+					grant.Schema,
+					grant.Table,
+				)
+			}
+			continue
+		}
+		columnsExist, err := tableColumnsExist(
+			ctx,
+			transaction,
+			grant.Schema,
+			grant.Table,
+			grant.UpdateColumns,
+		)
+		if err != nil {
+			return err
+		}
+		if !columnsExist {
+			if finalMigration {
+				return fmt.Errorf(
+					"declared application grant columns on %q.%q do not exist",
+					grant.Schema,
+					grant.Table,
+				)
+			}
+			continue
+		}
 		table := pgx.Identifier{grant.Schema, grant.Table}.Sanitize()
 		var ordinaryPrivileges []string
 		for _, privilege := range grant.Privileges {
@@ -302,6 +351,76 @@ func applyApplicationGrants(
 		}
 	}
 	return nil
+}
+
+func schemaExists(ctx context.Context, transaction pgx.Tx, schema string) (bool, error) {
+	var exists bool
+	err := transaction.QueryRow(
+		ctx,
+		`SELECT EXISTS (
+			SELECT 1
+			FROM pg_catalog.pg_namespace
+			WHERE nspname = $1
+		)`,
+		schema,
+	).Scan(&exists)
+	return exists, err
+}
+
+func tableExists(
+	ctx context.Context,
+	transaction pgx.Tx,
+	schema string,
+	table string,
+) (bool, error) {
+	var exists bool
+	err := transaction.QueryRow(
+		ctx,
+		`SELECT EXISTS (
+			SELECT 1
+			FROM pg_catalog.pg_class AS class
+			JOIN pg_catalog.pg_namespace AS namespace
+			  ON namespace.oid = class.relnamespace
+			WHERE namespace.nspname = $1
+			  AND class.relname = $2
+			  AND class.relkind IN ('r', 'p')
+		)`,
+		schema,
+		table,
+	).Scan(&exists)
+	return exists, err
+}
+
+func tableColumnsExist(
+	ctx context.Context,
+	transaction pgx.Tx,
+	schema string,
+	table string,
+	columns []string,
+) (bool, error) {
+	if len(columns) == 0 {
+		return true, nil
+	}
+	var count int
+	err := transaction.QueryRow(
+		ctx,
+		`SELECT count(*)
+		 FROM pg_catalog.pg_attribute AS attribute
+		 JOIN pg_catalog.pg_class AS class
+		   ON class.oid = attribute.attrelid
+		 JOIN pg_catalog.pg_namespace AS namespace
+		   ON namespace.oid = class.relnamespace
+		 WHERE namespace.nspname = $1
+		   AND class.relname = $2
+		   AND class.relkind IN ('r', 'p')
+		   AND attribute.attnum > 0
+		   AND NOT attribute.attisdropped
+		   AND attribute.attname = ANY($3::text[])`,
+		schema,
+		table,
+		columns,
+	).Scan(&count)
+	return count == len(columns), err
 }
 
 func advisoryLockKey() int64 {

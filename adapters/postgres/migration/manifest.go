@@ -108,6 +108,15 @@ var (
 	}
 )
 
+const (
+	coreScope           Scope = "core"
+	directoryScope      Scope = "directory"
+	coreLedgerName            = "core_version"
+	directoryLedgerName       = "directory_version"
+	directorySchemaName       = "stacks_directory"
+	migrationSchemaName       = "stacks_migrations"
+)
+
 // LoadManifest reads exact migration bytes from files and constructs a
 // validated immutable manifest value.
 func LoadManifest(
@@ -255,12 +264,25 @@ func (manifest Manifest) Validate() error {
 // ValidateManifestSet validates each scope and rejects overlapping ownership,
 // ledger, and scope claims.
 func ValidateManifestSet(manifests []Manifest) error {
+	if len(manifests) == 0 {
+		return fmt.Errorf("core migration manifest is required")
+	}
+	if manifests[0].Scope != coreScope {
+		return fmt.Errorf("core migration manifest must be first")
+	}
+
 	scopes := make(map[Scope]struct{}, len(manifests))
 	ledgers := make(map[string]Scope, len(manifests))
 	treeOwners := make(map[string]Scope)
 	objectOwners := make(map[string]Scope)
 
-	for _, manifest := range manifests {
+	for index, manifest := range manifests {
+		if manifest.Scope != coreScope && manifest.Scope != directoryScope {
+			return fmt.Errorf("migration scope %q is unsupported", manifest.Scope)
+		}
+		if index > 0 && manifest.Scope != directoryScope {
+			return fmt.Errorf("only the directory migration scope may follow core")
+		}
 		if err := manifest.Validate(); err != nil {
 			return err
 		}
@@ -320,15 +342,25 @@ func ValidateManifestSet(manifests []Manifest) error {
 			objectOwners[key] = manifest.Scope
 		}
 	}
-	migrationSchema := OwnedObject{
-		Kind: ObjectSchema, Schema: "stacks_migrations", Name: "stacks_migrations",
+	core := manifests[0]
+	if core.Ledger != coreLedgerName {
+		return fmt.Errorf("core migration ledger must be %q", coreLedgerName)
 	}
-	if _, owned := objectOwners[migrationSchema.key()]; !owned {
-		return fmt.Errorf("migration manifest set has no exact stacks_migrations schema owner")
+	migrationSchema := OwnedObject{
+		Kind: ObjectSchema, Schema: migrationSchemaName, Name: migrationSchemaName,
+	}
+	if owner, owned := objectOwners[migrationSchema.key()]; !owned || owner != coreScope {
+		return fmt.Errorf("core migration scope must exactly own the stacks_migrations schema")
+	}
+	coreLedger := OwnedObject{
+		Kind: ObjectTable, Schema: migrationSchemaName, Name: coreLedgerName,
+	}
+	if owner, owned := objectOwners[coreLedger.key()]; !owned || owner != coreScope {
+		return fmt.Errorf("core migration scope must exactly own ledger %q", coreLedgerName)
 	}
 	for _, manifest := range manifests {
 		ledger := OwnedObject{
-			Kind: ObjectTable, Schema: "stacks_migrations", Name: manifest.Ledger,
+			Kind: ObjectTable, Schema: migrationSchemaName, Name: manifest.Ledger,
 		}
 		owner, owned := objectOwners[ledger.key()]
 		if !owned || owner != manifest.Scope {
@@ -338,6 +370,39 @@ func ValidateManifestSet(manifests []Manifest) error {
 				manifest.Ledger,
 			)
 		}
+		if !hasLedgerSelectGrant(manifest) {
+			return fmt.Errorf(
+				"migration scope %q must grant only SELECT on ledger %q",
+				manifest.Scope,
+				manifest.Ledger,
+			)
+		}
+	}
+	if len(manifests) == 1 {
+		return nil
+	}
+	if len(manifests) != 2 {
+		return fmt.Errorf("only core and directory migration scopes are supported")
+	}
+	directory := manifests[1]
+	if directory.Ledger != directoryLedgerName {
+		return fmt.Errorf("directory migration ledger must be %q", directoryLedgerName)
+	}
+	if len(directory.OwnedSchemaTrees) != 1 ||
+		directory.OwnedSchemaTrees[0] != directorySchemaName {
+		return fmt.Errorf(
+			"directory migration scope must own only the %q schema tree",
+			directorySchemaName,
+		)
+	}
+	if len(directory.OwnedObjects) != 1 ||
+		directory.OwnedObjects[0] != (OwnedObject{
+			Kind: ObjectTable, Schema: migrationSchemaName, Name: directoryLedgerName,
+		}) {
+		return fmt.Errorf(
+			"directory migration scope must own only ledger %q outside its schema tree",
+			directoryLedgerName,
+		)
 	}
 	return nil
 }
@@ -482,6 +547,19 @@ func validateGrants(manifest Manifest, ownership ownershipSet) error {
 		if len(grant.Privileges) == 0 {
 			return fmt.Errorf("manifest %q table grant %q has no privileges", manifest.Scope, target)
 		}
+		if grant.Schema == migrationSchemaName {
+			if grant.Table != manifest.Ledger ||
+				len(grant.Privileges) != 1 ||
+				grant.Privileges[0] != PrivilegeSelect ||
+				len(grant.UpdateColumns) != 0 {
+				return fmt.Errorf(
+					"manifest %q ledger grant must be only SELECT on %s.%s",
+					manifest.Scope,
+					migrationSchemaName,
+					manifest.Ledger,
+				)
+			}
+		}
 
 		seen := make(map[Privilege]struct{}, len(grant.Privileges))
 		hasUpdate := false
@@ -547,6 +625,19 @@ func validateGrants(manifest Manifest, ownership ownershipSet) error {
 		}
 	}
 	return nil
+}
+
+func hasLedgerSelectGrant(manifest Manifest) bool {
+	for _, grant := range manifest.ApplicationTableGrants {
+		if grant.Schema == migrationSchemaName &&
+			grant.Table == manifest.Ledger &&
+			len(grant.Privileges) == 1 &&
+			grant.Privileges[0] == PrivilegeSelect &&
+			len(grant.UpdateColumns) == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func validateIdentifier(label, identifier string) error {

@@ -188,6 +188,144 @@ func TestMigratorRollsBackFailedVersionAndLedgerInsert(t *testing.T) {
 	}
 }
 
+func TestMigratorAppliesVersionAwareGrantsOnCleanInstall(t *testing.T) {
+	database := postgrestest.NewDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
+	manifest := testVersionedGrantManifest()
+
+	result, err := testMigrator(database, manifest).Apply(ctx)
+	if err != nil {
+		t.Fatalf("clean Migrator.Apply() error = %v", err)
+	}
+	if len(result.Scopes) != 1 ||
+		len(result.Scopes[0].Applied) != 2 ||
+		result.Scopes[0].Applied[0] != 1 ||
+		result.Scopes[0].Applied[1] != 2 {
+		t.Fatalf("clean versioned apply result = %#v, want versions 1 and 2", result)
+	}
+	assertApplicationCanUseVersionTwoGrant(t, ctx, database)
+}
+
+func TestMigratorAppliesVersionAwareGrantsOnUpgrade(t *testing.T) {
+	database := postgrestest.NewDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
+	initial := testVersionedGrantManifest()
+	initial.Migrations = initial.Migrations[:1]
+	initial.ApplicationTableGrants = initial.ApplicationTableGrants[:2]
+	if _, err := testMigrator(database, initial).Apply(ctx); err != nil {
+		t.Fatalf("initial version 1 Migrator.Apply() error = %v", err)
+	}
+
+	result, err := testMigrator(database, testVersionedGrantManifest()).Apply(ctx)
+	if err != nil {
+		t.Fatalf("upgrade Migrator.Apply() error = %v", err)
+	}
+	if len(result.Scopes) != 1 ||
+		len(result.Scopes[0].Applied) != 1 ||
+		result.Scopes[0].Applied[0] != 2 {
+		t.Fatalf("upgrade apply result = %#v, want only version 2", result)
+	}
+	assertApplicationCanUseVersionTwoGrant(t, ctx, database)
+}
+
+func TestMigratorRollsBackFinalVersionWhenDeclaredGrantIsMissing(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     string
+		columns    []string
+		versionSQL string
+	}{
+		{
+			name:       "table",
+			target:     "missing_records",
+			versionSQL: "CREATE TABLE stacks_core.version_two_marker (id bigint PRIMARY KEY)",
+		},
+		{
+			name:    "update column",
+			target:  "version_two_marker",
+			columns: []string{"missing_column"},
+			versionSQL: `
+				CREATE TABLE stacks_core.version_two_marker (
+					id bigint PRIMARY KEY,
+					present_column text NOT NULL
+				)`,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			database := postgrestest.NewDatabase(t)
+			ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+			defer cancel()
+			initial := testCoreManifest()
+			if _, err := testMigrator(database, initial).Apply(ctx); err != nil {
+				t.Fatalf("initial Migrator.Apply() error = %v", err)
+			}
+
+			manifest := testCoreManifest()
+			manifest.Migrations = append(
+				manifest.Migrations,
+				testMigration(2, "final_grant", test.versionSQL),
+			)
+			privileges := []Privilege{PrivilegeSelect}
+			if len(test.columns) > 0 {
+				privileges = append(privileges, PrivilegeUpdate)
+			}
+			manifest.ApplicationTableGrants = append(
+				manifest.ApplicationTableGrants,
+				TableGrant{
+					Schema:        "stacks_core",
+					Table:         test.target,
+					Privileges:    privileges,
+					UpdateColumns: test.columns,
+				},
+			)
+
+			if _, err := testMigrator(database, manifest).Apply(ctx); err == nil {
+				t.Fatal("final Migrator.Apply() error = nil, want missing grant target rejection")
+			}
+			connection := openTestConnection(t, ctx, database.AdminURL())
+			defer connection.Close(context.Background())
+			var marker *string
+			if err := connection.QueryRow(
+				ctx,
+				"SELECT to_regclass('stacks_core.version_two_marker')::text",
+			).Scan(&marker); err != nil {
+				t.Fatalf("inspect rolled-back final table: %v", err)
+			}
+			if marker != nil {
+				t.Fatalf("final migration table = %q, want rollback", *marker)
+			}
+			var versions []int64
+			rows, err := connection.Query(
+				ctx,
+				"SELECT version FROM "+qualifiedLedger("core_version")+" ORDER BY version",
+			)
+			if err != nil {
+				t.Fatalf("query final migration ledger: %v", err)
+			}
+			for rows.Next() {
+				var version int64
+				if err := rows.Scan(&version); err != nil {
+					rows.Close()
+					t.Fatalf("scan final migration ledger: %v", err)
+				}
+				versions = append(versions, version)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				t.Fatalf("iterate final migration ledger: %v", err)
+			}
+			rows.Close()
+			if len(versions) != 1 || versions[0] != 1 {
+				t.Fatalf("versions after rejected final grant = %v, want [1]", versions)
+			}
+		})
+	}
+}
+
 func TestMigratorSerializesConcurrentApplyWithoutSleep(t *testing.T) {
 	database := postgrestest.NewDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
@@ -306,6 +444,18 @@ func TestApplicationRoleCanInspectButCannotMigrate(t *testing.T) {
 	); err == nil {
 		t.Fatal("application role inserted migration ledger row")
 	}
+	if _, err := application.Exec(
+		ctx,
+		"UPDATE "+qualifiedLedger("core_version")+" SET name = 'forbidden' WHERE version = 1",
+	); err == nil {
+		t.Fatal("application role updated migration ledger row")
+	}
+	if _, err := application.Exec(
+		ctx,
+		"DELETE FROM "+qualifiedLedger("core_version")+" WHERE version = 1",
+	); err == nil {
+		t.Fatal("application role deleted migration ledger row")
+	}
 	if _, err := application.Exec(ctx, "CREATE TABLE stacks_core.forbidden (id bigint)"); err == nil {
 		t.Fatal("application role created a scope-owned table")
 	}
@@ -416,6 +566,63 @@ func testDirectoryManifest() Manifest {
 		{Schema: "stacks_directory", Table: "profiles", Privileges: []Privilege{PrivilegeSelect}},
 	}
 	return manifest
+}
+
+func testVersionedGrantManifest() Manifest {
+	manifest := testCoreManifest()
+	manifest.Migrations = append(manifest.Migrations, testMigration(
+		2,
+		"future_records",
+		`CREATE TABLE stacks_core.future_records (
+			id bigint PRIMARY KEY,
+			status text NOT NULL,
+			protected text NOT NULL
+		);
+		INSERT INTO stacks_core.future_records (id, status, protected)
+		VALUES (1, 'pending', 'immutable')`,
+	))
+	manifest.ApplicationTableGrants = append(
+		manifest.ApplicationTableGrants,
+		TableGrant{
+			Schema:        "stacks_core",
+			Table:         "future_records",
+			Privileges:    []Privilege{PrivilegeSelect, PrivilegeUpdate},
+			UpdateColumns: []string{"status"},
+		},
+	)
+	return manifest
+}
+
+func assertApplicationCanUseVersionTwoGrant(
+	t *testing.T,
+	ctx context.Context,
+	database postgrestest.Database,
+) {
+	t.Helper()
+	application := openTestConnection(t, ctx, database.ApplicationURL())
+	defer application.Close(context.Background())
+	if _, err := application.Exec(
+		ctx,
+		"UPDATE stacks_core.future_records SET status = 'complete' WHERE id = 1",
+	); err != nil {
+		t.Fatalf("application update version 2 declared column: %v", err)
+	}
+	if _, err := application.Exec(
+		ctx,
+		"UPDATE stacks_core.future_records SET protected = 'changed' WHERE id = 1",
+	); err == nil {
+		t.Fatal("application updated version 2 protected column")
+	}
+	var status string
+	if err := application.QueryRow(
+		ctx,
+		"SELECT status FROM stacks_core.future_records WHERE id = 1",
+	).Scan(&status); err != nil {
+		t.Fatalf("application inspect version 2 table: %v", err)
+	}
+	if status != "complete" {
+		t.Fatalf("version 2 status = %q, want complete", status)
+	}
 }
 
 func openTestConnection(t *testing.T, ctx context.Context, databaseURL string) *pgx.Conn {
