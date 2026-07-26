@@ -4,10 +4,13 @@ package localdb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/JakeFAU/stacks/adapters/postgres/migration"
@@ -17,14 +20,16 @@ import (
 const (
 	ConfirmationToken = "delete-local-stacks-postgres"
 
-	postgresService       = "postgres"
-	postgresVolumeKey     = "postgres_data"
-	postgresMount         = "/var/lib/postgresql"
-	composeFile           = "compose.yaml"
-	composeProject        = "stacks"
-	composeProjectLabel   = "com.docker.compose.project"
-	composeServiceLabel   = "com.docker.compose.service"
-	composeVolumeKeyLabel = "com.docker.compose.volume"
+	postgresService         = "postgres"
+	postgresVolumeKey       = "postgres_data"
+	postgresMount           = "/var/lib/postgresql"
+	composeFileName         = "compose.yaml"
+	composeProject          = "stacks"
+	composeProjectLabel     = "com.docker.compose.project"
+	composeServiceLabel     = "com.docker.compose.service"
+	composeVolumeKeyLabel   = "com.docker.compose.volume"
+	composeWorkingDirLabel  = "com.docker.compose.project.working_dir"
+	composeConfigFilesLabel = "com.docker.compose.project.config_files"
 )
 
 var dockerRedirectEnvironment = []string{
@@ -93,7 +98,11 @@ func (resetter Resetter) Reset(
 		return fmt.Errorf("reset local PostgreSQL: migrator is required")
 	}
 
-	target, err := resetter.inspectTarget(ctx)
+	projectDirectory, composePath, err := repositoryComposeTarget()
+	if err != nil {
+		return err
+	}
+	target, err := resetter.inspectTarget(ctx, projectDirectory, composePath)
 	if err != nil {
 		return err
 	}
@@ -106,7 +115,7 @@ func (resetter Resetter) Reset(
 		postgresService,
 		target.volumeName,
 	); err != nil {
-		return fmt.Errorf("reset local PostgreSQL: write warning: %w", err)
+		return errors.New("reset local PostgreSQL: write warning operation failed")
 	}
 
 	commands := []struct {
@@ -114,25 +123,62 @@ func (resetter Resetter) Reset(
 		name  string
 		args  []string
 	}{
-		{stage: "stop", name: "docker", args: resetter.composeArgs(target.contextName, "stop", postgresService)},
-		{stage: "container removal", name: "docker", args: resetter.composeArgs(target.contextName, "rm", "-f", postgresService)},
-		{stage: "volume removal", name: "docker", args: []string{"--context", target.contextName, "volume", "rm", target.volumeName}},
-		{stage: "recreate and wait", name: "docker", args: resetter.composeArgs(target.contextName, "up", "-d", "--wait", postgresService)},
+		{
+			stage: "stop",
+			name:  "docker",
+			args: resetter.composeArgs(
+				target.endpoint,
+				projectDirectory,
+				composePath,
+				"stop",
+				postgresService,
+			),
+		},
+		{
+			stage: "container removal",
+			name:  "docker",
+			args: resetter.composeArgs(
+				target.endpoint,
+				projectDirectory,
+				composePath,
+				"rm",
+				"-f",
+				postgresService,
+			),
+		},
+		{
+			stage: "volume removal",
+			name:  "docker",
+			args:  []string{"--host", target.endpoint, "volume", "rm", target.volumeName},
+		},
+		{
+			stage: "recreate and wait",
+			name:  "docker",
+			args: resetter.composeArgs(
+				target.endpoint,
+				projectDirectory,
+				composePath,
+				"up",
+				"-d",
+				"--wait",
+				postgresService,
+			),
+		},
 	}
 	for _, command := range commands {
 		if _, err := resetter.Runner.Run(ctx, command.name, command.args...); err != nil {
-			return fmt.Errorf("reset local PostgreSQL: %s operation failed", command.stage)
+			return newOperationError(ctx, command.stage, err)
 		}
 	}
 	if _, err := resetter.Migrator.Apply(ctx); err != nil {
-		return fmt.Errorf("reset local PostgreSQL: migrate operation failed")
+		return newOperationError(ctx, "migrate", err)
 	}
 	return nil
 }
 
 type resetTarget struct {
-	contextName string
-	volumeName  string
+	endpoint   string
+	volumeName string
 }
 
 type composeModel struct {
@@ -160,15 +206,26 @@ type volumeInspection struct {
 	Labels map[string]string `json:"Labels"`
 }
 
-func (resetter Resetter) inspectTarget(ctx context.Context) (resetTarget, error) {
-	contextName, err := resetter.inspectLocalContext(ctx)
+func (resetter Resetter) inspectTarget(
+	ctx context.Context,
+	projectDirectory string,
+	composePath string,
+) (resetTarget, error) {
+	endpoint, err := resetter.inspectLocalContext(ctx)
 	if err != nil {
 		return resetTarget{}, err
 	}
 	configOutput, err := resetter.Runner.Run(
 		ctx,
 		"docker",
-		resetter.composeArgs(contextName, "config", "--format", "json")...,
+		resetter.composeArgs(
+			endpoint,
+			projectDirectory,
+			composePath,
+			"config",
+			"--format",
+			"json",
+		)...,
 	)
 	if err != nil {
 		return resetTarget{}, fmt.Errorf("reset local PostgreSQL: inspect Compose configuration")
@@ -202,7 +259,14 @@ func (resetter Resetter) inspectTarget(ctx context.Context) (resetTarget, error)
 	containerOutput, err := resetter.Runner.Run(
 		ctx,
 		"docker",
-		resetter.composeArgs(contextName, "ps", "-q", postgresService)...,
+		resetter.composeArgs(
+			endpoint,
+			projectDirectory,
+			composePath,
+			"ps",
+			"-q",
+			postgresService,
+		)...,
 	)
 	if err != nil {
 		return resetTarget{}, fmt.Errorf("reset local PostgreSQL: inspect PostgreSQL service")
@@ -214,8 +278,8 @@ func (resetter Resetter) inspectTarget(ctx context.Context) (resetTarget, error)
 	containerInspectionOutput, err := resetter.Runner.Run(
 		ctx,
 		"docker",
-		"--context",
-		contextName,
+		"--host",
+		endpoint,
 		"inspect",
 		"--format",
 		"{{json .}}",
@@ -232,6 +296,13 @@ func (resetter Resetter) inspectTarget(ctx context.Context) (resetTarget, error)
 		container.Config.Labels[composeServiceLabel] != postgresService {
 		return resetTarget{}, fmt.Errorf("reset local PostgreSQL: PostgreSQL service labels do not match")
 	}
+	if !matchesComposeProvenance(
+		container.Config.Labels,
+		projectDirectory,
+		composePath,
+	) {
+		return resetTarget{}, fmt.Errorf("reset local PostgreSQL: PostgreSQL service provenance does not match")
+	}
 	mounts := make([]containerMount, 0, 1)
 	for _, mount := range container.Mounts {
 		if mount.Destination == postgresMount {
@@ -247,8 +318,8 @@ func (resetter Resetter) inspectTarget(ctx context.Context) (resetTarget, error)
 	volumeOutput, err := resetter.Runner.Run(
 		ctx,
 		"docker",
-		"--context",
-		contextName,
+		"--host",
+		endpoint,
 		"volume",
 		"inspect",
 		"--format",
@@ -267,7 +338,7 @@ func (resetter Resetter) inspectTarget(ctx context.Context) (resetTarget, error)
 		inspected.Labels[composeVolumeKeyLabel] != postgresVolumeKey {
 		return resetTarget{}, fmt.Errorf("reset local PostgreSQL: PostgreSQL volume labels do not match")
 	}
-	return resetTarget{contextName: contextName, volumeName: volume.Name}, nil
+	return resetTarget{endpoint: endpoint, volumeName: volume.Name}, nil
 }
 
 type containerInspection struct {
@@ -313,18 +384,94 @@ func (resetter Resetter) inspectLocalContext(ctx context.Context) (string, error
 			!strings.HasPrefix(endpoint, "npipe:////./pipe/")) {
 		return "", fmt.Errorf("reset local PostgreSQL: Docker context endpoint is not local")
 	}
-	return contextName, nil
+	return endpoint, nil
 }
 
-func (resetter Resetter) composeArgs(contextName string, arguments ...string) []string {
+func (resetter Resetter) composeArgs(
+	endpoint string,
+	projectDirectory string,
+	composePath string,
+	arguments ...string,
+) []string {
 	result := []string{
-		"--context",
-		contextName,
+		"--host",
+		endpoint,
 		"compose",
+		"--project-directory",
+		projectDirectory,
 		"--file",
-		composeFile,
+		composePath,
 		"--project-name",
 		composeProject,
 	}
 	return append(result, arguments...)
+}
+
+func repositoryComposeTarget() (string, string, error) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok || !filepath.IsAbs(sourceFile) {
+		return "", "", errors.New("reset local PostgreSQL: repository Compose target is unresolved")
+	}
+	projectDirectory := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
+	composePath := filepath.Clean(filepath.Join(projectDirectory, composeFileName))
+	if !filepath.IsAbs(projectDirectory) ||
+		!filepath.IsAbs(composePath) ||
+		filepath.Dir(composePath) != projectDirectory {
+		return "", "", errors.New("reset local PostgreSQL: repository Compose target is unresolved")
+	}
+	info, err := os.Stat(composePath)
+	if err != nil || info.IsDir() {
+		return "", "", errors.New("reset local PostgreSQL: repository Compose target is unresolved")
+	}
+	return projectDirectory, composePath, nil
+}
+
+func matchesComposeProvenance(
+	labels map[string]string,
+	projectDirectory string,
+	composePath string,
+) bool {
+	workingDirectory := labels[composeWorkingDirLabel]
+	configFiles := strings.Split(labels[composeConfigFilesLabel], ",")
+	return filepath.IsAbs(workingDirectory) &&
+		filepath.Clean(workingDirectory) == workingDirectory &&
+		workingDirectory == projectDirectory &&
+		len(configFiles) == 1 &&
+		filepath.IsAbs(configFiles[0]) &&
+		filepath.Clean(configFiles[0]) == configFiles[0] &&
+		configFiles[0] == composePath
+}
+
+type operationError struct {
+	message string
+	cause   error
+}
+
+func (err operationError) Error() string {
+	return err.message
+}
+
+func (err operationError) Unwrap() error {
+	return err.cause
+}
+
+func newOperationError(ctx context.Context, stage string, err error) error {
+	var safeCause error
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		safeCause = context.DeadlineExceeded
+	case errors.Is(ctx.Err(), context.Canceled):
+		safeCause = context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		safeCause = context.DeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		safeCause = context.Canceled
+	}
+	return operationError{
+		message: fmt.Sprintf(
+			"reset local PostgreSQL: %s operation failed",
+			stage,
+		),
+		cause: safeCause,
+	}
 }

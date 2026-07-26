@@ -4,11 +4,40 @@ package pgconfig
 import (
 	"errors"
 	"net"
+	"os"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+var postgresConnectionEnvironment = []string{
+	"PGHOST",
+	"PGHOSTADDR",
+	"PGPORT",
+	"PGDATABASE",
+	"PGUSER",
+	"PGPASSWORD",
+	"PGPASSFILE",
+	"PGAPPNAME",
+	"PGCONNECT_TIMEOUT",
+	"PGSSLMODE",
+	"PGSSLKEY",
+	"PGSSLCERT",
+	"PGSSLSNI",
+	"PGSSLROOTCERT",
+	"PGSSLPASSWORD",
+	"PGSSLNEGOTIATION",
+	"PGTARGETSESSIONATTRS",
+	"PGSERVICE",
+	"PGSERVICEFILE",
+	"PGTZ",
+	"PGOPTIONS",
+	"PGMINPROTOCOLVERSION",
+	"PGMAXPROTOCOLVERSION",
+	"PGCHANNELBINDING",
+	"PGREQUIREAUTH",
+}
 
 var allowedConnectionKeys = []string{
 	"host",
@@ -43,6 +72,11 @@ var allowedConnectionKeys = []string{
 // ParseLocal applies pgx v5 connection parsing while rejecting redirection
 // parameters and every non-loopback primary or fallback endpoint.
 func ParseLocal(connectionString string) (*pgx.ConnConfig, error) {
+	for _, variable := range postgresConnectionEnvironment {
+		if value, present := os.LookupEnv(variable); present && value != "" {
+			return nil, errors.New("ambient PostgreSQL connection configuration is not allowed")
+		}
+	}
 	if strings.TrimSpace(connectionString) == "" {
 		return nil, errors.New("local PostgreSQL connection configuration is required")
 	}

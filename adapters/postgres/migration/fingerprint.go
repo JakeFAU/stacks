@@ -3,6 +3,7 @@ package migration
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -248,10 +249,9 @@ func readCatalog(
 		return nil, fmt.Errorf("read owned PostgreSQL indexes: %w", err)
 	}
 
-	functionSchemas, functionNames := splitExactObjects(exactFunctions)
-	functionSignatures := make([]string, len(exactFunctions))
-	for index, object := range exactFunctions {
-		functionSignatures[index] = object.FunctionSignature
+	exactFunctionOIDs, err := resolveExactFunctionOIDs(ctx, connection, exactFunctions)
+	if err != nil {
+		return nil, err
 	}
 	if err := queryCatalogObjects(
 		ctx,
@@ -273,14 +273,8 @@ func readCatalog(
 		   FROM pg_catalog.pg_proc AS procedure
 		   JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
 		  WHERE namespace.nspname = ANY($1::text[])
-		     OR (
-		            namespace.nspname,
-		            procedure.proname,
-		            concat('(', pg_catalog.pg_get_function_identity_arguments(procedure.oid), ')')
-		        ) IN (
-		            SELECT * FROM unnest($2::text[], $3::text[], $4::text[])
-		        )`,
-		[]any{treeSchemas, functionSchemas, functionNames, functionSignatures},
+		     OR procedure.oid = ANY($2::oid[])`,
+		[]any{treeSchemas, exactFunctionOIDs},
 		add,
 	); err != nil {
 		return nil, fmt.Errorf("read owned PostgreSQL functions: %w", err)
@@ -323,6 +317,39 @@ func readCatalog(
 		result = append(result, object)
 	}
 	return result, nil
+}
+
+func resolveExactFunctionOIDs(
+	ctx context.Context,
+	connection *pgx.Conn,
+	functions []OwnedObject,
+) ([]uint32, error) {
+	oids := make([]uint32, 0, len(functions))
+	seen := make(map[uint32]struct{}, len(functions))
+	for _, function := range functions {
+		declaration := function.Schema + "." + function.Name + function.FunctionSignature
+		var oid sql.NullInt64
+		if err := connection.QueryRow(
+			ctx,
+			`SELECT pg_catalog.to_regprocedure($1)::oid`,
+			declaration,
+		).Scan(&oid); err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("resolve exact owned PostgreSQL function")
+		}
+		if !oid.Valid {
+			return nil, fmt.Errorf("resolve exact owned PostgreSQL function")
+		}
+		resolved := uint32(oid.Int64)
+		if _, duplicate := seen[resolved]; duplicate {
+			return nil, fmt.Errorf("resolve exact owned PostgreSQL function")
+		}
+		seen[resolved] = struct{}{}
+		oids = append(oids, resolved)
+	}
+	return oids, nil
 }
 
 func queryCatalogObjects(
