@@ -1,10 +1,36 @@
 package identity_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/JakeFAU/stacks/core/identity"
 )
+
+func BenchmarkResolverRanksLargeEntitySet(b *testing.B) {
+	const snapshotCount = 1_000
+
+	snapshots := make([]identity.EntitySnapshot, snapshotCount)
+	for index := range snapshots {
+		snapshots[index] = identity.EntitySnapshot{
+			ID:          fmt.Sprintf("entity-%04d", index),
+			Kind:        identity.KindPerson,
+			DisplayName: fmt.Sprintf("Synthetic Person %04d", index),
+			Aliases: []identity.Alias{{
+				Type:  identity.AliasTypeName,
+				Value: fmt.Sprintf("Test Person %04d", index),
+			}},
+		}
+	}
+	mention := identity.Mention{Name: "Unmatched Example"}
+	resolver := identity.Resolver{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		resolver.Resolve(mention, snapshots)
+	}
+}
 
 func TestResolverAutoResolvesAcceptedExactEmail(t *testing.T) {
 	resolution := identity.Resolver{}.Resolve(identity.Mention{Email: "riya.chen@synthetic.example"}, []identity.EntitySnapshot{{

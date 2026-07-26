@@ -97,19 +97,24 @@ func TestNewAuthorizedHTTPClientDoesNotExposeCredentialFileContents(t *testing.T
 	}
 }
 
-func TestAuthorizerRejectsMismatchedStateWithoutWritingToken(t *testing.T) {
-	fixture := newAuthorizationFixture(t, []string{"https://example.test/readonly"}, successfulTokenTransport(t))
-	result := fixture.start(t)
-	parsed := parseURL(t, fixture.authorizationURL(t))
-	redirect := parseURL(t, parsed.Query().Get("redirect_uri"))
-	fixture.callbackExpectingStatus(t, redirect, "synthetic-code", "wrong-state", http.StatusBadRequest)
+func TestOAuthCallbackHandlerIgnoresMismatchedStateUntilValidCallback(t *testing.T) {
+	results := make(chan oauthCallback, 1)
+	handler := oauthCallbackHandler("matching-state", results)
 
-	err := <-result
-	if err == nil || !strings.Contains(err.Error(), "state mismatch") {
-		t.Fatalf("Authorize() error = %v, want state mismatch", err)
+	mismatchedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(mismatchedResponse, newOAuthCallbackRequest(t, "untrusted-code", "wrong-state"))
+	if mismatchedResponse.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched callback status = %d, want %d", mismatchedResponse.Code, http.StatusBadRequest)
 	}
-	if _, statErr := os.Stat(fixture.tokenFile); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("token file exists after rejected callback: %v", statErr)
+	select {
+	case result := <-results:
+		t.Fatalf("mismatched callback completed authorization: %#v", result)
+	default:
+	}
+
+	handler.ServeHTTP(httptest.NewRecorder(), newOAuthCallbackRequest(t, "trusted-code", "matching-state"))
+	if result := <-results; result.code != "trusted-code" || result.err != nil {
+		t.Fatalf("published callback = %#v, want trusted code", result)
 	}
 }
 
