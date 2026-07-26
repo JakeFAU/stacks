@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -14,11 +15,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/smithy-go"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
+	"go.uber.org/zap"
 
 	"stacks/internal/cli"
 	"stacks/internal/config"
@@ -32,6 +35,202 @@ import (
 	"stacks/internal/observability"
 	"stacks/internal/source"
 )
+
+func TestExecutionDependenciesComposeRuntimeCommandsTelemetryAndShutdown(t *testing.T) {
+	decisionRecorder, err := observability.NewDecisionRecorder(noop.NewMeterProvider().Meter("synthetic"))
+	if err != nil {
+		t.Fatalf("create decision recorder: %v", err)
+	}
+	tracerProvider := &recordingExecutionTracerProvider{
+		TracerProvider: tracenoop.NewTracerProvider(),
+	}
+	meterProvider := &recordingExecutionMeterProvider{
+		MeterProvider: noop.NewMeterProvider(),
+	}
+	runtime := &recordingExecutionObservability{
+		logger:         zap.NewNop(),
+		tracerProvider: tracerProvider,
+		meterProvider:  meterProvider,
+		decisions:      decisionRecorder,
+	}
+
+	originalNewRuntime := newObservabilityRuntime
+	originalCommandProvider := composeCommands
+	t.Cleanup(func() {
+		newObservabilityRuntime = originalNewRuntime
+		composeCommands = originalCommandProvider
+	})
+
+	bootstrapSettings := config.Settings{
+		LogLevel:  "error",
+		Telemetry: config.TelemetrySettings{Enabled: false},
+	}
+	var runtimeSettings config.Settings
+	newObservabilityRuntime = func(_ context.Context, settings config.Settings) (executionObservability, error) {
+		runtimeSettings = settings
+		return runtime, nil
+	}
+
+	var (
+		commandProviderCalls int
+		commandSettings      config.Settings
+		commandTracer        trace.Tracer
+		commandDecisions     *observability.DecisionRecorder
+		commandInvocations   modeltelemetry.Recorder
+	)
+	composeCommands = func(
+		_ context.Context,
+		settings config.Settings,
+		_, _ io.Writer,
+		tracer trace.Tracer,
+		decisions *observability.DecisionRecorder,
+		invocations modeltelemetry.Recorder,
+	) (map[string]cli.Command, error) {
+		commandProviderCalls++
+		commandSettings = settings
+		commandTracer = tracer
+		commandDecisions = decisions
+		commandInvocations = invocations
+		return map[string]cli.Command{}, nil
+	}
+
+	dependencies, err := newExecutionDependencies(t.Context(), bootstrapSettings)
+	if err != nil {
+		t.Fatalf("newExecutionDependencies() error = %v", err)
+	}
+	if dependencies.Runtime == nil {
+		t.Fatal("runtime dependency = nil")
+	}
+	if dependencies.CommandProvider == nil {
+		t.Fatal("command provider dependency = nil")
+	}
+	if dependencies.Shutdown == nil {
+		t.Fatal("shutdown dependency = nil")
+	}
+	if !reflect.DeepEqual(runtimeSettings, bootstrapSettings) {
+		t.Fatalf("observability settings = %#v, want %#v", runtimeSettings, bootstrapSettings)
+	}
+	if commandProviderCalls != 0 || runtime.decisionRecorderCalls != 0 ||
+		len(tracerProvider.names) != 0 || len(meterProvider.names) != 0 {
+		t.Fatalf(
+			"eager command telemetry construction = provider:%d decisions:%d tracers:%v meters:%v",
+			commandProviderCalls,
+			runtime.decisionRecorderCalls,
+			tracerProvider.names,
+			meterProvider.names,
+		)
+	}
+
+	validatedSettings := config.Settings{
+		LogLevel: "warn",
+		Database: config.DatabaseSettings{
+			URL:             "postgres://synthetic-app",
+			MigrationURL:    "postgres://synthetic-admin",
+			Scopes:          []config.DatabaseScope{config.DatabaseScopeCore},
+			ApplicationRole: "synthetic_role",
+		},
+	}
+	if _, err := dependencies.CommandProvider.Commands(
+		t.Context(),
+		validatedSettings,
+		io.Discard,
+		io.Discard,
+	); err != nil {
+		t.Fatalf("Commands() error = %v", err)
+	}
+	if commandProviderCalls != 1 {
+		t.Fatalf("command provider calls = %d, want 1", commandProviderCalls)
+	}
+	if !reflect.DeepEqual(commandSettings, validatedSettings) {
+		t.Fatalf("command settings = %#v, want %#v", commandSettings, validatedSettings)
+	}
+	if runtime.decisionRecorderCalls != 1 || commandDecisions != decisionRecorder {
+		t.Fatalf(
+			"decision recorder calls/value = %d/%p, want 1/%p",
+			runtime.decisionRecorderCalls,
+			commandDecisions,
+			decisionRecorder,
+		)
+	}
+	if strings.Join(tracerProvider.names, ",") != "stacks" || commandTracer == nil {
+		t.Fatalf("command tracer names/value = %v/%v, want stacks/non-nil", tracerProvider.names, commandTracer)
+	}
+	if strings.Join(meterProvider.names, ",") != "stacks" || commandInvocations == nil {
+		t.Fatalf("command meter names/recorder = %v/%v, want stacks/non-nil", meterProvider.names, commandInvocations)
+	}
+
+	shutdownContext := t.Context()
+	if err := dependencies.Shutdown(shutdownContext); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if runtime.shutdownCalls != 1 || runtime.shutdownContext != shutdownContext {
+		t.Fatalf(
+			"runtime shutdown calls/context = %d/%v, want 1/%v",
+			runtime.shutdownCalls,
+			runtime.shutdownContext,
+			shutdownContext,
+		)
+	}
+}
+
+type recordingExecutionObservability struct {
+	logger                *zap.Logger
+	tracerProvider        trace.TracerProvider
+	meterProvider         metric.MeterProvider
+	decisions             *observability.DecisionRecorder
+	decisionRecorderCalls int
+	shutdownCalls         int
+	shutdownContext       context.Context
+}
+
+func (runtime *recordingExecutionObservability) Logger() *zap.Logger {
+	return runtime.logger
+}
+
+func (runtime *recordingExecutionObservability) TracerProvider() trace.TracerProvider {
+	return runtime.tracerProvider
+}
+
+func (runtime *recordingExecutionObservability) MeterProvider() metric.MeterProvider {
+	return runtime.meterProvider
+}
+
+func (runtime *recordingExecutionObservability) DecisionRecorder() (*observability.DecisionRecorder, error) {
+	runtime.decisionRecorderCalls++
+	return runtime.decisions, nil
+}
+
+func (runtime *recordingExecutionObservability) Shutdown(ctx context.Context) error {
+	runtime.shutdownCalls++
+	runtime.shutdownContext = ctx
+	return nil
+}
+
+type recordingExecutionTracerProvider struct {
+	trace.TracerProvider
+	names []string
+}
+
+func (provider *recordingExecutionTracerProvider) Tracer(
+	name string,
+	options ...trace.TracerOption,
+) trace.Tracer {
+	provider.names = append(provider.names, name)
+	return provider.TracerProvider.Tracer(name, options...)
+}
+
+type recordingExecutionMeterProvider struct {
+	metric.MeterProvider
+	names []string
+}
+
+func (provider *recordingExecutionMeterProvider) Meter(
+	name string,
+	options ...metric.MeterOption,
+) metric.Meter {
+	provider.names = append(provider.names, name)
+	return provider.MeterProvider.Meter(name, options...)
+}
 
 func TestAWSLoadOptionsUseDefaultCredentialChainWhenProfileIsAbsent(t *testing.T) {
 	options := awsLoadOptions("", "us-east-1")
