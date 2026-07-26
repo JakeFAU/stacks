@@ -44,6 +44,42 @@ evidence uses its own independently configured directory scope.
   optional shared profile
 - an explicit compatible model ID; Bedrock also requires an explicit AWS region
 
+## Command-line interface
+
+`stacks --help` and nested `--help` commands describe the supported operator
+syntax without constructing database or provider dependencies. Running
+`stacks` and `stacks serve` are equivalent forms of the health service. Cobra
+also provides shell-completion support through `stacks completion --help`; it
+is an auxiliary transport command, not an application or provider command.
+
+```text
+stacks
+├── serve
+├── auth
+│   ├── google
+│   └── google-directory
+├── doctor
+├── sync
+├── entities
+│   ├── list
+│   └── show <entity-id>
+├── review
+│   ├── list
+│   ├── show <proposal-id>
+│   ├── accept <proposal-id> <entity-id>
+│   ├── accept-directory <proposal-id> <directory-profile-id> [--entity <entity-id>]
+│   ├── reject <proposal-id>
+│   ├── create <proposal-id> --name <name> [--email <email>]
+│   └── correct <effective-decision-id> <entity-id>
+├── analyze
+├── db-migrate
+├── db-status
+└── db-reset <confirmation>
+```
+
+`analyze` runs the currently configured cited temporal analysis for the
+accepted employee-manager pair; it does not select or install a provider.
+
 ## Configure the local environment
 
 Copy the example and edit the copy; never commit `.env`:

@@ -32,7 +32,7 @@ cmd/stacks/                        process entrypoint and dependency composition
 core/                              provider-neutral evidence, identity, observation, and temporal contracts (separate Go module)
 adapters/postgres/                 canonical PostgreSQL repositories and scoped embedded migrations (separate Go module)
 internal/app/                      application lifecycle, command dispatch, and review mapping
-internal/cli/                      operator commands, output, and consumer-owned ports
+internal/cli/                      Cobra command tree, operator syntax, output, and consumer-owned ports
 internal/config/                   environment loading, defaults, and command-specific validation
 internal/ingest/                   resumable canonical ingestion orchestration
 internal/analysis/                 read-only temporal analysis use case over canonical observations
@@ -348,6 +348,12 @@ No numeric coverage target is enforced. Coverage is not a substitute for testing
 ## Dependencies
 
 Before adding a dependency, verify that the standard library or a small local implementation is insufficient.
+
+Cobra is the intentional exception for the root application's CLI transport.
+Keep `github.com/spf13/cobra` inside `internal/cli`, construct a fresh command
+tree for each execution, and keep Cobra types out of `core`,
+`adapters/postgres`, providers, storage, and domain contracts. Do not use the
+`cobra-cli` generator or package-global command state.
 
 A new dependency should justify its:
 
