@@ -73,6 +73,9 @@ func Execute(
 			if err != nil {
 				return err
 			}
+			if dependencies.Shutdown == nil {
+				return fmt.Errorf("runtime shutdown is not configured")
+			}
 			runError := dispatch(ctx, invocation, settings, dependencies, stdout, stderr)
 			shutdownError := shutdownExecution(ctx, dependencies.Shutdown)
 			return errors.Join(runError, shutdownError)
@@ -110,9 +113,6 @@ func dispatch(
 }
 
 func shutdownExecution(ctx context.Context, shutdown func(context.Context) error) error {
-	if shutdown == nil {
-		return fmt.Errorf("runtime shutdown is not configured")
-	}
 	shutdownContext, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
 		runtimeShutdownTimeout,

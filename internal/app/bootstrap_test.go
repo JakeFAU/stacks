@@ -448,6 +448,72 @@ func TestExecuteCanceledCommandUsesValuePreservingShutdownContext(t *testing.T) 
 	}
 }
 
+func TestExecuteRejectsMissingShutdownBeforeApplicationWork(t *testing.T) {
+	validSync := config.Settings{
+		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
+		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+	}
+	tests := []struct {
+		name         string
+		args         []string
+		settings     config.Settings
+		dependencies func(*int) ExecutionDependencies
+	}{
+		{
+			name: "serve",
+			args: []string{"serve"},
+			dependencies: func(applicationCalls *int) ExecutionDependencies {
+				return ExecutionDependencies{
+					Runtime: RuntimeFunc(func(context.Context, config.Settings) error {
+						(*applicationCalls)++
+						return nil
+					}),
+				}
+			},
+		},
+		{
+			name:     "non-server command",
+			args:     []string{"sync"},
+			settings: validSync,
+			dependencies: func(applicationCalls *int) ExecutionDependencies {
+				return ExecutionDependencies{
+					CommandProvider: CommandProviderFunc(func(
+						context.Context, config.Settings, io.Writer, io.Writer,
+					) (map[string]cli.Command, error) {
+						(*applicationCalls)++
+						return map[string]cli.Command{
+							"sync": cli.CommandFunc(func(context.Context, cli.Invocation) error {
+								(*applicationCalls)++
+								return nil
+							}),
+						}, nil
+					}),
+				}
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			applicationCalls := 0
+			err := Execute(
+				t.Context(),
+				testCase.args,
+				settingsLoader(testCase.settings),
+				fixedBootstrap(testCase.dependencies(&applicationCalls)),
+				io.Discard,
+				io.Discard,
+			)
+			if err == nil || !strings.Contains(err.Error(), "runtime shutdown is not configured") {
+				t.Fatalf("Execute() error = %v, want missing shutdown failure", err)
+			}
+			if applicationCalls != 0 {
+				t.Fatalf("application calls = %d, want 0", applicationCalls)
+			}
+		})
+	}
+}
+
 func TestExecuteReportsMissingRequiredDependencies(t *testing.T) {
 	validSync := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
