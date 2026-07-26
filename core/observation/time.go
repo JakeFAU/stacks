@@ -82,7 +82,7 @@ func Until(end time.Time) (TemporalExtent, error) {
 	}
 	return TemporalExtent{
 		kind:   TemporalInterval,
-		end:    end.UTC(),
+		end:    timepoint.Normalize(end),
 		hasEnd: true,
 	}, nil
 }
