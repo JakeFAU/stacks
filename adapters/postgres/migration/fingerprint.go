@@ -3,7 +3,6 @@ package migration
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -355,17 +354,17 @@ func resolveExactFunctionOID(
 	if err != nil {
 		return 0, err
 	}
-	parameterTypes, err := functionParameterTypes(
+	identityTypes, err := functionIdentityTypes(
 		ctx,
 		connection,
-		function.FunctionParameters,
+		function.FunctionIdentityArguments,
 	)
 	if err != nil {
 		return 0, err
 	}
 	matches := make([]uint32, 0, 1)
 	for _, candidate := range candidates {
-		if matchesFunctionParameterTypes(candidate.argumentTypes, parameterTypes) {
+		if matchesFunctionParameterTypes(candidate.argumentTypes, identityTypes) {
 			matches = append(matches, candidate.oid)
 		}
 	}
@@ -415,52 +414,41 @@ func exactFunctionCandidates(
 	return candidates, nil
 }
 
-func functionParameterTypes(
+func functionIdentityTypes(
 	ctx context.Context,
 	connection *pgx.Conn,
-	signature string,
+	identityArguments string,
 ) ([]map[uint32]struct{}, error) {
-	parameters := strings.TrimSpace(signature[1 : len(signature)-1])
-	if parameters == "" {
+	identityTypes, valid := splitFunctionArguments(identityArguments)
+	if !valid {
+		return nil, exactFunctionResolutionError(ctx)
+	}
+	if len(identityTypes) == 0 {
 		return nil, nil
 	}
 
-	declarations := strings.Split(parameters, ",")
-	result := make([]map[uint32]struct{}, 0, len(declarations))
-	for _, declaration := range declarations {
-		tokens := strings.Fields(declaration)
-		types := make(map[uint32]struct{})
-		for index := range tokens {
-			suffix := strings.Join(tokens[index:], " ")
-			var oid sql.NullInt64
-			var namespace string
-			err := connection.QueryRow(
-				ctx,
-				`SELECT type_record.oid, namespace.nspname
-				   FROM pg_catalog.pg_type AS type_record
-				   JOIN pg_catalog.pg_namespace AS namespace
-				     ON namespace.oid = type_record.typnamespace
-				  WHERE type_record.oid = pg_catalog.to_regtype($1)`,
-				suffix,
-			).Scan(&oid, &namespace)
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-				continue
-			}
-			qualifier, qualified := functionTypeQualifier(suffix)
-			if !oid.Valid ||
-				(namespace != "pg_catalog" && !qualified) ||
-				(qualified && namespace != qualifier) {
-				continue
-			}
-			types[uint32(oid.Int64)] = struct{}{}
-		}
-		if len(types) == 0 {
+	result := make([]map[uint32]struct{}, 0, len(identityTypes))
+	for _, identityType := range identityTypes {
+		var oid uint32
+		var namespace string
+		err := connection.QueryRow(
+			ctx,
+			`SELECT type_record.oid, namespace.nspname
+			   FROM pg_catalog.pg_type AS type_record
+			   JOIN pg_catalog.pg_namespace AS namespace
+			     ON namespace.oid = type_record.typnamespace
+			  WHERE type_record.oid = pg_catalog.to_regtype($1)`,
+			identityType,
+		).Scan(&oid, &namespace)
+		if err != nil {
 			return nil, exactFunctionResolutionError(ctx)
 		}
-		result = append(result, types)
+		qualifier, qualified := functionTypeQualifier(identityType)
+		if (namespace != "pg_catalog" && !qualified) ||
+			(qualified && namespace != qualifier) {
+			return nil, exactFunctionResolutionError(ctx)
+		}
+		result = append(result, map[uint32]struct{}{oid: struct{}{}})
 	}
 	return result, nil
 }

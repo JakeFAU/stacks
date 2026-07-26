@@ -70,10 +70,11 @@ func TestReadCatalogExactFunctionSelectsOnlyDeclaredOverload(t *testing.T) {
 		t.Fatalf("create declared function overload: %v", err)
 	}
 	manifest := Manifest{OwnedObjects: []OwnedObject{{
-		Kind:               ObjectFunction,
-		Schema:             "synthetic_exact",
-		Name:               "normalize",
-		FunctionParameters: "(value integer)",
+		Kind:                      ObjectFunction,
+		Schema:                    "synthetic_exact",
+		Name:                      "normalize",
+		FunctionParameters:        "(value integer)",
+		FunctionIdentityArguments: "(integer)",
 	}}}
 	before, err := readCatalog(ctx, connection, manifest)
 	if err != nil {
@@ -112,10 +113,11 @@ func TestReadCatalogExactFunctionResolvesEquivalentTypeSpelling(t *testing.T) {
 		t.Fatalf("create exact function with canonical type spelling: %v", err)
 	}
 	manifest := Manifest{OwnedObjects: []OwnedObject{{
-		Kind:               ObjectFunction,
-		Schema:             "synthetic_exact",
-		Name:               "normalize",
-		FunctionParameters: "(value int)",
+		Kind:                      ObjectFunction,
+		Schema:                    "synthetic_exact",
+		Name:                      "normalize",
+		FunctionParameters:        "(value int)",
+		FunctionIdentityArguments: "(int)",
 	}}}
 	objects, err := readCatalog(ctx, connection, manifest)
 	if err != nil {
@@ -129,6 +131,35 @@ func TestReadCatalogExactFunctionResolvesEquivalentTypeSpelling(t *testing.T) {
 	}
 	if functions != 1 {
 		t.Fatalf("exact function count = %d, want exactly 1", functions)
+	}
+}
+
+func TestReadCatalogExactFunctionDoesNotScanIdentitySuffixes(t *testing.T) {
+	database := postgrestest.NewDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), fingerprintIntegrationTimeout)
+	defer cancel()
+	connection, err := pgx.Connect(ctx, database.AdminURL())
+	if err != nil {
+		t.Fatalf("connect to isolated database: %v", err)
+	}
+	defer connection.Close(context.Background())
+
+	if _, err := connection.Exec(ctx, `
+		CREATE SCHEMA synthetic_exact;
+		CREATE FUNCTION synthetic_exact.normalize(integer)
+		RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+	`); err != nil {
+		t.Fatalf("create exact function with suffix-matching type: %v", err)
+	}
+	_, err = readCatalog(ctx, connection, Manifest{OwnedObjects: []OwnedObject{{
+		Kind:                      ObjectFunction,
+		Schema:                    "synthetic_exact",
+		Name:                      "normalize",
+		FunctionParameters:        "(foo bar integer)",
+		FunctionIdentityArguments: "(foo bar integer)",
+	}}})
+	if err == nil {
+		t.Fatal("readCatalog() error = nil, want full identity-type resolution")
 	}
 }
 
@@ -150,10 +181,11 @@ func TestReadCatalogExactFunctionSelectsZeroArgumentFunction(t *testing.T) {
 		t.Fatalf("create zero-argument exact function: %v", err)
 	}
 	objects, err := readCatalog(ctx, connection, Manifest{OwnedObjects: []OwnedObject{{
-		Kind:               ObjectFunction,
-		Schema:             "synthetic_exact",
-		Name:               "normalize",
-		FunctionParameters: "()",
+		Kind:                      ObjectFunction,
+		Schema:                    "synthetic_exact",
+		Name:                      "normalize",
+		FunctionParameters:        "()",
+		FunctionIdentityArguments: "()",
 	}}})
 	if err != nil {
 		t.Fatalf("read zero-argument exact function: %v", err)
@@ -194,10 +226,11 @@ func TestReadCatalogExactFunctionQualifiedCustomTypeIgnoresSearchPath(t *testing
 		t.Fatalf("create qualified custom-type overloads: %v", err)
 	}
 	manifest := Manifest{OwnedObjects: []OwnedObject{{
-		Kind:               ObjectFunction,
-		Schema:             "synthetic_exact",
-		Name:               "normalize",
-		FunctionParameters: "(value synthetic_type_a.shared_type)",
+		Kind:                      ObjectFunction,
+		Schema:                    "synthetic_exact",
+		Name:                      "normalize",
+		FunctionParameters:        "(value synthetic_type_a.shared_type)",
+		FunctionIdentityArguments: "(synthetic_type_a.shared_type)",
 	}}}
 	before, err := resolveExactFunctionOID(ctx, connection, manifest.OwnedObjects[0])
 	if err != nil {
@@ -240,10 +273,11 @@ func TestReadCatalogExactFunctionRejectsUnqualifiedCustomType(t *testing.T) {
 	}
 	const privateParameters = "(value private_type)"
 	_, err = readCatalog(ctx, connection, Manifest{OwnedObjects: []OwnedObject{{
-		Kind:               ObjectFunction,
-		Schema:             "synthetic_exact",
-		Name:               "normalize",
-		FunctionParameters: privateParameters,
+		Kind:                      ObjectFunction,
+		Schema:                    "synthetic_exact",
+		Name:                      "normalize",
+		FunctionParameters:        privateParameters,
+		FunctionIdentityArguments: "(private_type)",
 	}}})
 	if err == nil {
 		t.Fatal("readCatalog() error = nil, want unqualified custom-type rejection")
@@ -266,10 +300,11 @@ func TestReadCatalogMissingExactFunctionReturnsBoundedError(t *testing.T) {
 
 	const privateSignature = "(private_missing_type)"
 	_, err = readCatalog(ctx, connection, Manifest{OwnedObjects: []OwnedObject{{
-		Kind:               ObjectFunction,
-		Schema:             "synthetic_exact",
-		Name:               "missing",
-		FunctionParameters: privateSignature,
+		Kind:                      ObjectFunction,
+		Schema:                    "synthetic_exact",
+		Name:                      "missing",
+		FunctionParameters:        privateSignature,
+		FunctionIdentityArguments: "(private_missing_type)",
 	}}})
 	if err == nil {
 		t.Fatal("readCatalog() error = nil, want missing exact function rejection")
@@ -299,16 +334,18 @@ func TestReadCatalogAmbiguousExactFunctionReturnsBoundedError(t *testing.T) {
 	const privateSignature = "(other integer)"
 	_, err = readCatalog(ctx, connection, Manifest{OwnedObjects: []OwnedObject{
 		{
-			Kind:               ObjectFunction,
-			Schema:             "synthetic_exact",
-			Name:               "normalize",
-			FunctionParameters: "(value int)",
+			Kind:                      ObjectFunction,
+			Schema:                    "synthetic_exact",
+			Name:                      "normalize",
+			FunctionParameters:        "(value int)",
+			FunctionIdentityArguments: "(int)",
 		},
 		{
-			Kind:               ObjectFunction,
-			Schema:             "synthetic_exact",
-			Name:               "normalize",
-			FunctionParameters: privateSignature,
+			Kind:                      ObjectFunction,
+			Schema:                    "synthetic_exact",
+			Name:                      "normalize",
+			FunctionParameters:        privateSignature,
+			FunctionIdentityArguments: "(integer)",
 		},
 	}})
 	if err == nil {

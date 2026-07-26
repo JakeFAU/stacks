@@ -65,18 +65,22 @@ const (
 
 // OwnedObject identifies one exact object owned by a migration scope. Parent
 // is set only for triggers and contains the owning table name.
-// FunctionParameters is set only for functions and uses a deliberately narrow
-// simple-input grammar with lowercase ordinary identifiers, single spaces, and
-// comma-space separators. It supports optional parameter names, unqualified
-// built-in type spellings, schema-qualified custom types, arrays, and built-in
-// multiword types. Modes, defaults, type modifiers, quoted identifiers, and
-// other PostgreSQL declaration syntax are unsupported.
+// FunctionParameters is the normalized exact SQL source parameter declaration
+// used for static migration ownership. FunctionIdentityArguments is the
+// corresponding normalized type-only identity declaration. Both are set only
+// for functions, include parentheses, and use comma-space separators. Each
+// source parameter is either its exact identity type or one ordinary name
+// followed by that type. Identity types support unqualified built-ins,
+// schema-qualified custom types, arrays, and built-in multiword spellings.
+// Modes, defaults, modifiers, quoted identifiers, and other declaration syntax
+// are unsupported.
 type OwnedObject struct {
-	Kind               ObjectKind
-	Schema             string
-	Parent             string
-	Name               string
-	FunctionParameters string
+	Kind                      ObjectKind
+	Schema                    string
+	Parent                    string
+	Name                      string
+	FunctionParameters        string
+	FunctionIdentityArguments string
 }
 
 // Manifest describes one independently versioned migration scope.
@@ -518,7 +522,8 @@ func validateOwnedObject(object OwnedObject) error {
 		return nil
 	}
 	if object.Kind == ObjectTrigger {
-		if object.FunctionParameters != "" {
+		if object.FunctionParameters != "" ||
+			object.FunctionIdentityArguments != "" {
 			return fmt.Errorf("trigger object function parameters must be blank")
 		}
 		if err := validateIdentifier("parent", object.Parent); err != nil {
@@ -530,57 +535,86 @@ func validateOwnedObject(object OwnedObject) error {
 		return fmt.Errorf("%s object parent must be blank", object.Kind)
 	}
 	if object.Kind == ObjectFunction {
-		if err := validateFunctionParameters(object.FunctionParameters); err != nil {
+		if err := validateFunctionDeclarations(
+			object.FunctionParameters,
+			object.FunctionIdentityArguments,
+		); err != nil {
 			return err
 		}
 		return nil
 	}
-	if object.FunctionParameters != "" {
+	if object.FunctionParameters != "" ||
+		object.FunctionIdentityArguments != "" {
 		return fmt.Errorf("%s object function parameters must be blank", object.Kind)
 	}
 	return nil
 }
 
-func validateFunctionParameters(parameters string) error {
-	if len(parameters) < 2 ||
-		parameters[0] != '(' ||
-		parameters[len(parameters)-1] != ')' ||
-		strings.TrimSpace(parameters) != parameters ||
-		strings.ContainsAny(parameters, "\x00\r\n") {
-		return fmt.Errorf("function object parameters must use normalized simple-input grammar")
+func validateFunctionDeclarations(parameters, identityArguments string) error {
+	identity, valid := splitFunctionArguments(identityArguments)
+	if !valid {
+		return functionDeclarationError()
 	}
-	body := parameters[1 : len(parameters)-1]
-	if body == "" {
-		return nil
+	for _, identityType := range identity {
+		if !validateFunctionIdentityType(identityType) {
+			return functionDeclarationError()
+		}
 	}
 
-	segments := strings.Split(body, ",")
-	normalized := make([]string, 0, len(segments))
-	for _, segment := range segments {
-		segment = strings.TrimSpace(segment)
-		if segment == "" {
-			return fmt.Errorf("function object parameters must use normalized simple-input grammar")
-		}
-		tokens := strings.Fields(segment)
-		if strings.Join(tokens, " ") != segment ||
-			!validateFunctionParameterTokens(tokens) {
-			return fmt.Errorf("function object parameters must use normalized simple-input grammar")
-		}
-		normalized = append(normalized, segment)
+	source, valid := splitFunctionArguments(parameters)
+	if !valid || len(source) != len(identity) {
+		return functionDeclarationError()
 	}
-	if strings.Join(normalized, ", ") != body {
-		return fmt.Errorf("function object parameters must use normalized simple-input grammar")
+	for index, sourceParameter := range source {
+		identityType := identity[index]
+		if sourceParameter == identityType {
+			continue
+		}
+		name, sourceType, named := strings.Cut(sourceParameter, " ")
+		if !named ||
+			!identifierPattern.MatchString(name) ||
+			reservedFunctionDeclarationToken(name) ||
+			sourceType != identityType {
+			return functionDeclarationError()
+		}
 	}
 	return nil
 }
 
-func validateFunctionParameterTokens(tokens []string) bool {
+func splitFunctionArguments(arguments string) ([]string, bool) {
+	if len(arguments) < 2 ||
+		arguments[0] != '(' ||
+		arguments[len(arguments)-1] != ')' ||
+		strings.TrimSpace(arguments) != arguments ||
+		strings.ContainsAny(arguments, "\x00\r\n") {
+		return nil, false
+	}
+	body := arguments[1 : len(arguments)-1]
+	if body == "" {
+		return nil, true
+	}
+	segments := strings.Split(body, ",")
+	for index, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" ||
+			strings.Join(strings.Fields(segment), " ") != segment {
+			return nil, false
+		}
+		segments[index] = segment
+	}
+	if strings.Join(segments, ", ") != body {
+		return nil, false
+	}
+	return segments, true
+}
+
+func validateFunctionIdentityType(identityType string) bool {
+	tokens := strings.Fields(identityType)
 	if len(tokens) == 0 {
 		return false
 	}
 	for _, token := range tokens {
-		switch token {
-		case "default", "in", "out", "inout", "variadic", "table":
+		if reservedFunctionDeclarationToken(token) {
 			return false
 		}
 	}
@@ -595,6 +629,19 @@ func validateFunctionParameterTokens(tokens []string) bool {
 		}
 	}
 	return true
+}
+
+func reservedFunctionDeclarationToken(token string) bool {
+	switch token {
+	case "default", "in", "out", "inout", "variadic", "table":
+		return true
+	default:
+		return false
+	}
+}
+
+func functionDeclarationError() error {
+	return fmt.Errorf("function object declarations must use matching normalized simple-input grammar")
 }
 
 func validateFunctionTypeToken(token string) (bool, bool) {
@@ -781,6 +828,9 @@ func (ownership ownershipSet) owns(object OwnedObject) bool {
 }
 
 func (object OwnedObject) key() string {
+	// Static ownership matches the exact source declaration discovered in
+	// migration SQL. Identity arguments are validated separately and are not
+	// available to createdObjects.
 	return object.Schema + "\x00" + string(object.Kind) + "\x00" + object.Parent + "\x00" + object.Name + "\x00" + object.FunctionParameters
 }
 
