@@ -3,6 +3,8 @@ package observation
 import (
 	"fmt"
 	"time"
+
+	"github.com/JakeFAU/stacks/core/timepoint"
 )
 
 // TemporalKind distinguishes the temporal meanings an observation may carry.
@@ -37,7 +39,7 @@ func AtTime(instant time.Time) (TemporalExtent, error) {
 	}
 	return TemporalExtent{
 		kind:     TemporalInstant,
-		start:    instant.UTC(),
+		start:    timepoint.Normalize(instant),
 		hasStart: true,
 	}, nil
 }
@@ -48,13 +50,14 @@ func During(start, end time.Time) (TemporalExtent, error) {
 	if start.IsZero() || end.IsZero() {
 		return TemporalExtent{}, fmt.Errorf("valid interval bounds are required")
 	}
+	start, end = timepoint.Normalize(start), timepoint.Normalize(end)
 	if !end.After(start) {
 		return TemporalExtent{}, fmt.Errorf("valid interval end must be after start")
 	}
 	return TemporalExtent{
 		kind:     TemporalInterval,
-		start:    start.UTC(),
-		end:      end.UTC(),
+		start:    start,
+		end:      end,
 		hasStart: true,
 		hasEnd:   true,
 	}, nil
@@ -67,7 +70,7 @@ func Since(start time.Time) (TemporalExtent, error) {
 	}
 	return TemporalExtent{
 		kind:     TemporalInterval,
-		start:    start.UTC(),
+		start:    timepoint.Normalize(start),
 		hasStart: true,
 	}, nil
 }
@@ -90,13 +93,14 @@ func Within(start, end time.Time) (TemporalExtent, error) {
 	if start.IsZero() || end.IsZero() {
 		return TemporalExtent{}, fmt.Errorf("valid time window bounds are required")
 	}
+	start, end = timepoint.Normalize(start), timepoint.Normalize(end)
 	if !end.After(start) {
 		return TemporalExtent{}, fmt.Errorf("valid time window end must be after start")
 	}
 	return TemporalExtent{
 		kind:     TemporalWindow,
 		start:    start.UTC(),
-		end:      end.UTC(),
+		end:      timepoint.Normalize(end),
 		hasStart: true,
 		hasEnd:   true,
 	}, nil

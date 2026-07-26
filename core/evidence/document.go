@@ -7,6 +7,9 @@ import (
 	"hash"
 	"strings"
 	"time"
+
+	"github.com/JakeFAU/stacks/core/internal/canonicalhash"
+	"github.com/JakeFAU/stacks/core/timepoint"
 )
 
 // DocumentVersionInput contains source metadata and structured content for one
@@ -64,10 +67,10 @@ func NewDocumentVersion(input DocumentVersionInput) (DocumentVersion, error) {
 		if input.SourceTime.IsZero() {
 			return DocumentVersion{}, fmt.Errorf("document source time must not be zero")
 		}
-		value := input.SourceTime.UTC()
+		value := timepoint.Normalize(*input.SourceTime)
 		sourceTime = &value
 	}
-	version := DocumentVersion{provider: provider, providerDocumentID: providerDocumentID, title: title, locator: locator, providerVersion: providerVersion, providerRevision: providerRevision, modifiedAt: input.ModifiedAt.UTC(), sourceTime: sourceTime, recordedAt: input.RecordedAt.UTC(), sections: sections}
+	version := DocumentVersion{provider: provider, providerDocumentID: providerDocumentID, title: title, locator: locator, providerVersion: providerVersion, providerRevision: providerRevision, modifiedAt: timepoint.Normalize(input.ModifiedAt), sourceTime: sourceTime, recordedAt: timepoint.Normalize(input.RecordedAt), sections: sections}
 	version.digest, version.legacyDigest = digestDocumentVersion(version, false), digestDocumentVersion(version, true)
 	return version, nil
 }
@@ -89,6 +92,7 @@ func (version DocumentVersion) SourceTime() *time.Time {
 
 func (version DocumentVersion) RecordedAt() time.Time { return version.recordedAt }
 func (version DocumentVersion) Digest() ContentDigest { return version.digest }
+func (version DocumentVersion) DigestVersion() string { return DocumentDigestVersion }
 func (version DocumentVersion) LegacyRevisionInclusiveDigest() ContentDigest {
 	return version.legacyDigest
 }
@@ -110,6 +114,9 @@ func (version DocumentVersion) sectionByID(id string) (Section, bool) {
 }
 
 func digestDocumentVersion(version DocumentVersion, includeProviderRevision bool) ContentDigest {
+	if !includeProviderRevision {
+		return digestCanonicalDocumentVersion(version)
+	}
 	hasher := sha256.New()
 	writeString(hasher, version.title)
 	writeString(hasher, version.locator)
@@ -142,6 +149,34 @@ func digestDocumentVersion(version DocumentVersion, includeProviderRevision bool
 	return digest
 }
 
+func digestCanonicalDocumentVersion(version DocumentVersion) ContentDigest {
+	encoder := canonicalhash.New(DocumentDigestVersion)
+	encoder.String(version.title)
+	encoder.String(version.locator)
+	encoder.String(version.providerVersion)
+	encoder.Time(version.modifiedAt)
+	encoder.Bool(version.sourceTime != nil)
+	if version.sourceTime != nil {
+		encoder.Time(*version.sourceTime)
+	}
+	encoder.Uint64(uint64(len(version.sections)))
+	for _, section := range version.sections {
+		encoder.String(section.ID())
+		encoder.String(section.Title())
+		encoder.String(section.ParentID())
+		path := section.Path()
+		encoder.Uint64(uint64(len(path)))
+		for _, pathTitle := range path {
+			encoder.String(pathTitle)
+		}
+		encoder.Uint64(uint64(section.Order()))
+		encoder.String(section.Role())
+		contentDigest := DigestContent([]byte(section.Text()))
+		encoder.Bytes(contentDigest[:])
+	}
+	return contentDigest(encoder)
+}
+
 func writeString(hasher hash.Hash, value string) { writeBytes(hasher, []byte(value)) }
 func writeBytes(hasher hash.Hash, value []byte) {
 	writeLength(hasher, uint64(len(value)))
@@ -159,21 +194,28 @@ type EvidenceSpanInput struct {
 	SectionID              string
 	StartOffset, EndOffset int
 	Quote                  string
+	RecordedAt             time.Time
 }
 
 // EvidenceSpan is an immutable exact citation into one section of one document version.
 type EvidenceSpan struct {
 	provider, providerDocumentID string
 	documentDigest               ContentDigest
+	id                           EvidenceID
+	locator                      string
 	sectionID                    string
 	startOffset, endOffset       int
 	text                         string
+	recordedAt                   time.Time
 }
 
 // NewEvidenceSpan validates an exact section-local quote and constructs a citation.
 func NewEvidenceSpan(input EvidenceSpanInput) (EvidenceSpan, error) {
 	if input.Document.provider == "" || input.Document.providerDocumentID == "" {
 		return EvidenceSpan{}, fmt.Errorf("evidence document is required")
+	}
+	if input.RecordedAt.IsZero() {
+		return EvidenceSpan{}, fmt.Errorf("evidence recorded time is required")
 	}
 	sectionID := strings.TrimSpace(input.SectionID)
 	if sectionID == "" {
@@ -192,7 +234,13 @@ func NewEvidenceSpan(input EvidenceSpanInput) (EvidenceSpan, error) {
 	if section.Text()[input.StartOffset:input.EndOffset] != input.Quote {
 		return EvidenceSpan{}, fmt.Errorf("evidence quote does not exactly match section text")
 	}
-	return EvidenceSpan{provider: input.Document.provider, providerDocumentID: input.Document.providerDocumentID, documentDigest: input.Document.digest, sectionID: sectionID, startOffset: input.StartOffset, endOffset: input.EndOffset, text: input.Quote}, nil
+	return EvidenceSpan{
+		provider: input.Document.provider, providerDocumentID: input.Document.providerDocumentID,
+		documentDigest: input.Document.digest,
+		id:             SourceSpanID(input.Document, sectionID, input.StartOffset, input.EndOffset), locator: input.Document.locator,
+		sectionID: sectionID, startOffset: input.StartOffset, endOffset: input.EndOffset, text: input.Quote,
+		recordedAt: timepoint.Normalize(input.RecordedAt),
+	}, nil
 }
 
 func (span EvidenceSpan) Provider() string              { return span.provider }
@@ -202,6 +250,32 @@ func (span EvidenceSpan) SectionID() string             { return span.sectionID 
 func (span EvidenceSpan) StartOffset() int              { return span.startOffset }
 func (span EvidenceSpan) EndOffset() int                { return span.endOffset }
 func (span EvidenceSpan) Text() string                  { return span.text }
+func (span EvidenceSpan) RecordedAt() time.Time         { return span.recordedAt }
+func (span EvidenceSpan) ID() EvidenceID                { return span.id }
+func (span EvidenceSpan) Locator() string               { return span.locator }
+func (span EvidenceSpan) Digest() ContentDigest {
+	encoder := canonicalhash.New(EvidenceSpanDigestVersion)
+	encoder.String(string(span.id))
+	encoder.Time(span.recordedAt)
+	return contentDigest(encoder)
+}
+func (span EvidenceSpan) DigestVersion() string { return EvidenceSpanDigestVersion }
+
+// SourceSpanID derives an opaque stable evidence identifier from the source
+// coordinates that define an exact span. It intentionally excludes extraction
+// configuration and recorded time.
+func SourceSpanID(document DocumentVersion, sectionID string, startOffset, endOffset int) EvidenceID {
+	encoder := canonicalhash.New(EvidenceIDVersion)
+	encoder.String(document.provider)
+	encoder.String(document.providerDocumentID)
+	encoder.String(document.DigestVersion())
+	digest := document.Digest()
+	encoder.Bytes(digest[:])
+	encoder.String(sectionID)
+	encoder.Uint64(uint64(startOffset))
+	encoder.Uint64(uint64(endOffset))
+	return EvidenceID(contentDigest(encoder).String())
+}
 
 func utf8ByteBoundary(text string, offset int) bool {
 	return offset == 0 || offset == len(text) || (offset > 0 && offset < len(text) && text[offset]&0xc0 != 0x80)

@@ -21,16 +21,6 @@ func TestCompleteObservationPreflightRejectsBeforeDatabaseAccess(t *testing.T) {
 		want   error
 	}{
 		{
-			name: "unrepresentable_recorded_at",
-			invoke: func(t *testing.T) error {
-				value := codecActiveObservation(t, func(input *observation.ObservationInput) {
-					input.RecordedAt = time.Date(2026, time.July, 25, 12, 0, 0, 1, time.UTC)
-				})
-				return completeWithoutDatabase(t, repository, value, codecOrigin(), nil, nil)
-			},
-			want: ErrObservationNotRepresentable,
-		},
-		{
 			name: "unsupported_text_term",
 			invoke: func(t *testing.T) error {
 				text, err := observation.NewTextTerm("synthetic unsupported text")
@@ -210,28 +200,6 @@ func TestCompleteObservationNeverRendersInvalidObservationIDBeforePreflight(t *t
 				return codecActiveObservation(t, func(input *observation.ObservationInput) {
 					input.ID = invalidObservationID
 					input.Derivation.RunID = ""
-				})
-			},
-		},
-		{
-			name: "unrepresentable_recorded_at",
-			value: func(t *testing.T) observation.Observation {
-				return codecActiveObservation(t, func(input *observation.ObservationInput) {
-					input.ID = invalidObservationID
-					input.RecordedAt = time.Date(2026, time.July, 25, 12, 0, 0, 1, time.UTC)
-				})
-			},
-		},
-		{
-			name: "unrepresentable_valid_time",
-			value: func(t *testing.T) observation.Observation {
-				instant, err := observation.AtTime(time.Date(2026, time.July, 25, 12, 0, 0, 1, time.UTC))
-				if err != nil {
-					t.Fatalf("new unrepresentable instant: %v", err)
-				}
-				return codecActiveObservation(t, func(input *observation.ObservationInput) {
-					input.ID = invalidObservationID
-					input.ValidTime = instant
 				})
 			},
 		},

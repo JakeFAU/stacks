@@ -311,7 +311,7 @@ func persistenceEvidence(t *testing.T) evidence.EvidenceSpan {
 	version := documentVersion(t, syntheticDocument("document-persistence-validation", "Synthetic evidence."))
 	span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
 		Document: version, SectionID: "transcript-tab", StartOffset: 0,
-		EndOffset: len("Synthetic evidence."), Quote: "Synthetic evidence.",
+		EndOffset: len("Synthetic evidence."), Quote: "Synthetic evidence.", RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("NewEvidenceSpan() error = %v", err)

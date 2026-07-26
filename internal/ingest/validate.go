@@ -55,18 +55,7 @@ func validateEvidenceIdentities(records []EvidenceRecord) (map[string][sha256.Si
 		if !canonicalLocalIdentifier(record.Key) {
 			return nil, ErrPersistenceReference
 		}
-		identity := digestIdentity(struct {
-			Provider       string
-			DocumentID     string
-			DocumentDigest string
-			TabID          string
-			StartOffset    int
-			EndOffset      int
-		}{
-			Provider: record.Span.Provider(), DocumentID: record.Span.ProviderDocumentID(),
-			DocumentDigest: record.Span.DocumentDigest().String(), TabID: record.Span.SectionID(),
-			StartOffset: record.Span.StartOffset(), EndOffset: record.Span.EndOffset(),
-		})
+		identity := sha256.Sum256([]byte(record.Span.ID()))
 		if _, exists := byKey[record.Key]; exists {
 			return nil, ErrPersistenceCollision
 		}

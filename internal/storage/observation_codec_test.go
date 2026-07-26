@@ -25,20 +25,17 @@ func TestObservationCompatibilityErrorSupportsErrorsIs(t *testing.T) {
 	}
 }
 
-func TestEncodeLegacyObservationRejectsUnrepresentableRecordedAt(t *testing.T) {
+func TestLegacyObservationCodecReceivesCanonicalRecordedAt(t *testing.T) {
 	const privatePredicate = "private_predicate_must_not_leak"
 	notMicrosecond := time.Date(2026, time.July, 25, 12, 0, 0, 1, time.UTC)
 	value := newCodecObservation(t, privatePredicate, observation.UnknownTime(), notMicrosecond)
 
-	_, err := encodeLegacyObservation(value, legacyObservationCompatibility{}, nil, nil)
-	if !errors.Is(err, ErrObservationNotRepresentable) ||
-		!strings.Contains(err.Error(), "recorded_at_not_representable") ||
-		strings.Contains(err.Error(), privatePredicate) {
-		t.Fatalf("encode error = %v", err)
+	if !legacyTimestampRepresentable(value.RecordedAt()) {
+		t.Fatalf("recorded time = %v, want canonical legacy-representable time", value.RecordedAt())
 	}
 }
 
-func TestEncodeLegacyObservationRejectsUnrepresentableValidTime(t *testing.T) {
+func TestLegacyObservationCodecReceivesCanonicalValidTime(t *testing.T) {
 	notMicrosecond := time.Date(2026, time.July, 25, 12, 0, 0, 1, time.UTC)
 	later := notMicrosecond.Add(time.Hour)
 	instant, err := observation.AtTime(notMicrosecond)
@@ -68,10 +65,8 @@ func TestEncodeLegacyObservationRejectsUnrepresentableValidTime(t *testing.T) {
 		{name: "during_end", validTime: duringEnd},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			value := newCodecObservation(t, "compatible_predicate", testCase.validTime, codecRecordedAt)
-			_, err := encodeLegacyObservation(value, legacyObservationCompatibility{}, nil, nil)
-			if !errors.Is(err, ErrObservationNotRepresentable) {
-				t.Fatalf("encode error = %v, want ErrObservationNotRepresentable", err)
+			if err := ensureLegacyValidTimePrecision(testCase.validTime, "canonical-observation"); err != nil {
+				t.Fatalf("valid time = %#v, want canonical legacy-representable time: %v", testCase.validTime, err)
 			}
 		})
 	}

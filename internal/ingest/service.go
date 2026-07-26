@@ -86,12 +86,16 @@ type VersionState struct {
 	ID               string
 	DerivationID     string
 	DerivationDigest [sha256.Size]byte
-	RecordedAt       time.Time
-	LeaseOwner       string
-	LeaseExpiresAt   time.Time
-	Status           VersionStatus
-	RetryCount       int
-	FailureCode      FailureCode
+	// DocumentRecordedAt is the source document version's first durable time.
+	// Every exact evidence span for the version uses this time, independent of
+	// extraction retries or configurations.
+	DocumentRecordedAt time.Time
+	RecordedAt         time.Time
+	LeaseOwner         string
+	LeaseExpiresAt     time.Time
+	Status             VersionStatus
+	RetryCount         int
+	FailureCode        FailureCode
 }
 
 // DerivationIdentity names one extraction attempt configuration independently
@@ -461,7 +465,7 @@ func (service *Service) completion(
 	for _, citation := range output.Citations {
 		span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
 			Document: version, SectionID: citation.TabID, StartOffset: citation.StartOffset,
-			EndOffset: citation.EndOffset, Quote: citation.Quote,
+			EndOffset: citation.EndOffset, Quote: citation.Quote, RecordedAt: state.DocumentRecordedAt,
 		})
 		if err != nil {
 			return Completion{}, err

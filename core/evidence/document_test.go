@@ -8,7 +8,7 @@ import (
 	"github.com/JakeFAU/stacks/core/evidence"
 )
 
-const stableDigestGolden = "636138cffa70a8a1b034669d3cfb423c258cae3fc9a943842a01daf31cd795ec"
+const stableDigestGolden = "c48323ec2669ee9dfea8d5c702ab31ffd6c68107d033df07c7f1c2861ea1943b"
 const legacyRevisionDigestGolden = "3cfec92c9511780154a2a0517ec094652350c23cb1fa588648b033ffee1d3f46"
 
 func TestPublicAPIUsesProviderNeutralTimeAndSectionNames(t *testing.T) {
@@ -101,13 +101,53 @@ func TestDocumentVersionRetainsImmutableSourceProvenance(t *testing.T) {
 	}
 }
 
-func TestDocumentVersionPreservesStableAndLegacyDigestGoldens(t *testing.T) {
+func TestDocumentVersionDigestV3Golden(t *testing.T) {
 	version := document(t, []evidence.Section{section(t, "t.transcript", "Transcript", "Alex: synthetic words")})
+	if version.DigestVersion() != evidence.DocumentDigestVersion {
+		t.Fatalf("DigestVersion() = %q, want %q", version.DigestVersion(), evidence.DocumentDigestVersion)
+	}
 	if got := version.Digest().String(); got != stableDigestGolden {
 		t.Fatalf("Digest() = %q, want %q", got, stableDigestGolden)
 	}
 	if got := version.LegacyRevisionInclusiveDigest().String(); got != legacyRevisionDigestGolden {
 		t.Fatalf("LegacyRevisionInclusiveDigest() = %q, want %q", got, legacyRevisionDigestGolden)
+	}
+}
+
+func TestDocumentDigestIgnoresRecordedAtAndProviderRevision(t *testing.T) {
+	input := documentInput([]evidence.Section{section(t, "t.transcript", "Transcript", "Alex: synthetic words")})
+	first, err := evidence.NewDocumentVersion(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.RecordedAt = input.RecordedAt.Add(24 * time.Hour)
+	input.ProviderRevision = "docs-revision-99"
+	second, err := evidence.NewDocumentVersion(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Digest() != second.Digest() {
+		t.Fatal("content digest changed for recorded time or provider revision")
+	}
+}
+
+func TestEvidenceSpanDigestCoversExactSourceRangeAndRecordedTime(t *testing.T) {
+	version := document(t, []evidence.Section{section(t, "t.transcript", "Transcript", "Alex synthetic")})
+	recordedAt := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	first, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{Document: version, SectionID: "t.transcript", StartOffset: 0, EndOffset: 4, Quote: "Alex", RecordedAt: recordedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{Document: version, SectionID: "t.transcript", StartOffset: 5, EndOffset: 14, Quote: "synthetic", RecordedAt: recordedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{Document: version, SectionID: "t.transcript", StartOffset: 0, EndOffset: 4, Quote: "Alex", RecordedAt: recordedAt.Add(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID() == second.ID() || first.Digest() == second.Digest() || first.ID() != third.ID() || first.Digest() == third.Digest() {
+		t.Fatal("evidence digest or identity does not distinguish its required fields")
 	}
 }
 
@@ -139,21 +179,21 @@ func TestDocumentVersionAllowsMissingOptionalProviderRevision(t *testing.T) {
 
 func TestEvidenceSpanRejectsInvalidUTF8ByteOffsets(t *testing.T) {
 	version := document(t, []evidence.Section{section(t, "t.transcript", "Transcript", "AéB")})
-	if _, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{Document: version, SectionID: "t.transcript", StartOffset: 2, EndOffset: 3}); err == nil {
+	if _, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{Document: version, SectionID: "t.transcript", StartOffset: 2, EndOffset: 3, RecordedAt: version.RecordedAt()}); err == nil {
 		t.Fatal("NewEvidenceSpan() error = nil, want invalid UTF-8 offset error")
 	}
 }
 
 func TestEvidenceSpanRejectsExactQuoteMismatch(t *testing.T) {
 	version := document(t, []evidence.Section{section(t, "t.transcript", "Transcript", "Alex: synthetic words")})
-	if _, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{Document: version, SectionID: "t.transcript", EndOffset: 4, Quote: "Alec"}); err == nil {
+	if _, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{Document: version, SectionID: "t.transcript", EndOffset: 4, Quote: "Alec", RecordedAt: version.RecordedAt()}); err == nil {
 		t.Fatal("NewEvidenceSpan() error = nil, want exact quote mismatch error")
 	}
 }
 
 func TestEvidenceSpanRetainsProviderDocumentSectionAndExactLocalText(t *testing.T) {
 	version := document(t, []evidence.Section{section(t, "t.transcript", "Transcript", "Alex: synthetic words")})
-	span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{Document: version, SectionID: "t.transcript", StartOffset: 6, EndOffset: 15, Quote: "synthetic"})
+	span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{Document: version, SectionID: "t.transcript", StartOffset: 6, EndOffset: 15, Quote: "synthetic", RecordedAt: version.RecordedAt()})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -317,7 +317,7 @@ func createLegacyObservationFixture(t *testing.T, pool *pgxpool.Pool) legacyObse
 		t.Fatalf("put legacy compatibility document version: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic", RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("create legacy compatibility evidence span: %v", err)

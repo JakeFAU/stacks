@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/timepoint"
 )
 
 // ObservationID is assigned by the extraction boundary. Retries for the same
@@ -101,6 +102,7 @@ type Observation struct {
 	confidence    Confidence
 	hasConfidence bool
 	legacyUncited bool
+	digest        evidence.ContentDigest
 }
 
 // NewObservation validates and constructs a canonical observation.
@@ -136,7 +138,7 @@ func NewObservation(input ObservationInput) (Observation, error) {
 		id:            id,
 		statement:     statement,
 		validTime:     input.ValidTime,
-		recordedAt:    input.RecordedAt.UTC(),
+		recordedAt:    timepoint.Normalize(input.RecordedAt),
 		evidence:      evidenceLinks,
 		derivation:    derivation,
 		status:        input.Status,
@@ -149,6 +151,7 @@ func NewObservation(input ObservationInput) (Observation, error) {
 		result.confidence = *input.Confidence
 		result.hasConfidence = true
 	}
+	result.digest = digestObservation(result)
 	return result, nil
 }
 
@@ -249,6 +252,16 @@ func (role EvidenceRole) valid() bool {
 // ID returns the stable observation identifier.
 func (value Observation) ID() ObservationID {
 	return value.id
+}
+
+// Digest returns the versioned semantic observation digest.
+func (value Observation) Digest() evidence.ContentDigest {
+	return value.digest
+}
+
+// DigestVersion returns the encoding version for Digest.
+func (value Observation) DigestVersion() string {
+	return ObservationDigestVersion
 }
 
 // Statement returns the proposition.

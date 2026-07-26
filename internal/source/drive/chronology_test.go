@@ -222,7 +222,7 @@ func (repository *chronologyRepository) PrepareVersion(
 ) (ingest.VersionState, error) {
 	return ingest.VersionState{
 		ID: "version-" + version.ProviderDocumentID(), DerivationID: "derivation-" + version.ProviderDocumentID(),
-		DerivationDigest: derivation.Digest, RecordedAt: time.Date(2026, time.July, 22, 12, 0, 0, 123456000, time.UTC), LeaseOwner: "owner-" + version.ProviderDocumentID(),
+		DerivationDigest: derivation.Digest, DocumentRecordedAt: version.RecordedAt(), RecordedAt: time.Date(2026, time.July, 22, 12, 0, 0, 123456000, time.UTC), LeaseOwner: "owner-" + version.ProviderDocumentID(),
 		LeaseExpiresAt: time.Now().Add(leaseDuration), Status: ingest.VersionStatusPending,
 	}, nil
 }

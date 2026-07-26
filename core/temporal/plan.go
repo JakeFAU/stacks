@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/JakeFAU/stacks/core/timepoint"
 )
 
 // Intent identifies the temporal question the retrieval layer must execute.
@@ -43,7 +45,7 @@ func At(label string, instant time.Time) (TemporalSelection, error) {
 	if instant.IsZero() {
 		return TemporalSelection{}, fmt.Errorf("temporal selection instant is required")
 	}
-	return TemporalSelection{kind: SelectionPoint, label: label, start: instant.UTC()}, nil
+	return TemporalSelection{kind: SelectionPoint, label: label, start: timepoint.Normalize(instant)}, nil
 }
 
 // Between selects the half-open valid-time window [start, end).
@@ -55,14 +57,15 @@ func Between(label string, start, end time.Time) (TemporalSelection, error) {
 	if start.IsZero() || end.IsZero() {
 		return TemporalSelection{}, fmt.Errorf("temporal selection window bounds are required")
 	}
+	start, end = timepoint.Normalize(start), timepoint.Normalize(end)
 	if !end.After(start) {
 		return TemporalSelection{}, fmt.Errorf("temporal selection window end must be after start")
 	}
 	return TemporalSelection{
 		kind:  SelectionWindow,
 		label: label,
-		start: start.UTC(),
-		end:   end.UTC(),
+		start: start,
+		end:   end,
 	}, nil
 }
 
@@ -111,7 +114,7 @@ func KnownAsOf(cutoff time.Time) (KnowledgeScope, error) {
 	if cutoff.IsZero() {
 		return KnowledgeScope{}, fmt.Errorf("knowledge cutoff is required")
 	}
-	return KnowledgeScope{kind: KnowledgeAsOf, asOf: cutoff.UTC()}, nil
+	return KnowledgeScope{kind: KnowledgeAsOf, asOf: timepoint.Normalize(cutoff)}, nil
 }
 
 // Kind returns the recorded-time scope kind.

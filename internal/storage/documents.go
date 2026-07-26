@@ -331,12 +331,17 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 	if err != nil {
 		return ingest.VersionState{}, err
 	}
+	documentRecordedAt, err := documents.documentVersionRecordedAt(ctx, stored.ID)
+	if err != nil {
+		return ingest.VersionState{}, err
+	}
 	claimedAt := time.Now().UTC().Truncate(legacyPostgresTimestampPrecision)
 	leaseExpiresAt := claimedAt.Add(leaseDuration)
 	state := ingest.VersionState{
-		ID:               stored.ID,
-		DerivationDigest: derivation.Digest,
-		RecordedAt:       claimedAt,
+		ID:                 stored.ID,
+		DerivationDigest:   derivation.Digest,
+		DocumentRecordedAt: documentRecordedAt,
+		RecordedAt:         claimedAt,
 	}
 	storedAdmissible := true
 	storedRegion := nullableModelRegion(derivation.Provider, derivation.Region)
@@ -418,6 +423,17 @@ func (repository *IngestionRepository) PrepareVersion(ctx context.Context, versi
 		return ingest.VersionState{}, fmt.Errorf("commit ingestion version preparation: %w", err)
 	}
 	return state, nil
+}
+
+func (repository *DocumentRepository) documentVersionRecordedAt(ctx context.Context, documentVersionID string) (time.Time, error) {
+	var recordedAt time.Time
+	if err := repository.query.QueryRow(ctx, `
+		SELECT recorded_at
+		FROM stacks.document_versions
+		WHERE id = $1`, documentVersionID).Scan(&recordedAt); err != nil {
+		return time.Time{}, fmt.Errorf("load document version first recorded time: %w", err)
+	}
+	return recordedAt.UTC().Truncate(time.Microsecond), nil
 }
 
 // RecordFailure stores only finite processing state and a bounded diagnostic

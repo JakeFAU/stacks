@@ -2433,7 +2433,7 @@ func TestCompleteVersionExactRetryToleratesAdditionalSharedEvidence(t *testing.T
 	end := start + len("assigned")
 	sharedSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: fixture.version, SectionID: "tab-synthetic",
-		StartOffset: start, EndOffset: end, Quote: transcript[start:end],
+		StartOffset: start, EndOffset: end, Quote: transcript[start:end], RecordedAt: fixture.version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new additional shared evidence: %v", err)
@@ -2705,7 +2705,7 @@ func TestCompleteVersionRejectsCompletedWriteSetMismatch(t *testing.T) {
 				transcript := fixture.evidence[0].Span.Text()
 				changed, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 					Document: fixture.version, SectionID: fixture.evidence[0].Span.SectionID(),
-					StartOffset: 0, EndOffset: len(transcript) - 1, Quote: transcript[:len(transcript)-1],
+					StartOffset: 0, EndOffset: len(transcript) - 1, Quote: transcript[:len(transcript)-1], RecordedAt: fixture.version.RecordedAt(),
 				})
 				if err != nil {
 					t.Fatalf("new changed synthetic evidence: %v", err)
@@ -3047,14 +3047,14 @@ func TestPendingUnassociatedIdentityPersistsExactEvidenceWithoutTeachingAliases(
 	}
 	alexSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: version, SectionID: "tab-synthetic", StartOffset: 0,
-		EndOffset: len(alexEvidence), Quote: alexEvidence,
+		EndOffset: len(alexEvidence), Quote: alexEvidence, RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new Alex evidence span: %v", err)
 	}
 	bobSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: version, SectionID: "tab-synthetic", StartOffset: len(alexEvidence) + 1,
-		EndOffset: len(transcript), Quote: bobEvidence,
+		EndOffset: len(transcript), Quote: bobEvidence, RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new Bob evidence span: %v", err)
@@ -3237,7 +3237,7 @@ func TestPre00005LegacyRowsRemainAuditableButNotCurrentlyAdmissible(t *testing.T
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: version, SectionID: "tab-synthetic", StartOffset: 0,
-		EndOffset: len("Synthetic"), Quote: "Synthetic",
+		EndOffset: len("Synthetic"), Quote: "Synthetic", RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new legacy evidence span: %v", err)
@@ -4645,7 +4645,7 @@ func (repository *snapshotCoherenceRepository) PrepareVersion(ctx context.Contex
 	}
 	return ingest.VersionState{
 		ID: repository.versionID, DerivationID: repository.derivationID, DerivationDigest: derivation.Digest,
-		RecordedAt: recordedAt, LeaseOwner: repository.leaseOwner, LeaseExpiresAt: leaseExpiresAt, Status: ingest.VersionStatusPending,
+		DocumentRecordedAt: version.RecordedAt(), RecordedAt: recordedAt, LeaseOwner: repository.leaseOwner, LeaseExpiresAt: leaseExpiresAt, Status: ingest.VersionStatusPending,
 	}, nil
 }
 
@@ -5517,7 +5517,7 @@ func completeVersionedPairSignal(
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: version, SectionID: "tab-synthetic",
-		StartOffset: 0, EndOffset: len(transcript), Quote: transcript,
+		StartOffset: 0, EndOffset: len(transcript), Quote: transcript, RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new current-version evidence: %v", err)
@@ -5765,7 +5765,7 @@ func createPendingPairSignal(t *testing.T, pool *pgxpool.Pool, validTime time.Ti
 		t.Fatalf("put pair-analysis document: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic", RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new pair-analysis evidence span: %v", err)
@@ -6339,7 +6339,7 @@ func TestPutEvidenceSpanRejectsImmutableQuoteConflict(t *testing.T) {
 		t.Fatalf("put evidence document version: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic", RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new evidence span: %v", err)
@@ -6365,7 +6365,7 @@ func TestCompleteObservationRejectsNotesOnlySignalEvidence(t *testing.T) {
 		t.Fatalf("put notes document version: %v", err)
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
-		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic",
+		Document: version, SectionID: "tab-synthetic", StartOffset: 0, EndOffset: len("Synthetic"), Quote: "Synthetic", RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new notes evidence span: %v", err)
@@ -6532,7 +6532,7 @@ func createDirectoryPendingMentionFixtureWithSurfaceEmail(
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: version, SectionID: "tab-synthetic", StartOffset: 0,
-		EndOffset: len(quote), Quote: quote,
+		EndOffset: len(quote), Quote: quote, RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new synthetic directory evidence: %v", err)
@@ -6903,6 +6903,7 @@ func createSyntheticMentionAndSpan(t *testing.T, pool *pgxpool.Pool) (string, st
 		StartOffset: 0,
 		EndOffset:   len("Synthetic"),
 		Quote:       "Synthetic",
+		RecordedAt:  version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new synthetic evidence span: %v", err)
@@ -6950,7 +6951,7 @@ func newCanonicalIngestionFixture(t *testing.T, pool *pgxpool.Pool, label string
 	}
 	span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: version, SectionID: "tab-synthetic", StartOffset: 0,
-		EndOffset: len(transcript), Quote: transcript,
+		EndOffset: len(transcript), Quote: transcript, RecordedAt: version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new canonical ingestion evidence: %v", err)
@@ -6999,7 +7000,7 @@ func newCompletedRetryFixture(t *testing.T, pool *pgxpool.Pool, label string) ca
 	employeeEnd := employeeStart + len("Synthetic Employee")
 	employeeSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: fixture.version, SectionID: "tab-synthetic",
-		StartOffset: employeeStart, EndOffset: employeeEnd, Quote: transcript[employeeStart:employeeEnd],
+		StartOffset: employeeStart, EndOffset: employeeEnd, Quote: transcript[employeeStart:employeeEnd], RecordedAt: fixture.version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new completed-retry employee evidence: %v", err)
@@ -7009,7 +7010,7 @@ func newCompletedRetryFixture(t *testing.T, pool *pgxpool.Pool, label string) ca
 	managerEnd := managerStart + len("Synthetic Manager")
 	managerSpan, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 		Document: fixture.version, SectionID: "tab-synthetic",
-		StartOffset: managerStart, EndOffset: managerEnd, Quote: transcript[managerStart:managerEnd],
+		StartOffset: managerStart, EndOffset: managerEnd, Quote: transcript[managerStart:managerEnd], RecordedAt: fixture.version.RecordedAt(),
 	})
 	if err != nil {
 		t.Fatalf("new completed-retry manager evidence: %v", err)
@@ -7285,7 +7286,7 @@ func prepareIngestionEvidence(
 		}
 		span, err := knowledge.NewEvidenceSpan(knowledge.EvidenceSpanInput{
 			Document: version, SectionID: "tab-synthetic", StartOffset: start,
-			EndOffset: start + len(input.quote), Quote: input.quote,
+			EndOffset: start + len(input.quote), Quote: input.quote, RecordedAt: version.RecordedAt(),
 		})
 		if err != nil {
 			t.Fatalf("new synthetic ingestion evidence %q: %v", input.key, err)

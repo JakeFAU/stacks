@@ -190,7 +190,7 @@ func TestSyncSkipsExtractionForUnchangedVersion(t *testing.T) {
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
 		ID: "version-unchanged", DerivationID: "derivation-unchanged",
-		DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusComplete,
+		DerivationDigest: derivation.Digest, DocumentRecordedAt: recordedAt, RecordedAt: recordedAt, Status: VersionStatusComplete,
 	}
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
 	service := testService(document, repository, model)
@@ -258,7 +258,7 @@ func TestSyncEnrichesCompleteDerivationWithoutModelInvocation(t *testing.T) {
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
 		ID: "version-directory-complete", DerivationID: "derivation-directory-complete",
-		DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusComplete,
+		DerivationDigest: derivation.Digest, DocumentRecordedAt: recordedAt, RecordedAt: recordedAt, Status: VersionStatusComplete,
 	}
 	model := &recordingModel{
 		responses: []extract.Response{validEmptyResponse(t)},
@@ -307,7 +307,7 @@ func TestSyncNeverEnrichesFailedCompletionOrBusyDerivation(t *testing.T) {
 				derivation := testDerivationIdentity(t, version)
 				repository.versions[derivationKey(version, derivation)] = VersionState{
 					ID: "version-directory-busy", DerivationID: "derivation-directory-busy",
-					DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusPending,
+					DerivationDigest: derivation.Digest, DocumentRecordedAt: recordedAt, RecordedAt: recordedAt, Status: VersionStatusPending,
 					LeaseOwner: "other-worker",
 				}
 			},
@@ -593,7 +593,7 @@ func TestSyncReturnsBusyWithoutInvokingModelForActiveDerivationLease(t *testing.
 	derivation := testDerivationIdentity(t, version)
 	repository.versions[derivationKey(version, derivation)] = VersionState{
 		ID: "version-busy", DerivationID: "derivation-busy", DerivationDigest: derivation.Digest,
-		RecordedAt: recordedAt, Status: VersionStatusPending, LeaseOwner: "other-worker",
+		DocumentRecordedAt: recordedAt, RecordedAt: recordedAt, Status: VersionStatusPending, LeaseOwner: "other-worker",
 	}
 	model := &recordingModel{responses: []extract.Response{validEmptyResponse(t)}}
 	service := testService(document, repository, model)
@@ -1352,7 +1352,7 @@ func TestCompletionReplacesRawSignalRationaleWithDeterministicExplanation(t *tes
 
 	completion, err := service.completion(version, VersionState{
 		ID: "version-id", DerivationID: "derivation-id",
-		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), RecordedAt: recordedAt,
+		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), DocumentRecordedAt: version.RecordedAt(), RecordedAt: recordedAt,
 	}, extract.Response{
 		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
 	}, output, nil)
@@ -1400,7 +1400,7 @@ func TestCompletionBuildsCanonicalCompatibleObservationDraft(t *testing.T) {
 
 	completion, err := service.completion(version, VersionState{
 		ID: "version-id", DerivationID: "derivation-id",
-		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), RecordedAt: runRecordedAt,
+		DerivationDigest: sha256.Sum256([]byte("synthetic derivation")), DocumentRecordedAt: version.RecordedAt(), RecordedAt: runRecordedAt,
 	}, extract.Response{
 		ModelID: "synthetic-model", PromptVersion: extract.ExtractionPromptVersion,
 	}, output, nil)
@@ -1423,6 +1423,40 @@ func TestCompletionBuildsCanonicalCompatibleObservationDraft(t *testing.T) {
 	}
 	if draft.SourceConfidence.Scale() != observation.ConfidenceUnitInterval || draft.SourceConfidence.Value() != 0.8 {
 		t.Fatalf("draft source confidence = %#v, want unit_interval 0.8", draft.SourceConfidence)
+	}
+}
+
+func TestCompletionUsesDocumentFirstRecordedTimeForEvidence(t *testing.T) {
+	const transcript = "Leader assigns follow-up."
+	version := documentVersion(t, syntheticDocument("document-evidence-recorded-at", transcript))
+	documentRecordedAt := time.Date(2026, time.July, 25, 12, 0, 0, 123456000, time.UTC)
+	state := VersionState{
+		ID: "version-id", DerivationID: "derivation-id", DerivationDigest: sha256.Sum256([]byte("synthetic derivation")),
+		DocumentRecordedAt: documentRecordedAt,
+		RecordedAt:         documentRecordedAt.Add(time.Hour),
+	}
+	output := extract.ExtractionOutput{Citations: []extract.Citation{{
+		ID: "citation-1", TabID: "transcript-tab", StartOffset: 0, EndOffset: len(transcript), Quote: transcript,
+	}}}
+
+	completion, err := (&Service{}).completion(version, state, extract.Response{}, output, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(completion.Evidence) != 1 {
+		t.Fatalf("evidence count = %d, want 1", len(completion.Evidence))
+	}
+	if got := completion.Evidence[0].Span.RecordedAt(); got != documentRecordedAt {
+		t.Fatalf("evidence recorded time = %v, want document first recorded time %v", got, documentRecordedAt)
+	}
+	retry := state
+	retry.RecordedAt = retry.RecordedAt.Add(time.Hour)
+	retryCompletion, err := (&Service{}).completion(version, retry, extract.Response{}, output, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retryCompletion.Evidence[0].Span.ID() != completion.Evidence[0].Span.ID() || retryCompletion.Evidence[0].Span.Digest() != completion.Evidence[0].Span.Digest() {
+		t.Fatal("evidence changed across an extraction retry with identical source coordinates")
 	}
 }
 
@@ -1695,7 +1729,7 @@ func (repository *memoryRepository) PrepareVersion(_ context.Context, version ev
 		state = VersionState{
 			ID:               "version-" + version.Digest().String()[:12],
 			DerivationID:     "derivation-" + fmt.Sprintf("%x", derivation.Digest[:6]),
-			DerivationDigest: derivation.Digest, RecordedAt: recordedAt, Status: VersionStatusPending,
+			DerivationDigest: derivation.Digest, DocumentRecordedAt: version.RecordedAt(), RecordedAt: recordedAt, Status: VersionStatusPending,
 			LeaseOwner: fmt.Sprintf("owner-%d", repository.prepareClaims), LeaseExpiresAt: leaseExpiresAt,
 		}
 		repository.lastLeaseExpiresAt = leaseExpiresAt
@@ -1992,7 +2026,7 @@ func TestComputeDerivationDigestChangesWithMaterialExtractionConfiguration(t *te
 	}
 }
 
-func TestComputeDerivationDigestPreservesBedrockV5Bytes(t *testing.T) {
+func TestComputeDerivationDigestUsesCanonicalDocumentDigest(t *testing.T) {
 	sections, err := evidenceSections([]source.Tab{{ID: "transcript-tab", Title: "Transcript", Path: []string{"Transcript"}, Role: source.TabRoleTranscript, Text: "Synthetic transcript."}})
 	if err != nil {
 		t.Fatal(err)
@@ -2016,7 +2050,7 @@ func TestComputeDerivationDigestPreservesBedrockV5Bytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hex.EncodeToString(got[:]) != "b000ccd59675147eebe18c0698207b23ab154160413ec40800c09dbb32e266e1" {
+	if hex.EncodeToString(got[:]) != "323c5911d390d049b6f50fce13c8eada6ad8391e38b44b138ecf852991715290" {
 		t.Fatalf("digest = %x", got)
 	}
 }
