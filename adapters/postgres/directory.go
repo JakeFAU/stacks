@@ -348,7 +348,8 @@ func (store DirectoryStore) LoadIdentityState(
 		JOIN stacks_directory.profiles AS profile
 		  ON profile.id = link.profile_id
 		JOIN stacks_core.resolution_decisions AS current
-		  ON current.proposal_id = link.proposal_id
+		  ON current.id = link.decision_id
+		 AND current.proposal_id = link.proposal_id
 		 AND current.entity_id = link.entity_id
 		WHERE current.outcome = 'accepted'
 		  AND NOT EXISTS (
@@ -440,12 +441,12 @@ func lockDirectoryProposal(
 	transaction *Transaction,
 	mention DirectoryPendingMention,
 ) error {
-	if _, err := transaction.Exec(ctx, `
-		SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
-		identityAuthorityLockNamespace,
-		mention.ProposalID,
+	if err := lockResolutionProposalAuthority(
+		ctx,
+		transaction,
+		identity.ProposalID(mention.ProposalID),
 	); err != nil {
-		return fmt.Errorf("lock directory proposal authority: %w", err)
+		return err
 	}
 	var storedMentionID string
 	if err := transaction.QueryRow(ctx, `
@@ -502,11 +503,37 @@ func lockDirectoryAuthorities(
 	return nil
 }
 
+func lockDirectoryProviderAuthority(
+	ctx context.Context,
+	transaction *Transaction,
+	provider string,
+	subjectID string,
+) error {
+	if _, err := transaction.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
+		directoryAuthorityNamespace+"/"+strings.TrimSpace(provider),
+		strings.TrimSpace(subjectID),
+	); err != nil {
+		return fmt.Errorf("lock directory provider authority: %w", err)
+	}
+	return nil
+}
+
 func persistDirectoryProfiles(
 	ctx context.Context,
 	transaction *Transaction,
 	input DirectoryPersistInput,
 ) ([]storedDirectoryProfile, error) {
+	profiles := prepareDirectoryProfiles(input)
+	for _, profile := range profiles {
+		if err := persistDirectoryProfile(ctx, transaction, profile, input.RecordedAt); err != nil {
+			return nil, err
+		}
+	}
+	return profiles, nil
+}
+
+func prepareDirectoryProfiles(input DirectoryPersistInput) []storedDirectoryProfile {
 	byDigest := make(map[[sha256.Size]byte]storedDirectoryProfile)
 	for _, raw := range input.Lookup.Profiles {
 		profile := canonicalDirectoryProfile(raw)
@@ -531,12 +558,7 @@ func persistDirectoryProfiles(
 	sort.Slice(profiles, func(left, right int) bool {
 		return bytes.Compare(profiles[left].digest[:], profiles[right].digest[:]) < 0
 	})
-	for _, profile := range profiles {
-		if err := persistDirectoryProfile(ctx, transaction, profile, input.RecordedAt); err != nil {
-			return nil, err
-		}
-	}
-	return profiles, nil
+	return profiles
 }
 
 func persistDirectoryProfile(
@@ -557,18 +579,6 @@ func persistDirectoryProfile(
 		recordedAt,
 	); err != nil {
 		return fmt.Errorf("insert directory profile: %w", err)
-	}
-	var storedProvider, storedSubject string
-	if err := transaction.QueryRow(ctx, `
-		SELECT provider, provider_subject_id
-		FROM stacks_directory.profiles
-		WHERE id = $1`,
-		profile.profileID,
-	).Scan(&storedProvider, &storedSubject); err != nil {
-		return fmt.Errorf("load directory profile: %w", err)
-	}
-	if storedProvider != profile.profile.Provider || storedSubject != profile.profile.SubjectID {
-		return fmt.Errorf("stored directory profile conflicts: %w", ErrConflict)
 	}
 
 	var observedAt any
@@ -592,6 +602,43 @@ func persistDirectoryProfile(
 	); err != nil {
 		return fmt.Errorf("insert directory snapshot: %w", err)
 	}
+
+	for index, email := range profile.profile.Emails {
+		if _, err := transaction.Exec(ctx, `
+			INSERT INTO stacks_directory.profile_emails (
+				snapshot_id, normalized_email, is_primary, email_order
+			)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (snapshot_id, normalized_email) DO NOTHING`,
+			profile.snapshotID,
+			email.Value,
+			email.Primary,
+			index,
+		); err != nil {
+			return fmt.Errorf("insert directory profile email: %w", err)
+		}
+	}
+	return requireExactDirectoryProfile(ctx, transaction, profile)
+}
+
+func requireExactDirectoryProfile(
+	ctx context.Context,
+	transaction *Transaction,
+	profile storedDirectoryProfile,
+) error {
+	var storedProvider, storedSubject string
+	if err := transaction.QueryRow(ctx, `
+		SELECT provider, provider_subject_id
+		FROM stacks_directory.profiles
+		WHERE id = $1`,
+		profile.profileID,
+	).Scan(&storedProvider, &storedSubject); err != nil {
+		return fmt.Errorf("load directory profile: %w", err)
+	}
+	if storedProvider != profile.profile.Provider || storedSubject != profile.profile.SubjectID {
+		return fmt.Errorf("stored directory profile conflicts: %w", ErrConflict)
+	}
+
 	var (
 		storedProfileID, storedSource, storedDisplayName string
 		storedObservedAt                                 *time.Time
@@ -619,21 +666,6 @@ func persistDirectoryProfile(
 		return fmt.Errorf("stored directory snapshot conflicts: %w", ErrConflict)
 	}
 
-	for index, email := range profile.profile.Emails {
-		if _, err := transaction.Exec(ctx, `
-			INSERT INTO stacks_directory.profile_emails (
-				snapshot_id, normalized_email, is_primary, email_order
-			)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (snapshot_id, normalized_email) DO NOTHING`,
-			profile.snapshotID,
-			email.Value,
-			email.Primary,
-			index,
-		); err != nil {
-			return fmt.Errorf("insert directory profile email: %w", err)
-		}
-	}
 	rows, err := transaction.Query(ctx, `
 		SELECT normalized_email, is_primary, email_order
 		FROM stacks_directory.profile_emails
@@ -677,14 +709,8 @@ func persistDirectoryAttempt(
 	input DirectoryPersistInput,
 	profiles []storedDirectoryProfile,
 ) (string, error) {
+	attemptID, attemptDigest, snapshotIDs := prepareDirectoryAttempt(input, profiles)
 	queryDigest := digestDirectoryQuery(input.Query)
-	snapshotIDs := make([]string, len(profiles))
-	for index, profile := range profiles {
-		snapshotIDs[index] = profile.snapshotID
-	}
-	sort.Strings(snapshotIDs)
-	attemptDigest := digestDirectoryAttempt(input, queryDigest, snapshotIDs)
-	attemptID := directoryOpaqueID(directoryAttemptDigest+"/id", fmt.Sprintf("%x", attemptDigest))
 	if _, err := transaction.Exec(ctx, `
 		INSERT INTO stacks_directory.lookup_attempts (
 			id, mention_id, proposal_id, provider, query_kind, email_evidence,
@@ -712,6 +738,42 @@ func persistDirectoryAttempt(
 	); err != nil {
 		return "", fmt.Errorf("insert directory lookup attempt: %w", err)
 	}
+	if err := requireExactDirectoryAttempt(
+		ctx,
+		transaction,
+		input,
+		attemptID,
+		attemptDigest,
+		snapshotIDs,
+	); err != nil {
+		return "", err
+	}
+	return attemptID, nil
+}
+
+func prepareDirectoryAttempt(
+	input DirectoryPersistInput,
+	profiles []storedDirectoryProfile,
+) (string, [sha256.Size]byte, []string) {
+	queryDigest := digestDirectoryQuery(input.Query)
+	snapshotIDs := make([]string, len(profiles))
+	for index, profile := range profiles {
+		snapshotIDs[index] = profile.snapshotID
+	}
+	sort.Strings(snapshotIDs)
+	attemptDigest := digestDirectoryAttempt(input, queryDigest, snapshotIDs)
+	attemptID := directoryOpaqueID(directoryAttemptDigest+"/id", fmt.Sprintf("%x", attemptDigest))
+	return attemptID, attemptDigest, snapshotIDs
+}
+
+func requireExactDirectoryAttempt(
+	ctx context.Context,
+	transaction *Transaction,
+	input DirectoryPersistInput,
+	attemptID string,
+	attemptDigest [sha256.Size]byte,
+	snapshotIDs []string,
+) error {
 	var (
 		storedMention, storedProposal, storedProvider, storedOutcome string
 		storedRecordedAt                                             time.Time
@@ -736,7 +798,7 @@ func persistDirectoryAttempt(
 		&storedSnapshots,
 		&storedDigest,
 	); err != nil {
-		return "", fmt.Errorf("load directory lookup attempt: %w", err)
+		return fmt.Errorf("load directory lookup attempt: %w", err)
 	}
 	if storedMention != input.Mention.MentionID ||
 		storedProposal != input.Mention.ProposalID ||
@@ -746,9 +808,9 @@ func persistDirectoryAttempt(
 		!sameDirectoryTimePointer(storedRetryAfter, input.RetryAfter) ||
 		!equalDirectoryStrings(storedSnapshots, snapshotIDs) ||
 		!bytes.Equal(storedDigest, attemptDigest[:]) {
-		return "", fmt.Errorf("stored directory lookup attempt conflicts: %w", ErrConflict)
+		return fmt.Errorf("stored directory lookup attempt conflicts: %w", ErrConflict)
 	}
-	return attemptID, nil
+	return nil
 }
 
 func persistAutomaticDirectoryAuthority(
@@ -1111,7 +1173,13 @@ func persistDirectoryEntityLink(
 		proposalID,
 		profile.snapshotID,
 		string(candidateID),
+		string(decisionID),
+		entityID,
 	)
+	var nullableCandidate any
+	if candidateID != "" {
+		nullableCandidate = candidateID
+	}
 	var nullableDecision any
 	if decisionID != "" {
 		nullableDecision = decisionID
@@ -1128,15 +1196,15 @@ func persistDirectoryEntityLink(
 		profile.snapshotID,
 		attemptID,
 		proposalID,
-		candidateID,
+		nullableCandidate,
 		nullableDecision,
 		entityID,
 		recordedAt,
 	); err != nil {
 		return fmt.Errorf("insert directory entity link: %w", err)
 	}
-	var storedCandidate, storedEntity string
-	var storedDecision *string
+	var storedCandidate, storedDecision *string
+	var storedEntity string
 	if err := transaction.QueryRow(ctx, `
 		SELECT candidate_id, decision_id, entity_id
 		FROM stacks_directory.entity_links
@@ -1145,7 +1213,7 @@ func persistDirectoryEntityLink(
 	).Scan(&storedCandidate, &storedDecision, &storedEntity); err != nil {
 		return fmt.Errorf("load directory entity link: %w", err)
 	}
-	if storedCandidate != string(candidateID) ||
+	if !sameDirectoryStringPointer(storedCandidate, string(candidateID)) ||
 		storedEntity != entityID ||
 		!sameDirectoryStringPointer(storedDecision, string(decisionID)) {
 		return fmt.Errorf("stored directory entity link conflicts: %w", ErrConflict)
@@ -1226,7 +1294,8 @@ func loadDirectoryProviderOwners(
 		JOIN stacks_directory.profiles AS profile
 		  ON profile.id = link.profile_id
 		JOIN stacks_core.resolution_decisions AS current
-		  ON current.proposal_id = link.proposal_id
+		  ON current.id = link.decision_id
+		 AND current.proposal_id = link.proposal_id
 		 AND current.entity_id = link.entity_id
 		WHERE profile.provider = $1
 		  AND profile.provider_subject_id = $2
@@ -1256,6 +1325,33 @@ func loadDirectoryProviderOwners(
 		return nil, fmt.Errorf("iterate directory provider owners: %w", err)
 	}
 	return owners, nil
+}
+
+func requireDirectoryProviderOwner(
+	ctx context.Context,
+	transaction *Transaction,
+	provider string,
+	subjectID string,
+	entityID string,
+) error {
+	owners, err := loadDirectoryProviderOwners(
+		ctx,
+		transaction,
+		provider,
+		subjectID,
+	)
+	if err != nil {
+		return err
+	}
+	for _, owner := range owners {
+		if owner != entityID {
+			return fmt.Errorf(
+				"directory provider subject already belongs to another entity: %w",
+				ErrConflict,
+			)
+		}
+	}
+	return nil
 }
 
 func chooseDirectoryAuthorityEntity(

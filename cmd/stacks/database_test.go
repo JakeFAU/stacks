@@ -36,7 +36,7 @@ func TestDatabaseCommandsEmitOnlyBoundedTelemetry(t *testing.T) {
 		ApplicationRole: "synthetic_role",
 		Scopes:          []config.DatabaseScope{config.DatabaseScopeCore},
 	}}
-	runtime := pocCommandRuntime{
+	runtime := commandRuntime{
 		newMigrationApplier: func(config.DatabaseSettings) cli.MigrationApplier {
 			return commandMigrationApplier{}
 		},
@@ -47,7 +47,7 @@ func TestDatabaseCommandsEmitOnlyBoundedTelemetry(t *testing.T) {
 			return commandDatabaseResetter{}
 		},
 	}
-	commands, err := pocCommandProviderWithRuntime(
+	commands, err := commandProviderWithRuntime(
 		t.Context(),
 		settings,
 		io.Discard,
@@ -58,7 +58,7 @@ func TestDatabaseCommandsEmitOnlyBoundedTelemetry(t *testing.T) {
 		runtime,
 	)
 	if err != nil {
-		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
 	for _, invocation := range []struct {
 		command config.Command
@@ -122,7 +122,7 @@ func TestDatabaseCommandsConstructNoProviders(t *testing.T) {
 	migrateConstructed := 0
 	statusConstructed := 0
 	resetConstructed := 0
-	runtime := pocCommandRuntime{
+	runtime := commandRuntime{
 		newMigrationApplier: func(config.DatabaseSettings) cli.MigrationApplier {
 			migrateConstructed++
 			return commandMigrationApplier{}
@@ -136,7 +136,7 @@ func TestDatabaseCommandsConstructNoProviders(t *testing.T) {
 			return commandDatabaseResetter{}
 		},
 	}
-	commands, err := pocCommandProviderWithRuntime(
+	commands, err := commandProviderWithRuntime(
 		t.Context(),
 		settings,
 		io.Discard,
@@ -147,7 +147,7 @@ func TestDatabaseCommandsConstructNoProviders(t *testing.T) {
 		runtime,
 	)
 	if err != nil {
-		t.Fatalf("pocCommandProviderWithRuntime() error = %v", err)
+		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
 	if err := commands[string(config.CommandDBMigrate)].Run(t.Context(), nil); err != nil {
 		t.Fatalf("db-migrate Run() error = %v", err)

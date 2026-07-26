@@ -50,8 +50,8 @@ func TestDatabaseScopeValidationRejectsUnknownDuplicateAndMissingCore(t *testing
 
 func TestDirectoryProviderRequiresDirectoryDatabaseScope(t *testing.T) {
 	settings := Settings{
-		Database: DatabaseSettings{Scopes: []DatabaseScope{DatabaseScopeCore}},
-		PoC:      PoCSettings{Directory: GoogleDirectorySettings{Enabled: true}},
+		Database:    DatabaseSettings{Scopes: []DatabaseScope{DatabaseScopeCore}},
+		Application: ApplicationSettings{Directory: GoogleDirectorySettings{Enabled: true}},
 	}
 	if err := settings.Validate(CommandSync); err == nil ||
 		!strings.Contains(err.Error(), DatabaseScopesEnvironmentVariable) {
@@ -61,11 +61,35 @@ func TestDirectoryProviderRequiresDirectoryDatabaseScope(t *testing.T) {
 
 func TestDisabledDirectoryAcceptsCoreOnlyDatabaseScope(t *testing.T) {
 	settings := Settings{
-		Database: DatabaseSettings{Scopes: []DatabaseScope{DatabaseScopeCore}},
-		PoC:      PoCSettings{Directory: GoogleDirectorySettings{Enabled: false}},
+		Database:    DatabaseSettings{Scopes: []DatabaseScope{DatabaseScopeCore}},
+		Application: ApplicationSettings{Directory: GoogleDirectorySettings{Enabled: false}},
 	}
 	if err := settings.Validate(CommandServe); err != nil {
 		t.Fatalf("Settings.Validate() error = %v, want core-only disabled-directory configuration", err)
+	}
+}
+
+func TestApplicationDatabaseCommandsRequireCanonicalDatabaseURL(t *testing.T) {
+	t.Parallel()
+
+	for _, command := range []Command{
+		CommandDoctor,
+		CommandSync,
+		CommandEntities,
+		CommandReview,
+		CommandAnalyze,
+	} {
+		command := command
+		t.Run(string(command), func(t *testing.T) {
+			t.Parallel()
+			settings := Settings{Database: DatabaseSettings{
+				Scopes: []DatabaseScope{DatabaseScopeCore},
+			}}
+			if err := settings.Validate(command); err == nil ||
+				!strings.Contains(err.Error(), DatabaseURLEnvironmentVariable) {
+				t.Fatalf("Settings.Validate(%q) error = %v, want canonical database URL rejection", command, err)
+			}
+		})
 	}
 }
 

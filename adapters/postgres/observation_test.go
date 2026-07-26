@@ -277,87 +277,6 @@ func TestCanonicalObservationExactRetryIsReadOnlyAndConflictIsBounded(t *testing
 	}
 }
 
-func TestCanonicalObservationRejectsLegacyStorageShapes(t *testing.T) {
-	fixture := newObservationRepositoryFixture(t)
-	subject, err := observation.NewTextTerm("Project Atlas")
-	if err != nil {
-		t.Fatalf("observation.NewTextTerm(subject) error = %v", err)
-	}
-	object, err := observation.NewTextTerm("synthetic commitment")
-	if err != nil {
-		t.Fatalf("observation.NewTextTerm(object) error = %v", err)
-	}
-	predicate, err := observation.NewPredicate("project.commitment")
-	if err != nil {
-		t.Fatalf("observation.NewPredicate() error = %v", err)
-	}
-	legacyConfidence, err := observation.NewLegacyConfidence(0.75)
-	if err != nil {
-		t.Fatalf("observation.NewLegacyConfidence() error = %v", err)
-	}
-	legacyValues := []observation.Observation{
-		mustObservation(t, observation.ObservationInput{
-			ID:         "observation:legacy/uncited",
-			Statement:  observation.Statement{Subject: subject, Predicate: predicate, Object: object},
-			ValidTime:  observation.UnknownTime(),
-			RecordedAt: observationRecordedAt,
-			Derivation: observation.Derivation{
-				Method:  "legacy",
-				Version: "legacy-v1",
-			},
-			Status:        observation.StatusObserved,
-			LegacyUncited: true,
-		}),
-		mustObservation(t, observation.ObservationInput{
-			ID:         "observation:legacy/derivation",
-			Statement:  observation.Statement{Subject: subject, Predicate: predicate, Object: object},
-			ValidTime:  observation.UnknownTime(),
-			RecordedAt: observationRecordedAt,
-			Evidence:   []observation.EvidenceLink{supportingLink(fixture.evidence[0])},
-			Derivation: observation.Derivation{
-				Method:            "legacy",
-				LegacyUnversioned: true,
-			},
-			Status: observation.StatusObserved,
-		}),
-		mustObservation(t, observation.ObservationInput{
-			ID:         "observation:legacy/confidence",
-			Statement:  observation.Statement{Subject: subject, Predicate: predicate, Object: object},
-			ValidTime:  observation.UnknownTime(),
-			RecordedAt: observationRecordedAt,
-			Evidence:   []observation.EvidenceLink{supportingLink(fixture.evidence[0])},
-			Derivation: observation.Derivation{
-				Method:  "structured-extraction",
-				Version: "extractor-v3",
-			},
-			Status:     observation.StatusObserved,
-			Confidence: &legacyConfidence,
-		}),
-	}
-	for _, value := range legacyValues {
-		t.Run(string(value.ID()), func(t *testing.T) {
-			err := fixture.database.InTransaction(fixture.ctx, func(transaction *postgres.Transaction) error {
-				_, err := transaction.PutObservation(fixture.ctx, value)
-				return err
-			})
-			if err == nil {
-				t.Fatal("PutObservation() error = nil, want legacy-shape rejection")
-			}
-			var count int
-			if err := fixture.admin.QueryRow(
-				fixture.ctx,
-				`SELECT count(*) FROM stacks_core.observations WHERE id = $1`,
-				value.ID(),
-			).Scan(&count); err != nil {
-				t.Fatalf("count rejected legacy observation: %v", err)
-			}
-			if count != 0 {
-				t.Fatalf("rejected legacy observation row count = %d, want 0", count)
-			}
-		})
-	}
-}
-
 func TestCanonicalObservationLoadRejectsCorruptDigest(t *testing.T) {
 	fixture := newObservationRepositoryFixture(t)
 	subject, err := observation.NewTextTerm("Project Atlas")
@@ -464,16 +383,4 @@ func TestCanonicalObservationUncitedTransactionRollsBack(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("uncited observation row count = %d, want 0 after rollback", count)
 	}
-}
-
-func mustObservation(
-	t testing.TB,
-	input observation.ObservationInput,
-) observation.Observation {
-	t.Helper()
-	value, err := observation.NewObservation(input)
-	if err != nil {
-		t.Fatalf("observation.NewObservation(%q) error = %v", input.ID, err)
-	}
-	return value
 }

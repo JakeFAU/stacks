@@ -50,8 +50,9 @@ type documentReader interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-// PutDocumentVersion stores canonical content and its source revision
-// observation atomically.
+// PutDocumentVersion stores canonical immutable content. Callers that observe
+// provider revision metadata must append a SourceRevisionObservation
+// explicitly in the same transaction.
 func (database *Database) PutDocumentVersion(
 	ctx context.Context,
 	version evidence.DocumentVersion,
@@ -67,27 +68,7 @@ func (database *Database) PutDocumentVersion(
 	err := database.InTransaction(ctx, func(transaction *Transaction) error {
 		var err error
 		result, err = transaction.PutDocumentVersion(ctx, version)
-		if err != nil {
-			return err
-		}
-		revision, err := evidence.NewSourceRevisionObservation(
-			evidence.SourceRevisionObservationInput{
-				Provider:              version.Provider(),
-				ProviderDocumentID:    version.ProviderDocumentID(),
-				DocumentDigestVersion: version.DigestVersion(),
-				DocumentDigest:        version.Digest(),
-				ProviderVersion:       version.ProviderVersion(),
-				ProviderRevision:      version.ProviderRevision(),
-				FirstRecordedAt:       result.Ref.RecordedAt,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("construct source revision observation: %w", err)
-		}
-		if _, err := transaction.PutSourceRevisionObservation(ctx, revision); err != nil {
-			return err
-		}
-		return nil
+		return err
 	})
 	if err != nil {
 		return PutDocumentVersionResult{}, wrapDocumentError(ctx, "put document version", err)

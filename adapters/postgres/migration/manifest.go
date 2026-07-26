@@ -513,6 +513,10 @@ func validateOwnedObject(object OwnedObject) error {
 		return err
 	}
 	if object.Kind == ObjectSchema {
+		if object.FunctionParameters != "" ||
+			object.FunctionIdentityArguments != "" {
+			return fmt.Errorf("schema object function parameters must be blank")
+		}
 		if object.Parent != "" {
 			return fmt.Errorf("schema object parent must be blank")
 		}

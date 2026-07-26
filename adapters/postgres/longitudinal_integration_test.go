@@ -48,7 +48,6 @@ func TestProjectCommitmentChronologyPreservesChangeUncertaintyAndCounterevidence
 			Title:              "Synthetic Project Atlas note",
 			Locator:            "synthetic://project-atlas/note-" + string(rune('1'+index)),
 			ProviderVersion:    "synthetic-v1",
-			ProviderRevision:   "revision-1",
 			ModifiedAt:         noteDates[index],
 			RecordedAt:         recordedAt,
 			SourceTime:         &sourceTime,

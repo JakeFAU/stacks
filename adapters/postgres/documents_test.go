@@ -15,10 +15,7 @@ func TestDocumentVersionRoundTripsCanonicalSourceAndSectionState(t *testing.T) {
 	fixture := newDocumentRepositoryFixture(t)
 	document := canonicalDocument(t, "source-opaque-a", "revision-a", documentRecordedAt)
 
-	put, err := fixture.database.PutDocumentVersion(fixture.ctx, document)
-	if err != nil {
-		t.Fatalf("PutDocumentVersion() error = %v", err)
-	}
+	put := putDocumentWithRevision(t, fixture, document, "revision-a")
 	if !put.ContentCreated {
 		t.Fatal("PutDocumentVersion() ContentCreated = false, want true")
 	}
@@ -41,14 +38,8 @@ func TestDocumentVersionRevisionChurnReusesStableContentVersion(t *testing.T) {
 	first := canonicalDocument(t, "source-opaque-a", "revision-a", documentRecordedAt)
 	second := canonicalDocument(t, "source-opaque-a", "revision-b", documentRecordedAt.Add(time.Hour))
 
-	firstPut, err := fixture.database.PutDocumentVersion(fixture.ctx, first)
-	if err != nil {
-		t.Fatalf("first PutDocumentVersion() error = %v", err)
-	}
-	secondPut, err := fixture.database.PutDocumentVersion(fixture.ctx, second)
-	if err != nil {
-		t.Fatalf("second PutDocumentVersion() error = %v", err)
-	}
+	firstPut := putDocumentWithRevision(t, fixture, first, "revision-a")
+	secondPut := putDocumentWithRevision(t, fixture, second, "revision-b")
 	if !firstPut.ContentCreated || secondPut.ContentCreated {
 		t.Fatalf("content created results = (%v, %v), want (true, false)", firstPut.ContentCreated, secondPut.ContentCreated)
 	}
@@ -72,16 +63,11 @@ func TestDocumentVersionRevisionChurnReusesStableContentVersion(t *testing.T) {
 func TestProviderRevisionChurnAppendsProvenanceWithoutRewritingContent(t *testing.T) {
 	fixture := newDocumentRepositoryFixture(t)
 	first := canonicalDocument(t, "source-opaque-a", "revision-a", documentRecordedAt)
-	firstPut, err := fixture.database.PutDocumentVersion(fixture.ctx, first)
-	if err != nil {
-		t.Fatalf("first PutDocumentVersion() error = %v", err)
-	}
+	firstPut := putDocumentWithRevision(t, fixture, first, "revision-a")
 	contentXID := rowXID(t, fixture.ctx, fixture.admin, "document_versions", firstPut.Ref.VersionID)
 
 	second := canonicalDocument(t, "source-opaque-a", "revision-b", documentRecordedAt.Add(time.Hour))
-	if _, err := fixture.database.PutDocumentVersion(fixture.ctx, second); err != nil {
-		t.Fatalf("second PutDocumentVersion() error = %v", err)
-	}
+	putDocumentWithRevision(t, fixture, second, "revision-b")
 	if got := rowXID(t, fixture.ctx, fixture.admin, "document_versions", firstPut.Ref.VersionID); got != contentXID {
 		t.Fatalf("provider revision churn rewrote content xmin from %s to %s", contentXID, got)
 	}
@@ -142,7 +128,7 @@ func TestSourceRevisionObservationRejectsRecordedTimeDifferentFromContent(t *tes
 		correct := sourceRevision(
 			t,
 			document,
-			document.ProviderRevision(),
+			"revision-a",
 			put.Ref.RecordedAt,
 		)
 		correctCreated, correctErr = transaction.PutSourceRevisionObservation(
@@ -228,20 +214,14 @@ func TestLoadDocumentVersionRejectsSourceRevisionRecordedTimeDifferentFromConten
 func TestDocumentVersionExactRetryIsReadOnly(t *testing.T) {
 	fixture := newDocumentRepositoryFixture(t)
 	document := canonicalDocument(t, "source-opaque-a", "revision-a", documentRecordedAt)
-	first, err := fixture.database.PutDocumentVersion(fixture.ctx, document)
-	if err != nil {
-		t.Fatalf("first PutDocumentVersion() error = %v", err)
-	}
+	first := putDocumentWithRevision(t, fixture, document, "revision-a")
 	before := []string{
 		rowXID(t, fixture.ctx, fixture.admin, "source_documents", first.Ref.SourceDocumentID),
 		rowXID(t, fixture.ctx, fixture.admin, "document_versions", first.Ref.VersionID),
 		rowXID(t, fixture.ctx, fixture.admin, "source_revision_observations", documentRevisionID(t, document, first.Ref.RecordedAt)),
 	}
 
-	second, err := fixture.database.PutDocumentVersion(fixture.ctx, document)
-	if err != nil {
-		t.Fatalf("repeated PutDocumentVersion() error = %v", err)
-	}
+	second := putDocumentWithRevision(t, fixture, document, "revision-a")
 	if second.ContentCreated || second.Ref != first.Ref {
 		t.Fatalf("repeated PutDocumentVersion() = %#v, want original ref and no content creation", second)
 	}
@@ -316,7 +296,6 @@ func assertDocumentRecord(
 		got.Version.Title() != want.Title() ||
 		got.Version.Locator() != want.Locator() ||
 		got.Version.ProviderVersion() != want.ProviderVersion() ||
-		got.Version.ProviderRevision() != "" ||
 		got.Version.ModifiedAt() != want.ModifiedAt() ||
 		got.Version.RecordedAt() != wantRef.RecordedAt ||
 		got.Version.DigestVersion() != want.DigestVersion() ||

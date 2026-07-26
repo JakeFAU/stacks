@@ -55,12 +55,17 @@ func (verification ReviewerVerification) ValidForEmail(email string) bool {
 		entity.NormalizeEmail(verification.Query.Email) != normalizedEmail ||
 		entity.NormalizeName(verification.Query.Name) != "" ||
 		verification.Query.EmailEvidence != entity.EmailEvidenceReviewerSupplied ||
+		strings.TrimSpace(verification.Lookup.Provider) != reviewerDirectoryProvider ||
 		verification.RecordedAt.IsZero() ||
+		!timepoint.IsCanonical(verification.RecordedAt) ||
 		verification.AttemptCount < 0 ||
 		!boundedDirectoryOutcome(verification.Lookup.Outcome) ||
 		verification.Evaluation.Outcome != verification.Lookup.Outcome ||
 		verification.Lookup.RetryAfter < 0 ||
-		(verification.RetryAfter != nil && verification.RetryAfter.IsZero()) {
+		(verification.RetryAfter != nil &&
+			(verification.RetryAfter.IsZero() ||
+				!timepoint.IsCanonical(*verification.RetryAfter) ||
+				verification.RetryAfter.Before(verification.RecordedAt))) {
 		return false
 	}
 	if retryableDirectoryOutcome(verification.Lookup.Outcome) {
@@ -72,6 +77,22 @@ func (verification ReviewerVerification) ValidForEmail(email string) bool {
 	}
 	for _, profile := range verification.Lookup.Profiles {
 		if !validReviewerDirectoryProfile(profile) {
+			return false
+		}
+	}
+	if verification.Evaluation.Profile != nil {
+		if !validReviewerDirectoryProfile(*verification.Evaluation.Profile) ||
+			!reviewerDirectoryProfileInSet(
+				*verification.Evaluation.Profile,
+				verification.Lookup.Profiles,
+			) {
+			return false
+		}
+	}
+	for _, candidate := range verification.Evaluation.Candidates {
+		if !validReviewerDirectoryProfile(candidate) ||
+			!reviewerDirectoryProfileInSet(candidate, verification.Lookup.Profiles) ||
+			!reviewerDirectoryProfileHasEmail(candidate, normalizedEmail) {
 			return false
 		}
 	}
@@ -128,7 +149,9 @@ func validReviewerDirectoryProfile(profile entity.DirectoryProfile) bool {
 	if strings.TrimSpace(profile.Provider) != reviewerDirectoryProvider ||
 		strings.TrimSpace(profile.SubjectID) == "" ||
 		strings.TrimSpace(profile.DisplayName) == "" ||
-		len(profile.Emails) == 0 {
+		len(profile.Emails) == 0 ||
+		profile.ObservedAt.IsZero() ||
+		!timepoint.IsCanonical(profile.ObservedAt) {
 		return false
 	}
 	switch profile.Source {
@@ -150,6 +173,18 @@ func reviewerDirectoryProfileHasEmail(
 ) bool {
 	for _, candidate := range profile.Emails {
 		if entity.NormalizeEmail(candidate.Value) == email {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewerDirectoryProfileInSet(
+	profile entity.DirectoryProfile,
+	values []entity.DirectoryProfile,
+) bool {
+	for _, value := range values {
+		if sameReviewerDirectoryProfile(profile, value) {
 			return true
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	postgres "github.com/JakeFAU/stacks/adapters/postgres"
 	"github.com/JakeFAU/stacks/adapters/postgres/coremigrations"
 	"github.com/JakeFAU/stacks/adapters/postgres/directorymigrations"
 	"github.com/JakeFAU/stacks/adapters/postgres/migration"
@@ -25,8 +26,12 @@ func TestPostgresProbeReportsCoreOnlyMigrationStatus(t *testing.T) {
 	}).Apply(ctx); err != nil {
 		t.Fatalf("install core manifest: %v", err)
 	}
-	probe := NewPostgresProbeWithScopes(database.ApplicationURL(), []migration.Scope{"core"})
-	defer probe.Close()
+	connection, err := postgres.Open(ctx, database.ApplicationURL())
+	if err != nil {
+		t.Fatalf("open canonical database: %v", err)
+	}
+	defer connection.Close()
+	probe := NewPostgresProbeWithScopes(connection, []migration.Scope{"core"})
 	if err := probe.Ping(ctx); err != nil {
 		t.Fatalf("Ping() error = %v", err)
 	}
@@ -51,11 +56,15 @@ func TestPostgresProbeReportsConfiguredDirectoryMigrationStatus(t *testing.T) {
 	}).Apply(ctx); err != nil {
 		t.Fatalf("install core and directory manifests: %v", err)
 	}
+	connection, err := postgres.Open(ctx, database.ApplicationURL())
+	if err != nil {
+		t.Fatalf("open canonical database: %v", err)
+	}
+	defer connection.Close()
 	probe := NewPostgresProbeWithScopes(
-		database.ApplicationURL(),
+		connection,
 		[]migration.Scope{"core", "directory"},
 	)
-	defer probe.Close()
 	statuses, err := probe.MigrationStatus(ctx)
 	if err != nil {
 		t.Fatalf("MigrationStatus() error = %v", err)

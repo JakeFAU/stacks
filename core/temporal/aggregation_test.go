@@ -154,13 +154,6 @@ func TestAggregateWindowRejectsDivergentPayloadForSameObservationIDRegardlessOfO
 				input.Confidence = &confidence
 			},
 		},
-		{
-			name: "legacy uncited state",
-			mutate: func(input *observation.ObservationInput) {
-				input.Evidence = nil
-				input.LegacyUncited = true
-			},
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -433,64 +426,6 @@ func TestAggregateWindowKeepsCounterevidenceOnlyCandidateUnresolved(t *testing.T
 	}
 }
 
-func TestAggregateWindowKeepsLegacyUncitedObservationUnresolved(t *testing.T) {
-	validTime := mustDuring(t,
-		time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC),
-		time.Date(2025, time.June, 1, 0, 0, 0, 0, time.UTC),
-	)
-	candidate := legacyUncitedStateCandidate(
-		t,
-		"status",
-		"active",
-		"observation-legacy-uncited",
-		validTime,
-		time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC),
-	)
-	summary, err := temporal.AggregateWindow(
-		aggregationWindow(t),
-		temporal.CurrentKnowledge(),
-		[]temporal.StateCandidate{candidate, candidate},
-	)
-	if err != nil {
-		t.Fatalf("AggregateWindow() error = %v", err)
-	}
-	if len(summary.Facts) != 0 {
-		t.Fatalf("Facts = %v, want no legacy-uncited promotion", summary.Facts)
-	}
-	if len(summary.Unresolved) != 1 || summary.Unresolved[0].Reason != temporal.UnresolvedLegacyUncited {
-		t.Fatalf("Unresolved = %v, want legacy-uncited candidate", summary.Unresolved)
-	}
-	got := summary.Unresolved[0].Candidates[0]
-	if !got.LegacyUncited ||
-		!slices.Equal(got.ObservationIDs, []observation.ObservationID{"observation-legacy-uncited"}) ||
-		len(got.SupportingEvidenceIDs) != 0 ||
-		len(got.ContradictingEvidenceIDs) != 0 {
-		t.Errorf("legacy-uncited candidate = %+v, want explicit marker with no invented evidence", got)
-	}
-
-	afterSelection, err := temporal.Between(
-		"Q3 2025",
-		time.Date(2025, time.July, 1, 0, 0, 0, 0, time.UTC),
-		time.Date(2025, time.October, 1, 0, 0, 0, 0, time.UTC),
-	)
-	if err != nil {
-		t.Fatalf("Between(Q3) error = %v", err)
-	}
-	comparison, err := temporal.CompareWindowSummaries(
-		summary,
-		temporal.WindowSummary{Selection: afterSelection},
-	)
-	if err != nil {
-		t.Fatalf("CompareWindowSummaries() error = %v", err)
-	}
-	compared := comparison.BeforeUnresolved[0].Candidates[0]
-	if !compared.LegacyUncited ||
-		len(compared.SupportingEvidenceIDs) != 0 ||
-		len(compared.ContradictingEvidenceIDs) != 0 {
-		t.Errorf("compared legacy-uncited candidate = %+v, want explicit marker with no invented evidence", compared)
-	}
-}
-
 func TestAggregateWindowNeverUsesConfidenceToChooseTruth(t *testing.T) {
 	validTime := mustDuring(t,
 		time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC),
@@ -623,15 +558,14 @@ func withConfidence(t *testing.T, source observation.Observation, value float64)
 func rebuildObservation(t *testing.T, source observation.Observation, confidence *observation.Confidence) observation.Observation {
 	t.Helper()
 	result, err := observation.NewObservation(observation.ObservationInput{
-		ID:            source.ID(),
-		Statement:     source.Statement(),
-		ValidTime:     source.ValidTime(),
-		RecordedAt:    source.RecordedAt(),
-		Evidence:      source.EvidenceLinks(),
-		Derivation:    source.Derivation(),
-		Status:        source.Status(),
-		Confidence:    confidence,
-		LegacyUncited: source.LegacyUncited(),
+		ID:         source.ID(),
+		Statement:  source.Statement(),
+		ValidTime:  source.ValidTime(),
+		RecordedAt: source.RecordedAt(),
+		Evidence:   source.EvidenceLinks(),
+		Derivation: source.Derivation(),
+		Status:     source.Status(),
+		Confidence: confidence,
 	})
 	if err != nil {
 		t.Fatalf("NewObservation(rebuild) error = %v", err)
@@ -651,15 +585,14 @@ func replaceCandidateObservation(
 		confidencePointer = &confidence
 	}
 	input := observation.ObservationInput{
-		ID:            source.Observation.ID(),
-		Statement:     source.Observation.Statement(),
-		ValidTime:     source.Observation.ValidTime(),
-		RecordedAt:    source.Observation.RecordedAt(),
-		Evidence:      source.Observation.EvidenceLinks(),
-		Derivation:    source.Observation.Derivation(),
-		Status:        source.Observation.Status(),
-		Confidence:    confidencePointer,
-		LegacyUncited: source.Observation.LegacyUncited(),
+		ID:         source.Observation.ID(),
+		Statement:  source.Observation.Statement(),
+		ValidTime:  source.Observation.ValidTime(),
+		RecordedAt: source.Observation.RecordedAt(),
+		Evidence:   source.Observation.EvidenceLinks(),
+		Derivation: source.Observation.Derivation(),
+		Status:     source.Observation.Status(),
+		Confidence: confidencePointer,
 	}
 	mutate(&input)
 	replacement, err := observation.NewObservation(input)
@@ -668,47 +601,4 @@ func replaceCandidateObservation(
 	}
 	source.Observation = replacement
 	return source
-}
-
-func legacyUncitedStateCandidate(
-	t *testing.T,
-	key string,
-	value string,
-	observationID observation.ObservationID,
-	validTime observation.TemporalExtent,
-	recordedAt time.Time,
-) temporal.StateCandidate {
-	t.Helper()
-	subject, err := observation.NewTextTerm("entity-1")
-	if err != nil {
-		t.Fatalf("NewTextTerm(subject) error = %v", err)
-	}
-	object, err := observation.NewTextTerm(value)
-	if err != nil {
-		t.Fatalf("NewTextTerm(object) error = %v", err)
-	}
-	predicate, err := observation.NewPredicate(key)
-	if err != nil {
-		t.Fatalf("NewPredicate() error = %v", err)
-	}
-	valueObservation, err := observation.NewObservation(observation.ObservationInput{
-		ID: observationID,
-		Statement: observation.Statement{
-			Subject:   subject,
-			Predicate: predicate,
-			Object:    object,
-		},
-		ValidTime:  validTime,
-		RecordedAt: recordedAt,
-		Derivation: observation.Derivation{
-			Method:            "legacy-import",
-			LegacyUnversioned: true,
-		},
-		Status:        observation.StatusObserved,
-		LegacyUncited: true,
-	})
-	if err != nil {
-		t.Fatalf("NewObservation(legacy uncited) error = %v", err)
-	}
-	return temporal.StateCandidate{Key: key, Value: value, Observation: valueObservation}
 }

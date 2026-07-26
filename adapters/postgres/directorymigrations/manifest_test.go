@@ -160,6 +160,59 @@ func TestDirectoryAbsenceLeavesCoreMigrationCurrent(t *testing.T) {
 	}
 }
 
+func TestDirectoryEntityLinksPreserveStagedAndDecisionProofs(t *testing.T) {
+	database, ctx := installDirectoryTestScopes(t, true)
+	connection := openDirectorySchemaConnection(t, ctx, database.AdminURL())
+	defer connection.Close(context.Background())
+
+	var candidateNullable bool
+	if err := connection.QueryRow(ctx, `
+		SELECT NOT attribute.attnotnull
+		FROM pg_catalog.pg_attribute AS attribute
+		JOIN pg_catalog.pg_class AS relation
+		  ON relation.oid = attribute.attrelid
+		JOIN pg_catalog.pg_namespace AS namespace
+		  ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = 'stacks_directory'
+		  AND relation.relname = 'entity_links'
+		  AND attribute.attname = 'candidate_id'`,
+	).Scan(&candidateNullable); err != nil {
+		t.Fatalf("inspect directory candidate nullability: %v", err)
+	}
+	if !candidateNullable {
+		t.Fatal("directory decision proof candidate_id is not nullable")
+	}
+
+	rows, err := connection.Query(ctx, `
+		SELECT indexname
+		FROM pg_catalog.pg_indexes
+		WHERE schemaname = 'stacks_directory'
+		  AND tablename = 'entity_links'
+		  AND (
+		    indexdef LIKE '%WHERE (decision_id IS NULL)%'
+		    OR indexdef LIKE '%WHERE (decision_id IS NOT NULL)%'
+		  )
+		ORDER BY indexname`)
+	if err != nil {
+		t.Fatalf("inspect directory proof indexes: %v", err)
+	}
+	defer rows.Close()
+	var indexes []string
+	for rows.Next() {
+		var index string
+		if err := rows.Scan(&index); err != nil {
+			t.Fatalf("scan directory proof index: %v", err)
+		}
+		indexes = append(indexes, index)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate directory proof indexes: %v", err)
+	}
+	if len(indexes) != 2 {
+		t.Fatalf("directory proof partial indexes = %#v, want staged and decision indexes", indexes)
+	}
+}
+
 func installDirectoryTestScopes(
 	t testing.TB,
 	includeDirectory bool,

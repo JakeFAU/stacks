@@ -1546,7 +1546,7 @@ func documentVersion(t *testing.T, document source.Document) evidence.DocumentVe
 	}
 	version, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
 		Provider: document.Provider, ProviderDocumentID: document.ID, Title: document.Title,
-		Locator: document.Locator, ProviderVersion: document.Version, ProviderRevision: document.Revision,
+		Locator: document.Locator, ProviderVersion: document.Version,
 		ModifiedAt: document.ModifiedAt, SourceTime: document.MeetingTime,
 		RecordedAt: recordedAt, Sections: sections,
 	})
@@ -2081,7 +2081,7 @@ func TestComputeDerivationDigestUsesCanonicalDocumentDigest(t *testing.T) {
 	}
 	version, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
 		Provider: "drive", ProviderDocumentID: "document-compat", Title: "Synthetic Meeting",
-		Locator: "https://example.invalid/document", ProviderVersion: "version-1", ProviderRevision: "revision-1",
+		Locator: "https://example.invalid/document", ProviderVersion: "version-1",
 		ModifiedAt: time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC),
 		RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC),
 		Sections:   sections,

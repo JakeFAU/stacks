@@ -13,7 +13,6 @@ import (
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/oauth2"
 
 	"github.com/JakeFAU/stacks/adapters/postgres/coremigrations"
@@ -60,78 +59,39 @@ func RequireRestrictedDisclosure(ctx context.Context, invocation modelpolicy.Inv
 	return ErrDisclosureNotConfirmed
 }
 
-const (
-	enableVectorMigrationVersion              int64 = 1
-	managerConfidenceMigrationVersion         int64 = 2
-	ingestionProcessingStateMigrationVersion  int64 = 3
-	temporalPairAnalysisMigrationVersion      int64 = 4
-	managerConfidenceFinalFixesVersion        int64 = 5
-	legacyAdmissionBoundaryVersion            int64 = 6
-	compatibilityAdmissionBoundaryVersion     int64 = 7
-	snapshotCoherenceAdmissionBoundaryVersion int64 = 8
-	doctorMigrationInspectionVersion          int64 = 9
-	modelProviderProvenanceVersion            int64 = 10
-	currentDocumentMigrationVersion           int64 = 11
-	googleDirectoryIdentityMigrationVersion   int64 = 12
-)
-
-const migrationSetQuery = `
-	WITH latest_migration_state AS (
-		SELECT DISTINCT ON (version_id) version_id, is_applied
-		FROM public.goose_db_version
-		ORDER BY version_id, id DESC
-	)
-	SELECT NOT EXISTS (
-		SELECT 1
-		FROM unnest($1::bigint[]) AS required(version_id)
-		LEFT JOIN latest_migration_state AS applied
-			ON applied.version_id = required.version_id AND applied.is_applied
-		WHERE applied.version_id IS NULL
-	)`
-
-type postgresRow interface {
-	Scan(...any) error
-}
-
-type postgresConnection interface {
+type postgresQueryBoundary interface {
 	Ping(context.Context) error
-	QueryRow(context.Context, string, ...any) postgresRow
-	Close()
+	InspectMigrationStatus(
+		context.Context,
+		[]migration.Manifest,
+		[]migration.Scope,
+	) ([]migration.ScopeStatus, error)
 }
 
-type postgresFactory func(context.Context, string) (postgresConnection, error)
-
-// PostgresProbe owns one lazily opened read-only inspection connection.
+// PostgresProbe performs read-only checks through one caller-owned canonical
+// PostgreSQL query boundary.
 type PostgresProbe struct {
-	databaseURL string
-	open        postgresFactory
-	connection  postgresConnection
-	inspector   migrationInspector
+	database    postgresQueryBoundary
+	manifests   []migration.Manifest
+	configured  []migration.Scope
 	manifestErr error
 }
 
-type migrationInspector interface {
-	Status(context.Context) ([]migration.ScopeStatus, error)
+// NewPostgresProbe constructs a read-only core-scope probe.
+func NewPostgresProbe(database postgresQueryBoundary) *PostgresProbe {
+	return NewPostgresProbeWithScopes(database, []migration.Scope{"core"})
 }
 
-// NewPostgresProbe constructs a probe without opening a connection.
-func NewPostgresProbe(databaseURL string) *PostgresProbe {
-	return NewPostgresProbeWithScopes(databaseURL, []migration.Scope{"core"})
-}
-
-// NewPostgresProbeWithScopes constructs a read-only status probe for both
-// known manifests and an explicit configured-scope selection.
+// NewPostgresProbeWithScopes constructs a read-only status probe over the
+// caller-owned database and an explicit configured-scope selection.
 func NewPostgresProbeWithScopes(
-	databaseURL string,
+	database postgresQueryBoundary,
 	configured []migration.Scope,
 ) *PostgresProbe {
-	probe := newPostgresProbe(databaseURL, func(ctx context.Context, databaseURL string) (postgresConnection, error) {
-		pool, err := pgxpool.New(ctx, databaseURL)
-		if err != nil {
-			return nil, err
-		}
-		return pgxPoolConnection{pool: pool}, nil
-	})
+	probe := &PostgresProbe{
+		database:   database,
+		configured: append([]migration.Scope(nil), configured...),
+	}
 	core, err := coremigrations.Manifest()
 	if err != nil {
 		probe.manifestErr = err
@@ -142,42 +102,19 @@ func NewPostgresProbeWithScopes(
 		probe.manifestErr = err
 		return probe
 	}
-	probe.inspector = migration.Inspector{
-		DatabaseURL: databaseURL,
-		Manifests:   []migration.Manifest{core, directory},
-		Configured:  append([]migration.Scope(nil), configured...),
-	}
+	probe.manifests = []migration.Manifest{core, directory}
 	return probe
 }
 
-func newPostgresProbe(databaseURL string, open postgresFactory) *PostgresProbe {
-	return &PostgresProbe{databaseURL: databaseURL, open: open}
-}
-
-// Ping opens and verifies the configured PostgreSQL connection.
+// Ping verifies the caller-owned PostgreSQL connection.
 func (probe *PostgresProbe) Ping(ctx context.Context) error {
-	connection, err := probe.connect(ctx)
-	if err != nil {
-		return fmt.Errorf("open PostgreSQL doctor connection: %w", err)
+	if probe == nil || probe.database == nil {
+		return fmt.Errorf("PostgreSQL doctor database is not configured")
 	}
-	if err := connection.Ping(ctx); err != nil {
+	if err := probe.database.Ping(ctx); err != nil {
 		return fmt.Errorf("ping PostgreSQL for doctor: %w", err)
 	}
 	return nil
-}
-
-// MigrationsCurrent verifies every required Goose migration's latest state
-// without applying or modifying any migration.
-func (probe *PostgresProbe) MigrationsCurrent(ctx context.Context) (bool, error) {
-	connection, err := probe.connect(ctx)
-	if err != nil {
-		return false, fmt.Errorf("open PostgreSQL doctor connection: %w", err)
-	}
-	var current bool
-	if err := connection.QueryRow(ctx, migrationSetQuery, requiredMigrationVersions()).Scan(&current); err != nil {
-		return false, fmt.Errorf("inspect PostgreSQL migrations: %w", err)
-	}
-	return current, nil
 }
 
 // MigrationStatus inspects both known scoped manifests without writing.
@@ -187,63 +124,10 @@ func (probe *PostgresProbe) MigrationStatus(
 	if probe.manifestErr != nil {
 		return nil, fmt.Errorf("load PostgreSQL migration manifests: %w", probe.manifestErr)
 	}
-	if probe.inspector == nil {
+	if probe == nil || probe.database == nil {
 		return nil, fmt.Errorf("PostgreSQL migration inspector is not configured")
 	}
-	return probe.inspector.Status(ctx)
-}
-
-func requiredMigrationVersions() []int64 {
-	return []int64{
-		enableVectorMigrationVersion,
-		managerConfidenceMigrationVersion,
-		ingestionProcessingStateMigrationVersion,
-		temporalPairAnalysisMigrationVersion,
-		managerConfidenceFinalFixesVersion,
-		legacyAdmissionBoundaryVersion,
-		compatibilityAdmissionBoundaryVersion,
-		snapshotCoherenceAdmissionBoundaryVersion,
-		doctorMigrationInspectionVersion,
-		modelProviderProvenanceVersion,
-		currentDocumentMigrationVersion,
-		googleDirectoryIdentityMigrationVersion,
-	}
-}
-
-// Close releases the probe connection when one was opened.
-func (probe *PostgresProbe) Close() {
-	if probe != nil && probe.connection != nil {
-		probe.connection.Close()
-		probe.connection = nil
-	}
-}
-
-func (probe *PostgresProbe) connect(ctx context.Context) (postgresConnection, error) {
-	if probe.connection != nil {
-		return probe.connection, nil
-	}
-	connection, err := probe.open(ctx, probe.databaseURL)
-	if err != nil {
-		return nil, err
-	}
-	probe.connection = connection
-	return connection, nil
-}
-
-type pgxPoolConnection struct {
-	pool *pgxpool.Pool
-}
-
-func (connection pgxPoolConnection) Ping(ctx context.Context) error {
-	return connection.pool.Ping(ctx)
-}
-
-func (connection pgxPoolConnection) QueryRow(ctx context.Context, query string, arguments ...any) postgresRow {
-	return connection.pool.QueryRow(ctx, query, arguments...)
-}
-
-func (connection pgxPoolConnection) Close() {
-	connection.pool.Close()
+	return probe.database.InspectMigrationStatus(ctx, probe.manifests, probe.configured)
 }
 
 type googleSourceFactory func(context.Context) (source.RepresentativeSource, error)

@@ -150,6 +150,36 @@ func TestFingerprintManifestRejectsZeroExpectedFingerprint(t *testing.T) {
 	}
 }
 
+func TestSchemaOwnedObjectRejectsFunctionOnlyFields(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*OwnedObject)
+	}{
+		{
+			name: "source declaration",
+			mutate: func(object *OwnedObject) {
+				object.FunctionParameters = "()"
+			},
+		},
+		{
+			name: "identity declaration",
+			mutate: func(object *OwnedObject) {
+				object.FunctionIdentityArguments = "()"
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			object := OwnedObject{
+				Kind: ObjectSchema, Schema: "stacks_example", Name: "stacks_example",
+			}
+			testCase.mutate(&object)
+			if err := validateOwnedObject(object); err == nil {
+				t.Fatal("validateOwnedObject(schema) error = nil, want function-field rejection")
+			}
+		})
+	}
+}
+
 func TestManifestRejectsExactFunctionWithoutSourceOrIdentityDeclaration(t *testing.T) {
 	t.Parallel()
 

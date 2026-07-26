@@ -35,33 +35,6 @@ func TestUnitIntervalConfidenceRejectsOutsideRangeAndNonFinite(t *testing.T) {
 	}
 }
 
-func TestLegacyConfidencePreservesEveryFiniteValue(t *testing.T) {
-	for _, value := range []float64{-2.5, 0.75, 4.25} {
-		t.Run(confidenceCaseName(value), func(t *testing.T) {
-			confidence, err := observation.NewLegacyConfidence(value)
-			if err != nil {
-				t.Fatalf("NewLegacyConfidence(%v) error = %v", value, err)
-			}
-			if confidence.Value() != value {
-				t.Errorf("Value() = %v, want %v", confidence.Value(), value)
-			}
-			if confidence.Scale() != observation.ConfidenceUnspecifiedLegacy {
-				t.Errorf("Scale() = %q, want %q", confidence.Scale(), observation.ConfidenceUnspecifiedLegacy)
-			}
-		})
-	}
-}
-
-func TestLegacyConfidenceRejectsNonFinite(t *testing.T) {
-	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
-		t.Run(confidenceCaseName(value), func(t *testing.T) {
-			if _, err := observation.NewLegacyConfidence(value); err == nil {
-				t.Fatalf("NewLegacyConfidence(%v) error = nil, want validation error", value)
-			}
-		})
-	}
-}
-
 func confidenceCaseName(value float64) string {
 	switch {
 	case math.IsNaN(value):

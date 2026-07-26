@@ -1,8 +1,8 @@
 # Stacks
 
 Stacks builds provenance-backed temporal knowledge from personal source
-documents. This proof of concept reads tabbed Gemini meeting Docs from one
-Google Drive folder and analyzes one explicitly configured employee-manager
+documents. The current application reads tabbed Gemini meeting Docs from one
+Google Drive folder and can analyze one explicitly configured employee-manager
 pair for changes in observable interaction patterns.
 
 The analysis does not claim access to a manager's private beliefs or mental
@@ -26,11 +26,10 @@ manager-confidence workflow remain downstream in the application during the
 next extraction phases. The public core is experimental and has no independent
 release yet.
 
-The application PostgreSQL boundary consumes canonical `core/observation`
-values through a compatibility codec for the frozen legacy schema. That codec
-does not make the legacy schema complete canonical storage: unsupported terms,
-time windows, and explicit generic confidence scales remain deferred to the
-scoped-migration phase.
+The application PostgreSQL boundary stores canonical documents, evidence,
+observations, identity authority, admission history, and extraction lifecycle
+through the scoped core manifest. Optional Workspace directory identity
+evidence uses its own independently configured directory scope.
 
 ## Requirements
 
@@ -58,7 +57,7 @@ openssl rand -hex 24
 Use the generated values for `STACKS_DB_ADMIN_PASSWORD` and
 `STACKS_DB_APP_PASSWORD`, and put the application password into
 `STACKS_DATABASE_URL`. Set the corpus, Google, AWS, model, and pair values for
-your environment. `.env` is loaded by the proof-of-concept Make targets below;
+your environment. `.env` is loaded by the application Make targets below;
 the Go process itself reads environment variables and does not parse dotenv
 files.
 
@@ -117,8 +116,9 @@ implemented.
 by Compose and migrations, so they intentionally have no example values.
 `STACKS_TEST_DATABASE_URL` is the credential-bearing application-role input
 used by repository integration tests. `STACKS_TEST_MIGRATION_DATABASE_URL` is
-the schema-capable admin-role input used only by isolated forward-migration
-upgrade tests. Both are used only by the integration-test target.
+the schema-capable admin-role input used only by isolated migration
+installation and drift tests. Both are used only by the integration-test
+target.
 
 ## Optional Google Workspace directory identity enrichment
 
@@ -333,9 +333,9 @@ data, extracts content, invokes a model, changes configuration, or
 enables/disables logging. Missing or expired Google authorization directs the
 operator to `stacks auth google`.
 
-Migration 9 grants the application role only the schema usage and table read
-access needed to inspect Goose migration status. It does not grant schema
-creation, migration ownership, or broader database administration rights.
+Doctor reads the canonical scoped migration ledgers and schema fingerprints
+with the least-privileged application role. It does not apply migrations,
+create schemas, or require migration ownership.
 
 Doctor requires only the database, Google folder and OAuth paths, tab-title
 sets, explicit data mode, provider, model ID, and the selected provider's
@@ -366,30 +366,19 @@ claim expires. The bounded failure state releases the claim while it is still
 owned, so another sync cannot begin duplicate model work merely because a long
 attempt reached the lease boundary.
 
-The admission-boundary migrations preserve every pre-fix model payload and its
-provenance for audit, but exclude superseded extraction runs, mentions,
-decisions and their aliases, observations, signals, and reports from current
-resolution and analysis. Migration 7 retires work created before the
-`extract-v2` prompt/schema, v4 extraction namespace, and v5 analysis policy.
-Migration 8 also retires rows that could have paired a fetched undated title
-with a stale date from an earlier Drive listing. Current sync uses the v5
-extraction namespace and analysis uses policy v6. Run `sync` again to produce a
-current snapshot-coherent derivation, then review pair identities again; old
-proposals and corrections cannot re-admit their retired model mentions.
+The canonical schema admits reviewer identity work only from a completed,
+admitted extraction run for the source document's current version and from an
+independently admitted mention. Later quarantine or a newer current document
+version removes that proposal from current review without deleting its
+immutable evidence or derivation history.
 
-The first post-upgrade sync also recognizes the exact revision-inclusive digest
-used by older builds, attaches the revision-free stable content identity to the
-existing immutable document version, and reprocesses only because the
-derivation contract changed. A Drive revision-marker change alone therefore
-does not create a duplicate source version. The original revision remains
-immutable provenance.
-
-Migration 11 gives each logical source document an explicit current completed
-version. A changed document switches that pointer only when its validated
-extraction commits atomically; prior versions and derivations remain immutable
-audit history but no longer contribute identities or signals to current review
-and analysis. Re-observing an already completed version reuses its extraction
-without another model call and makes that version current again.
+Document content identity is stable across provider revision-marker changes.
+Provider revisions remain append-only source observations, while a changed
+content digest creates a new immutable document version. The source document's
+current-version pointer changes only after the selected version's validated
+extraction commits atomically. Re-observing an already completed version reuses
+its extraction without another model call and can make that version current
+again.
 
 Doctor's provider availability checks do not invoke a model and therefore
 cannot prove runtime quota, throughput, compatible structured output, or
@@ -534,4 +523,15 @@ permissions in the company account, or approval to process company IP. Report
 those gates as unvalidated until each is tested in its intended environment.
 
 `make db-down` and `make obs-down` stop local services without deleting named
-volumes. Removing database volumes is deliberately outside the normal workflow.
+volumes. During early development, the deliberately destructive canonical
+PostgreSQL reset is:
+
+```sh
+make db-reset CONFIRM=delete-local-stacks-postgres
+```
+
+The reset command accepts only loopback database URLs, rejects ambient Docker
+or Compose redirection, verifies the exact local Stacks PostgreSQL service and
+named volume, removes only that volume, recreates PostgreSQL, and applies the
+embedded canonical migrations. It is not part of normal startup or migration
+workflow.

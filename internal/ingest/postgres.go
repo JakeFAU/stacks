@@ -82,9 +82,6 @@ func (repository *PostgresRepository) PrepareVersion(
 		utf8.RuneCountInString(metadata.ProviderRevision) > maximumSourceRevisionMetadataRunes {
 		return VersionState{}, fmt.Errorf("prepare canonical version: source revision metadata is invalid")
 	}
-	if version.ProviderRevision() != "" {
-		return VersionState{}, fmt.Errorf("prepare canonical version: source revision must be supplied separately")
-	}
 	if err := (modelpolicy.Invocation{
 		Provider: derivation.Provider, DataMode: dataMode, Region: derivation.Region,
 	}).Validate(); err != nil {

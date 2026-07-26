@@ -45,7 +45,7 @@ type Settings struct {
 	LogLevel          string
 	Telemetry         TelemetrySettings
 	Database          DatabaseSettings
-	PoC               PoCSettings
+	Application       ApplicationSettings
 }
 
 // DatabaseScope identifies one selected embedded PostgreSQL migration scope.
@@ -205,8 +205,7 @@ func Load() (Settings, error) {
 			Scopes:          databaseScopes,
 			ApplicationRole: environmentOrDefault(DatabaseAppRoleEnvironmentVariable, defaultDatabaseAppRole),
 		},
-		PoC: PoCSettings{
-			DatabaseURL:           os.Getenv(DatabaseURLEnvironmentVariable),
+		Application: ApplicationSettings{
 			GoogleFolderID:        os.Getenv(GoogleFolderIDEnvironmentVariable),
 			GoogleOAuthClientFile: os.Getenv(GoogleOAuthClientFileEnvironmentVariable),
 			GoogleOAuthTokenFile:  os.Getenv(GoogleOAuthTokenFileEnvironmentVariable),
@@ -236,9 +235,11 @@ func Load() (Settings, error) {
 			IngestionLeaseDuration:  ingestionLeaseDuration,
 			IngestionAttemptTimeout: ingestionAttemptTimeout,
 			ExtractionPromptVersion: environmentOrDefault(ExtractionPromptVersionEnvironmentVariable, defaultExtractionPromptVersion),
-			AnalysisPromptVersion:   environmentOrDefault(AnalysisPromptVersionEnvironmentVariable, defaultAnalysisPromptVersion),
-			EmployeeEntityID:        os.Getenv(EmployeeEntityIDEnvironmentVariable),
-			ManagerEntityID:         os.Getenv(ManagerEntityIDEnvironmentVariable),
+			ManagerConfidence: ManagerConfidenceSettings{
+				PromptVersion:    environmentOrDefault(AnalysisPromptVersionEnvironmentVariable, defaultAnalysisPromptVersion),
+				EmployeeEntityID: os.Getenv(EmployeeEntityIDEnvironmentVariable),
+				ManagerEntityID:  os.Getenv(ManagerEntityIDEnvironmentVariable),
+			},
 		},
 	}, nil
 }
@@ -246,10 +247,10 @@ func Load() (Settings, error) {
 // Validate applies command-specific database and application validation before
 // any connection or provider dependency can be constructed.
 func (settings Settings) Validate(command Command) error {
-	if err := settings.Database.validate(command, settings.PoC.Directory.Enabled); err != nil {
+	if err := settings.Database.validate(command, settings.Application.Directory.Enabled); err != nil {
 		return err
 	}
-	return settings.PoC.Validate(command)
+	return settings.Application.Validate(command)
 }
 
 func (settings DatabaseSettings) validate(command Command, directoryEnabled bool) error {
@@ -269,7 +270,7 @@ func (settings DatabaseSettings) validate(command Command, directoryEnabled bool
 		)
 	}
 	switch command {
-	case CommandDBStatus:
+	case CommandDoctor, CommandSync, CommandEntities, CommandReview, CommandAnalyze, CommandDBStatus:
 		return validateExactRequired(command, DatabaseURLEnvironmentVariable, settings.URL)
 	case CommandDBMigrate, CommandDBReset:
 		if command == CommandDBReset {

@@ -295,21 +295,12 @@ func (transaction *Transaction) AppendResolutionDecision(
 	} else if exact {
 		return nil
 	}
-	var proposalID string
-	if _, err := transaction.transaction.Exec(ctx, `
-		SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
-		identityAuthorityLockNamespace,
+	if err := lockResolutionProposalAuthority(
+		ctx,
+		transaction,
 		decision.ProposalID(),
 	); err != nil {
-		return wrapIdentityError(ctx, "lock resolution proposal authority", err)
-	}
-	if err := transaction.transaction.QueryRow(ctx, `
-		SELECT id
-		FROM stacks_core.resolution_proposals
-		WHERE id = $1`,
-		decision.ProposalID(),
-	).Scan(&proposalID); err != nil {
-		return wrapIdentityError(ctx, "lock resolution proposal", err)
+		return err
 	}
 	if exact, err := transaction.exactResolutionDecisionRetry(ctx, decision, aliases); err != nil {
 		return err
@@ -386,6 +377,31 @@ func (transaction *Transaction) AppendResolutionDecision(
 		); err != nil {
 			return wrapIdentityError(ctx, "insert entity alias assertion", conflictError(err))
 		}
+	}
+	return nil
+}
+
+func lockResolutionProposalAuthority(
+	ctx context.Context,
+	transaction *Transaction,
+	proposalID identity.ProposalID,
+) error {
+	if _, err := transaction.Exec(ctx, `
+		/* stacks_resolution_proposal_authority */
+		SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
+		identityAuthorityLockNamespace,
+		proposalID,
+	); err != nil {
+		return wrapIdentityError(ctx, "lock resolution proposal authority", err)
+	}
+	var storedProposalID identity.ProposalID
+	if err := transaction.QueryRow(ctx, `
+		SELECT id
+		FROM stacks_core.resolution_proposals
+		WHERE id = $1`,
+		proposalID,
+	).Scan(&storedProposalID); err != nil {
+		return wrapIdentityError(ctx, "lock resolution proposal", err)
 	}
 	return nil
 }

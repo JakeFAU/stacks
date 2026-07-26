@@ -19,7 +19,6 @@ type CheckName string
 
 const (
 	CheckDatabaseConnectivity        CheckName = "database.connectivity"
-	CheckDatabaseMigrations          CheckName = "database.migrations"
 	CheckDatabaseMigrationsCore      CheckName = "database.migrations.core"
 	CheckDatabaseMigrationsDirectory CheckName = "database.migrations.directory"
 	CheckGoogleAuthorization         CheckName = "google.authorization"
@@ -82,10 +81,6 @@ func (report Report) Healthy() bool {
 // Database exposes only read-only connectivity and migration inspection.
 type Database interface {
 	Ping(context.Context) error
-}
-
-type legacyMigrationDatabase interface {
-	MigrationsCurrent(context.Context) (bool, error)
 }
 
 type scopedMigrationDatabase interface {
@@ -173,18 +168,6 @@ func (service Service) Check(ctx context.Context) Report {
 					)
 				} else {
 					report.Checks = append(report.Checks, migrationChecks(statuses)...)
-				}
-			} else if legacy, found := service.Database.(legacyMigrationDatabase); found {
-				current, err := legacy.MigrationsCurrent(ctx)
-				if stop(&report, ctx, CheckDatabaseMigrations, err) {
-					return report
-				}
-				if err != nil {
-					report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migration state could not be inspected", "run `make db-migrate`"))
-				} else if !current {
-					report.Checks = append(report.Checks, failed(CheckDatabaseMigrations, "database migrations are pending", "run `make db-migrate`"))
-				} else {
-					report.Checks = append(report.Checks, ok(CheckDatabaseMigrations, "database migrations are current"))
 				}
 			} else {
 				report.Checks = append(report.Checks,

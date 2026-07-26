@@ -1,10 +1,7 @@
 package evidence
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
-	"hash"
 	"strings"
 	"time"
 
@@ -16,7 +13,7 @@ import (
 // immutable source document version.
 type DocumentVersionInput struct {
 	Provider, ProviderDocumentID, Title, Locator string
-	ProviderVersion, ProviderRevision            string
+	ProviderVersion                              string
 	ModifiedAt, RecordedAt                       time.Time
 	SourceTime                                   *time.Time
 	Sections                                     []Section
@@ -24,11 +21,11 @@ type DocumentVersionInput struct {
 
 // DocumentVersion is immutable source document evidence.
 type DocumentVersion struct {
-	provider, providerDocumentID, title, locator, providerVersion, providerRevision string
-	modifiedAt, recordedAt                                                          time.Time
-	sourceTime                                                                      *time.Time
-	digest, legacyDigest                                                            ContentDigest
-	sections                                                                        []Section
+	provider, providerDocumentID, title, locator, providerVersion string
+	modifiedAt, recordedAt                                        time.Time
+	sourceTime                                                    *time.Time
+	digest                                                        ContentDigest
+	sections                                                      []Section
 }
 
 // NewDocumentVersion validates and copies immutable source document evidence.
@@ -44,7 +41,7 @@ func NewDocumentVersion(input DocumentVersionInput) (DocumentVersion, error) {
 		return DocumentVersion{}, fmt.Errorf("document recorded time is required")
 	}
 	title, locator := strings.TrimSpace(input.Title), strings.TrimSpace(input.Locator)
-	providerVersion, providerRevision := strings.TrimSpace(input.ProviderVersion), strings.TrimSpace(input.ProviderRevision)
+	providerVersion := strings.TrimSpace(input.ProviderVersion)
 	if title == "" || locator == "" || providerVersion == "" || input.ModifiedAt.IsZero() {
 		return DocumentVersion{}, fmt.Errorf("document source provenance is required")
 	}
@@ -70,8 +67,8 @@ func NewDocumentVersion(input DocumentVersionInput) (DocumentVersion, error) {
 		value := timepoint.Normalize(*input.SourceTime)
 		sourceTime = &value
 	}
-	version := DocumentVersion{provider: provider, providerDocumentID: providerDocumentID, title: title, locator: locator, providerVersion: providerVersion, providerRevision: providerRevision, modifiedAt: timepoint.Normalize(input.ModifiedAt), sourceTime: sourceTime, recordedAt: timepoint.Normalize(input.RecordedAt), sections: sections}
-	version.digest, version.legacyDigest = digestDocumentVersion(version, false), digestDocumentVersion(version, true)
+	version := DocumentVersion{provider: provider, providerDocumentID: providerDocumentID, title: title, locator: locator, providerVersion: providerVersion, modifiedAt: timepoint.Normalize(input.ModifiedAt), sourceTime: sourceTime, recordedAt: timepoint.Normalize(input.RecordedAt), sections: sections}
+	version.digest = digestCanonicalDocumentVersion(version)
 	return version, nil
 }
 
@@ -80,7 +77,6 @@ func (version DocumentVersion) ProviderDocumentID() string { return version.prov
 func (version DocumentVersion) Title() string              { return version.title }
 func (version DocumentVersion) Locator() string            { return version.locator }
 func (version DocumentVersion) ProviderVersion() string    { return version.providerVersion }
-func (version DocumentVersion) ProviderRevision() string   { return version.providerRevision }
 func (version DocumentVersion) ModifiedAt() time.Time      { return version.modifiedAt }
 func (version DocumentVersion) SourceTime() *time.Time {
 	if version.sourceTime == nil {
@@ -93,13 +89,6 @@ func (version DocumentVersion) SourceTime() *time.Time {
 func (version DocumentVersion) RecordedAt() time.Time { return version.recordedAt }
 func (version DocumentVersion) Digest() ContentDigest { return version.digest }
 func (version DocumentVersion) DigestVersion() string { return DocumentDigestVersion }
-func (version DocumentVersion) LegacyRevisionInclusiveDigest() ContentDigest {
-	return version.legacyDigest
-}
-func (version DocumentVersion) LegacyRevisionInclusiveDigestFor(providerRevision string) ContentDigest {
-	version.providerRevision = strings.TrimSpace(providerRevision)
-	return digestDocumentVersion(version, true)
-}
 func (version DocumentVersion) Sections() []Section {
 	return append([]Section(nil), version.sections...)
 }
@@ -111,42 +100,6 @@ func (version DocumentVersion) sectionByID(id string) (Section, bool) {
 		}
 	}
 	return Section{}, false
-}
-
-func digestDocumentVersion(version DocumentVersion, includeProviderRevision bool) ContentDigest {
-	if !includeProviderRevision {
-		return digestCanonicalDocumentVersion(version)
-	}
-	hasher := sha256.New()
-	writeString(hasher, version.title)
-	writeString(hasher, version.locator)
-	writeString(hasher, version.providerVersion)
-	if includeProviderRevision {
-		writeString(hasher, version.providerRevision)
-	}
-	writeString(hasher, version.modifiedAt.UTC().Format(time.RFC3339Nano))
-	if version.sourceTime == nil {
-		writeString(hasher, "")
-	} else {
-		writeString(hasher, version.sourceTime.UTC().Format(time.RFC3339Nano))
-	}
-	writeLength(hasher, uint64(len(version.sections)))
-	for _, section := range version.sections {
-		writeString(hasher, section.ID())
-		writeString(hasher, section.Title())
-		writeString(hasher, section.ParentID())
-		writeLength(hasher, uint64(len(section.Path())))
-		for _, pathTitle := range section.Path() {
-			writeString(hasher, pathTitle)
-		}
-		writeLength(hasher, uint64(section.Order()))
-		writeString(hasher, section.Role())
-		contentDigest := DigestContent([]byte(section.Text()))
-		writeBytes(hasher, contentDigest[:])
-	}
-	var digest ContentDigest
-	copy(digest[:], hasher.Sum(nil))
-	return digest
 }
 
 func digestCanonicalDocumentVersion(version DocumentVersion) ContentDigest {
@@ -175,17 +128,6 @@ func digestCanonicalDocumentVersion(version DocumentVersion) ContentDigest {
 		encoder.Bytes(contentDigest[:])
 	}
 	return contentDigest(encoder)
-}
-
-func writeString(hasher hash.Hash, value string) { writeBytes(hasher, []byte(value)) }
-func writeBytes(hasher hash.Hash, value []byte) {
-	writeLength(hasher, uint64(len(value)))
-	_, _ = hasher.Write(value)
-}
-func writeLength(hasher hash.Hash, length uint64) {
-	var encoded [8]byte
-	binary.BigEndian.PutUint64(encoded[:], length)
-	_, _ = hasher.Write(encoded[:])
 }
 
 // EvidenceSpanInput contains the local source range required for a citation.

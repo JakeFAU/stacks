@@ -124,11 +124,18 @@ const (
 	GoogleAuthDirectory GoogleAuthTarget = "google-directory"
 )
 
-// PoCSettings holds the command-specific settings for the manager-confidence
-// proof of concept. Values are loaded without command validation so serving
-// health traffic remains possible before the PoC is configured.
-type PoCSettings struct {
-	DatabaseURL             string
+// ManagerConfidenceSettings groups the temporary manager-confidence query
+// configuration without making that use case a database scope.
+type ManagerConfidenceSettings struct {
+	PromptVersion    string
+	EmployeeEntityID string
+	ManagerEntityID  string
+}
+
+// ApplicationSettings holds command-specific application settings. Values are
+// loaded without command validation so serving health traffic remains possible
+// before the application is fully configured.
+type ApplicationSettings struct {
 	GoogleFolderID          string
 	GoogleOAuthClientFile   string
 	GoogleOAuthTokenFile    string
@@ -140,14 +147,12 @@ type PoCSettings struct {
 	IngestionLeaseDuration  time.Duration
 	IngestionAttemptTimeout time.Duration
 	ExtractionPromptVersion string
-	AnalysisPromptVersion   string
-	EmployeeEntityID        string
-	ManagerEntityID         string
+	ManagerConfidence       ManagerConfidenceSettings
 }
 
 // Validate verifies only the settings required by command. Serve intentionally
-// requires no PoC configuration, preserving the existing no-argument server.
-func (settings PoCSettings) Validate(command Command) error {
+// requires no application configuration, preserving the no-argument server.
+func (settings ApplicationSettings) Validate(command Command) error {
 	switch command {
 	case CommandServe, CommandDBMigrate, CommandDBStatus, CommandDBReset, "":
 		return nil
@@ -158,15 +163,11 @@ func (settings PoCSettings) Validate(command Command) error {
 	case CommandSync:
 		return settings.validateCorpusAndModel(command)
 	case CommandEntities:
-		return settings.validateRequired(command, DatabaseURLEnvironmentVariable)
+		return nil
 	case CommandReview:
-		if err := settings.validateRequired(command, DatabaseURLEnvironmentVariable); err != nil {
-			return err
-		}
 		return settings.validateGoogleDirectory(command)
 	case CommandAnalyze:
 		if err := settings.validateRequired(command,
-			DatabaseURLEnvironmentVariable,
 			EmployeeEntityIDEnvironmentVariable,
 			ManagerEntityIDEnvironmentVariable,
 		); err != nil {
@@ -178,9 +179,8 @@ func (settings PoCSettings) Validate(command Command) error {
 	}
 }
 
-func (settings PoCSettings) validateDoctor(command Command) error {
+func (settings ApplicationSettings) validateDoctor(command Command) error {
 	if err := settings.validateRequired(command,
-		DatabaseURLEnvironmentVariable,
 		GoogleFolderIDEnvironmentVariable,
 		GoogleOAuthClientFileEnvironmentVariable,
 		GoogleOAuthTokenFileEnvironmentVariable,
@@ -196,9 +196,8 @@ func (settings PoCSettings) validateDoctor(command Command) error {
 	return settings.validateGoogleDirectory(command)
 }
 
-func (settings PoCSettings) validateCorpusAndModel(command Command) error {
+func (settings ApplicationSettings) validateCorpusAndModel(command Command) error {
 	if err := settings.validateRequired(command,
-		DatabaseURLEnvironmentVariable,
 		GoogleFolderIDEnvironmentVariable,
 		GoogleOAuthClientFileEnvironmentVariable,
 		GoogleOAuthTokenFileEnvironmentVariable,
@@ -225,7 +224,7 @@ func (settings PoCSettings) validateCorpusAndModel(command Command) error {
 // ValidateGoogleAuth validates only the credentials for the selected explicit
 // authorization target. Directory paths are required even while enrichment is
 // disabled so they can be authorized before enabling it.
-func (settings PoCSettings) ValidateGoogleAuth(target GoogleAuthTarget) error {
+func (settings ApplicationSettings) ValidateGoogleAuth(target GoogleAuthTarget) error {
 	switch target {
 	case GoogleAuthDrive:
 		return settings.validateRequired(CommandAuth,
@@ -242,7 +241,7 @@ func (settings PoCSettings) ValidateGoogleAuth(target GoogleAuthTarget) error {
 	}
 }
 
-func (settings PoCSettings) validateGoogleDirectory(command Command) error {
+func (settings ApplicationSettings) validateGoogleDirectory(command Command) error {
 	if !settings.Directory.Enabled {
 		return nil
 	}
@@ -267,7 +266,7 @@ func (settings PoCSettings) validateGoogleDirectory(command Command) error {
 	return nil
 }
 
-func (settings PoCSettings) validateCorpusTitles() error {
+func (settings ApplicationSettings) validateCorpusTitles() error {
 	if len(normalizedTitleSet(settings.TranscriptTitles)) == 0 {
 		return fmt.Errorf("%s must include at least one title", TranscriptTitlesEnvironmentVariable)
 	}
@@ -277,7 +276,7 @@ func (settings PoCSettings) validateCorpusTitles() error {
 	return validateDistinctTabTitles(settings.TranscriptTitles, settings.NotesTitles)
 }
 
-func (settings PoCSettings) validateModelSettings(command Command) error {
+func (settings ApplicationSettings) validateModelSettings(command Command) error {
 	if err := settings.validateUnsupportedModelEnvironment(command); err != nil {
 		return err
 	}
@@ -321,14 +320,14 @@ func (settings PoCSettings) validateModelSettings(command Command) error {
 		return fmt.Errorf("%s must be %q; update it and run stacks sync to create current derivations",
 			ExtractionPromptVersionEnvironmentVariable, extract.ExtractionPromptVersion)
 	}
-	if settings.AnalysisPromptVersion != extract.AnalysisPromptVersion {
+	if settings.ManagerConfidence.PromptVersion != extract.AnalysisPromptVersion {
 		return fmt.Errorf("%s must be %q; update it and run stacks sync before analysis",
 			AnalysisPromptVersionEnvironmentVariable, extract.AnalysisPromptVersion)
 	}
 	return nil
 }
 
-func (settings PoCSettings) validateUnsupportedModelEnvironment(command Command) error {
+func (settings ApplicationSettings) validateUnsupportedModelEnvironment(command Command) error {
 	unsupported := make([]string, 0, len(settings.LegacyModelEnvironment))
 	for _, name := range unsupportedModelEnvironmentNames {
 		for _, configured := range settings.LegacyModelEnvironment {
@@ -377,7 +376,7 @@ func (settings ModelSettings) validateCredentials(command Command) error {
 	return nil
 }
 
-func (settings PoCSettings) validateRequired(command Command, names ...string) error {
+func (settings ApplicationSettings) validateRequired(command Command, names ...string) error {
 	for _, name := range names {
 		if strings.TrimSpace(settings.valueForEnvironment(name)) == "" {
 			return fmt.Errorf("%s is required for %s", name, command)
@@ -397,10 +396,8 @@ func validateExactRequired(command Command, name, value string) error {
 	return nil
 }
 
-func (settings PoCSettings) valueForEnvironment(name string) string {
+func (settings ApplicationSettings) valueForEnvironment(name string) string {
 	switch name {
-	case DatabaseURLEnvironmentVariable:
-		return settings.DatabaseURL
 	case GoogleFolderIDEnvironmentVariable:
 		return settings.GoogleFolderID
 	case GoogleOAuthClientFileEnvironmentVariable:
@@ -420,11 +417,11 @@ func (settings PoCSettings) valueForEnvironment(name string) string {
 	case ExtractionPromptVersionEnvironmentVariable:
 		return settings.ExtractionPromptVersion
 	case AnalysisPromptVersionEnvironmentVariable:
-		return settings.AnalysisPromptVersion
+		return settings.ManagerConfidence.PromptVersion
 	case EmployeeEntityIDEnvironmentVariable:
-		return settings.EmployeeEntityID
+		return settings.ManagerConfidence.EmployeeEntityID
 	case ManagerEntityIDEnvironmentVariable:
-		return settings.ManagerEntityID
+		return settings.ManagerConfidence.ManagerEntityID
 	default:
 		return ""
 	}

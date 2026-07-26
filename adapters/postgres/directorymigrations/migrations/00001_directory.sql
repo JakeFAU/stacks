@@ -106,15 +106,25 @@ CREATE TABLE stacks_directory.entity_links (
         REFERENCES stacks_directory.lookup_attempts (id),
     proposal_id text NOT NULL
         REFERENCES stacks_core.resolution_proposals (id),
-    candidate_id text NOT NULL
+    candidate_id text
         REFERENCES stacks_core.resolution_candidates (id),
     decision_id text
         REFERENCES stacks_core.resolution_decisions (id),
     entity_id text NOT NULL
         REFERENCES stacks_core.entities (id),
     recorded_at timestamptz(6) NOT NULL,
-    UNIQUE (candidate_id),
+    CONSTRAINT entity_links_proof_shape_check CHECK (
+        candidate_id IS NOT NULL OR decision_id IS NOT NULL
+    ),
     CONSTRAINT entity_links_decision_pair_check CHECK (
         decision_id IS NULL OR btrim(decision_id) <> ''
     )
 );
+
+CREATE UNIQUE INDEX entity_links_one_staged_candidate
+    ON stacks_directory.entity_links (candidate_id)
+    WHERE decision_id IS NULL;
+
+CREATE UNIQUE INDEX entity_links_one_decision_proof
+    ON stacks_directory.entity_links (decision_id)
+    WHERE decision_id IS NOT NULL;

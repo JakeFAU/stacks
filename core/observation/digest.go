@@ -28,14 +28,16 @@ func digestObservation(value Observation) evidence.ContentDigest {
 	encoder.String(value.derivation.RunID)
 	encoder.String(value.derivation.Model)
 	encoder.String(value.derivation.PromptVersion)
-	encoder.Bool(value.derivation.LegacyUnversioned)
+	// Preserve the canonical v2 field positions after retiring unsupported
+	// compatibility states.
+	encoder.Bool(false)
 	encoder.String(string(value.status))
 	encoder.Bool(value.hasConfidence)
 	if value.hasConfidence {
 		encoder.Uint64(math.Float64bits(value.confidence.value))
 		encoder.String(string(value.confidence.scale))
 	}
-	encoder.Bool(value.legacyUncited)
+	encoder.Bool(false)
 	return evidence.ContentDigest(encoder.Sum())
 }
 

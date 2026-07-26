@@ -213,8 +213,7 @@ func validateObservationReferences(
 ) error {
 	seenIDs := make(map[observation.ObservationID]struct{}, len(records))
 	for _, record := range records {
-		if !canonicalLocalIdentifier(string(record.ID)) || record.RecordedAt.IsZero() ||
-			record.Derivation.LegacyUnversioned {
+		if !canonicalLocalIdentifier(string(record.ID)) || record.RecordedAt.IsZero() {
 			return ErrPersistenceReference
 		}
 		if _, exists := seenIDs[record.ID]; exists {

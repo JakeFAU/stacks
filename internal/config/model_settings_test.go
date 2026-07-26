@@ -20,16 +20,16 @@ func TestLoadReadsExplicitModelSettings(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if settings.PoC.Model.DataMode != modelpolicy.DataModePersonal {
+	if settings.Application.Model.DataMode != modelpolicy.DataModePersonal {
 		t.Error("Load() data mode did not retain the explicit personal selection")
 	}
-	if settings.PoC.Model.Provider != modelpolicy.ProviderOpenAI {
+	if settings.Application.Model.Provider != modelpolicy.ProviderOpenAI {
 		t.Error("Load() provider did not retain the explicit OpenAI selection")
 	}
-	if settings.PoC.Model.ModelID != "test-model" || settings.PoC.Model.MaxOutputTokens != 1000 || settings.PoC.Model.MaxAttempts != defaultModelMaxAttempts {
+	if settings.Application.Model.ModelID != "test-model" || settings.Application.Model.MaxOutputTokens != 1000 || settings.Application.Model.MaxAttempts != defaultModelMaxAttempts {
 		t.Error("Load() did not retain explicit model settings and the default maximum attempts")
 	}
-	if settings.PoC.Model.OpenAIAPIKey != "synthetic-openai-key" {
+	if settings.Application.Model.OpenAIAPIKey != "synthetic-openai-key" {
 		t.Error("Load() did not retain the configured OpenAI API key in memory")
 	}
 }
@@ -49,8 +49,8 @@ func TestLoadDoesNotExposeProviderCredentialInErrors(t *testing.T) {
 	}
 }
 
-func TestPoCSettingsValidateKeepsNonModelCommandsLazy(t *testing.T) {
-	settings := PoCSettings{}
+func TestApplicationSettingsValidateKeepsNonModelCommandsLazy(t *testing.T) {
+	settings := ApplicationSettings{}
 	if err := settings.Validate(CommandServe); err != nil {
 		t.Fatalf("Validate(serve) error = %v, want no model requirement", err)
 	}
@@ -61,7 +61,7 @@ func TestPoCSettingsValidateKeepsNonModelCommandsLazy(t *testing.T) {
 		t.Fatalf("Validate(auth) error = %v, want no model requirement", err)
 	}
 
-	settings = PoCSettings{DatabaseURL: "postgres://synthetic"}
+	settings = ApplicationSettings{}
 	for _, command := range []Command{CommandEntities, CommandReview} {
 		if err := settings.Validate(command); err != nil {
 			t.Fatalf("Validate(%s) error = %v, want no model requirement", command, err)
@@ -69,7 +69,7 @@ func TestPoCSettingsValidateKeepsNonModelCommandsLazy(t *testing.T) {
 	}
 }
 
-func TestPoCSettingsValidateModelCommandsRequireExplicitModelSelection(t *testing.T) {
+func TestApplicationSettingsValidateModelCommandsRequireExplicitModelSelection(t *testing.T) {
 	for _, command := range []Command{CommandDoctor, CommandSync, CommandAnalyze} {
 		t.Run(string(command), func(t *testing.T) {
 			settings := validModelCommandSettings()
@@ -82,7 +82,7 @@ func TestPoCSettingsValidateModelCommandsRequireExplicitModelSelection(t *testin
 	}
 }
 
-func TestPoCSettingsValidateRejectsInvalidModelPolicyBeforeProviderBoundary(t *testing.T) {
+func TestApplicationSettingsValidateRejectsInvalidModelPolicyBeforeProviderBoundary(t *testing.T) {
 	tests := []struct {
 		name      string
 		configure func(*ModelSettings)
@@ -113,7 +113,7 @@ func TestPoCSettingsValidateRejectsInvalidModelPolicyBeforeProviderBoundary(t *t
 	}
 }
 
-func TestPoCSettingsValidateRequiresSelectedProviderCredential(t *testing.T) {
+func TestApplicationSettingsValidateRequiresSelectedProviderCredential(t *testing.T) {
 	tests := []struct {
 		name      string
 		configure func(*ModelSettings)
@@ -145,7 +145,7 @@ func TestPoCSettingsValidateRequiresSelectedProviderCredential(t *testing.T) {
 	}
 }
 
-func TestPoCSettingsValidateRejectsPaddedDirectProviderSettingsWithoutValues(t *testing.T) {
+func TestApplicationSettingsValidateRejectsPaddedDirectProviderSettingsWithoutValues(t *testing.T) {
 	tests := []struct {
 		name      string
 		configure func(*ModelSettings)
@@ -214,7 +214,7 @@ func TestPoCSettingsValidateRejectsPaddedDirectProviderSettingsWithoutValues(t *
 	}
 }
 
-func TestPoCSettingsValidateAcceptsExactDirectProviderSettings(t *testing.T) {
+func TestApplicationSettingsValidateAcceptsExactDirectProviderSettings(t *testing.T) {
 	for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
 		t.Run(string(provider), func(t *testing.T) {
 			settings := validModelCommandSettings()
@@ -233,7 +233,7 @@ func TestPoCSettingsValidateAcceptsExactDirectProviderSettings(t *testing.T) {
 	}
 }
 
-func TestPoCSettingsValidateDirectProviderIgnoresAmbientAWSRegion(t *testing.T) {
+func TestApplicationSettingsValidateDirectProviderIgnoresAmbientAWSRegion(t *testing.T) {
 	settings := validModelCommandSettings()
 	settings.Model.Provider = modelpolicy.ProviderOpenAI
 	settings.Model.OpenAIAPIKey = "synthetic-openai-key"
@@ -243,7 +243,7 @@ func TestPoCSettingsValidateDirectProviderIgnoresAmbientAWSRegion(t *testing.T) 
 	}
 }
 
-func TestPoCSettingsRejectsUnsupportedModelEnvironmentNamesWithoutValues(t *testing.T) {
+func TestApplicationSettingsRejectsUnsupportedModelEnvironmentNamesWithoutValues(t *testing.T) {
 	settings := validModelCommandSettings()
 	settings.LegacyModelEnvironment = []string{BedrockModelIDEnvironmentVariable, OpenAIBaseURLEnvironmentVariable}
 
@@ -264,11 +264,11 @@ func TestLoadRejectsUnsupportedModelEnvironmentNamesWithoutValues(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	legacyEnvironment := settings.PoC.LegacyModelEnvironment
-	settings.PoC = validModelCommandSettings()
-	settings.PoC.LegacyModelEnvironment = legacyEnvironment
+	legacyEnvironment := settings.Application.LegacyModelEnvironment
+	settings.Application = validModelCommandSettings()
+	settings.Application.LegacyModelEnvironment = legacyEnvironment
 
-	err = settings.PoC.Validate(CommandSync)
+	err = settings.Application.Validate(CommandSync)
 	if err == nil || !strings.Contains(err.Error(), BedrockModelIDEnvironmentVariable) || !strings.Contains(err.Error(), OpenAIBaseURLEnvironmentVariable) {
 		t.Fatalf("Validate(sync) error = %v, want unsupported environment names", err)
 	}
@@ -277,7 +277,7 @@ func TestLoadRejectsUnsupportedModelEnvironmentNamesWithoutValues(t *testing.T) 
 	}
 }
 
-func TestPoCSettingsValidateBoundsModelTokensAndAttempts(t *testing.T) {
+func TestApplicationSettingsValidateBoundsModelTokensAndAttempts(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string
 		configure func(*ModelSettings)
@@ -296,8 +296,8 @@ func TestPoCSettingsValidateBoundsModelTokensAndAttempts(t *testing.T) {
 	}
 }
 
-func validModelCommandSettings() PoCSettings {
-	return validPoCSettings()
+func validModelCommandSettings() ApplicationSettings {
+	return validApplicationSettings()
 }
 
 func clearModelEnvironment(t *testing.T) {

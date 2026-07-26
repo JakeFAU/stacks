@@ -48,12 +48,13 @@ func (transaction *Transaction) AppendAdmissionDecision(
 	); err != nil {
 		return wrapAdmissionError(ctx, "insert admission target", conflictError(err))
 	}
-	if _, err := transaction.transaction.Exec(ctx, `
-		SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
-		admissionAuthorityLockNamespace+"/"+string(decision.TargetKind()),
+	if err := lockAdmissionTargetAuthority(
+		ctx,
+		transaction,
+		string(decision.TargetKind()),
 		decision.TargetID(),
 	); err != nil {
-		return wrapAdmissionError(ctx, "lock admission target authority", err)
+		return err
 	}
 	var lockedTargetID string
 	if err := transaction.transaction.QueryRow(ctx, `
@@ -116,6 +117,23 @@ func (transaction *Transaction) AppendAdmissionDecision(
 		digest[:],
 	); err != nil {
 		return wrapAdmissionError(ctx, "insert admission decision", conflictError(err))
+	}
+	return nil
+}
+
+func lockAdmissionTargetAuthority(
+	ctx context.Context,
+	transaction *Transaction,
+	targetKind string,
+	targetID string,
+) error {
+	if _, err := transaction.Exec(ctx, `
+		/* stacks_admission_target_authority */
+		SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
+		admissionAuthorityLockNamespace+"/"+targetKind,
+		targetID,
+	); err != nil {
+		return wrapAdmissionError(ctx, "lock admission target authority", err)
 	}
 	return nil
 }

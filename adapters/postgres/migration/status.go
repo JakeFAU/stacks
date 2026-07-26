@@ -39,20 +39,9 @@ type Inspector struct {
 
 // Status returns one record for every known manifest in manifest order.
 func (inspector Inspector) Status(ctx context.Context) ([]ScopeStatus, error) {
-	if ctx == nil {
-		return nil, fmt.Errorf("inspect PostgreSQL migrations: context is required")
+	if err := inspector.validate(ctx, true); err != nil {
+		return nil, err
 	}
-	if strings.TrimSpace(inspector.DatabaseURL) == "" {
-		return nil, fmt.Errorf("inspect PostgreSQL migrations: database URL is required")
-	}
-	if err := ValidateManifestSet(inspector.Manifests); err != nil {
-		return nil, fmt.Errorf("inspect PostgreSQL migrations: %w", err)
-	}
-	configured, err := configuredScopeSet(inspector.Manifests, inspector.Configured)
-	if err != nil {
-		return nil, fmt.Errorf("inspect PostgreSQL migrations: %w", err)
-	}
-
 	connection, err := pgx.Connect(ctx, inspector.DatabaseURL)
 	if err != nil {
 		return nil, wrapContextError(ctx, "connect for PostgreSQL migration inspection", err)
@@ -60,6 +49,48 @@ func (inspector Inspector) Status(ctx context.Context) ([]ScopeStatus, error) {
 	defer func() {
 		_ = connection.Close(context.Background())
 	}()
+	return inspector.statusWithConnection(ctx, connection)
+}
+
+// StatusWithConnection inspects migration state through a caller-owned
+// PostgreSQL connection.
+func (inspector Inspector) StatusWithConnection(
+	ctx context.Context,
+	connection *pgx.Conn,
+) ([]ScopeStatus, error) {
+	if err := inspector.validate(ctx, false); err != nil {
+		return nil, err
+	}
+	if connection == nil {
+		return nil, fmt.Errorf("inspect PostgreSQL migrations: connection is required")
+	}
+	return inspector.statusWithConnection(ctx, connection)
+}
+
+func (inspector Inspector) validate(ctx context.Context, requireDatabaseURL bool) error {
+	if ctx == nil {
+		return fmt.Errorf("inspect PostgreSQL migrations: context is required")
+	}
+	if requireDatabaseURL && strings.TrimSpace(inspector.DatabaseURL) == "" {
+		return fmt.Errorf("inspect PostgreSQL migrations: database URL is required")
+	}
+	if err := ValidateManifestSet(inspector.Manifests); err != nil {
+		return fmt.Errorf("inspect PostgreSQL migrations: %w", err)
+	}
+	if _, err := configuredScopeSet(inspector.Manifests, inspector.Configured); err != nil {
+		return fmt.Errorf("inspect PostgreSQL migrations: %w", err)
+	}
+	return nil
+}
+
+func (inspector Inspector) statusWithConnection(
+	ctx context.Context,
+	connection *pgx.Conn,
+) ([]ScopeStatus, error) {
+	configured, err := configuredScopeSet(inspector.Manifests, inspector.Configured)
+	if err != nil {
+		return nil, fmt.Errorf("inspect PostgreSQL migrations: %w", err)
+	}
 
 	statuses := make([]ScopeStatus, 0, len(inspector.Manifests))
 	for _, manifest := range inspector.Manifests {

@@ -247,7 +247,7 @@ func newDocumentRepositoryFixture(t testing.TB) documentRepositoryFixture {
 func canonicalDocument(
 	t testing.TB,
 	providerDocumentID string,
-	providerRevision string,
+	_ string,
 	recordedAt time.Time,
 ) evidence.DocumentVersion {
 	t.Helper()
@@ -291,7 +291,6 @@ func canonicalDocument(
 		Title:              "Synthetic longitudinal record",
 		Locator:            "synthetic://documents/" + providerDocumentID,
 		ProviderVersion:    syntheticProviderVersion,
-		ProviderRevision:   providerRevision,
 		ModifiedAt:         documentModifiedAt,
 		SourceTime:         &sourceTime,
 		RecordedAt:         recordedAt,
@@ -303,6 +302,40 @@ func canonicalDocument(
 	return document
 }
 
+func putDocumentWithRevision(
+	t testing.TB,
+	fixture documentRepositoryFixture,
+	document evidence.DocumentVersion,
+	providerRevision string,
+) postgres.PutDocumentVersionResult {
+	t.Helper()
+	var result postgres.PutDocumentVersionResult
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *postgres.Transaction) error {
+			var err error
+			result, err = transaction.PutDocumentVersion(fixture.ctx, document)
+			if err != nil {
+				return err
+			}
+			revision := sourceRevision(
+				t,
+				document,
+				providerRevision,
+				result.Ref.RecordedAt,
+			)
+			_, err = transaction.PutSourceRevisionObservation(
+				fixture.ctx,
+				revision,
+			)
+			return err
+		},
+	); err != nil {
+		t.Fatalf("persist document and source revision: %v", err)
+	}
+	return result
+}
+
 func documentRevisionID(
 	t testing.TB,
 	document evidence.DocumentVersion,
@@ -312,7 +345,7 @@ func documentRevisionID(
 	return sourceRevision(
 		t,
 		document,
-		document.ProviderRevision(),
+		"revision-a",
 		firstRecordedAt,
 	).ID()
 }

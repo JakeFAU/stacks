@@ -13,6 +13,7 @@ import (
 	"github.com/JakeFAU/stacks/adapters/postgres/directorymigrations"
 	"github.com/JakeFAU/stacks/adapters/postgres/migration"
 	"github.com/JakeFAU/stacks/adapters/postgres/postgrestest"
+	"github.com/JakeFAU/stacks/core/admission"
 	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/jackc/pgx/v5"
 )
@@ -20,9 +21,10 @@ import (
 const directoryRepositoryTimeout = 15 * time.Second
 
 type canonicalDirectoryFixture struct {
-	ctx      context.Context
-	database *postgres.Database
-	admin    *pgx.Conn
+	ctx            context.Context
+	database       *postgres.Database
+	admin          *pgx.Conn
+	applicationURL string
 }
 
 func TestCanonicalDirectoryExactEmailCreatesAutomaticAuthority(t *testing.T) {
@@ -203,9 +205,9 @@ func TestCanonicalDirectoryReviewerAcceptanceProjectsOnlySelectedProfile(t *test
 		t.Fatalf("persist multiple review candidates: %v", err)
 	}
 
-	var selectedEntityID string
+	var selectedEntityID, selectedSnapshotID string
 	if err := fixture.admin.QueryRow(fixture.ctx, `
-		SELECT link.entity_id
+		SELECT link.entity_id, link.snapshot_id
 		FROM stacks_directory.entity_links AS link
 		JOIN stacks_directory.profiles AS profile
 		  ON profile.id = link.profile_id
@@ -213,7 +215,7 @@ func TestCanonicalDirectoryReviewerAcceptanceProjectsOnlySelectedProfile(t *test
 		  AND profile.provider_subject_id = $2`,
 		mention.ProposalID,
 		second.SubjectID,
-	).Scan(&selectedEntityID); err != nil {
+	).Scan(&selectedEntityID, &selectedSnapshotID); err != nil {
 		t.Fatalf("load selected directory candidate entity: %v", err)
 	}
 	decision, err := identity.NewResolutionDecision(identity.ResolutionDecisionInput{
@@ -228,13 +230,17 @@ func TestCanonicalDirectoryReviewerAcceptanceProjectsOnlySelectedProfile(t *test
 	if err != nil {
 		t.Fatalf("NewResolutionDecision() error = %v", err)
 	}
-	if err := fixture.database.InTransaction(
+	if _, err := (postgres.ReviewerStore{
+		Database:         fixture.database,
+		IncludeDirectory: true,
+	}).AcceptDirectoryCandidate(
 		fixture.ctx,
-		func(transaction *postgres.Transaction) error {
-			return transaction.AppendResolutionDecision(fixture.ctx, decision, nil)
+		postgres.ReviewerDirectoryDecisionCommand{
+			Decision:   decision,
+			SnapshotID: selectedSnapshotID,
 		},
 	); err != nil {
-		t.Fatalf("append reviewer directory decision: %v", err)
+		t.Fatalf("accept reviewer directory candidate: %v", err)
 	}
 
 	state, err := store.LoadIdentityState(fixture.ctx)
@@ -1028,7 +1034,12 @@ func newCanonicalDirectoryFixture(t testing.TB) canonicalDirectoryFixture {
 	t.Cleanup(func() {
 		_ = admin.Close(context.Background())
 	})
-	return canonicalDirectoryFixture{ctx: ctx, database: database, admin: admin}
+	return canonicalDirectoryFixture{
+		ctx:            ctx,
+		database:       database,
+		admin:          admin,
+		applicationURL: isolated.ApplicationURL(),
+	}
 }
 
 func seedCanonicalDirectoryMention(
@@ -1137,6 +1148,45 @@ func seedCanonicalDirectoryMention(
 		proposalID,
 	); err != nil {
 		t.Fatalf("seed canonical directory mention: %v", err)
+	}
+	for _, decisionInput := range []admission.DecisionInput{
+		{
+			ID:           "admission-run:" + runID,
+			TargetKind:   admission.TargetExtractionRun,
+			TargetID:     runID,
+			Outcome:      admission.Admitted,
+			ReasonCode:   "validated",
+			Authority:    admission.AuthorityPolicy,
+			RecordedAt:   canonicalDirectoryRecordedAt.Add(-2 * time.Hour),
+			SupersedesID: "",
+		},
+		{
+			ID:           "admission-mention:" + mentionID,
+			TargetKind:   admission.TargetMention,
+			TargetID:     mentionID,
+			Outcome:      admission.Admitted,
+			ReasonCode:   "validated",
+			Authority:    admission.AuthorityPolicy,
+			RecordedAt:   canonicalDirectoryRecordedAt.Add(-2 * time.Hour),
+			SupersedesID: "",
+		},
+	} {
+		decision, err := admission.NewDecision(decisionInput)
+		if err != nil {
+			t.Fatalf("construct seeded canonical admission decision: %v", err)
+		}
+		digest := decision.Digest()
+		if _, err := fixture.admin.Exec(
+			fixture.ctx,
+			`UPDATE stacks_core.admission_decisions
+			 SET digest_version = $1, digest = $2
+			 WHERE id = $3`,
+			decision.DigestVersion(),
+			digest[:],
+			decision.ID(),
+		); err != nil {
+			t.Fatalf("seed canonical admission decision digest: %v", err)
+		}
 	}
 	return postgres.DirectoryPendingMention{
 		MentionID:      mentionID,

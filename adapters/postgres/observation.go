@@ -448,12 +448,8 @@ func validateCanonicalObservation(value observation.Observation) error {
 		!timepoint.IsCanonical(value.RecordedAt()) {
 		return fmt.Errorf("complete canonical observation is required")
 	}
-	if value.LegacyUncited() {
-		return fmt.Errorf("legacy uncited observations are not canonical storage")
-	}
 	derivation := value.Derivation()
-	if derivation.LegacyUnversioned ||
-		strings.TrimSpace(derivation.Method) == "" ||
+	if strings.TrimSpace(derivation.Method) == "" ||
 		strings.TrimSpace(derivation.Version) == "" {
 		return fmt.Errorf("versioned canonical observation derivation is required")
 	}
@@ -709,7 +705,6 @@ func sameCanonicalObservation(
 		left.Status() == right.Status() &&
 		leftHasConfidence == rightHasConfidence &&
 		(!leftHasConfidence || leftConfidence == rightConfidence) &&
-		left.LegacyUncited() == right.LegacyUncited() &&
 		left.DigestVersion() == right.DigestVersion() &&
 		left.Digest() == right.Digest()
 }

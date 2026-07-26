@@ -9,7 +9,6 @@ import (
 )
 
 const stableDigestGolden = "c48323ec2669ee9dfea8d5c702ab31ffd6c68107d033df07c7f1c2861ea1943b"
-const legacyRevisionDigestGolden = "3cfec92c9511780154a2a0517ec094652350c23cb1fa588648b033ffee1d3f46"
 
 func TestPublicAPIUsesProviderNeutralTimeAndSectionNames(t *testing.T) {
 	documentType := reflect.TypeOf(evidence.DocumentVersion{})
@@ -18,6 +17,12 @@ func TestPublicAPIUsesProviderNeutralTimeAndSectionNames(t *testing.T) {
 	}
 	if _, exists := documentType.MethodByName("SourceMeetingTime"); exists {
 		t.Fatal("DocumentVersion exposes meeting-specific SourceMeetingTime")
+	}
+	if _, exists := documentType.MethodByName("ProviderRevision"); exists {
+		t.Fatal("DocumentVersion exposes source-revision compatibility metadata")
+	}
+	if _, exists := reflect.TypeOf(evidence.DocumentVersionInput{}).FieldByName("ProviderRevision"); exists {
+		t.Fatal("DocumentVersionInput exposes source-revision compatibility metadata")
 	}
 
 	spanInputType := reflect.TypeOf(evidence.EvidenceSpanInput{})
@@ -88,7 +93,7 @@ func TestDocumentVersionDigestChangesWhenSectionContentChanges(t *testing.T) {
 func TestDocumentVersionRetainsImmutableSourceProvenance(t *testing.T) {
 	meeting := time.Date(2026, time.July, 20, 9, 0, 0, 0, time.FixedZone("synthetic", -4*60*60))
 	input := documentInput([]evidence.Section{section(t, "t.transcript", "Transcript", "Alex: synthetic words")})
-	input.Title, input.Locator, input.ProviderVersion, input.ProviderRevision = "Synthetic weekly meeting", "https://docs.example.invalid/document/doc-1", "drive-version-42", "docs-revision-7"
+	input.Title, input.Locator, input.ProviderVersion = "Synthetic weekly meeting", "https://docs.example.invalid/document/doc-1", "drive-version-42"
 	input.ModifiedAt, input.SourceTime = time.Date(2026, time.July, 20, 15, 30, 0, 0, time.UTC), &meeting
 	version, err := evidence.NewDocumentVersion(input)
 	if err != nil {
@@ -96,7 +101,7 @@ func TestDocumentVersionRetainsImmutableSourceProvenance(t *testing.T) {
 	}
 	meeting = meeting.Add(24 * time.Hour)
 	got := version.SourceTime()
-	if version.Title() != input.Title || version.Locator() != input.Locator || version.ProviderVersion() != input.ProviderVersion || version.ProviderRevision() != input.ProviderRevision || got == nil || !got.Equal(time.Date(2026, time.July, 20, 9, 0, 0, 0, time.FixedZone("synthetic", -4*60*60))) {
+	if version.Title() != input.Title || version.Locator() != input.Locator || version.ProviderVersion() != input.ProviderVersion || got == nil || !got.Equal(time.Date(2026, time.July, 20, 9, 0, 0, 0, time.FixedZone("synthetic", -4*60*60))) {
 		t.Fatal("source provenance was not retained")
 	}
 }
@@ -109,25 +114,21 @@ func TestDocumentVersionDigestV3Golden(t *testing.T) {
 	if got := version.Digest().String(); got != stableDigestGolden {
 		t.Fatalf("Digest() = %q, want %q", got, stableDigestGolden)
 	}
-	if got := version.LegacyRevisionInclusiveDigest().String(); got != legacyRevisionDigestGolden {
-		t.Fatalf("LegacyRevisionInclusiveDigest() = %q, want %q", got, legacyRevisionDigestGolden)
-	}
 }
 
-func TestDocumentDigestIgnoresRecordedAtAndProviderRevision(t *testing.T) {
+func TestDocumentDigestIgnoresRecordedAt(t *testing.T) {
 	input := documentInput([]evidence.Section{section(t, "t.transcript", "Transcript", "Alex: synthetic words")})
 	first, err := evidence.NewDocumentVersion(input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	input.RecordedAt = input.RecordedAt.Add(24 * time.Hour)
-	input.ProviderRevision = "docs-revision-99"
 	second, err := evidence.NewDocumentVersion(input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first.Digest() != second.Digest() {
-		t.Fatal("content digest changed for recorded time or provider revision")
+		t.Fatal("content digest changed for recorded time")
 	}
 }
 
@@ -148,32 +149,6 @@ func TestEvidenceSpanDigestCoversExactSourceRangeAndRecordedTime(t *testing.T) {
 	}
 	if first.ID() == second.ID() || first.Digest() == second.Digest() || first.ID() != third.ID() || first.Digest() == third.Digest() {
 		t.Fatal("evidence digest or identity does not distinguish its required fields")
-	}
-}
-
-func TestDocumentVersionDigestIgnoresProviderRevisionChurn(t *testing.T) {
-	input := documentInput([]evidence.Section{section(t, "t.transcript", "Transcript", "Alex: synthetic words")})
-	input.ProviderRevision = "revision-1"
-	first, err := evidence.NewDocumentVersion(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	input.ProviderRevision = "revision-2"
-	second, err := evidence.NewDocumentVersion(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.Digest() != second.Digest() || first.LegacyRevisionInclusiveDigest() == second.LegacyRevisionInclusiveDigest() || second.LegacyRevisionInclusiveDigestFor("revision-1") != first.LegacyRevisionInclusiveDigest() {
-		t.Fatal("provider revision compatibility changed")
-	}
-}
-
-func TestDocumentVersionAllowsMissingOptionalProviderRevision(t *testing.T) {
-	input := documentInput([]evidence.Section{section(t, "t.transcript", "Transcript", "Alex: synthetic words")})
-	input.ProviderRevision = ""
-	version, err := evidence.NewDocumentVersion(input)
-	if err != nil || version.ProviderRevision() != "" {
-		t.Fatalf("NewDocumentVersion() = (%#v, %v), want optional revision", version, err)
 	}
 }
 
@@ -211,7 +186,7 @@ func document(t *testing.T, sections []evidence.Section) evidence.DocumentVersio
 	return got
 }
 func documentInput(sections []evidence.Section) evidence.DocumentVersionInput {
-	return evidence.DocumentVersionInput{Provider: "drive", ProviderDocumentID: "doc-1", Title: "Synthetic meeting", Locator: "https://docs.example.invalid/document/doc-1", ProviderVersion: "drive-version-1", ProviderRevision: "docs-revision-1", ModifiedAt: time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC), RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC), Sections: sections}
+	return evidence.DocumentVersionInput{Provider: "drive", ProviderDocumentID: "doc-1", Title: "Synthetic meeting", Locator: "https://docs.example.invalid/document/doc-1", ProviderVersion: "drive-version-1", ModifiedAt: time.Date(2026, time.July, 21, 11, 0, 0, 0, time.UTC), RecordedAt: time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC), Sections: sections}
 }
 func section(t *testing.T, id, title, text string) evidence.Section {
 	t.Helper()

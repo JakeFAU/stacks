@@ -157,7 +157,6 @@ func assertCanonicalObservationEqual(
 		!reflect.DeepEqual(got.EvidenceLinks(), want.EvidenceLinks()) ||
 		got.Derivation() != want.Derivation() ||
 		got.Status() != want.Status() ||
-		got.LegacyUncited() != want.LegacyUncited() ||
 		got.DigestVersion() != want.DigestVersion() ||
 		got.Digest() != want.Digest() {
 		t.Fatalf("loaded observation %q does not equal canonical payload", want.ID())

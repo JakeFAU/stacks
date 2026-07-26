@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/JakeFAU/stacks/adapters/postgres/migration"
 )
 
 // Database is a validated PostgreSQL connection pool. Callers own its
@@ -39,6 +41,38 @@ func (database *Database) Close() {
 		return
 	}
 	database.closeOnce.Do(database.pool.Close)
+}
+
+// Ping verifies connectivity through the caller-owned pool.
+func (database *Database) Ping(ctx context.Context) error {
+	if database == nil || database.pool == nil {
+		return fmt.Errorf("ping PostgreSQL database: database is closed")
+	}
+	if err := database.pool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping PostgreSQL database: %w", err)
+	}
+	return nil
+}
+
+// InspectMigrationStatus performs read-only scoped migration inspection
+// through one connection acquired from the caller-owned pool.
+func (database *Database) InspectMigrationStatus(
+	ctx context.Context,
+	manifests []migration.Manifest,
+	configured []migration.Scope,
+) ([]migration.ScopeStatus, error) {
+	if database == nil || database.pool == nil {
+		return nil, fmt.Errorf("inspect PostgreSQL migrations: database is closed")
+	}
+	connection, err := database.pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire PostgreSQL migration inspection connection: %w", err)
+	}
+	defer connection.Release()
+	return (migration.Inspector{
+		Manifests:  manifests,
+		Configured: configured,
+	}).StatusWithConnection(ctx, connection.Conn())
 }
 
 // InTransaction executes callback in one PostgreSQL transaction, committing on

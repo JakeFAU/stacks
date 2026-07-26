@@ -5,136 +5,125 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/google/uuid"
-
 	"stacks/internal/directory"
-	"stacks/internal/entity"
-	"stacks/internal/storage"
 )
 
-// StorageReviewStore adapts the PostgreSQL entity repository to private CLI
-// projections. It performs no logging or telemetry of review content.
-type StorageReviewStore struct {
-	repository            *storage.EntityRepository
+// CanonicalReviewRepository is the CLI-owned, adapter-neutral persistence
+// port. The application layer supplies the PostgreSQL mapping and owns IDs,
+// time, and transaction commands.
+type CanonicalReviewRepository interface {
+	ListEntities(context.Context) ([]EntityView, error)
+	ShowEntity(context.Context, string) (EntityView, error)
+	ListReviewProposals(context.Context) ([]ReviewProposal, error)
+	ShowReviewProposal(context.Context, string) (ReviewProposal, error)
+	AcceptReviewProposal(context.Context, string, string) (ReviewDecision, error)
+	AcceptDirectoryCandidate(context.Context, AcceptDirectoryInput) (ReviewDecision, error)
+	RejectReviewProposal(context.Context, string) (ReviewDecision, error)
+	CreateReviewPerson(
+		context.Context,
+		string,
+		CreatePersonInput,
+		*directory.ReviewerVerification,
+	) (ReviewDecision, error)
+	CorrectReviewDecision(context.Context, string, string) (ReviewDecision, error)
+}
+
+type canonicalReviewRepository = CanonicalReviewRepository
+
+// CanonicalReviewStore adapts the application-owned canonical repository to
+// the entity and review CLI services. It emits no logs or telemetry.
+type CanonicalReviewStore struct {
+	repository            canonicalReviewRepository
 	reviewerEmailVerifier ReviewerEmailVerifier
 }
 
-// NewStorageReviewStore creates a CLI store backed by the entity repository.
-func NewStorageReviewStore(
-	repository *storage.EntityRepository,
+// NewCanonicalReviewStore constructs the private local review boundary.
+func NewCanonicalReviewStore(
+	repository canonicalReviewRepository,
 	reviewerEmailVerifier ...ReviewerEmailVerifier,
-) *StorageReviewStore {
-	store := &StorageReviewStore{repository: repository}
+) *CanonicalReviewStore {
+	store := &CanonicalReviewStore{repository: repository}
 	if len(reviewerEmailVerifier) > 0 {
 		store.reviewerEmailVerifier = reviewerEmailVerifier[0]
 	}
 	return store
 }
 
-// ListEntities implements EntityStore.
-func (store *StorageReviewStore) ListEntities(ctx context.Context) ([]EntityView, error) {
-	if store.repository == nil {
+func (store *CanonicalReviewStore) ListEntities(
+	ctx context.Context,
+) ([]EntityView, error) {
+	if store == nil || store.repository == nil {
 		return nil, fmt.Errorf("list entities: repository is not configured")
 	}
-	details, err := store.repository.ListEntityDetails(ctx)
-	if err != nil {
-		return nil, err
-	}
-	entities := make([]EntityView, len(details))
-	for index, detail := range details {
-		entities[index] = EntityView{ID: detail.ID, DisplayName: detail.DisplayName, RecordedAt: detail.RecordedAt, Aliases: detail.Aliases, MentionCount: detail.MentionCount, Evidence: detail.Evidence}
-	}
-	return entities, nil
+	return store.repository.ListEntities(ctx)
 }
 
-// ShowEntity implements EntityStore.
-func (store *StorageReviewStore) ShowEntity(ctx context.Context, entityID string) (EntityView, error) {
-	if store.repository == nil {
+func (store *CanonicalReviewStore) ShowEntity(
+	ctx context.Context,
+	entityID string,
+) (EntityView, error) {
+	if store == nil || store.repository == nil {
 		return EntityView{}, fmt.Errorf("show entity: repository is not configured")
 	}
-	detail, err := store.repository.ShowEntityDetail(ctx, entityID)
-	if err != nil {
-		return EntityView{}, err
-	}
-	return EntityView{ID: detail.ID, DisplayName: detail.DisplayName, RecordedAt: detail.RecordedAt, Aliases: detail.Aliases, MentionCount: detail.MentionCount, Evidence: detail.Evidence}, nil
+	return store.repository.ShowEntity(ctx, entityID)
 }
 
-// ListReviewProposals implements ReviewStore.
-func (store *StorageReviewStore) ListReviewProposals(ctx context.Context) ([]ReviewProposal, error) {
-	if store.repository == nil {
+func (store *CanonicalReviewStore) ListReviewProposals(
+	ctx context.Context,
+) ([]ReviewProposal, error) {
+	if store == nil || store.repository == nil {
 		return nil, fmt.Errorf("list review proposals: repository is not configured")
 	}
-	details, err := store.repository.ListResolutionProposalDetails(ctx)
-	if err != nil {
-		return nil, err
-	}
-	proposals := make([]ReviewProposal, len(details))
-	for index, detail := range details {
-		proposals[index] = reviewProposalFromStorage(detail)
-	}
-	return proposals, nil
+	return store.repository.ListReviewProposals(ctx)
 }
 
-// ShowReviewProposal implements ReviewStore.
-func (store *StorageReviewStore) ShowReviewProposal(ctx context.Context, proposalID string) (ReviewProposal, error) {
-	if store.repository == nil {
+func (store *CanonicalReviewStore) ShowReviewProposal(
+	ctx context.Context,
+	proposalID string,
+) (ReviewProposal, error) {
+	if store == nil || store.repository == nil {
 		return ReviewProposal{}, fmt.Errorf("show review proposal: repository is not configured")
 	}
-	detail, err := store.repository.ShowResolutionProposalDetail(ctx, proposalID)
-	if err != nil {
-		return ReviewProposal{}, err
-	}
-	return reviewProposalFromStorage(detail), nil
+	return store.repository.ShowReviewProposal(ctx, proposalID)
 }
 
-// AcceptReviewProposal implements ReviewStore.
-func (store *StorageReviewStore) AcceptReviewProposal(ctx context.Context, proposalID, entityID string) (ReviewDecision, error) {
-	if store.repository == nil {
+func (store *CanonicalReviewStore) AcceptReviewProposal(
+	ctx context.Context,
+	proposalID, entityID string,
+) (ReviewDecision, error) {
+	if store == nil || store.repository == nil {
 		return ReviewDecision{}, fmt.Errorf("accept review proposal: repository is not configured")
 	}
-	decision, err := store.repository.RecordReviewDecision(ctx, storage.ResolutionDecisionInput{ProposalID: proposalID, Outcome: storage.ResolutionOutcomeAccepted, EntityID: entityID})
-	if err != nil {
-		return ReviewDecision{}, err
-	}
-	return reviewDecisionFromStorage(decision), nil
+	return store.repository.AcceptReviewProposal(ctx, proposalID, entityID)
 }
 
-// AcceptDirectoryCandidate implements ReviewStore.
-func (store *StorageReviewStore) AcceptDirectoryCandidate(ctx context.Context, input AcceptDirectoryInput) (ReviewDecision, error) {
-	if store.repository == nil {
+func (store *CanonicalReviewStore) AcceptDirectoryCandidate(
+	ctx context.Context,
+	input AcceptDirectoryInput,
+) (ReviewDecision, error) {
+	if store == nil || store.repository == nil {
 		return ReviewDecision{}, fmt.Errorf("accept directory candidate: repository is not configured")
 	}
-	_, decision, err := store.repository.AcceptDirectoryCandidate(ctx, storage.AcceptDirectoryInput{
-		ProposalID:         input.ProposalID,
-		DirectoryProfileID: input.DirectoryProfileID,
-		EntityID:           input.EntityID,
-	})
-	if err != nil {
-		return ReviewDecision{}, err
-	}
-	return reviewDecisionFromStorage(decision), nil
+	return store.repository.AcceptDirectoryCandidate(ctx, input)
 }
 
-// RejectReviewProposal implements ReviewStore.
-func (store *StorageReviewStore) RejectReviewProposal(ctx context.Context, proposalID string) (ReviewDecision, error) {
-	if store.repository == nil {
+func (store *CanonicalReviewStore) RejectReviewProposal(
+	ctx context.Context,
+	proposalID string,
+) (ReviewDecision, error) {
+	if store == nil || store.repository == nil {
 		return ReviewDecision{}, fmt.Errorf("reject review proposal: repository is not configured")
 	}
-	decision, err := store.repository.RecordReviewDecision(ctx, storage.ResolutionDecisionInput{ProposalID: proposalID, Outcome: storage.ResolutionOutcomeRejected})
-	if err != nil {
-		return ReviewDecision{}, err
-	}
-	return reviewDecisionFromStorage(decision), nil
+	return store.repository.RejectReviewProposal(ctx, proposalID)
 }
 
-// CreateReviewPerson implements ReviewStore.
-func (store *StorageReviewStore) CreateReviewPerson(ctx context.Context, proposalID string, input CreatePersonInput) (ReviewDecision, error) {
-	if store.repository == nil {
+func (store *CanonicalReviewStore) CreateReviewPerson(
+	ctx context.Context,
+	proposalID string,
+	input CreatePersonInput,
+) (ReviewDecision, error) {
+	if store == nil || store.repository == nil {
 		return ReviewDecision{}, fmt.Errorf("create review person: repository is not configured")
-	}
-	aliases := []storage.AliasInput{{Type: string(entity.AliasTypeName), NormalizedValue: entity.NormalizeName(input.Name)}}
-	if input.Email != "" {
-		aliases = append(aliases, storage.AliasInput{Type: string(entity.AliasTypeEmail), NormalizedValue: entity.NormalizeEmail(input.Email)})
 	}
 	verification, err := verifyReviewerEmail(
 		ctx,
@@ -144,18 +133,26 @@ func (store *StorageReviewStore) CreateReviewPerson(ctx context.Context, proposa
 	if err != nil {
 		return ReviewDecision{}, err
 	}
-	_, decision, err := store.repository.CreateReviewPerson(ctx, storage.CreateReviewPersonInput{
-		ProposalID:            proposalID,
-		EntityID:              uuid.NewString(),
-		Kind:                  string(entity.KindPerson),
-		DisplayName:           input.Name,
-		Aliases:               aliases,
-		DirectoryVerification: verification,
-	})
-	if err != nil {
-		return ReviewDecision{}, err
+	return store.repository.CreateReviewPerson(
+		ctx,
+		proposalID,
+		input,
+		verification,
+	)
+}
+
+func (store *CanonicalReviewStore) CorrectReviewDecision(
+	ctx context.Context,
+	effectiveDecisionID, entityID string,
+) (ReviewDecision, error) {
+	if store == nil || store.repository == nil {
+		return ReviewDecision{}, fmt.Errorf("correct review decision: repository is not configured")
 	}
-	return reviewDecisionFromStorage(decision), nil
+	return store.repository.CorrectReviewDecision(
+		ctx,
+		effectiveDecisionID,
+		entityID,
+	)
 }
 
 func verifyReviewerEmail(
@@ -183,36 +180,4 @@ func verifyReviewerEmail(
 		return nil, context.DeadlineExceeded
 	}
 	return nil, nil
-}
-
-// CorrectReviewDecision implements ReviewStore.
-func (store *StorageReviewStore) CorrectReviewDecision(ctx context.Context, effectiveDecisionID, entityID string) (ReviewDecision, error) {
-	if store.repository == nil {
-		return ReviewDecision{}, fmt.Errorf("correct review decision: repository is not configured")
-	}
-	decision, err := store.repository.CorrectReviewDecision(ctx, effectiveDecisionID, storage.ResolutionDecisionInput{Outcome: storage.ResolutionOutcomeAccepted, EntityID: entityID})
-	if err != nil {
-		return ReviewDecision{}, err
-	}
-	return reviewDecisionFromStorage(decision), nil
-}
-
-func reviewProposalFromStorage(detail storage.ResolutionProposalDetail) ReviewProposal {
-	proposal := ReviewProposal{ID: detail.ID, Context: detail.Context, Candidates: make([]ReviewCandidate, len(detail.Candidates))}
-	for index, candidate := range detail.Candidates {
-		proposal.Candidates[index] = ReviewCandidate{
-			EntityID:           candidate.EntityID,
-			DirectoryProfileID: candidate.DirectoryProfileID,
-			DisplayName:        candidate.DisplayName,
-			MaskedEmail:        candidate.MaskedEmail,
-			Source:             candidate.Source,
-			Confidence:         candidate.Confidence,
-			Reason:             candidate.Reason,
-		}
-	}
-	return proposal
-}
-
-func reviewDecisionFromStorage(decision storage.ResolutionDecision) ReviewDecision {
-	return ReviewDecision{ID: decision.ID, ProposalID: decision.ProposalID, SupersedesID: decision.SupersedesID, EntityID: decision.EntityID, Outcome: string(decision.Outcome)}
 }

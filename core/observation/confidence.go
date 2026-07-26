@@ -9,8 +9,7 @@ import (
 type ConfidenceScale string
 
 const (
-	ConfidenceUnitInterval      ConfidenceScale = "unit_interval"
-	ConfidenceUnspecifiedLegacy ConfidenceScale = "unspecified_legacy"
+	ConfidenceUnitInterval ConfidenceScale = "unit_interval"
 )
 
 // Confidence is immutable model metadata. It does not establish truth or
@@ -27,15 +26,6 @@ func NewUnitIntervalConfidence(value float64) (Confidence, error) {
 		return Confidence{}, fmt.Errorf("unit-interval confidence must be finite and between 0 and 1")
 	}
 	return Confidence{value: value, scale: ConfidenceUnitInterval}, nil
-}
-
-// NewLegacyConfidence preserves a finite historical score whose scale was not
-// declared.
-func NewLegacyConfidence(value float64) (Confidence, error) {
-	if !finite(value) {
-		return Confidence{}, fmt.Errorf("legacy confidence must be finite")
-	}
-	return Confidence{value: value, scale: ConfidenceUnspecifiedLegacy}, nil
 }
 
 func finite(value float64) bool {

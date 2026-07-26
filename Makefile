@@ -4,7 +4,7 @@ ENV_FILE ?= .env
 .PHONY: analyze auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up review run staticcheck sync test test-integration test-race
 
 analyze:
-	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the PoC" >&2; exit 1)
+	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the application" >&2; exit 1)
 	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks analyze
 
 auth-google:
@@ -45,11 +45,11 @@ db-up:
 	docker compose --env-file "$(ENV_FILE)" up --detach --wait postgres
 
 doctor:
-	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the PoC" >&2; exit 1)
+	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the application" >&2; exit 1)
 	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks doctor
 
 entities:
-	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the PoC" >&2; exit 1)
+	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the application" >&2; exit 1)
 	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks entities $(ARGS)
 
 fmt:
@@ -68,14 +68,14 @@ obs-up:
 	docker compose -f compose.observability.yaml up --detach
 
 review:
-	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the PoC" >&2; exit 1)
+	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the application" >&2; exit 1)
 	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks review $(ARGS)
 
 run:
 	go run ./cmd/stacks
 
 sync:
-	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the PoC" >&2; exit 1)
+	@test -f "$(ENV_FILE)" || (echo "copy .env.example to $(ENV_FILE) and configure the application" >&2; exit 1)
 	@set -a; . "$(ENV_FILE)"; set +a; go run ./cmd/stacks sync
 
 test:
@@ -96,7 +96,7 @@ test-integration:
 		test -n "$$STACKS_TEST_MIGRATION_DATABASE_URL" || (echo "STACKS_TEST_MIGRATION_DATABASE_URL is required" >&2; exit 1); \
 		(cd adapters/postgres && GOWORK=off go run ./cmd/validate-test-database) && \
 		(cd adapters/postgres && GOWORK=off go test ./... -count=1) && \
-		go test ./internal/ingest ./internal/directory ./internal/analysis ./internal/doctor -count=1
+		go test ./internal/ingest ./internal/directory ./internal/analysis ./internal/app ./internal/doctor -count=1
 
 staticcheck:
 	@sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' modules.txt | while IFS= read -r module; do \
