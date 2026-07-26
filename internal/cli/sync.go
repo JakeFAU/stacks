@@ -20,10 +20,7 @@ type SyncCommand struct {
 }
 
 // Run executes `sync` without positional arguments.
-func (command SyncCommand) Run(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return fmt.Errorf("sync command usage: sync")
-	}
+func (command SyncCommand) Run(ctx context.Context, _ Invocation) error {
 	if command.Service == nil {
 		return fmt.Errorf("sync command: service is not configured")
 	}

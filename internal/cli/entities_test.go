@@ -20,7 +20,7 @@ func TestEntitiesCommandShowsCanonicalEntityAliasesAndEvidence(t *testing.T) {
 	var stdout strings.Builder
 	command := EntitiesCommand{Service: &EntityService{Store: store}, Output: &stdout}
 
-	if err := command.Run(context.Background(), []string{"show", "person-1"}); err != nil {
+	if err := command.Run(context.Background(), Invocation{Command: CommandEntities, Action: ActionShow, Arguments: []string{"person-1"}}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	for _, value := range []string{"person-1", "Synthetic Person", "2026-07-21T12:00:00Z", "synthetic.person@example.test", "evidence-1", "Synthetic evidence context"} {

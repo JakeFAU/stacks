@@ -1,49 +1,190 @@
-// Package cli routes Stacks subcommands without coupling command handlers to
-// process-level concerns such as signals or exit status.
+// Package cli owns Stacks' typed command-line transport boundary.
 package cli
 
 import (
 	"context"
 	"fmt"
+	"io"
+	"strings"
+
+	"github.com/spf13/cobra"
 )
 
-const defaultCommand = "serve"
+const (
+	rootCommandUse                = "stacks"
+	reviewCreateNameFlagName      = "name"
+	reviewCreateEmailFlagName     = "email"
+	acceptDirectoryEntityFlagName = "entity"
+)
 
-// Command handles a parsed command and its remaining arguments.
+// CommandName identifies a top-level Stacks application command.
+type CommandName string
+
+const (
+	CommandServe     CommandName = "serve"
+	CommandAuth      CommandName = "auth"
+	CommandDoctor    CommandName = "doctor"
+	CommandSync      CommandName = "sync"
+	CommandEntities  CommandName = "entities"
+	CommandReview    CommandName = "review"
+	CommandAnalyze   CommandName = "analyze"
+	CommandDBMigrate CommandName = "db-migrate"
+	CommandDBStatus  CommandName = "db-status"
+	CommandDBReset   CommandName = "db-reset"
+)
+
+// Action identifies a validated nested command action.
+type Action string
+
+const (
+	ActionAuthGoogle          Action = "google"
+	ActionAuthGoogleDirectory Action = "google-directory"
+	ActionList                Action = "list"
+	ActionShow                Action = "show"
+	ActionAccept              Action = "accept"
+	ActionAcceptDirectory     Action = "accept-directory"
+	ActionReject              Action = "reject"
+	ActionCreate              Action = "create"
+	ActionCorrect             Action = "correct"
+)
+
+// Invocation is the validated, provider-neutral CLI input for one application command.
+type Invocation struct {
+	Command         CommandName
+	Action          Action
+	Arguments       []string
+	CreatePerson    *CreatePersonInput
+	AcceptDirectory *AcceptDirectoryInput
+}
+
+// Command executes a typed application invocation.
 type Command interface {
-	Run(ctx context.Context, args []string) error
+	Run(context.Context, Invocation) error
 }
 
 // CommandFunc adapts a function into a Command.
-type CommandFunc func(ctx context.Context, args []string) error
+type CommandFunc func(context.Context, Invocation) error
 
 // Run executes fn.
-func (fn CommandFunc) Run(ctx context.Context, args []string) error {
-	return fn(ctx, args)
+func (fn CommandFunc) Run(ctx context.Context, invocation Invocation) error {
+	return fn(ctx, invocation)
 }
 
-// Runner dispatches the first argument to a configured command.
+// Runner creates and executes a fresh command tree for one invocation.
 type Runner struct {
-	Commands map[string]Command
+	Execute CommandFunc
+	Input   io.Reader
+	Output  io.Writer
+	Error   io.Writer
 }
 
-// Run executes serve when no command is supplied, otherwise it dispatches the
-// requested command with the remaining arguments.
+// Run parses args and invokes the selected typed command leaf.
 func (r Runner) Run(ctx context.Context, args []string) error {
-	commandName := defaultCommand
-	commandArgs := args
-	if len(args) > 0 {
-		commandName = args[0]
-		commandArgs = args[1:]
+	root := r.newRootCommand()
+	root.SetArgs(args)
+	root.SetContext(ctx)
+	root.SetIn(r.Input)
+	root.SetOut(r.Output)
+	root.SetErr(r.Error)
+	return root.ExecuteContext(ctx)
+}
+
+func (r Runner) newRootCommand() *cobra.Command {
+	execute := func(command *cobra.Command, invocation Invocation) error {
+		if r.Execute == nil {
+			return fmt.Errorf("%s command is not configured", invocation.Command)
+		}
+		return r.Execute(command.Context(), invocation)
+	}
+	leaf := func(use string, topLevel CommandName, action Action, args cobra.PositionalArgs) *cobra.Command {
+		return &cobra.Command{
+			Use:  use,
+			Args: args,
+			RunE: func(command *cobra.Command, values []string) error {
+				return execute(command, Invocation{Command: topLevel, Action: action, Arguments: values})
+			},
+		}
 	}
 
-	command, ok := r.Commands[commandName]
-	if !ok {
-		return fmt.Errorf("unknown command %q", commandName)
-	}
-	if command == nil {
-		return fmt.Errorf("command %q is not configured", commandName)
+	root := &cobra.Command{
+		Use:           rootCommandUse,
+		Short:         "Build provenance-backed temporal knowledge",
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(command *cobra.Command, _ []string) error {
+			return execute(command, Invocation{Command: CommandServe})
+		},
 	}
 
-	return command.Run(ctx, commandArgs)
+	serve := leaf(string(CommandServe), CommandServe, "", cobra.NoArgs)
+	root.AddCommand(serve)
+	root.AddCommand(leaf(string(CommandDoctor), CommandDoctor, "", cobra.NoArgs))
+	root.AddCommand(leaf(string(CommandSync), CommandSync, "", cobra.NoArgs))
+	root.AddCommand(leaf(string(CommandAnalyze), CommandAnalyze, "", cobra.NoArgs))
+	root.AddCommand(leaf(string(CommandDBMigrate), CommandDBMigrate, "", cobra.NoArgs))
+	root.AddCommand(leaf(string(CommandDBStatus), CommandDBStatus, "", cobra.NoArgs))
+	root.AddCommand(leaf(string(CommandDBReset)+" <confirmation>", CommandDBReset, "", cobra.ExactArgs(1)))
+
+	auth := &cobra.Command{Use: string(CommandAuth)}
+	auth.AddCommand(leaf(string(ActionAuthGoogle), CommandAuth, ActionAuthGoogle, cobra.NoArgs))
+	auth.AddCommand(leaf(string(ActionAuthGoogleDirectory), CommandAuth, ActionAuthGoogleDirectory, cobra.NoArgs))
+	root.AddCommand(auth)
+
+	entities := &cobra.Command{Use: string(CommandEntities)}
+	entities.AddCommand(leaf(string(ActionList), CommandEntities, ActionList, cobra.NoArgs))
+	entities.AddCommand(leaf(string(ActionShow)+" <entity-id>", CommandEntities, ActionShow, cobra.ExactArgs(1)))
+	root.AddCommand(entities)
+
+	review := &cobra.Command{Use: string(CommandReview)}
+	review.AddCommand(leaf(string(ActionList), CommandReview, ActionList, cobra.NoArgs))
+	review.AddCommand(leaf(string(ActionShow)+" <proposal-id>", CommandReview, ActionShow, cobra.ExactArgs(1)))
+	review.AddCommand(leaf(string(ActionAccept)+" <proposal-id> <entity-id>", CommandReview, ActionAccept, cobra.ExactArgs(2)))
+	review.AddCommand(leaf(string(ActionReject)+" <proposal-id>", CommandReview, ActionReject, cobra.ExactArgs(1)))
+	review.AddCommand(leaf(string(ActionCorrect)+" <effective-decision-id> <entity-id>", CommandReview, ActionCorrect, cobra.ExactArgs(2)))
+
+	acceptDirectory := leaf(string(ActionAcceptDirectory)+" <proposal-id> <directory-profile-id>", CommandReview, ActionAcceptDirectory, cobra.ExactArgs(2))
+	acceptDirectory.Flags().String(acceptDirectoryEntityFlagName, "", "existing entity ID")
+	acceptDirectory.RunE = func(command *cobra.Command, values []string) error {
+		entityID, err := command.Flags().GetString(acceptDirectoryEntityFlagName)
+		if err != nil {
+			return fmt.Errorf("read %s flag: %w", acceptDirectoryEntityFlagName, err)
+		}
+		if command.Flags().Changed(acceptDirectoryEntityFlagName) && strings.TrimSpace(entityID) == "" {
+			return fmt.Errorf("review accept-directory: --entity requires an entity ID")
+		}
+		return execute(command, Invocation{
+			Command: CommandReview, Action: ActionAcceptDirectory, Arguments: values,
+			AcceptDirectory: &AcceptDirectoryInput{
+				ProposalID: values[0], DirectoryProfileID: values[1], EntityID: entityID,
+			},
+		})
+	}
+	review.AddCommand(acceptDirectory)
+
+	create := leaf(string(ActionCreate)+" <proposal-id>", CommandReview, ActionCreate, cobra.ExactArgs(1))
+	create.Flags().String(reviewCreateNameFlagName, "", "new person name")
+	create.Flags().String(reviewCreateEmailFlagName, "", "new person email")
+	_ = create.MarkFlagRequired(reviewCreateNameFlagName)
+	create.RunE = func(command *cobra.Command, values []string) error {
+		name, err := command.Flags().GetString(reviewCreateNameFlagName)
+		if err != nil {
+			return fmt.Errorf("read %s flag: %w", reviewCreateNameFlagName, err)
+		}
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("review create: --name is required")
+		}
+		email, err := command.Flags().GetString(reviewCreateEmailFlagName)
+		if err != nil {
+			return fmt.Errorf("read %s flag: %w", reviewCreateEmailFlagName, err)
+		}
+		return execute(command, Invocation{
+			Command: CommandReview, Action: ActionCreate, Arguments: values,
+			CreatePerson: &CreatePersonInput{Name: name, Email: email},
+		})
+	}
+	review.AddCommand(create)
+	root.AddCommand(review)
+
+	return root
 }

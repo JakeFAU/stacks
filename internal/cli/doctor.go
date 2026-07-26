@@ -21,10 +21,7 @@ type DoctorCommand struct {
 }
 
 // Run executes `stacks doctor` without positional arguments.
-func (command DoctorCommand) Run(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return errors.New("doctor command usage: doctor")
-	}
+func (command DoctorCommand) Run(ctx context.Context, _ Invocation) error {
 	if command.Service == nil {
 		return errors.New("doctor command: service is not configured")
 	}

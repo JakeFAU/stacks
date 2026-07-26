@@ -33,10 +33,7 @@ type DBMigrateCommand struct {
 }
 
 // Run applies migrations without positional arguments.
-func (command DBMigrateCommand) Run(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return errors.New("db-migrate command usage: db-migrate")
-	}
+func (command DBMigrateCommand) Run(ctx context.Context, _ Invocation) error {
 	if command.Migrator == nil {
 		return errors.New("db-migrate command: migrator is not configured")
 	}
@@ -73,10 +70,7 @@ type DBStatusCommand struct {
 }
 
 // Run inspects status without positional arguments or database writes.
-func (command DBStatusCommand) Run(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return errors.New("db-status command usage: db-status")
-	}
+func (command DBStatusCommand) Run(ctx context.Context, _ Invocation) error {
 	if command.Inspector == nil {
 		return errors.New("db-status command: inspector is not configured")
 	}
@@ -111,12 +105,12 @@ type DBResetCommand struct {
 }
 
 // Run requires exactly one confirmation argument.
-func (command DBResetCommand) Run(ctx context.Context, args []string) error {
-	if len(args) != 1 {
-		return errors.New("db-reset command usage: db-reset delete-local-stacks-postgres")
-	}
+func (command DBResetCommand) Run(ctx context.Context, invocation Invocation) error {
 	if command.Resetter == nil {
 		return errors.New("db-reset command: resetter is not configured")
 	}
-	return command.Resetter.Reset(ctx, args[0], command.Output)
+	if len(invocation.Arguments) != 1 {
+		return errors.New("db-reset command: invocation is invalid")
+	}
+	return command.Resetter.Reset(ctx, invocation.Arguments[0], command.Output)
 }

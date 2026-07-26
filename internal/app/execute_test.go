@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -12,6 +13,44 @@ import (
 	"stacks/internal/cli"
 	"stacks/internal/config"
 )
+
+func TestExecuteHelpAndSyntaxFailuresDoNotConstructCommands(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		isHelp bool
+	}{
+		{name: "root help", args: []string{"--help"}, isHelp: true},
+		{name: "nested help", args: []string{"review", "create", "--help"}, isHelp: true},
+		{name: "unknown command", args: []string{"unknown"}},
+		{name: "invalid arity", args: []string{"entities", "show"}},
+		{name: "unknown flag", args: []string{"review", "create", "proposal-1", "--unknown"}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			providerCalls := 0
+			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+				providerCalls++
+				return nil, errors.New("provider must not be constructed")
+			})
+			err := Execute(t.Context(), testCase.args, config.Settings{},
+				RuntimeFunc(func(context.Context, config.Settings) error {
+					return errors.New("serve must not run")
+				}),
+				provider, io.Discard, io.Discard)
+			if testCase.isHelp {
+				if err != nil {
+					t.Fatalf("Execute() help error = %v", err)
+				}
+			} else if err == nil {
+				t.Fatal("Execute() error = nil, want syntax failure")
+			}
+			if providerCalls != 0 {
+				t.Fatalf("provider calls = %d, want 0", providerCalls)
+			}
+		})
+	}
+}
 
 func TestExecuteServesWithoutApplicationSettings(t *testing.T) {
 	called := false
@@ -32,22 +71,22 @@ func TestExecuteServesWithoutApplicationSettings(t *testing.T) {
 func TestExecuteRoutesEntityAndReviewCommandsWithRemainingArguments(t *testing.T) {
 	settings := config.Settings{Database: config.DatabaseSettings{URL: "postgres://synthetic"}}
 	cases := []struct {
-		name        string
-		arguments   []string
-		commandName string
-		wantArgs    []string
+		name           string
+		arguments      []string
+		commandName    string
+		wantInvocation cli.Invocation
 	}{
-		{name: "entities", arguments: []string{"entities", "show", "person-1"}, commandName: "entities", wantArgs: []string{"show", "person-1"}},
-		{name: "review", arguments: []string{"review", "accept", "proposal-1", "person-1"}, commandName: "review", wantArgs: []string{"accept", "proposal-1", "person-1"}},
+		{name: "entities", arguments: []string{"entities", "show", "person-1"}, commandName: "entities", wantInvocation: cli.Invocation{Command: cli.CommandEntities, Action: cli.ActionShow, Arguments: []string{"person-1"}}},
+		{name: "review", arguments: []string{"review", "accept", "proposal-1", "person-1"}, commandName: "review", wantInvocation: cli.Invocation{Command: cli.CommandReview, Action: cli.ActionAccept, Arguments: []string{"proposal-1", "person-1"}}},
 	}
 
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			var gotArgs []string
+			var gotInvocation cli.Invocation
 			var stdoutCalled bool
 			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
-				return map[string]cli.Command{testCase.commandName: cli.CommandFunc(func(_ context.Context, args []string) error {
-					gotArgs = append([]string(nil), args...)
+				return map[string]cli.Command{testCase.commandName: cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
+					gotInvocation = invocation
 					stdoutCalled = true
 					return nil
 				})}, nil
@@ -59,8 +98,8 @@ func TestExecuteRoutesEntityAndReviewCommandsWithRemainingArguments(t *testing.T
 			if err != nil {
 				t.Fatalf("Execute() error = %v", err)
 			}
-			if !stdoutCalled || !reflect.DeepEqual(gotArgs, testCase.wantArgs) {
-				t.Fatalf("command call = (%t, %#v), want (true, %#v)", stdoutCalled, gotArgs, testCase.wantArgs)
+			if !stdoutCalled || !reflect.DeepEqual(gotInvocation, testCase.wantInvocation) {
+				t.Fatalf("command call = (%t, %#v), want (true, %#v)", stdoutCalled, gotInvocation, testCase.wantInvocation)
 			}
 		})
 	}
@@ -71,10 +110,10 @@ func TestExecuteRoutesGoogleAuthWithRemainingArguments(t *testing.T) {
 		GoogleOAuthClientFile: "/synthetic/client.json",
 		GoogleOAuthTokenFile:  "/synthetic/token.json",
 	}}
-	var gotArgs []string
+	var gotInvocation cli.Invocation
 	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
-		return map[string]cli.Command{"auth": cli.CommandFunc(func(_ context.Context, args []string) error {
-			gotArgs = append([]string(nil), args...)
+		return map[string]cli.Command{"auth": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
+			gotInvocation = invocation
 			return nil
 		})}, nil
 	})
@@ -85,8 +124,8 @@ func TestExecuteRoutesGoogleAuthWithRemainingArguments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if !reflect.DeepEqual(gotArgs, []string{"google"}) {
-		t.Fatalf("auth command args = %#v, want %#v", gotArgs, []string{"google"})
+	if gotInvocation.Command != cli.CommandAuth || gotInvocation.Action != cli.ActionAuthGoogle || len(gotInvocation.Arguments) != 0 {
+		t.Fatalf("auth command invocation = %#v, want typed Google auth", gotInvocation)
 	}
 }
 
@@ -110,10 +149,10 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 	syncCalls := 0
 	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
 		providerCalls++
-		return map[string]cli.Command{"sync": cli.CommandFunc(func(_ context.Context, args []string) error {
+		return map[string]cli.Command{"sync": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
 			syncCalls++
-			if len(args) != 0 {
-				return fmt.Errorf("sync received unexpected arguments")
+			if invocation.Command != cli.CommandSync || invocation.Action != "" || len(invocation.Arguments) != 0 {
+				return fmt.Errorf("sync received unexpected invocation")
 			}
 			return nil
 		})}, nil
@@ -146,10 +185,10 @@ func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
 	doctorCalls := 0
 	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
 		providerCalls++
-		return map[string]cli.Command{"doctor": cli.CommandFunc(func(_ context.Context, args []string) error {
+		return map[string]cli.Command{"doctor": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
 			doctorCalls++
-			if len(args) != 0 {
-				return fmt.Errorf("doctor received unexpected arguments")
+			if invocation.Command != cli.CommandDoctor || invocation.Action != "" || len(invocation.Arguments) != 0 {
+				return fmt.Errorf("doctor received unexpected invocation")
 			}
 			return nil
 		})}, nil
@@ -181,10 +220,10 @@ func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
 	analyzeCalls := 0
 	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
 		providerCalls++
-		return map[string]cli.Command{"analyze": cli.CommandFunc(func(_ context.Context, args []string) error {
+		return map[string]cli.Command{"analyze": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
 			analyzeCalls++
-			if len(args) != 0 {
-				return fmt.Errorf("analyze received unexpected arguments")
+			if invocation.Command != cli.CommandAnalyze || invocation.Action != "" || len(invocation.Arguments) != 0 {
+				return fmt.Errorf("analyze received unexpected invocation")
 			}
 			return nil
 		})}, nil

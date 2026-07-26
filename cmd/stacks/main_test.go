@@ -58,7 +58,7 @@ func TestRestrictedSyncChecksDisclosureBeforeExternalConstruction(t *testing.T) 
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	err = commands[string(config.CommandSync)].Run(context.Background(), nil)
+	err = commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync})
 	if !errors.Is(err, errStopAfterModelConstruction) {
 		t.Fatalf("sync error = %v, want sentinel model-construction stop", err)
 	}
@@ -80,7 +80,7 @@ func TestRestrictedAnalyzeChecksDisclosureBeforeExternalConstruction(t *testing.
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	err = commands[string(config.CommandAnalyze)].Run(context.Background(), nil)
+	err = commands[string(config.CommandAnalyze)].Run(context.Background(), cli.Invocation{Command: cli.CommandAnalyze})
 	if !errors.Is(err, errStopAfterModelConstruction) {
 		t.Fatalf("analyze error = %v, want sentinel model-construction stop", err)
 	}
@@ -110,7 +110,7 @@ func TestFailedRestrictedGateConstructsNoSourceStorageOrModel(t *testing.T) {
 			if err != nil {
 				t.Fatalf("commandProviderWithRuntime() error = %v", err)
 			}
-			err = commands[string(command)].Run(context.Background(), nil)
+			err = commands[string(command)].Run(context.Background(), cli.Invocation{Command: cli.CommandName(command)})
 			if !errors.Is(err, doctor.ErrDisclosureNotConfirmed) {
 				t.Fatalf("%s error = %v, want disclosure rejection", command, err)
 			}
@@ -149,7 +149,7 @@ func TestCanceledRestrictedSyncGateConstructsNoDriveDirectoryStorageOrModel(t *t
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err = commands[string(config.CommandSync)].Run(ctx, nil)
+	err = commands[string(config.CommandSync)].Run(ctx, cli.Invocation{Command: cli.CommandSync})
 
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("sync error = %v, want context.Canceled", err)
@@ -186,7 +186,7 @@ func TestFailedRestrictedReviewGateConstructsNoDirectoryOrStorage(t *testing.T) 
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
 
-	err = commands[string(config.CommandReview)].Run(context.Background(), []string{"list"})
+	err = commands[string(config.CommandReview)].Run(context.Background(), cli.Invocation{Command: cli.CommandReview, Action: cli.ActionList})
 
 	if !errors.Is(err, doctor.ErrDisclosureNotConfirmed) {
 		t.Fatalf("review error = %v, want disclosure rejection", err)
@@ -210,7 +210,7 @@ func TestRestrictedDirectProvidersRejectBeforeExternalConstruction(t *testing.T)
 				if err != nil {
 					t.Fatalf("commandProviderWithRuntime() error = %v", err)
 				}
-				if err := commands[string(command)].Run(context.Background(), nil); err == nil {
+				if err := commands[string(command)].Run(context.Background(), cli.Invocation{Command: cli.CommandName(command)}); err == nil {
 					t.Fatalf("%s error = nil, want static policy rejection", command)
 				}
 				if len(calls) != 0 {
@@ -232,7 +232,7 @@ func TestPersonalSyncPerformsNoDisclosureInspection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	err = commands[string(config.CommandSync)].Run(context.Background(), nil)
+	err = commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync})
 	if !errors.Is(err, errStopAfterModelConstruction) {
 		t.Fatalf("sync error = %v, want sentinel model-construction stop", err)
 	}
@@ -271,7 +271,7 @@ func TestAuthCommandConstructsOnlySelectedAuthorizer(t *testing.T) {
 			if err != nil {
 				t.Fatalf("commandProviderWithRuntime() error = %v", err)
 			}
-			if err := commands[string(config.CommandAuth)].Run(context.Background(), []string{testCase.argument}); err != nil {
+			if err := commands[string(config.CommandAuth)].Run(context.Background(), cli.Invocation{Command: cli.CommandAuth, Action: cli.Action(testCase.argument)}); err != nil {
 				t.Fatalf("auth %s error = %v", testCase.argument, err)
 			}
 			if calls.drive != testCase.wantDrive || calls.directory != testCase.wantDirectory {
@@ -291,9 +291,9 @@ func TestAuthCommandRejectsInvalidTargetBeforeConstructingAuthorizers(t *testing
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	err = commands[string(config.CommandAuth)].Run(context.Background(), []string{"invalid"})
-	if err == nil || err.Error() != "usage: stacks auth google | stacks auth google-directory" {
-		t.Fatalf("auth error = %v, want exact usage error", err)
+	err = commands[string(config.CommandAuth)].Run(context.Background(), cli.Invocation{Command: cli.CommandAuth})
+	if err == nil || !strings.Contains(err.Error(), "invocation is invalid") {
+		t.Fatalf("auth error = %v, want invalid invocation error", err)
 	}
 	if calls != 0 {
 		t.Fatalf("authorizer constructors = %d, want 0", calls)
@@ -350,10 +350,10 @@ func TestDisabledSyncAndReviewDoNotConstructDirectoryBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err != nil {
+	if err := commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync}); err != nil {
 		t.Fatalf("disabled sync error = %v", err)
 	}
-	if err := commands[string(config.CommandReview)].Run(context.Background(), []string{"list"}); err == nil {
+	if err := commands[string(config.CommandReview)].Run(context.Background(), cli.Invocation{Command: cli.CommandReview, Action: cli.ActionList}); err == nil {
 		t.Fatal("review list error = nil, want nil repository sentinel")
 	}
 
@@ -415,7 +415,7 @@ func TestEnabledSyncConstructsOneDirectoryBoundaryAndOneSharedRepositoryOwner(t 
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
 
-	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err != nil {
+	if err := commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync}); err != nil {
 		t.Fatalf("enabled sync error = %v", err)
 	}
 	want := []string{"drive", "directory", "postgres", "model", "close"}
@@ -473,7 +473,7 @@ func TestEnabledSyncContinuesWhenDirectoryConstructionIsUnavailable(t *testing.T
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
 
-	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err != nil {
+	if err := commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync}); err != nil {
 		t.Fatalf("enabled sync error = %v, want unavailable directory to remain additive", err)
 	}
 	want := []string{"drive", "directory", "postgres", "model", "close"}
@@ -519,9 +519,9 @@ func TestEnabledReviewUsageContinuesWhenDirectoryConstructionIsUnavailable(t *te
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
 
-	err = commands[string(config.CommandReview)].Run(context.Background(), []string{"invalid"})
-	if err == nil || !strings.HasPrefix(err.Error(), "review command usage:") {
-		t.Fatalf("review error = %v, want unrelated review usage result", err)
+	err = commands[string(config.CommandReview)].Run(context.Background(), cli.Invocation{Command: cli.CommandReview})
+	if err == nil || !strings.Contains(err.Error(), "invocation is invalid") {
+		t.Fatalf("review error = %v, want invalid invocation result", err)
 	}
 	if strings.Contains(err.Error(), privateDirectoryFailure) {
 		t.Fatalf("review error exposed directory construction detail: %v", err)
@@ -580,7 +580,7 @@ func TestDirectoryConstructionCancellationRemainsCanonical(t *testing.T) {
 				t.Fatalf("commandProviderWithRuntime() error = %v", err)
 			}
 
-			err = commands[string(config.CommandSync)].Run(context.Background(), nil)
+			err = commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync})
 			if err != errors.Unwrap(testCase.err) {
 				t.Fatalf("sync error = %v, want canonical %v", err, errors.Unwrap(testCase.err))
 			}
@@ -628,7 +628,7 @@ func TestReviewDirectoryConstructionCancellationRemainsCanonical(t *testing.T) {
 				t.Fatalf("commandProviderWithRuntime() error = %v", err)
 			}
 
-			err = commands[string(config.CommandReview)].Run(context.Background(), []string{"invalid"})
+			err = commands[string(config.CommandReview)].Run(context.Background(), cli.Invocation{Command: cli.CommandReview})
 			if err != errors.Unwrap(testCase.err) {
 				t.Fatalf("review error = %v, want canonical %v", err, errors.Unwrap(testCase.err))
 			}
@@ -662,7 +662,7 @@ func TestRestrictedSyncConstructsDirectoryOnlyAfterDisclosureGate(t *testing.T) 
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); !errors.Is(err, errStopAfterModelConstruction) {
+	if err := commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync}); !errors.Is(err, errStopAfterModelConstruction) {
 		t.Fatalf("sync error = %v, want sentinel model-construction stop after fail-soft directory construction", err)
 	}
 	want := []string{"logging", "google", "directory", "postgres", "model", "close"}
@@ -715,7 +715,7 @@ func TestDoctorConstructsOptionalProbeOnlyWhenEnabledAndNeverConstructsRuntimeOr
 				t.Fatalf("commandProviderWithRuntime() error = %v", err)
 			}
 
-			if err := commands[string(config.CommandDoctor)].Run(context.Background(), nil); err != nil {
+			if err := commands[string(config.CommandDoctor)].Run(context.Background(), cli.Invocation{Command: cli.CommandDoctor}); err != nil {
 				t.Fatalf("doctor error = %v", err)
 			}
 			wantProbeConstructions := 0
@@ -770,7 +770,7 @@ func TestDoctorOpensAndClosesOneCanonicalDatabaseOwner(t *testing.T) {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
 
-	if err := commands[string(config.CommandDoctor)].Run(context.Background(), nil); err != nil {
+	if err := commands[string(config.CommandDoctor)].Run(context.Background(), cli.Invocation{Command: cli.CommandDoctor}); err != nil {
 		t.Fatalf("doctor error = %v", err)
 	}
 	if opens != 1 || database.pings != 1 || database.statuses != 1 || database.closes != 1 {
@@ -949,7 +949,7 @@ func TestPaddedDirectProviderSettingsRejectBeforeAnyBoundary(t *testing.T) {
 					t.Fatalf("commandProviderWithRuntime() error = %v", err)
 				}
 
-				err = commands[string(command)].Run(context.Background(), nil)
+				err = commands[string(command)].Run(context.Background(), cli.Invocation{Command: cli.CommandName(command)})
 				if err == nil || !strings.Contains(err.Error(), testCase.wantName) {
 					t.Fatalf("%s error = %v, want bounded %s rejection", command, err, testCase.wantName)
 				}

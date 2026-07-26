@@ -11,9 +11,9 @@ import (
 
 func TestReviewCommandAcceptRequiresExplicitProposalID(t *testing.T) {
 	command := ReviewCommand{Service: &ReviewService{Store: &fakeReviewStore{}}}
-	err := command.Run(context.Background(), []string{"accept"})
-	if err == nil || !strings.Contains(err.Error(), "proposal ID") {
-		t.Fatalf("Run() error = %v, want explicit proposal ID error", err)
+	err := command.Run(context.Background(), Invocation{Command: CommandReview, Action: ActionAccept})
+	if err == nil || !strings.Contains(err.Error(), "invocation is invalid") {
+		t.Fatalf("Run() error = %v, want invalid invocation error", err)
 	}
 }
 
@@ -26,15 +26,13 @@ func TestReviewCommandAcceptDirectoryRequiresExactProposalAndSnapshotIDs(t *test
 	}}
 	command := ReviewCommand{Service: &ReviewService{Store: store}}
 
-	for _, args := range [][]string{
-		{"accept-directory"},
-		{"accept-directory", "proposal-directory"},
+	for _, invocation := range []Invocation{
+		{Command: CommandReview, Action: ActionAcceptDirectory},
+		{Command: CommandReview, Action: ActionAcceptDirectory},
 	} {
-		err := command.Run(context.Background(), args)
-		if err == nil ||
-			!strings.Contains(err.Error(), "proposal ID") ||
-			!strings.Contains(err.Error(), "directory profile ID") {
-			t.Fatalf("Run(%q) error = %v, want exact proposal/profile ID error", args, err)
+		err := command.Run(context.Background(), invocation)
+		if err == nil || !strings.Contains(err.Error(), "invocation is invalid") {
+			t.Fatalf("Run(%#v) error = %v, want invalid invocation error", invocation, err)
 		}
 	}
 	if store.acceptedDirectory != (AcceptDirectoryInput{}) {
@@ -44,27 +42,21 @@ func TestReviewCommandAcceptDirectoryRequiresExactProposalAndSnapshotIDs(t *test
 
 func TestReviewCommandAcceptDirectoryParsesOptionalExistingEntity(t *testing.T) {
 	for _, testCase := range []struct {
-		name string
-		args []string
-		want AcceptDirectoryInput
+		name       string
+		invocation Invocation
+		want       AcceptDirectoryInput
 	}{
 		{
-			name: "create person",
-			args: []string{"accept-directory", "proposal-directory", "profile-directory"},
+			name:       "create person",
+			invocation: Invocation{Command: CommandReview, Action: ActionAcceptDirectory, AcceptDirectory: &AcceptDirectoryInput{ProposalID: "proposal-directory", DirectoryProfileID: "profile-directory"}},
 			want: AcceptDirectoryInput{
 				ProposalID:         "proposal-directory",
 				DirectoryProfileID: "profile-directory",
 			},
 		},
 		{
-			name: "existing person",
-			args: []string{
-				"accept-directory",
-				"proposal-directory",
-				"profile-directory",
-				"--entity",
-				"person-existing",
-			},
+			name:       "existing person",
+			invocation: Invocation{Command: CommandReview, Action: ActionAcceptDirectory, AcceptDirectory: &AcceptDirectoryInput{ProposalID: "proposal-directory", DirectoryProfileID: "profile-directory", EntityID: "person-existing"}},
 			want: AcceptDirectoryInput{
 				ProposalID:         "proposal-directory",
 				DirectoryProfileID: "profile-directory",
@@ -75,8 +67,8 @@ func TestReviewCommandAcceptDirectoryParsesOptionalExistingEntity(t *testing.T) 
 		t.Run(testCase.name, func(t *testing.T) {
 			store := &fakeReviewStore{}
 			command := ReviewCommand{Service: &ReviewService{Store: store}}
-			if err := command.Run(context.Background(), testCase.args); err != nil {
-				t.Fatalf("Run(%q) error = %v", testCase.args, err)
+			if err := command.Run(context.Background(), testCase.invocation); err != nil {
+				t.Fatalf("Run(%#v) error = %v", testCase.invocation, err)
 			}
 			if store.acceptedDirectory != testCase.want {
 				t.Fatalf("accept-directory input = %#v, want %#v", store.acceptedDirectory, testCase.want)
@@ -110,7 +102,7 @@ func TestReviewCommandWritesPrivateProposalContextOnlyToStdout(t *testing.T) {
 	var stdout strings.Builder
 	command := ReviewCommand{Service: &ReviewService{Store: store}, Output: &stdout}
 
-	if err := command.Run(context.Background(), []string{"show", "proposal-1"}); err != nil {
+	if err := command.Run(context.Background(), Invocation{Command: CommandReview, Action: ActionShow, Arguments: []string{"proposal-1"}}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if !strings.Contains(stdout.String(), privateContext) {
@@ -145,7 +137,7 @@ func TestReviewCommandShowsOrderedProvenanceAndEffectiveAuthority(t *testing.T) 
 	var stdout strings.Builder
 	command := ReviewCommand{Service: &ReviewService{Store: store}, Output: &stdout}
 
-	if err := command.Run(context.Background(), []string{"show", "proposal-provenance"}); err != nil {
+	if err := command.Run(context.Background(), Invocation{Command: CommandReview, Action: ActionShow, Arguments: []string{"proposal-provenance"}}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	output := stdout.String()
@@ -179,7 +171,7 @@ func TestReviewCommandListRendersCompactHighestRankedGuessAndContext(t *testing.
 	var stdout strings.Builder
 	command := ReviewCommand{Service: &ReviewService{Store: store}, Output: &stdout}
 
-	if err := command.Run(context.Background(), []string{"list"}); err != nil {
+	if err := command.Run(context.Background(), Invocation{Command: CommandReview, Action: ActionList}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	want := "proposal-1 | guess=person-primary | confidence=0.812 | alternatives=1 | reason=\"exact accepted alias similarity\" | context=\"Synthetic transcript context\"\n"
@@ -204,7 +196,7 @@ func TestReviewCommandListBoundsPrivateTextToOneLine(t *testing.T) {
 	var stdout strings.Builder
 	command := ReviewCommand{Service: &ReviewService{Store: store}, Output: &stdout}
 
-	if err := command.Run(context.Background(), []string{"list"}); err != nil {
+	if err := command.Run(context.Background(), Invocation{Command: CommandReview, Action: ActionList}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	line := stdout.String()
@@ -242,7 +234,7 @@ func TestReviewCommandDirectoryCandidateListIsMaskedAndShowHasRequestedDetail(t 
 		Service: &ReviewService{Store: store},
 		Output:  &listOutput,
 	}
-	if err := listCommand.Run(context.Background(), []string{"list"}); err != nil {
+	if err := listCommand.Run(context.Background(), Invocation{Command: CommandReview, Action: ActionList}); err != nil {
 		t.Fatalf("list Run() error = %v", err)
 	}
 	listed := listOutput.String()
@@ -267,7 +259,7 @@ func TestReviewCommandDirectoryCandidateListIsMaskedAndShowHasRequestedDetail(t 
 		Service: &ReviewService{Store: store},
 		Output:  &showOutput,
 	}
-	if err := showCommand.Run(context.Background(), []string{"show", "proposal-directory"}); err != nil {
+	if err := showCommand.Run(context.Background(), Invocation{Command: CommandReview, Action: ActionShow, Arguments: []string{"proposal-directory"}}); err != nil {
 		t.Fatalf("show Run() error = %v", err)
 	}
 	shown := showOutput.String()
@@ -303,20 +295,20 @@ func TestReviewCommandAppliesEveryReviewTransitionAndSurfacesCurrentStateFailure
 	store := newStatefulReviewStore()
 	command := ReviewCommand{Service: &ReviewService{Store: store}}
 
-	for _, args := range [][]string{
-		{"accept", "proposal-1", "person-1"},
-		{"reject", "proposal-2"},
-		{"create", "proposal-3", "--name", "Synthetic Person", "--email", "person@example.test"},
-		{"correct", "decision-1", "person-2"},
+	for _, invocation := range []Invocation{
+		{Command: CommandReview, Action: ActionAccept, Arguments: []string{"proposal-1", "person-1"}},
+		{Command: CommandReview, Action: ActionReject, Arguments: []string{"proposal-2"}},
+		{Command: CommandReview, Action: ActionCreate, Arguments: []string{"proposal-3"}, CreatePerson: &CreatePersonInput{Name: "Synthetic Person", Email: "person@example.test"}},
+		{Command: CommandReview, Action: ActionCorrect, Arguments: []string{"decision-1", "person-2"}},
 	} {
-		if err := command.Run(context.Background(), args); err != nil {
-			t.Fatalf("Run(%q) error = %v", args, err)
+		if err := command.Run(context.Background(), invocation); err != nil {
+			t.Fatalf("Run(%#v) error = %v", invocation, err)
 		}
 	}
-	if err := command.Run(context.Background(), []string{"accept", "proposal-1", "person-1"}); err == nil || !strings.Contains(err.Error(), "effective decision") {
+	if err := command.Run(context.Background(), Invocation{Command: CommandReview, Action: ActionAccept, Arguments: []string{"proposal-1", "person-1"}}); err == nil || !strings.Contains(err.Error(), "effective decision") {
 		t.Fatalf("repeat accept error = %v, want effective-state error", err)
 	}
-	if err := command.Run(context.Background(), []string{"correct", "decision-1", "person-1"}); err == nil || !strings.Contains(err.Error(), "not effective") {
+	if err := command.Run(context.Background(), Invocation{Command: CommandReview, Action: ActionCorrect, Arguments: []string{"decision-1", "person-1"}}); err == nil || !strings.Contains(err.Error(), "not effective") {
 		t.Fatalf("stale correction error = %v, want stale-state error", err)
 	}
 	if got, want := store.actions, []string{

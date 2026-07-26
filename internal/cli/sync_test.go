@@ -28,7 +28,7 @@ func TestSyncCommandPrintsOnlyBoundedOutcomesOperationalIDsAndCounts(t *testing.
 	var output bytes.Buffer
 	command := SyncCommand{Service: service, Output: &output}
 
-	if err := command.Run(context.Background(), nil); err != nil {
+	if err := command.Run(context.Background(), Invocation{Command: CommandSync}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	want := "document_id=document-1 version_id=version-1 outcome=unchanged retry_count=0\n" +
@@ -49,13 +49,6 @@ func TestSyncCommandPrintsOnlyBoundedOutcomesOperationalIDsAndCounts(t *testing.
 	}
 }
 
-func TestSyncCommandRejectsArguments(t *testing.T) {
-	err := (SyncCommand{Service: &fixedSyncer{}}).Run(context.Background(), []string{"unexpected"})
-	if err == nil || !strings.Contains(err.Error(), "sync command usage") {
-		t.Fatalf("Run() error = %v, want usage error", err)
-	}
-}
-
 func TestSyncCommandRendersCompletedDocumentOutcomesBeforeReturningAggregateError(t *testing.T) {
 	service := &fixedSyncer{
 		summary: ingest.Summary{
@@ -69,7 +62,7 @@ func TestSyncCommandRendersCompletedDocumentOutcomesBeforeReturningAggregateErro
 		err: ingest.ErrFailurePersistence,
 	}
 	var output bytes.Buffer
-	err := (SyncCommand{Service: service, Output: &output}).Run(context.Background(), nil)
+	err := (SyncCommand{Service: service, Output: &output}).Run(context.Background(), Invocation{Command: CommandSync})
 	if !errors.Is(err, ingest.ErrFailurePersistence) {
 		t.Fatalf("Run() error = %v, want aggregate persistence error", err)
 	}
@@ -88,7 +81,7 @@ func TestSyncCommandRendersCompletedDocumentOutcomesBeforeReturningCancellation(
 		err: context.Canceled,
 	}
 	var output bytes.Buffer
-	err := (SyncCommand{Service: service, Output: &output}).Run(context.Background(), nil)
+	err := (SyncCommand{Service: service, Output: &output}).Run(context.Background(), Invocation{Command: CommandSync})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context cancellation", err)
 	}

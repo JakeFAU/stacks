@@ -24,10 +24,7 @@ type AnalyzeCommand struct {
 }
 
 // Run executes `analyze` without positional arguments.
-func (command AnalyzeCommand) Run(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return fmt.Errorf("analyze command usage: analyze")
-	}
+func (command AnalyzeCommand) Run(ctx context.Context, _ Invocation) error {
 	if command.Service == nil {
 		return fmt.Errorf("analyze command: service is not configured")
 	}

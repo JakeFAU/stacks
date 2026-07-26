@@ -17,22 +17,19 @@ type AuthCommand struct {
 }
 
 // Run executes `stacks auth google` or `stacks auth google-directory`.
-func (command AuthCommand) Run(ctx context.Context, args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: stacks auth google | stacks auth google-directory")
-	}
-	switch args[0] {
-	case "google":
+func (command AuthCommand) Run(ctx context.Context, invocation Invocation) error {
+	switch invocation.Action {
+	case ActionAuthGoogle:
 		if command.GoogleDrive == nil {
 			return errors.New("google authorization is not configured")
 		}
 		return command.GoogleDrive.Authorize(ctx)
-	case "google-directory":
+	case ActionAuthGoogleDirectory:
 		if command.GoogleDirectory == nil {
 			return errors.New("google directory authorization is not configured")
 		}
 		return command.GoogleDirectory.Authorize(ctx)
 	default:
-		return errors.New("usage: stacks auth google | stacks auth google-directory")
+		return errors.New("auth command: invocation is invalid")
 	}
 }
