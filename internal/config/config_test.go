@@ -511,6 +511,25 @@ func TestApplicationSettingsValidateRejectsOverlappingNormalizedTabTitles(t *tes
 	}
 }
 
+func TestApplicationSettingsValidationDoesNotExposeOverlappingTitle(t *testing.T) {
+	const secretLikeTitle = "Synthetic Secret Title Marker"
+	settings := validApplicationSettings()
+	settings.TranscriptTitles = []string{secretLikeTitle}
+	settings.NotesTitles = []string{"  synthetic   secret title marker "}
+
+	err := settings.Validate(CommandSync)
+	if err == nil {
+		t.Fatal("Validate(sync) error = nil, want overlapping titles rejection")
+	}
+	if !strings.Contains(err.Error(), TranscriptTitlesEnvironmentVariable) ||
+		!strings.Contains(err.Error(), NotesTitlesEnvironmentVariable) {
+		t.Fatalf("Validate(sync) error = %v, want bounded title setting names", err)
+	}
+	if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(secretLikeTitle)) {
+		t.Fatalf("Validate(sync) error exposed loaded title: %v", err)
+	}
+}
+
 func TestApplicationSettingsValidateDoctorDoesNotRequireAnalysisSettings(t *testing.T) {
 	settings := validApplicationSettings()
 	settings.Model.AWSProfile = ""

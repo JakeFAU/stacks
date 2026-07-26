@@ -76,12 +76,19 @@ func TestConfigValidateCommandRejectsMissingTarget(t *testing.T) {
 }
 
 func TestConfigValidateCommandRejectsInvalidAuthAction(t *testing.T) {
-	err := (ConfigValidateCommand{}).Run(context.Background(), Invocation{
+	var output strings.Builder
+	err := (ConfigValidateCommand{Output: &output}).Run(context.Background(), Invocation{
 		Command:          CommandConfig,
 		Action:           ActionValidate,
 		ConfigValidation: &ConfigValidationInput{Command: CommandAuth, Action: ActionList},
 	})
 	if err == nil {
 		t.Fatal("Run() error = nil, want invalid auth action rejection")
+	}
+	if err.Error() != "configuration validation target is invalid" {
+		t.Fatalf("Run() error = %q, want invalid auth target rejection", err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("Run() output = %q, want none for invalid auth target", output.String())
 	}
 }

@@ -146,10 +146,15 @@ func validateDatabaseScopes(scopes []DatabaseScope) error {
 			coreCount++
 		case DatabaseScopeDirectory:
 		default:
-			return fmt.Errorf("%s contains unknown scope %q", DatabaseScopesEnvironmentVariable, scope)
+			return fmt.Errorf(
+				"%s may contain only %q and %q",
+				DatabaseScopesEnvironmentVariable,
+				DatabaseScopeCore,
+				DatabaseScopeDirectory,
+			)
 		}
 		if _, duplicate := seen[scope]; duplicate {
-			return fmt.Errorf("%s contains duplicate scope %q", DatabaseScopesEnvironmentVariable, scope)
+			return fmt.Errorf("%s must not contain duplicate scopes", DatabaseScopesEnvironmentVariable)
 		}
 		seen[scope] = struct{}{}
 	}

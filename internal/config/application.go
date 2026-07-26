@@ -431,7 +431,7 @@ func validateDistinctTabTitles(transcriptTitles, notesTitles []string) error {
 	transcriptSet := normalizedTitleSet(transcriptTitles)
 	for title := range normalizedTitleSet(notesTitles) {
 		if _, exists := transcriptSet[title]; exists {
-			return fmt.Errorf("%s and %s must not overlap at normalized title %q", TranscriptTitlesEnvironmentVariable, NotesTitlesEnvironmentVariable, title)
+			return fmt.Errorf("%s and %s must not overlap after title normalization", TranscriptTitlesEnvironmentVariable, NotesTitlesEnvironmentVariable)
 		}
 	}
 	return nil

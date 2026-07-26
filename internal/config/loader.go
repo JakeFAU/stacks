@@ -510,17 +510,31 @@ func stringListValue(values *viper.Viper, key, environmentName string) ([]string
 }
 
 func databaseScopeValues(values *viper.Viper) ([]DatabaseScope, error) {
-	rawScopes, err := stringListValue(values, configKeyDatabaseScopes, DatabaseScopesEnvironmentVariable)
-	if err != nil {
-		return nil, err
+	var rawScopes []string
+	switch value := values.Get(configKeyDatabaseScopes).(type) {
+	case string:
+		parts := strings.Split(value, ",")
+		rawScopes = make([]string, len(parts))
+		for index, part := range parts {
+			rawScopes[index] = strings.TrimSpace(part)
+			if rawScopes[index] == "" {
+				return nil, fmt.Errorf("%s must contain comma-separated nonblank scope names", DatabaseScopesEnvironmentVariable)
+			}
+		}
+	default:
+		var err error
+		rawScopes, err = stringListValue(values, configKeyDatabaseScopes, DatabaseScopesEnvironmentVariable)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(rawScopes) == 0 {
-		return nil, fmt.Errorf("%s must contain nonblank comma-separated scopes", DatabaseScopesEnvironmentVariable)
+		return nil, fmt.Errorf("%s must contain comma-separated nonblank scope names", DatabaseScopesEnvironmentVariable)
 	}
 	scopes := make([]DatabaseScope, len(rawScopes))
 	for index, scope := range rawScopes {
 		if scope == "" {
-			return nil, fmt.Errorf("%s must contain nonblank comma-separated scopes", DatabaseScopesEnvironmentVariable)
+			return nil, fmt.Errorf("%s must contain comma-separated nonblank scope names", DatabaseScopesEnvironmentVariable)
 		}
 		scopes[index] = DatabaseScope(scope)
 	}

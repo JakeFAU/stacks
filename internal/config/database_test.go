@@ -48,6 +48,50 @@ func TestDatabaseScopeValidationRejectsUnknownDuplicateAndMissingCore(t *testing
 	}
 }
 
+func TestLoadDatabaseScopesRejectsBlankEnvironmentMembers(t *testing.T) {
+	tests := []struct {
+		name   string
+		scopes string
+	}{
+		{name: "blank middle member", scopes: "core,,directory"},
+		{name: "whitespace-only middle member", scopes: "core,  ,directory"},
+		{name: "blank leading member", scopes: ",core"},
+		{name: "blank trailing member", scopes: "core,"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			t.Setenv(DatabaseScopesEnvironmentVariable, testCase.scopes)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatal("Load() error = nil, want blank database scope rejection")
+			}
+			if !strings.Contains(err.Error(), DatabaseScopesEnvironmentVariable) {
+				t.Fatalf("Load() error = %v, want bounded database scope setting name", err)
+			}
+			if strings.Contains(err.Error(), testCase.scopes) {
+				t.Fatalf("Load() error exposed loaded database scopes: %v", err)
+			}
+		})
+	}
+}
+
+func TestDatabaseScopeValidationDoesNotExposeLoadedScope(t *testing.T) {
+	const secretLikeScope = "synthetic-secret-scope-marker"
+
+	err := validateDatabaseScopes([]DatabaseScope{DatabaseScopeCore, DatabaseScope(secretLikeScope)})
+	if err == nil {
+		t.Fatal("validateDatabaseScopes() error = nil, want unknown scope rejection")
+	}
+	if !strings.Contains(err.Error(), DatabaseScopesEnvironmentVariable) {
+		t.Fatalf("validateDatabaseScopes() error = %v, want bounded database scope setting name", err)
+	}
+	if strings.Contains(err.Error(), secretLikeScope) {
+		t.Fatalf("validateDatabaseScopes() error exposed loaded scope: %v", err)
+	}
+}
+
 func TestDirectoryProviderRequiresDirectoryDatabaseScope(t *testing.T) {
 	settings := Settings{
 		Database:    DatabaseSettings{Scopes: []DatabaseScope{DatabaseScopeCore}},
