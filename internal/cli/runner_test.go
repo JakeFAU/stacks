@@ -70,8 +70,8 @@ func TestRunnerDistinguishesOmittedAndBlankConfig(t *testing.T) {
 			calls++
 			return nil
 		}}).Run(t.Context(), []string{"--config", value, "serve"})
-		if err == nil || calls != 0 {
-			t.Fatalf("config %q error/calls = %v/%d", value, err, calls)
+		if err == nil || err.Error() != invalidCommandSyntaxMessage || calls != 0 {
+			t.Fatalf("config %q error/calls = %v/%d, want %q/0", value, err, calls, invalidCommandSyntaxMessage)
 		}
 	}
 }

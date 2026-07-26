@@ -102,19 +102,27 @@ func (r Runner) Run(ctx context.Context, args []string) error {
 }
 
 func (r Runner) newRootCommand(handled *bool) *cobra.Command {
-	execute := func(command *cobra.Command, invocation Invocation) error {
-		*handled = true
-		if command.Flags().Changed(configFlagName) {
-			configFile, err := command.Flags().GetString(configFlagName)
-			if err != nil {
-				return fmt.Errorf("read %s flag: %w", configFlagName, err)
-			}
-			if strings.TrimSpace(configFile) == "" {
-				return fmt.Errorf("--%s requires a configuration file", configFlagName)
-			}
-			copied := configFile
-			invocation.ConfigFile = &copied
+	selectedConfigFile := func(command *cobra.Command) (*string, error) {
+		if !command.Flags().Changed(configFlagName) {
+			return nil, nil
 		}
+		configFile, err := command.Flags().GetString(configFlagName)
+		if err != nil {
+			return nil, fmt.Errorf("read %s flag: %w", configFlagName, err)
+		}
+		if strings.TrimSpace(configFile) == "" {
+			return nil, fmt.Errorf("--%s requires a configuration file", configFlagName)
+		}
+		copied := configFile
+		return &copied, nil
+	}
+	execute := func(command *cobra.Command, invocation Invocation) error {
+		configFile, err := selectedConfigFile(command)
+		if err != nil {
+			return err
+		}
+		*handled = true
+		invocation.ConfigFile = configFile
 		if r.Execute == nil {
 			return fmt.Errorf("%s command is not configured", invocation.Command)
 		}
@@ -125,7 +133,6 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 			Use:  use,
 			Args: args,
 			RunE: func(command *cobra.Command, values []string) error {
-				*handled = true
 				return execute(command, Invocation{Command: topLevel, Action: action, Arguments: values})
 			},
 		}
@@ -219,6 +226,9 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	acceptDirectory := leaf(string(ActionAcceptDirectory)+" <proposal-id> <directory-profile-id>", CommandReview, ActionAcceptDirectory, cobra.ExactArgs(2))
 	acceptDirectory.Flags().String(acceptDirectoryEntityFlagName, "", "existing entity ID")
 	acceptDirectory.RunE = func(command *cobra.Command, values []string) error {
+		if _, err := selectedConfigFile(command); err != nil {
+			return err
+		}
 		*handled = true
 		entityID, err := command.Flags().GetString(acceptDirectoryEntityFlagName)
 		if err != nil {
@@ -241,6 +251,9 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	create.Flags().String(reviewCreateEmailFlagName, "", "new person email")
 	_ = create.MarkFlagRequired(reviewCreateNameFlagName)
 	create.RunE = func(command *cobra.Command, values []string) error {
+		if _, err := selectedConfigFile(command); err != nil {
+			return err
+		}
 		*handled = true
 		name, err := command.Flags().GetString(reviewCreateNameFlagName)
 		if err != nil {
