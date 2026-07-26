@@ -13,12 +13,13 @@ import (
 
 const decisionEventName = "stacks.decision"
 
-// DecisionObservation describes one completed operational decision. Name and
-// outcome must be bounded, low-cardinality values; never use document text,
-// prompts, IDs, or other private/user-controlled values.
+// DecisionObservation describes one completed operational decision. Name,
+// outcome, and optional reason must be bounded, low-cardinality values; never
+// use document text, prompts, IDs, or other private/user-controlled values.
 type DecisionObservation struct {
 	Name       string
 	Outcome    string
+	Reason     string
 	Duration   time.Duration
 	InputSize  int64
 	OutputSize int64
@@ -97,6 +98,9 @@ func (r *DecisionRecorder) Record(ctx context.Context, observation DecisionObser
 		attribute.Int64("stacks.decision.output.size", observation.OutputSize),
 		attribute.Float64("stacks.decision.duration_seconds", observation.Duration.Seconds()),
 	)
+	if observation.Reason != "" {
+		eventAttributes = append(eventAttributes, attribute.String("stacks.decision.reason", observation.Reason))
+	}
 	if observation.Confidence != nil {
 		r.confidence.Record(ctx, *observation.Confidence, metricOptions)
 		eventAttributes = append(eventAttributes, attribute.Float64("stacks.decision.confidence", *observation.Confidence))

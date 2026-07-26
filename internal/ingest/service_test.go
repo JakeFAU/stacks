@@ -14,6 +14,7 @@ import (
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/observation"
 	"go.opentelemetry.io/otel/codes"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.uber.org/zap"
@@ -1275,6 +1276,51 @@ func TestSyncRecordsOneSuccessfulBoundedIngestionSpanAndDecision(t *testing.T) {
 	}
 	if len(decisions.observations) != 1 || decisions.observations[0].Name != ingestionDecisionName || decisions.observations[0].Outcome != string(OutcomeCompleted) {
 		t.Fatalf("decision observations = %#v, want one bounded completed decision", decisions.observations)
+	}
+}
+
+func TestSyncRecordsBoundedIngestionFailureReasonOnDecisionEvent(t *testing.T) {
+	const privateValue = "Synthetic private model output"
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	decisions, err := observability.NewDecisionRecorder(metricnoop.NewMeterProvider().Meter("synthetic"))
+	if err != nil {
+		t.Fatalf("NewDecisionRecorder() error = %v", err)
+	}
+	service := testService(
+		syntheticDocument("document-failed-telemetry", "Leader assigns follow-up."),
+		newMemoryRepository(),
+		&recordingModel{responses: []extract.Response{{
+			Output:        json.RawMessage(`{"private":"` + privateValue + `"}`),
+			ModelID:       "synthetic-model",
+			PromptVersion: extract.ExtractionPromptVersion,
+			Outcome:       "success",
+		}}},
+	)
+	service.Tracer = provider.Tracer("synthetic")
+	service.Decisions = decisions
+
+	summary, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if len(summary.Results) != 1 || summary.Results[0].FailureCode != FailureInvalidOutput {
+		t.Fatalf("summary results = %#v, want one invalid-output failure", summary.Results)
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 || len(spans[0].Events) != 1 {
+		t.Fatalf("spans = %#v, want one ingestion span with one decision event", spans)
+	}
+	eventAttributes := make(map[string]string)
+	for _, value := range spans[0].Events[0].Attributes {
+		eventAttributes[string(value.Key)] = value.Value.String()
+	}
+	if eventAttributes["stacks.decision.reason"] != string(FailureInvalidOutput) {
+		t.Fatalf("decision event attributes = %#v, want bounded invalid-output reason", eventAttributes)
+	}
+	if strings.Contains(renderRecordedSpan(spans[0]), privateValue) {
+		t.Fatal("recorded span disclosed private model output")
 	}
 }
 
