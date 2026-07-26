@@ -1,0 +1,330 @@
+package postgres_test
+
+import (
+	"reflect"
+	"testing"
+	"time"
+
+	postgres "github.com/JakeFAU/stacks/adapters/postgres"
+	"github.com/JakeFAU/stacks/core/admission"
+	"github.com/JakeFAU/stacks/core/identity"
+	"github.com/JakeFAU/stacks/core/observation"
+)
+
+func TestObservationQueryResolvesCurrentIdentityAndAdmission(t *testing.T) {
+	fixture := newObservationRepositoryFixture(t)
+	firstEntity := canonicalEntity(t, "entity:opaque/relationship-a", "Synthetic Contributor A")
+	secondEntity := canonicalEntity(t, "entity:opaque/relationship-b", "Synthetic Contributor B")
+	correctedEntity := canonicalEntity(t, "entity:opaque/relationship-c", "Synthetic Contributor C")
+	firstMention := canonicalMention(
+		t,
+		"mention:opaque/relationship-a",
+		fixture.evidence[0],
+		"Synthetic Contributor A",
+		"",
+	)
+	secondMention := canonicalMention(
+		t,
+		"mention:opaque/relationship-b",
+		fixture.evidence[1],
+		"Synthetic Contributor B",
+		"",
+	)
+	firstProposal := canonicalProposal(
+		t,
+		"proposal:opaque/relationship-a",
+		firstMention.ID(),
+		fixture.evidence[0],
+	)
+	secondProposal := canonicalProposal(
+		t,
+		"proposal:opaque/relationship-b",
+		secondMention.ID(),
+		fixture.evidence[1],
+	)
+	initialFirstDecision := canonicalResolutionDecision(
+		t,
+		"decision:opaque/relationship-a-initial",
+		firstProposal.ID(),
+		identity.DecisionAccepted,
+		firstEntity.ID(),
+		identity.AuthorityReviewer,
+		"",
+		observationRecordedAt.Add(time.Minute),
+	)
+	correctedFirstDecision := canonicalResolutionDecision(
+		t,
+		"decision:opaque/relationship-a-corrected",
+		firstProposal.ID(),
+		identity.DecisionAccepted,
+		correctedEntity.ID(),
+		identity.AuthorityReviewer,
+		initialFirstDecision.ID(),
+		observationRecordedAt.Add(2*time.Minute),
+	)
+	secondDecision := canonicalResolutionDecision(
+		t,
+		"decision:opaque/relationship-b",
+		secondProposal.ID(),
+		identity.DecisionAccepted,
+		secondEntity.ID(),
+		identity.AuthorityReviewer,
+		"",
+		observationRecordedAt.Add(time.Minute),
+	)
+	if err := fixture.database.InTransaction(fixture.ctx, func(transaction *postgres.Transaction) error {
+		for _, entity := range []identity.Entity{firstEntity, secondEntity, correctedEntity} {
+			if _, err := transaction.PutEntity(fixture.ctx, entity); err != nil {
+				return err
+			}
+		}
+		for _, mention := range []identity.MentionRecord{firstMention, secondMention} {
+			if _, err := transaction.PutMention(fixture.ctx, mention); err != nil {
+				return err
+			}
+		}
+		for _, proposal := range []identity.ResolutionProposal{firstProposal, secondProposal} {
+			if _, err := transaction.PutResolutionProposal(fixture.ctx, proposal); err != nil {
+				return err
+			}
+		}
+		if err := transaction.AppendResolutionDecision(
+			fixture.ctx,
+			initialFirstDecision,
+			nil,
+		); err != nil {
+			return err
+		}
+		if err := transaction.AppendResolutionDecision(
+			fixture.ctx,
+			correctedFirstDecision,
+			nil,
+		); err != nil {
+			return err
+		}
+		return transaction.AppendResolutionDecision(fixture.ctx, secondDecision, nil)
+	}); err != nil {
+		t.Fatalf("persist relationship identity authority: %v", err)
+	}
+
+	firstMentionTerm, err := observation.NewMentionTerm(string(firstMention.ID()))
+	if err != nil {
+		t.Fatalf("observation.NewMentionTerm(first) error = %v", err)
+	}
+	secondMentionTerm, err := observation.NewMentionTerm(string(secondMention.ID()))
+	if err != nil {
+		t.Fatalf("observation.NewMentionTerm(second) error = %v", err)
+	}
+	firstEntityTerm, err := observation.NewEntityTerm(string(firstEntity.ID()), "")
+	if err != nil {
+		t.Fatalf("observation.NewEntityTerm(first) error = %v", err)
+	}
+	secondEntityTerm, err := observation.NewEntityTerm(
+		string(secondEntity.ID()),
+		string(secondMention.ID()),
+	)
+	if err != nil {
+		t.Fatalf("observation.NewEntityTerm(second) error = %v", err)
+	}
+	direct := canonicalObservation(
+		t,
+		"observation:relationship/direct",
+		firstEntityTerm,
+		"collaboration.supports",
+		secondMentionTerm,
+		observation.UnknownTime(),
+		observationRecordedAt.Add(3*time.Minute),
+		observation.StatusObserved,
+		[]observation.EvidenceLink{supportingLink(fixture.evidence[0])},
+		nil,
+		fixture.run.ID,
+	)
+	corrected := canonicalObservation(
+		t,
+		"observation:relationship/corrected",
+		firstMentionTerm,
+		"collaboration.supports",
+		secondEntityTerm,
+		observation.UnknownTime(),
+		observationRecordedAt.Add(4*time.Minute),
+		observation.StatusObserved,
+		[]observation.EvidenceLink{
+			supportingLink(fixture.evidence[1]),
+			{
+				EvidenceID: fixture.evidence[0].ID(),
+				Role:       observation.EvidenceContradicting,
+			},
+		},
+		nil,
+		fixture.run.ID,
+	)
+	retired := canonicalObservation(
+		t,
+		"observation:relationship/retired",
+		firstEntityTerm,
+		"collaboration.supports",
+		secondEntityTerm,
+		observation.UnknownTime(),
+		observationRecordedAt.Add(5*time.Minute),
+		observation.StatusObserved,
+		[]observation.EvidenceLink{supportingLink(fixture.evidence[0])},
+		nil,
+		fixture.run.ID,
+	)
+	quarantined := canonicalObservation(
+		t,
+		"observation:relationship/quarantined",
+		firstEntityTerm,
+		"collaboration.supports",
+		secondEntityTerm,
+		observation.UnknownTime(),
+		observationRecordedAt.Add(6*time.Minute),
+		observation.StatusObserved,
+		[]observation.EvidenceLink{supportingLink(fixture.evidence[1])},
+		nil,
+		fixture.run.ID,
+	)
+	if err := fixture.database.InTransaction(fixture.ctx, func(transaction *postgres.Transaction) error {
+		for _, value := range []observation.Observation{direct, corrected, retired, quarantined} {
+			if _, err := transaction.PutObservation(fixture.ctx, value); err != nil {
+				return err
+			}
+		}
+		decisions := []admission.Decision{
+			canonicalAdmissionDecision(
+				t,
+				"admission:relationship/direct",
+				admission.TargetObservation,
+				string(direct.ID()),
+				admission.Admitted,
+				admission.AuthorityPolicy,
+				"",
+				observationRecordedAt.Add(7*time.Minute),
+			),
+			canonicalAdmissionDecision(
+				t,
+				"admission:relationship/corrected",
+				admission.TargetObservation,
+				string(corrected.ID()),
+				admission.Admitted,
+				admission.AuthorityPolicy,
+				"",
+				observationRecordedAt.Add(7*time.Minute),
+			),
+			canonicalAdmissionDecision(
+				t,
+				"admission:relationship/retired-initial",
+				admission.TargetObservation,
+				string(retired.ID()),
+				admission.Admitted,
+				admission.AuthorityPolicy,
+				"",
+				observationRecordedAt.Add(7*time.Minute),
+			),
+			canonicalAdmissionDecision(
+				t,
+				"admission:relationship/quarantined",
+				admission.TargetObservation,
+				string(quarantined.ID()),
+				admission.Quarantined,
+				admission.AuthorityPolicy,
+				"",
+				observationRecordedAt.Add(7*time.Minute),
+			),
+		}
+		for _, decision := range decisions {
+			if err := transaction.AppendAdmissionDecision(fixture.ctx, decision); err != nil {
+				return err
+			}
+		}
+		return transaction.AppendAdmissionDecision(
+			fixture.ctx,
+			canonicalAdmissionDecision(
+				t,
+				"admission:relationship/retired-current",
+				admission.TargetObservation,
+				string(retired.ID()),
+				admission.Retired,
+				admission.AuthorityReviewer,
+				"admission:relationship/retired-initial",
+				observationRecordedAt.Add(8*time.Minute),
+			),
+		)
+	}); err != nil {
+		t.Fatalf("persist relationship observations and admission: %v", err)
+	}
+
+	directRecords, err := fixture.database.ListAdmittedRelationshipObservations(
+		fixture.ctx,
+		firstEntity.ID(),
+		secondEntity.ID(),
+	)
+	if err != nil {
+		t.Fatalf("ListAdmittedRelationshipObservations(direct pair) error = %v", err)
+	}
+	if len(directRecords) != 1 ||
+		directRecords[0].Observation.ID() != direct.ID() ||
+		directRecords[0].SubjectEntityID != firstEntity.ID() ||
+		directRecords[0].ObjectEntityID != secondEntity.ID() {
+		t.Fatalf("direct pair records = %#v, want only direct admitted observation", directRecords)
+	}
+	directSubjectEntityID, directGroundingID, ok := directRecords[0].Observation.Statement().Subject.Entity()
+	if !ok ||
+		directSubjectEntityID != string(firstEntity.ID()) ||
+		directGroundingID != "" {
+		t.Fatalf(
+			"direct assertion subject = (%q, %q, %v), want original direct entity",
+			directSubjectEntityID,
+			directGroundingID,
+			ok,
+		)
+	}
+
+	correctedRecords, err := fixture.database.ListAdmittedRelationshipObservations(
+		fixture.ctx,
+		correctedEntity.ID(),
+		secondEntity.ID(),
+	)
+	if err != nil {
+		t.Fatalf("ListAdmittedRelationshipObservations(corrected pair) error = %v", err)
+	}
+	if len(correctedRecords) != 1 ||
+		correctedRecords[0].Observation.ID() != corrected.ID() ||
+		correctedRecords[0].EffectiveAdmission.Outcome() != admission.Admitted {
+		t.Fatalf("corrected pair records = %#v, want only current-authority observation", correctedRecords)
+	}
+	if len(correctedRecords[0].Evidence) != 2 {
+		t.Fatalf("corrected observation evidence count = %d, want 2", len(correctedRecords[0].Evidence))
+	}
+	gotRoles := make(map[string]observation.EvidenceRole, 2)
+	for index, record := range correctedRecords[0].Evidence {
+		gotRoles[string(record.Span.ID())] = record.Role
+		if index > 0 {
+			previous := correctedRecords[0].Evidence[index-1]
+			if previous.Span.ID() > record.Span.ID() ||
+				(previous.Span.ID() == record.Span.ID() && previous.Role > record.Role) {
+				t.Fatalf(
+					"corrected evidence is not in canonical ID-role order: %#v",
+					correctedRecords[0].Evidence,
+				)
+			}
+		}
+	}
+	wantRoles := map[string]observation.EvidenceRole{
+		string(fixture.evidence[0].ID()): observation.EvidenceContradicting,
+		string(fixture.evidence[1].ID()): observation.EvidenceSupporting,
+	}
+	if !reflect.DeepEqual(gotRoles, wantRoles) {
+		t.Fatalf("corrected evidence roles = %v, want %v", gotRoles, wantRoles)
+	}
+	for _, record := range correctedRecords[0].Evidence {
+		if record.Span.ID() == "" ||
+			record.SourceDocumentID == "" ||
+			record.DocumentVersionID == "" ||
+			record.SectionID == "" ||
+			record.SectionTitle == "" ||
+			record.SectionRole == "" {
+			t.Fatalf("incomplete generic evidence provenance = %#v", record)
+		}
+	}
+}

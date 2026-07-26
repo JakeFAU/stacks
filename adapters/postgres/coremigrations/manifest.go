@@ -8,11 +8,12 @@ import (
 )
 
 const (
-	coreSchema       = "stacks_core"
-	migrationSchema  = "stacks_migrations"
-	coreLedger       = "core_version"
-	documentsVersion = 1
-	identityVersion  = 2
+	coreSchema        = "stacks_core"
+	migrationSchema   = "stacks_migrations"
+	coreLedger        = "core_version"
+	documentsVersion  = 1
+	identityVersion   = 2
+	extractionVersion = 3
 )
 
 //go:embed migrations/*.sql
@@ -34,6 +35,11 @@ func Manifest() (migration.Manifest, error) {
 				Version: identityVersion,
 				Name:    "identity_admission",
 				Path:    "migrations/00002_identity_admission.sql",
+			},
+			{
+				Version: extractionVersion,
+				Name:    "extraction_observations",
+				Path:    "migrations/00003_extraction_observations.sql",
 			},
 		},
 		[]string{coreSchema},
@@ -79,6 +85,30 @@ func Manifest() (migration.Manifest, error) {
 			immutableTableGrant("entity_alias_assertions"),
 			immutableTableGrant("admission_targets"),
 			immutableTableGrant("admission_decisions"),
+			{
+				Schema:     coreSchema,
+				Table:      "extraction_runs",
+				Privileges: []migration.Privilege{migration.PrivilegeSelect, migration.PrivilegeInsert, migration.PrivilegeUpdate},
+				UpdateColumns: []string{
+					"state",
+					"completed_at",
+					"write_set_digest_version",
+					"write_set_digest",
+				},
+			},
+			{
+				Schema:     coreSchema,
+				Table:      "extraction_attempts",
+				Privileges: []migration.Privilege{migration.PrivilegeSelect, migration.PrivilegeInsert, migration.PrivilegeUpdate},
+				UpdateColumns: []string{
+					"lease_expires_at",
+					"state",
+					"terminal_at",
+					"failure_code",
+				},
+			},
+			immutableTableGrant("observations"),
+			immutableTableGrant("observation_evidence"),
 			{
 				Schema:     migrationSchema,
 				Table:      coreLedger,

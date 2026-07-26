@@ -24,8 +24,8 @@ func TestCoreManifestStartsWithDocumentsAndEvidence(t *testing.T) {
 	if manifest.Scope != "core" || manifest.Ledger != "core_version" {
 		t.Fatalf("manifest identity = (%q, %q), want (core, core_version)", manifest.Scope, manifest.Ledger)
 	}
-	if len(manifest.Migrations) != 2 {
-		t.Fatalf("migration count = %d, want 2", len(manifest.Migrations))
+	if len(manifest.Migrations) != 3 {
+		t.Fatalf("migration count = %d, want 3", len(manifest.Migrations))
 	}
 	first := manifest.Migrations[0]
 	if first.Version != 1 || first.Name != "documents_evidence" {
@@ -34,6 +34,10 @@ func TestCoreManifestStartsWithDocumentsAndEvidence(t *testing.T) {
 	second := manifest.Migrations[1]
 	if second.Version != 2 || second.Name != "identity_admission" {
 		t.Fatalf("second migration = (%d, %q), want (2, identity_admission)", second.Version, second.Name)
+	}
+	third := manifest.Migrations[2]
+	if third.Version != 3 || third.Name != "extraction_observations" {
+		t.Fatalf("third migration = (%d, %q), want (3, extraction_observations)", third.Version, third.Name)
 	}
 
 	wantTables := []string{
@@ -44,7 +48,11 @@ func TestCoreManifestStartsWithDocumentsAndEvidence(t *testing.T) {
 		"entities",
 		"entity_alias_assertions",
 		"evidence_spans",
+		"extraction_attempts",
+		"extraction_runs",
 		"mentions",
+		"observation_evidence",
+		"observations",
 		"resolution_candidates",
 		"resolution_decisions",
 		"resolution_proposal_evidence",
@@ -488,7 +496,11 @@ func TestDocumentsMigrationContainsNoVerticalOrProviderObjects(t *testing.T) {
 		"entities",
 		"entity_alias_assertions",
 		"evidence_spans",
+		"extraction_attempts",
+		"extraction_runs",
 		"mentions",
+		"observation_evidence",
+		"observations",
 		"resolution_candidates",
 		"resolution_decisions",
 		"resolution_proposal_evidence",
@@ -588,8 +600,8 @@ func TestCleanCoreDocumentsInstallUsesTextIDsAndTimestampSix(t *testing.T) {
 	).Scan(&appliedVersion); err != nil {
 		t.Fatalf("application role read core migration ledger: %v", err)
 	}
-	if appliedVersion != 2 {
-		t.Fatalf("application-visible core ledger version = %d, want 2", appliedVersion)
+	if appliedVersion != 3 {
+		t.Fatalf("application-visible core ledger version = %d, want 3", appliedVersion)
 	}
 }
 
