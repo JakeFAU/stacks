@@ -112,6 +112,7 @@ const (
 	coreScope           Scope = "core"
 	directoryScope      Scope = "directory"
 	coreLedgerName            = "core_version"
+	coreSchemaName            = "stacks_core"
 	directoryLedgerName       = "directory_version"
 	directorySchemaName       = "stacks_directory"
 	migrationSchemaName       = "stacks_migrations"
@@ -346,17 +347,8 @@ func ValidateManifestSet(manifests []Manifest) error {
 	if core.Ledger != coreLedgerName {
 		return fmt.Errorf("core migration ledger must be %q", coreLedgerName)
 	}
-	migrationSchema := OwnedObject{
-		Kind: ObjectSchema, Schema: migrationSchemaName, Name: migrationSchemaName,
-	}
-	if owner, owned := objectOwners[migrationSchema.key()]; !owned || owner != coreScope {
-		return fmt.Errorf("core migration scope must exactly own the stacks_migrations schema")
-	}
-	coreLedger := OwnedObject{
-		Kind: ObjectTable, Schema: migrationSchemaName, Name: coreLedgerName,
-	}
-	if owner, owned := objectOwners[coreLedger.key()]; !owned || owner != coreScope {
-		return fmt.Errorf("core migration scope must exactly own ledger %q", coreLedgerName)
+	if err := validateCoreOwnership(core); err != nil {
+		return err
 	}
 	for _, manifest := range manifests {
 		ledger := OwnedObject{
@@ -403,6 +395,42 @@ func ValidateManifestSet(manifests []Manifest) error {
 			"directory migration scope must own only ledger %q outside its schema tree",
 			directoryLedgerName,
 		)
+	}
+	return nil
+}
+
+func validateCoreOwnership(core Manifest) error {
+	if len(core.OwnedSchemaTrees) != 1 || core.OwnedSchemaTrees[0] != coreSchemaName {
+		return fmt.Errorf(
+			"core migration scope must own exactly the %q schema tree",
+			coreSchemaName,
+		)
+	}
+
+	migrationSchema := OwnedObject{
+		Kind: ObjectSchema, Schema: migrationSchemaName, Name: migrationSchemaName,
+	}
+	coreLedger := OwnedObject{
+		Kind: ObjectTable, Schema: migrationSchemaName, Name: coreLedgerName,
+	}
+	requiredObjects := map[OwnedObject]struct{}{
+		migrationSchema: {},
+		coreLedger:      {},
+	}
+	for _, object := range core.OwnedObjects {
+		if _, required := requiredObjects[object]; !required {
+			return fmt.Errorf(
+				"core migration scope owns unexpected exact object %s",
+				object.description(),
+			)
+		}
+		delete(requiredObjects, object)
+	}
+	if _, missing := requiredObjects[migrationSchema]; missing {
+		return fmt.Errorf("core migration scope must exactly own the %q schema", migrationSchemaName)
+	}
+	if _, missing := requiredObjects[coreLedger]; missing {
+		return fmt.Errorf("core migration scope must exactly own ledger %q", coreLedgerName)
 	}
 	return nil
 }

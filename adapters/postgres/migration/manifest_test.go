@@ -651,6 +651,117 @@ func TestManifestSetRequiresCoreFirstOwnedScopes(t *testing.T) {
 	}
 }
 
+func TestManifestSetRejectsNoncanonicalCoreOwnership(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{
+			name: "missing core schema tree",
+			mutate: func(core *Manifest) {
+				core.OwnedSchemaTrees = nil
+			},
+		},
+		{
+			name: "wrong core schema tree",
+			mutate: func(core *Manifest) {
+				core.OwnedSchemaTrees = []string{"stacks_wrong"}
+			},
+		},
+		{
+			name: "extra core schema tree",
+			mutate: func(core *Manifest) {
+				core.OwnedSchemaTrees = append(core.OwnedSchemaTrees, "stacks_extra")
+			},
+		},
+		{
+			name: "extra core exact table",
+			mutate: func(core *Manifest) {
+				core.OwnedObjects = append(core.OwnedObjects, OwnedObject{
+					Kind: ObjectTable, Schema: "stacks_migrations", Name: "unexpected_version",
+				})
+			},
+		},
+		{
+			name: "extra core exact function",
+			mutate: func(core *Manifest) {
+				core.OwnedObjects = append(core.OwnedObjects, OwnedObject{
+					Kind: ObjectFunction, Schema: "stacks_other", Name: "unexpected_function",
+				})
+			},
+		},
+		{
+			name: "extra core exact trigger",
+			mutate: func(core *Manifest) {
+				core.OwnedObjects = append(core.OwnedObjects, OwnedObject{
+					Kind:   ObjectTrigger,
+					Schema: "stacks_other",
+					Parent: "records",
+					Name:   "unexpected_trigger",
+				})
+			},
+		},
+		{
+			name: "extra core exact schema",
+			mutate: func(core *Manifest) {
+				core.OwnedObjects = append(core.OwnedObjects, OwnedObject{
+					Kind: ObjectSchema, Schema: "stacks_other", Name: "stacks_other",
+				})
+			},
+		},
+		{
+			name: "unexpected directory ledger object",
+			mutate: func(core *Manifest) {
+				core.OwnedObjects = append(core.OwnedObjects, OwnedObject{
+					Kind: ObjectTable, Schema: "stacks_migrations", Name: "directory_version",
+				})
+			},
+		},
+		{
+			name: "redundant exact object inside core tree",
+			mutate: func(core *Manifest) {
+				core.OwnedObjects = append(core.OwnedObjects, OwnedObject{
+					Kind: ObjectTable, Schema: "stacks_core", Name: "records",
+				})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			core := coreManifestForSet()
+			test.mutate(&core)
+
+			err := ValidateManifestSet([]Manifest{core})
+			if err == nil {
+				t.Fatal("ValidateManifestSet() error = nil, want canonical core ownership rejection")
+			}
+			if !strings.Contains(err.Error(), "core") {
+				t.Fatalf("ValidateManifestSet() error = %q, want core ownership context", err)
+			}
+		})
+	}
+}
+
+func TestManifestSetAcceptsCanonicalCoreOwnership(t *testing.T) {
+	t.Parallel()
+
+	core := coreManifestForSet()
+	directory := directoryManifestForSet()
+	for _, manifests := range [][]Manifest{
+		{core},
+		{core, directory},
+	} {
+		if err := ValidateManifestSet(manifests); err != nil {
+			t.Fatalf("ValidateManifestSet(%d scopes) error = %v", len(manifests), err)
+		}
+	}
+}
+
 func validManifest(scope Scope, ledger string) Manifest {
 	return Manifest{
 		Scope:  scope,
