@@ -47,38 +47,29 @@ func Execute(
 	commandProvider CommandProvider,
 	stdout, stderr io.Writer,
 ) error {
-	command := config.CommandServe
-	if len(args) > 0 {
-		command = config.Command(args[0])
-	}
-	if err := settings.Validate(command); err != nil {
-		return err
-	}
-
-	runner := cli.Runner{Commands: map[string]cli.Command{
-		string(config.CommandServe): cli.CommandFunc(func(ctx context.Context, _ []string) error {
-			return runtime.Serve(ctx, settings)
-		}),
-	}}
-	if command == config.CommandAuth ||
-		command == config.CommandDoctor ||
-		command == config.CommandSync ||
-		command == config.CommandEntities ||
-		command == config.CommandReview ||
-		command == config.CommandAnalyze ||
-		command == config.CommandDBMigrate ||
-		command == config.CommandDBStatus ||
-		command == config.CommandDBReset {
-		if commandProvider == nil {
-			return fmt.Errorf("%s command is not configured", command)
-		}
-		commands, err := commandProvider.Commands(ctx, settings, stdout, stderr)
-		if err != nil {
-			return err
-		}
-		for name, registered := range commands {
-			runner.Commands[name] = registered
-		}
+	runner := cli.Runner{
+		Input: nil, Output: stdout, Error: stderr,
+		Execute: func(ctx context.Context, invocation cli.Invocation) error {
+			command := config.Command(invocation.Command)
+			if err := settings.Validate(command); err != nil {
+				return err
+			}
+			if command == config.CommandServe {
+				return runtime.Serve(ctx, settings)
+			}
+			if commandProvider == nil {
+				return fmt.Errorf("%s command is not configured", command)
+			}
+			commands, err := commandProvider.Commands(ctx, settings, stdout, stderr)
+			if err != nil {
+				return err
+			}
+			selected, ok := commands[string(command)]
+			if !ok || selected == nil {
+				return fmt.Errorf("%s command is not configured", command)
+			}
+			return selected.Run(ctx, invocation)
+		},
 	}
 	return runner.Run(ctx, args)
 }

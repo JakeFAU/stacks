@@ -12,6 +12,7 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"stacks/internal/analysis"
+	"stacks/internal/cli"
 	"stacks/internal/config"
 	"stacks/internal/directory"
 	"stacks/internal/extract"
@@ -72,7 +73,7 @@ func TestCoreCommandsOpenOnlyCanonicalPostgresRepositories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err != nil {
+	if err := commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync}); err != nil {
 		t.Fatalf("sync error = %v", err)
 	}
 	if opened != 1 || closed != 1 {
@@ -116,7 +117,7 @@ func TestCoreOnlyCompositionConstructsNoDirectoryBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err != nil {
+	if err := commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync}); err != nil {
 		t.Fatalf("core-only sync error = %v", err)
 	}
 	if directoryLookups != 0 || directoryRepositories != 0 {
@@ -161,7 +162,7 @@ func TestEnabledDirectoryUsesOptionalCanonicalScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	if err := commands[string(config.CommandSync)].Run(context.Background(), nil); err != nil {
+	if err := commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync}); err != nil {
 		t.Fatalf("directory-enabled sync error = %v", err)
 	}
 	if !includeDirectory {
@@ -200,7 +201,7 @@ func TestEnabledDirectoryWithoutScopeFailsBeforeConstruction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	err = commands[string(config.CommandSync)].Run(context.Background(), nil)
+	err = commands[string(config.CommandSync)].Run(context.Background(), cli.Invocation{Command: cli.CommandSync})
 	if err == nil || !strings.Contains(err.Error(), config.DatabaseScopesEnvironmentVariable) {
 		t.Fatalf("sync error = %v, want missing optional scope", err)
 	}
@@ -235,7 +236,7 @@ func TestAnalyzeUsesReadOnlyCanonicalQueryRepository(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	err = commands[string(config.CommandAnalyze)].Run(context.Background(), nil)
+	err = commands[string(config.CommandAnalyze)].Run(context.Background(), cli.Invocation{Command: cli.CommandAnalyze})
 	if !errors.Is(err, analysis.ErrPairNotAccepted) {
 		t.Fatalf("analyze error = %v, want canonical pair authority rejection", err)
 	}

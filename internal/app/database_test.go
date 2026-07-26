@@ -31,7 +31,7 @@ func TestExecuteRoutesDBMigrateAndDBStatusThroughLazyCommandProvider(t *testing.
 				providerCalls++
 				return map[string]cli.Command{string(command): cli.CommandFunc(func(
 					context.Context,
-					[]string,
+					cli.Invocation,
 				) error {
 					commandCalls++
 					return nil

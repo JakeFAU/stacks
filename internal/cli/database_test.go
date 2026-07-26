@@ -33,7 +33,7 @@ func TestDBMigratePrintsOnlyBoundedScopeVersions(t *testing.T) {
 			Scope: "core", Applied: []int64{2, 3}, CurrentVersion: 3,
 		}}}},
 		Output: &output,
-	}).Run(t.Context(), nil)
+	}).Run(t.Context(), Invocation{Command: CommandDBMigrate})
 	if err != nil {
 		t.Fatalf("DBMigrateCommand.Run() error = %v", err)
 	}
@@ -58,7 +58,7 @@ func TestDBStatusPrintsFixedScopeStateVersionConfiguredRecords(t *testing.T) {
 			},
 		}},
 		Output: &output,
-	}).Run(t.Context(), nil)
+	}).Run(t.Context(), Invocation{Command: CommandDBStatus})
 	if err != nil {
 		t.Fatalf("DBStatusCommand.Run() error = %v", err)
 	}

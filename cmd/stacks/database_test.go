@@ -61,14 +61,14 @@ func TestDatabaseCommandsEmitOnlyBoundedTelemetry(t *testing.T) {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
 	for _, invocation := range []struct {
-		command config.Command
-		args    []string
+		command   config.Command
+		arguments []string
 	}{
 		{command: config.CommandDBMigrate},
 		{command: config.CommandDBStatus},
-		{command: config.CommandDBReset, args: []string{"delete-local-stacks-postgres"}},
+		{command: config.CommandDBReset, arguments: []string{"delete-local-stacks-postgres"}},
 	} {
-		if err := commands[string(invocation.command)].Run(t.Context(), invocation.args); err != nil {
+		if err := commands[string(invocation.command)].Run(t.Context(), cli.Invocation{Command: cli.CommandName(invocation.command), Arguments: invocation.arguments}); err != nil {
 			t.Fatalf("%s Run() error = %v", invocation.command, err)
 		}
 	}
@@ -149,15 +149,15 @@ func TestDatabaseCommandsConstructNoProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commandProviderWithRuntime() error = %v", err)
 	}
-	if err := commands[string(config.CommandDBMigrate)].Run(t.Context(), nil); err != nil {
+	if err := commands[string(config.CommandDBMigrate)].Run(t.Context(), cli.Invocation{Command: cli.CommandDBMigrate}); err != nil {
 		t.Fatalf("db-migrate Run() error = %v", err)
 	}
-	if err := commands[string(config.CommandDBStatus)].Run(t.Context(), nil); err != nil {
+	if err := commands[string(config.CommandDBStatus)].Run(t.Context(), cli.Invocation{Command: cli.CommandDBStatus}); err != nil {
 		t.Fatalf("db-status Run() error = %v", err)
 	}
 	if err := commands[string(config.CommandDBReset)].Run(
 		t.Context(),
-		[]string{"delete-local-stacks-postgres"},
+		cli.Invocation{Command: cli.CommandDBReset, Arguments: []string{"delete-local-stacks-postgres"}},
 	); err != nil {
 		t.Fatalf("db-reset Run() error = %v", err)
 	}

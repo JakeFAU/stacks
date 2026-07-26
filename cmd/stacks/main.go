@@ -247,7 +247,7 @@ func commandProviderWithRuntime(
 	runtime commandRuntime,
 ) (map[string]cli.Command, error) {
 	return map[string]cli.Command{
-		string(config.CommandDBMigrate): cli.CommandFunc(func(ctx context.Context, args []string) error {
+		string(config.CommandDBMigrate): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			return runDatabaseCommand(ctx, tracer, "database.migrate", func(ctx context.Context) error {
 				if err := settings.Validate(config.CommandDBMigrate); err != nil {
 					return err
@@ -258,10 +258,10 @@ func commandProviderWithRuntime(
 				return (cli.DBMigrateCommand{
 					Migrator: runtime.newMigrationApplier(settings.Database),
 					Output:   stdout,
-				}).Run(ctx, args)
+				}).Run(ctx, invocation)
 			})
 		}),
-		string(config.CommandDBStatus): cli.CommandFunc(func(ctx context.Context, args []string) error {
+		string(config.CommandDBStatus): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			return runDatabaseCommand(ctx, tracer, "database.status", func(ctx context.Context) error {
 				if err := settings.Validate(config.CommandDBStatus); err != nil {
 					return err
@@ -272,10 +272,10 @@ func commandProviderWithRuntime(
 				return (cli.DBStatusCommand{
 					Inspector: runtime.newMigrationInspector(settings.Database),
 					Output:    stdout,
-				}).Run(ctx, args)
+				}).Run(ctx, invocation)
 			})
 		}),
-		string(config.CommandDBReset): cli.CommandFunc(func(ctx context.Context, args []string) error {
+		string(config.CommandDBReset): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			return runDatabaseCommand(ctx, tracer, "database.reset", func(ctx context.Context) error {
 				if err := settings.Validate(config.CommandDBReset); err != nil {
 					return err
@@ -286,18 +286,15 @@ func commandProviderWithRuntime(
 				return (cli.DBResetCommand{
 					Resetter: runtime.newDatabaseResetter(settings.Database),
 					Output:   stdout,
-				}).Run(ctx, args)
+				}).Run(ctx, invocation)
 			})
 		}),
-		string(config.CommandAuth): cli.CommandFunc(func(ctx context.Context, args []string) error {
+		string(config.CommandAuth): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			if err := settings.Validate(config.CommandAuth); err != nil {
 				return err
 			}
-			if len(args) != 1 {
-				return (cli.AuthCommand{}).Run(ctx, args)
-			}
-			switch config.GoogleAuthTarget(args[0]) {
-			case config.GoogleAuthDrive:
+			switch invocation.Action {
+			case cli.ActionAuthGoogle:
 				if err := settings.Application.ValidateGoogleAuth(config.GoogleAuthDrive); err != nil {
 					return err
 				}
@@ -306,8 +303,8 @@ func commandProviderWithRuntime(
 				}
 				return (cli.AuthCommand{GoogleDrive: runtime.newDriveAuthorizer(
 					settings.Application.GoogleOAuthClientFile, settings.Application.GoogleOAuthTokenFile, stdout,
-				)}).Run(ctx, args)
-			case config.GoogleAuthDirectory:
+				)}).Run(ctx, invocation)
+			case cli.ActionAuthGoogleDirectory:
 				if err := settings.Application.ValidateGoogleAuth(config.GoogleAuthDirectory); err != nil {
 					return err
 				}
@@ -316,12 +313,12 @@ func commandProviderWithRuntime(
 				}
 				return (cli.AuthCommand{GoogleDirectory: runtime.newDirectoryAuthorizer(
 					settings.Application.Directory.OAuthClientFile, settings.Application.Directory.OAuthTokenFile, stdout,
-				)}).Run(ctx, args)
+				)}).Run(ctx, invocation)
 			default:
-				return (cli.AuthCommand{}).Run(ctx, args)
+				return (cli.AuthCommand{}).Run(ctx, invocation)
 			}
 		}),
-		string(config.CommandDoctor): cli.CommandFunc(func(ctx context.Context, args []string) error {
+		string(config.CommandDoctor): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			if err := settings.Validate(config.CommandDoctor); err != nil {
 				return err
 			}
@@ -355,9 +352,9 @@ func commandProviderWithRuntime(
 					Invocation: modelInvocation(settings.Application.Model), Model: model, Disclosure: disclosure,
 				},
 				Output: stdout,
-			}).Run(ctx, args)
+			}).Run(ctx, invocation)
 		}),
-		string(config.CommandSync): cli.CommandFunc(func(ctx context.Context, args []string) error {
+		string(config.CommandSync): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			if err := settings.Validate(config.CommandSync); err != nil {
 				return err
 			}
@@ -417,9 +414,9 @@ func commandProviderWithRuntime(
 				settings.Application, sourceBoundary, model, repositories.ingestion,
 				directoryService, tracer, decisions, time.Now,
 			)
-			return (cli.SyncCommand{Service: service, Output: stdout}).Run(ctx, args)
+			return (cli.SyncCommand{Service: service, Output: stdout}).Run(ctx, invocation)
 		}),
-		string(config.CommandEntities): cli.CommandFunc(func(ctx context.Context, args []string) error {
+		string(config.CommandEntities): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			if err := settings.Validate(config.CommandEntities); err != nil {
 				return err
 			}
@@ -440,9 +437,9 @@ func commandProviderWithRuntime(
 			return (cli.EntitiesCommand{
 				Service: &cli.EntityService{Store: repositories.entities},
 				Output:  stdout,
-			}).Run(ctx, args)
+			}).Run(ctx, invocation)
 		}),
-		string(config.CommandReview): cli.CommandFunc(func(ctx context.Context, args []string) error {
+		string(config.CommandReview): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			if err := settings.Validate(config.CommandReview); err != nil {
 				return err
 			}
@@ -496,9 +493,9 @@ func commandProviderWithRuntime(
 			store := cli.NewCanonicalReviewStore(repositories.review, verifier)
 			return (cli.ReviewCommand{
 				Service: &cli.ReviewService{Store: store}, Output: stdout,
-			}).Run(ctx, args)
+			}).Run(ctx, invocation)
 		}),
-		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, args []string) error {
+		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			if err := settings.Validate(config.CommandAnalyze); err != nil {
 				return err
 			}
@@ -530,7 +527,7 @@ func commandProviderWithRuntime(
 			return (cli.AnalyzeCommand{
 				Service: service, EmployeeID: settings.Application.ManagerConfidence.EmployeeEntityID,
 				ManagerID: settings.Application.ManagerConfidence.ManagerEntityID, Output: stdout,
-			}).Run(ctx, args)
+			}).Run(ctx, invocation)
 		}),
 	}, nil
 }

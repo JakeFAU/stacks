@@ -10,21 +10,21 @@ import (
 func TestAuthCommandRunsOnlySelectedGoogleAuthorization(t *testing.T) {
 	for _, testCase := range []struct {
 		name          string
-		argument      string
+		action        Action
 		wantDrive     int
 		wantDirectory int
 		driveErr      error
 		directoryErr  error
 	}{
-		{name: "Drive", argument: "google", wantDrive: 1, directoryErr: errors.New("private directory sentinel")},
-		{name: "directory", argument: "google-directory", wantDirectory: 1, driveErr: errors.New("private drive sentinel")},
+		{name: "Drive", action: ActionAuthGoogle, wantDrive: 1, directoryErr: errors.New("private directory sentinel")},
+		{name: "directory", action: ActionAuthGoogleDirectory, wantDirectory: 1, driveErr: errors.New("private drive sentinel")},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			drive := &recordingAuthorizer{err: testCase.driveErr}
 			directory := &recordingAuthorizer{err: testCase.directoryErr}
 			command := AuthCommand{GoogleDrive: drive, GoogleDirectory: directory}
 
-			err := command.Run(context.Background(), []string{testCase.argument})
+			err := command.Run(context.Background(), Invocation{Command: CommandAuth, Action: testCase.action})
 			if err != nil {
 				t.Fatalf("Run() error = %v, want selected authorizer success", err)
 			}
@@ -40,9 +40,9 @@ func TestAuthCommandRejectsInvalidTargetWithoutAuthorizing(t *testing.T) {
 	directory := &recordingAuthorizer{err: errors.New("private directory sentinel")}
 	command := AuthCommand{GoogleDrive: drive, GoogleDirectory: directory}
 
-	err := command.Run(context.Background(), []string{"doctor"})
-	if err == nil || err.Error() != "usage: stacks auth google | stacks auth google-directory" {
-		t.Fatalf("Run() error = %v, want exact usage error", err)
+	err := command.Run(context.Background(), Invocation{Command: CommandAuth})
+	if err == nil || !strings.Contains(err.Error(), "invocation is invalid") {
+		t.Fatalf("Run() error = %v, want invalid invocation error", err)
 	}
 	if strings.Contains(err.Error(), "private") {
 		t.Fatalf("Run() error exposed private sentinel: %v", err)

@@ -56,7 +56,7 @@ type EntitiesCommand struct {
 }
 
 // Run executes `entities list` or `entities show <entity-id>`.
-func (command EntitiesCommand) Run(ctx context.Context, args []string) error {
+func (command EntitiesCommand) Run(ctx context.Context, invocation Invocation) error {
 	if command.Service == nil {
 		return fmt.Errorf("entities command: service is not configured")
 	}
@@ -64,7 +64,8 @@ func (command EntitiesCommand) Run(ctx context.Context, args []string) error {
 	if output == nil {
 		output = io.Discard
 	}
-	if len(args) == 1 && args[0] == "list" {
+	switch invocation.Action {
+	case ActionList:
 		entities, err := command.Service.List(ctx)
 		if err != nil {
 			return err
@@ -73,16 +74,19 @@ func (command EntitiesCommand) Run(ctx context.Context, args []string) error {
 			fmt.Fprintf(output, "%s\t%s\trecorded=%s\tmentions=%d\n", entity.ID, entity.DisplayName, entity.RecordedAt.UTC().Format(time.RFC3339), entity.MentionCount)
 		}
 		return nil
-	}
-	if len(args) == 2 && args[0] == "show" {
-		entity, err := command.Service.Show(ctx, args[1])
+	case ActionShow:
+		if len(invocation.Arguments) != 1 {
+			return fmt.Errorf("entities command: invocation is invalid")
+		}
+		entity, err := command.Service.Show(ctx, invocation.Arguments[0])
 		if err != nil {
 			return err
 		}
 		renderEntity(output, entity)
 		return nil
+	default:
+		return fmt.Errorf("entities command: invocation is invalid")
 	}
-	return fmt.Errorf("entities command usage: entities list | entities show <entity-id>")
 }
 
 func renderEntity(output io.Writer, entity EntityView) {

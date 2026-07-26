@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"strings"
@@ -174,7 +173,7 @@ type ReviewCommand struct {
 }
 
 // Run executes a review subcommand.
-func (command ReviewCommand) Run(ctx context.Context, args []string) error {
+func (command ReviewCommand) Run(ctx context.Context, invocation Invocation) error {
 	if command.Service == nil {
 		return fmt.Errorf("review command: service is not configured")
 	}
@@ -182,7 +181,8 @@ func (command ReviewCommand) Run(ctx context.Context, args []string) error {
 	if output == nil {
 		output = io.Discard
 	}
-	if len(args) == 1 && args[0] == "list" {
+	switch invocation.Action {
+	case ActionList:
 		proposals, err := command.Service.List(ctx)
 		if err != nil {
 			return err
@@ -191,53 +191,49 @@ func (command ReviewCommand) Run(ctx context.Context, args []string) error {
 			renderReviewListProposal(output, proposal)
 		}
 		return nil
-	}
-	if len(args) > 0 && args[0] == "accept" && len(args) != 3 {
-		return fmt.Errorf("review accept: proposal ID and entity ID are required")
-	}
-	if len(args) == 2 && args[0] == "show" {
-		proposal, err := command.Service.Show(ctx, args[1])
+	case ActionShow:
+		if len(invocation.Arguments) != 1 {
+			return fmt.Errorf("review command: invocation is invalid")
+		}
+		proposal, err := command.Service.Show(ctx, invocation.Arguments[0])
 		if err != nil {
 			return err
 		}
 		renderProposal(output, proposal)
 		return nil
-	}
-	if len(args) == 3 && args[0] == "accept" {
-		_, err := command.Service.Accept(ctx, args[1], args[2])
-		return err
-	}
-	if len(args) > 0 && args[0] == "accept-directory" {
-		input, err := parseAcceptDirectory(args[1:])
-		if err != nil {
-			return err
+	case ActionAccept:
+		if len(invocation.Arguments) != 2 {
+			return fmt.Errorf("review command: invocation is invalid")
 		}
-		_, err = command.Service.AcceptDirectory(ctx, input)
+		_, err := command.Service.Accept(ctx, invocation.Arguments[0], invocation.Arguments[1])
 		return err
-	}
-	if len(args) > 0 && args[0] == "reject" && len(args) != 2 {
-		return fmt.Errorf("review reject: proposal ID is required")
-	}
-	if len(args) == 2 && args[0] == "reject" {
-		_, err := command.Service.Reject(ctx, args[1])
-		return err
-	}
-	if len(args) >= 2 && args[0] == "create" {
-		input, err := parseCreatePerson(args[2:])
-		if err != nil {
-			return err
+	case ActionAcceptDirectory:
+		if invocation.AcceptDirectory == nil {
+			return fmt.Errorf("review command: invocation is invalid")
 		}
-		_, err = command.Service.Create(ctx, args[1], input)
+		_, err := command.Service.AcceptDirectory(ctx, *invocation.AcceptDirectory)
 		return err
-	}
-	if len(args) > 0 && args[0] == "correct" && len(args) != 3 {
-		return fmt.Errorf("review correct: effective decision ID and entity ID are required")
-	}
-	if len(args) == 3 && args[0] == "correct" {
-		_, err := command.Service.Correct(ctx, args[1], args[2])
+	case ActionReject:
+		if len(invocation.Arguments) != 1 {
+			return fmt.Errorf("review command: invocation is invalid")
+		}
+		_, err := command.Service.Reject(ctx, invocation.Arguments[0])
 		return err
+	case ActionCreate:
+		if len(invocation.Arguments) != 1 || invocation.CreatePerson == nil {
+			return fmt.Errorf("review command: invocation is invalid")
+		}
+		_, err := command.Service.Create(ctx, invocation.Arguments[0], *invocation.CreatePerson)
+		return err
+	case ActionCorrect:
+		if len(invocation.Arguments) != 2 {
+			return fmt.Errorf("review command: invocation is invalid")
+		}
+		_, err := command.Service.Correct(ctx, invocation.Arguments[0], invocation.Arguments[1])
+		return err
+	default:
+		return fmt.Errorf("review command: invocation is invalid")
 	}
-	return fmt.Errorf("review command usage: review list | review show <proposal-id> | review accept <proposal-id> <entity-id> | review accept-directory <proposal-id> <directory-profile-id> [--entity <entity-id>] | review reject <proposal-id> | review create <proposal-id> --name <name> [--email <email>] | review correct <effective-decision-id> <entity-id>")
 }
 
 func renderReviewListProposal(output io.Writer, proposal ReviewProposal) {
@@ -289,51 +285,6 @@ func boundedReviewListText(value string, maximumRunes int) string {
 	}
 	marker := []rune(reviewListTruncationMarker)
 	return string(runes[:maximumRunes-len(marker)]) + reviewListTruncationMarker
-}
-
-func parseCreatePerson(args []string) (CreatePersonInput, error) {
-	flags := flag.NewFlagSet("review create", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	name := flags.String("name", "", "")
-	email := flags.String("email", "", "")
-	if err := flags.Parse(args); err != nil {
-		return CreatePersonInput{}, fmt.Errorf("review create: %w", err)
-	}
-	if flags.NArg() != 0 || strings.TrimSpace(*name) == "" {
-		return CreatePersonInput{}, fmt.Errorf("review create: --name is required")
-	}
-	return CreatePersonInput{Name: *name, Email: *email}, nil
-}
-
-func parseAcceptDirectory(args []string) (AcceptDirectoryInput, error) {
-	if len(args) < 2 ||
-		strings.TrimSpace(args[0]) == "" ||
-		strings.TrimSpace(args[1]) == "" {
-		return AcceptDirectoryInput{}, fmt.Errorf("review accept-directory: proposal ID and directory profile ID are required")
-	}
-	flags := flag.NewFlagSet("review accept-directory", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	entityID := flags.String("entity", "", "")
-	if err := flags.Parse(args[2:]); err != nil {
-		return AcceptDirectoryInput{}, fmt.Errorf("review accept-directory: %w", err)
-	}
-	if flags.NArg() != 0 {
-		return AcceptDirectoryInput{}, fmt.Errorf("review accept-directory: unexpected arguments")
-	}
-	entityProvided := false
-	flags.Visit(func(current *flag.Flag) {
-		if current.Name == "entity" {
-			entityProvided = true
-		}
-	})
-	if entityProvided && strings.TrimSpace(*entityID) == "" {
-		return AcceptDirectoryInput{}, fmt.Errorf("review accept-directory: --entity requires an entity ID")
-	}
-	return AcceptDirectoryInput{
-		ProposalID:         args[0],
-		DirectoryProfileID: args[1],
-		EntityID:           *entityID,
-	}, nil
 }
 
 func renderProposal(output io.Writer, proposal ReviewProposal) {

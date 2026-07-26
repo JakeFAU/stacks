@@ -44,7 +44,7 @@ func TestDoctorRendersReportAndFailsOnlyForFailedChecks(t *testing.T) {
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			var output bytes.Buffer
-			err := (DoctorCommand{Service: fakeDoctor{report: testCase.report}, Output: &output}).Run(context.Background(), nil)
+			err := (DoctorCommand{Service: fakeDoctor{report: testCase.report}, Output: &output}).Run(context.Background(), Invocation{Command: CommandDoctor})
 			if (err != nil) != testCase.wantErr {
 				t.Fatalf("Run() error = %v, wantErr %t", err, testCase.wantErr)
 			}
@@ -61,13 +61,9 @@ func TestDoctorRendersReportAndFailsOnlyForFailedChecks(t *testing.T) {
 }
 
 func TestDoctorRejectsArgumentsAndPreservesCancellation(t *testing.T) {
-	if err := (DoctorCommand{Service: fakeDoctor{}}).Run(context.Background(), []string{"unexpected"}); err == nil {
-		t.Fatal("Run() error = nil, want usage error")
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := (DoctorCommand{Service: fakeDoctor{report: doctor.Report{Err: context.Canceled}}}).Run(ctx, nil)
+	err := (DoctorCommand{Service: fakeDoctor{report: doctor.Report{Err: context.Canceled}}}).Run(ctx, Invocation{Command: CommandDoctor})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context.Canceled", err)
 	}

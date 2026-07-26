@@ -36,7 +36,7 @@ func TestAnalyzeCommandRendersBoundedCitedReport(t *testing.T) {
 		Service: service, EmployeeID: "employee-id", ManagerID: "manager-id", Output: &output,
 	}
 
-	if err := command.Run(context.Background(), nil); err != nil {
+	if err := command.Run(context.Background(), Invocation{Command: CommandAnalyze}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if service.employeeID != "employee-id" || service.managerID != "manager-id" {
@@ -70,18 +70,11 @@ func TestAnalyzeCommandRendersExplicitEmptyCounterevidenceAndGaps(t *testing.T) 
 		EmployeeID: "employee-id", ManagerID: "manager-id", Output: &output,
 	}
 
-	if err := command.Run(context.Background(), nil); err != nil {
+	if err := command.Run(context.Background(), Invocation{Command: CommandAnalyze}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if got := strings.Count(output.String(), "(none)"); got < 2 {
 		t.Fatalf("empty sections marked none %d times, want at least counterevidence and gaps:\n%s", got, output.String())
-	}
-}
-
-func TestAnalyzeCommandRejectsArguments(t *testing.T) {
-	command := AnalyzeCommand{Service: &fakeAnalyzer{}, EmployeeID: "employee-id", ManagerID: "manager-id"}
-	if err := command.Run(context.Background(), []string{"unexpected"}); err == nil {
-		t.Fatal("Run() error = nil, want analyze usage error")
 	}
 }
 
@@ -95,7 +88,7 @@ func TestAnalyzeCommandPassesOpaqueEntityIDsUnchanged(t *testing.T) {
 		Output: &output,
 	}
 
-	if err := command.Run(context.Background(), nil); err != nil {
+	if err := command.Run(context.Background(), Invocation{Command: CommandAnalyze}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if service.employeeID != "employee:opaque/7" || service.managerID != "manager:opaque/9" {
