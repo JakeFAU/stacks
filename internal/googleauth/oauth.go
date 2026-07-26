@@ -195,7 +195,6 @@ func oauthCallbackHandler(wantState string, result chan<- oauthCallback) http.Ha
 		}
 		if request.URL.Query().Get("state") != wantState {
 			http.Error(writer, "Google OAuth state mismatch", http.StatusBadRequest)
-			publish(oauthCallback{err: errors.New("google OAuth state mismatch")})
 			return
 		}
 		if request.URL.Query().Get("error") != "" {
