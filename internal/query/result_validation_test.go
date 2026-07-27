@@ -468,6 +468,93 @@ func TestTrajectoryPayloadRequiresTransitionFactsToMatchTransition(t *testing.T)
 	}
 }
 
+func TestTrajectoryPayloadRejectsInvalidNestedUnresolvedMaterial(t *testing.T) {
+	window := mustWindow(t, "window", 2026, time.January, 1)
+	key := mustStateKey(t, "entity-a", "predicate-a")
+	otherKey := mustStateKey(t, "entity-b", "predicate-a")
+	after := resultValidationFact(t, key, mustText(t, "after"), "trajectory-after")
+	other := resultValidationFact(t, otherKey, mustText(t, "other"), "trajectory-other")
+
+	tests := []struct {
+		name       string
+		unresolved UnresolvedItem
+	}{
+		{
+			name: "unknown unresolved reason",
+			unresolved: UnresolvedItem{
+				Key:        otherKey,
+				Reason:     temporal.UnresolvedReason("unknown"),
+				Candidates: []Fact{other},
+			},
+		},
+		{
+			name: "candidate key differs from unresolved key",
+			unresolved: UnresolvedItem{
+				Key:        otherKey,
+				Reason:     temporal.UnresolvedHypothesis,
+				Candidates: []Fact{after},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewTrajectoryPayload(TrajectoryResult{
+				Selection: window,
+				Transitions: []Transition{{
+					Kind:       temporal.ChangeAdded,
+					Key:        key,
+					ValidTime:  mustInstant(t),
+					After:      &after,
+					Unresolved: []UnresolvedItem{test.unresolved},
+				}},
+			}); err == nil {
+				t.Fatal("NewTrajectoryPayload() error = nil, want invalid nested unresolved material error")
+			}
+		})
+	}
+}
+
+func TestCausalPayloadRejectsInvalidNestedContributionAndCitationMaterial(t *testing.T) {
+	window := mustWindow(t, "window", 2026, time.January, 1)
+	tests := []struct {
+		name   string
+		mutate func(*CausalLink)
+	}{
+		{
+			name: "unknown contribution status",
+			mutate: func(link *CausalLink) {
+				link.Contributions[0].Status = observation.EpistemicStatus("unknown")
+			},
+		},
+		{
+			name: "duplicate supporting citation",
+			mutate: func(link *CausalLink) {
+				link.SupportingCitations = append(link.SupportingCitations, link.SupportingCitations[0])
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			link := CausalLink{
+				Cause:                  mustText(t, "cause"),
+				Effect:                 mustText(t, "effect"),
+				Contributions:          []Contribution{resultValidationContribution(t, "causal-nested")},
+				SupportingCitations:    []Citation{validCitation("causal-nested-evidence")},
+				ContradictingCitations: []Citation{},
+			}
+			test.mutate(&link)
+			if _, err := NewCausalPayload(CausalChainResult{
+				Selection: window,
+				Links:     []CausalLink{link},
+			}); err == nil {
+				t.Fatal("NewCausalPayload() error = nil, want invalid nested causal material error")
+			}
+		})
+	}
+}
+
 func TestValidateResultRevalidatesNestedPayload(t *testing.T) {
 	point := mustPoint(t, "point", 2026, time.January, 1)
 	key := mustStateKey(t, "entity-a", "predicate-a")
@@ -497,6 +584,107 @@ func TestValidateResultRevalidatesNestedPayload(t *testing.T) {
 	}
 }
 
+func TestValidateResultRevalidatesMutatedNestedPayloadForEveryNonPointIntent(t *testing.T) {
+	before := mustWindow(t, "before", 2026, time.January, 1)
+	after := mustWindow(t, "after", 2026, time.February, 1)
+	key := mustStateKey(t, "entity-a", "predicate-a")
+
+	tests := []struct {
+		name  string
+		build func(*testing.T) Result
+	}{
+		{
+			name: "trend",
+			build: func(t *testing.T) Result {
+				beforeFact := resultValidationFact(t, key, mustText(t, "before"), "validate-trend-before")
+				afterFact := resultValidationFact(t, key, mustText(t, "after"), "validate-trend-after")
+				payload, err := NewTrendPayload(TrendResult{
+					Before:         WindowResult{Selection: before, Facts: []Fact{beforeFact}, Unresolved: []UnresolvedItem{}},
+					After:          WindowResult{Selection: after, Facts: []Fact{afterFact}, Unresolved: []UnresolvedItem{}},
+					Changes:        []Change{{Kind: temporal.ChangeChanged, Key: key, Before: &beforeFact, After: &afterFact}},
+					UnresolvedKeys: []temporal.StateKey{},
+				})
+				if err != nil {
+					t.Fatalf("NewTrendPayload() error = %v", err)
+				}
+				payload.trend.Before.Facts[0].Contributions[0].RecordedAt = time.Time{}
+				return resultValidationEnvelope(
+					temporal.IntentTrendComparison,
+					[]observation.Predicate{},
+					[]temporal.TemporalSelection{before, after},
+					0,
+					payload,
+				)
+			},
+		},
+		{
+			name: "trajectory",
+			build: func(t *testing.T) Result {
+				fact := resultValidationFact(t, key, mustText(t, "after"), "validate-trajectory")
+				payload, err := NewTrajectoryPayload(TrajectoryResult{
+					Selection: before,
+					Transitions: []Transition{{
+						Kind:       temporal.ChangeAdded,
+						Key:        key,
+						ValidTime:  mustInstant(t),
+						After:      &fact,
+						Unresolved: []UnresolvedItem{},
+					}},
+				})
+				if err != nil {
+					t.Fatalf("NewTrajectoryPayload() error = %v", err)
+				}
+				payload.trajectory.Transitions[0].Unresolved = []UnresolvedItem{{
+					Key:        key,
+					Reason:     temporal.UnresolvedReason("unknown"),
+					Candidates: []Fact{fact},
+				}}
+				return resultValidationEnvelope(
+					temporal.IntentTrajectory,
+					[]observation.Predicate{},
+					[]temporal.TemporalSelection{before},
+					1,
+					payload,
+				)
+			},
+		},
+		{
+			name: "causal",
+			build: func(t *testing.T) Result {
+				payload, err := NewCausalPayload(CausalChainResult{
+					Selection: before,
+					Links: []CausalLink{{
+						Cause:                  mustText(t, "cause"),
+						Effect:                 mustText(t, "effect"),
+						Contributions:          []Contribution{resultValidationContribution(t, "validate-causal")},
+						SupportingCitations:    []Citation{validCitation("validate-causal-evidence")},
+						ContradictingCitations: []Citation{},
+					}},
+				})
+				if err != nil {
+					t.Fatalf("NewCausalPayload() error = %v", err)
+				}
+				payload.causal.Links[0].Contributions[0].Status = observation.EpistemicStatus("unknown")
+				return resultValidationEnvelope(
+					temporal.IntentCausalChain,
+					[]observation.Predicate{CausalPredicate},
+					[]temporal.TemporalSelection{before},
+					1,
+					payload,
+				)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := ValidateResult(test.build(t)); err == nil {
+				t.Fatal("ValidateResult() error = nil, want mutated nested payload validation error")
+			}
+		})
+	}
+}
+
 func TestValidateResultRejectsDuplicateGaps(t *testing.T) {
 	point := mustPoint(t, "point", 2026, time.January, 1)
 	payload, err := NewPointPayload(PointInTimeResult{
@@ -520,6 +708,26 @@ func TestValidateResultRejectsDuplicateGaps(t *testing.T) {
 	}
 	if err := ValidateResult(result); err == nil {
 		t.Fatal("ValidateResult() error = nil, want duplicate gap error")
+	}
+}
+
+func resultValidationEnvelope(
+	intent temporal.Intent,
+	predicates []observation.Predicate,
+	selections []temporal.TemporalSelection,
+	limit int,
+	payload IntentPayload,
+) Result {
+	return Result{
+		Intent:         intent,
+		EntityIDs:      []identity.EntityID{"entity-a"},
+		EntityMatch:    EntityMatchAll,
+		Predicates:     predicates,
+		Selections:     selections,
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          limit,
+		Payload:        payload,
+		Gaps:           []Gap{},
 	}
 }
 
