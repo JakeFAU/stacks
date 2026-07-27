@@ -39,7 +39,15 @@ type Settings struct {
 	LogLevel          string
 	Telemetry         TelemetrySettings
 	Database          DatabaseSettings
+	Query             QuerySettings
 	Application       ApplicationSettings
+}
+
+// QuerySettings bounds resource use for temporal queries before database access.
+type QuerySettings struct {
+	MaxEntities   int
+	MaxPredicates int
+	MaxChronology int
 }
 
 // DatabaseScope identifies one selected embedded PostgreSQL migration scope.
@@ -76,7 +84,30 @@ func (settings Settings) Validate(command Command) error {
 	if err := settings.Database.validate(command, settings.Application.Directory.Enabled); err != nil {
 		return err
 	}
+	if err := settings.Query.validate(command); err != nil {
+		return err
+	}
 	return settings.Application.Validate(command)
+}
+
+func (settings QuerySettings) validate(command Command) error {
+	if command != CommandQuery {
+		return nil
+	}
+	for _, limit := range []struct {
+		value       int
+		environment string
+		maximum     int
+	}{
+		{settings.MaxEntities, QueryMaxEntitiesEnvironmentVariable, maximumQueryEntities},
+		{settings.MaxPredicates, QueryMaxPredicatesEnvironmentVariable, maximumQueryPredicates},
+		{settings.MaxChronology, QueryMaxChronologyEnvironmentVariable, maximumQueryChronology},
+	} {
+		if limit.value < minimumQueryLimit || limit.value > limit.maximum {
+			return fmt.Errorf("%s must be between %d and %d", limit.environment, minimumQueryLimit, limit.maximum)
+		}
+	}
+	return nil
 }
 
 func (settings DatabaseSettings) validate(command Command, directoryEnabled bool) error {
@@ -87,7 +118,7 @@ func (settings DatabaseSettings) validate(command Command, directoryEnabled bool
 	if err := validateDatabaseScopes(scopes); err != nil {
 		return err
 	}
-	if directoryEnabled && !containsDatabaseScope(scopes, DatabaseScopeDirectory) {
+	if directoryEnabled && command != CommandQuery && !containsDatabaseScope(scopes, DatabaseScopeDirectory) {
 		return fmt.Errorf(
 			"%s must include %q when %s is enabled",
 			DatabaseScopesEnvironmentVariable,
@@ -96,7 +127,7 @@ func (settings DatabaseSettings) validate(command Command, directoryEnabled bool
 		)
 	}
 	switch command {
-	case CommandDoctor, CommandSync, CommandEntities, CommandReview, CommandAnalyze, CommandDBStatus:
+	case CommandDoctor, CommandSync, CommandEntities, CommandReview, CommandAnalyze, CommandQuery, CommandDBStatus:
 		return validateExactRequired(command, DatabaseURLEnvironmentVariable, settings.URL)
 	case CommandDBMigrate, CommandDBReset:
 		if command == CommandDBReset {

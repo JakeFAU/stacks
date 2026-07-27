@@ -168,6 +168,68 @@ analysis:
 	}
 }
 
+func TestValidateConfigDocumentAcceptsQueryLimitsInYAMLAndJSON(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		format string
+		body   string
+	}{
+		{name: "YAML", format: "yaml", body: "query:\n  max_entities: 16\n  max_predicates: 32\n  max_chronology: 1000\n"},
+		{name: "JSON", format: "json", body: `{"query":{"max_entities":16,"max_predicates":32,"max_chronology":1000}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if err := validateConfigDocument(testCase.format, []byte(testCase.body)); err != nil {
+				t.Fatalf("validateConfigDocument() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigurationExamplesPassStrictValidation(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		format string
+		path   string
+	}{
+		{name: "YAML", format: "yaml", path: filepath.Join("..", "..", "config.example.yaml")},
+		{name: "JSON", format: "json", path: filepath.Join("..", "..", "config.example.json")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			data, err := os.ReadFile(testCase.path)
+			if err != nil {
+				t.Fatalf("read example: %v", err)
+			}
+			if err := validateConfigDocument(testCase.format, data); err != nil {
+				t.Fatalf("validateConfigDocument(%s) error = %v", testCase.path, err)
+			}
+		})
+	}
+}
+
+func TestValidateConfigDocumentRejectsUnknownAndWrongTypedQueryLimits(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		format     string
+		body       string
+		wantConfig string
+	}{
+		{name: "unknown YAML key", format: "yaml", body: "query:\n  max_entitys: 16\n", wantConfig: "query.max_entitys"},
+		{name: "unknown JSON key", format: "json", body: `{"query":{"max_entitys":16}}`, wantConfig: "query.max_entitys"},
+		{name: "YAML string", format: "yaml", body: "query:\n  max_entities: private-query-limit\n", wantConfig: "query.max_entities"},
+		{name: "JSON string", format: "json", body: `{"query":{"max_chronology":"private-query-limit"}}`, wantConfig: "query.max_chronology"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateConfigDocument(testCase.format, []byte(testCase.body))
+			if err == nil || !strings.Contains(err.Error(), testCase.wantConfig) {
+				t.Fatalf("validateConfigDocument() error = %v, want strict %s rejection", err, testCase.wantConfig)
+			}
+			if strings.Contains(err.Error(), "private-query-limit") {
+				t.Fatalf("validateConfigDocument() error exposed query value: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateConfigDocumentRejectsUnknownDuplicateNullAndWrongTypes(t *testing.T) {
 	tests := []struct {
 		name   string

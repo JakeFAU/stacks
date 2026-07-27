@@ -137,6 +137,16 @@ func TestApplicationDatabaseCommandsRequireCanonicalDatabaseURL(t *testing.T) {
 	}
 }
 
+func TestQueryCommandRequiresCanonicalDatabaseURL(t *testing.T) {
+	settings := Settings{
+		Database: DatabaseSettings{Scopes: []DatabaseScope{DatabaseScopeCore}},
+		Query:    QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+	}
+	if err := settings.Validate(CommandQuery); err == nil || !strings.Contains(err.Error(), DatabaseURLEnvironmentVariable) {
+		t.Fatalf("Settings.Validate(query) error = %v, want canonical database URL rejection", err)
+	}
+}
+
 func TestDBMigrateRejectsUnsafeApplicationRoleBeforeConstruction(t *testing.T) {
 	t.Parallel()
 

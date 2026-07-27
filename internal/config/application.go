@@ -21,6 +21,13 @@ const (
 	defaultGoogleDirectoryFreshness   = 24 * time.Hour
 	defaultGoogleDirectoryRetryAfter  = 15 * time.Minute
 	defaultGoogleDirectoryMaxAttempts = 3
+	defaultQueryMaxEntities           = 16
+	defaultQueryMaxPredicates         = 32
+	defaultQueryMaxChronology         = 1000
+	minimumQueryLimit                 = 1
+	maximumQueryEntities              = 64
+	maximumQueryPredicates            = 256
+	maximumQueryChronology            = 10000
 
 	DatabaseURLEnvironmentVariable                = "STACKS_DATABASE_URL"
 	GoogleFolderIDEnvironmentVariable             = "STACKS_GOOGLE_FOLDER_ID"
@@ -59,6 +66,9 @@ const (
 	GoogleDirectoryFreshnessEnvironmentVariable   = "STACKS_GOOGLE_DIRECTORY_FRESHNESS"
 	GoogleDirectoryRetryAfterEnvironmentVariable  = "STACKS_GOOGLE_DIRECTORY_RETRY_AFTER"
 	GoogleDirectoryMaxAttemptsEnvironmentVariable = "STACKS_GOOGLE_DIRECTORY_MAX_ATTEMPTS"
+	QueryMaxEntitiesEnvironmentVariable           = "STACKS_QUERY_MAX_ENTITIES"
+	QueryMaxPredicatesEnvironmentVariable         = "STACKS_QUERY_MAX_PREDICATES"
+	QueryMaxChronologyEnvironmentVariable         = "STACKS_QUERY_MAX_CHRONOLOGY"
 )
 
 var unsupportedModelEnvironmentNames = []string{
@@ -84,6 +94,7 @@ const (
 	CommandEntities  Command = "entities"
 	CommandReview    Command = "review"
 	CommandAnalyze   Command = "analyze"
+	CommandQuery     Command = "query"
 	CommandDBMigrate Command = "db-migrate"
 	CommandDBStatus  Command = "db-status"
 	CommandDBReset   Command = "db-reset"

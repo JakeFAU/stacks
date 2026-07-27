@@ -39,6 +39,106 @@ model:
 	}
 }
 
+func TestLoadQueryUsesDefaultsAndInclusiveEnvironmentBounds(t *testing.T) {
+	clearConfigurationEnvironment(t)
+
+	settings, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if settings.Query != (QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000}) {
+		t.Fatalf("Query = %#v, want named defaults", settings.Query)
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		variable string
+		value    string
+		assert   func(QuerySettings) bool
+	}{
+		{name: "minimum entities", variable: QueryMaxEntitiesEnvironmentVariable, value: "1", assert: func(settings QuerySettings) bool { return settings.MaxEntities == 1 }},
+		{name: "maximum entities", variable: QueryMaxEntitiesEnvironmentVariable, value: "64", assert: func(settings QuerySettings) bool { return settings.MaxEntities == 64 }},
+		{name: "minimum predicates", variable: QueryMaxPredicatesEnvironmentVariable, value: "1", assert: func(settings QuerySettings) bool { return settings.MaxPredicates == 1 }},
+		{name: "maximum predicates", variable: QueryMaxPredicatesEnvironmentVariable, value: "256", assert: func(settings QuerySettings) bool { return settings.MaxPredicates == 256 }},
+		{name: "minimum chronology", variable: QueryMaxChronologyEnvironmentVariable, value: "1", assert: func(settings QuerySettings) bool { return settings.MaxChronology == 1 }},
+		{name: "maximum chronology", variable: QueryMaxChronologyEnvironmentVariable, value: "10000", assert: func(settings QuerySettings) bool { return settings.MaxChronology == 10000 }},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			t.Setenv(testCase.variable, testCase.value)
+
+			settings, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !testCase.assert(settings.Query) {
+				t.Fatalf("Query = %#v, want %s accepted", settings.Query, testCase.name)
+			}
+		})
+	}
+}
+
+func TestLoadWithOptionsAppliesQueryEnvironmentOverFileOverDefaults(t *testing.T) {
+	clearConfigurationEnvironment(t)
+	path := writeConfigFixture(t, ".yaml", "query:\n  max_entities: 2\n  max_predicates: 34\n  max_chronology: 999\n")
+	t.Setenv(QueryMaxEntitiesEnvironmentVariable, "3")
+
+	settings, err := LoadWithOptions(LoadOptions{ConfigFile: &path})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+	want := QuerySettings{MaxEntities: 3, MaxPredicates: 34, MaxChronology: 999}
+	if settings.Query != want {
+		t.Fatalf("Query = %#v, want %#v from environment over file", settings.Query, want)
+	}
+}
+
+func TestLoadWithOptionsKeepsQueryLoadsIndependent(t *testing.T) {
+	clearConfigurationEnvironment(t)
+	path := writeConfigFixture(t, ".json", `{"query":{"max_entities":4,"max_predicates":40,"max_chronology":400}}`)
+
+	if _, err := LoadWithOptions(LoadOptions{ConfigFile: &path}); err != nil {
+		t.Fatalf("first LoadWithOptions() error = %v", err)
+	}
+	settings, err := LoadWithOptions(LoadOptions{})
+	if err != nil {
+		t.Fatalf("second LoadWithOptions() error = %v", err)
+	}
+	if settings.Query != (QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000}) {
+		t.Fatalf("second Query = %#v, want defaults without prior file", settings.Query)
+	}
+}
+
+func TestLoadRejectsInvalidQueryLimitsWithoutDisclosingValues(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		variable string
+		value    string
+		private  bool
+	}{
+		{name: "entities below minimum", variable: QueryMaxEntitiesEnvironmentVariable, value: "0"},
+		{name: "entities above maximum", variable: QueryMaxEntitiesEnvironmentVariable, value: "65"},
+		{name: "predicates below minimum", variable: QueryMaxPredicatesEnvironmentVariable, value: "0"},
+		{name: "predicates above maximum", variable: QueryMaxPredicatesEnvironmentVariable, value: "257"},
+		{name: "chronology below minimum", variable: QueryMaxChronologyEnvironmentVariable, value: "0"},
+		{name: "chronology above maximum", variable: QueryMaxChronologyEnvironmentVariable, value: "10001"},
+		{name: "not an integer", variable: QueryMaxChronologyEnvironmentVariable, value: "private-query-limit", private: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			t.Setenv(testCase.variable, testCase.value)
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), testCase.variable) {
+				t.Fatalf("Load() error = %v, want bounded %s rejection", err, testCase.variable)
+			}
+			if testCase.private && strings.Contains(err.Error(), testCase.value) {
+				t.Fatalf("Load() error exposed configured query limit: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadWithOptionsAppliesJSONFileValues(t *testing.T) {
 	clearConfigurationEnvironment(t)
 	path := writeConfigFixture(t, ".json", `{
@@ -295,6 +395,9 @@ func clearConfigurationEnvironment(t *testing.T) {
 		IngestionAttemptTimeoutEnvironmentVariable,
 		ExtractionPromptVersionEnvironmentVariable,
 		AnalysisPromptVersionEnvironmentVariable,
+		QueryMaxEntitiesEnvironmentVariable,
+		QueryMaxPredicatesEnvironmentVariable,
+		QueryMaxChronologyEnvironmentVariable,
 		EmployeeEntityIDEnvironmentVariable,
 		ManagerEntityIDEnvironmentVariable,
 	} {

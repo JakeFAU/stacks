@@ -43,3 +43,7 @@ extraction:
   prompt_version: extract-v2
 analysis:
   prompt_version: analyze-v1
+query:
+  max_entities: 16
+  max_predicates: 32
+  max_chronology: 1000

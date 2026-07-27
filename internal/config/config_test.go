@@ -69,6 +69,56 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestSettingsValidateQueryRequiresOnlyDatabaseAndBoundedQuerySettings(t *testing.T) {
+	settings := Settings{
+		Database: DatabaseSettings{
+			URL:    "postgres://app:synthetic@127.0.0.1/stacks",
+			Scopes: []DatabaseScope{DatabaseScopeCore},
+		},
+		Query: QuerySettings{
+			MaxEntities:   16,
+			MaxPredicates: 32,
+			MaxChronology: 1000,
+		},
+		Application: ApplicationSettings{Directory: GoogleDirectorySettings{Enabled: true}},
+	}
+	if err := settings.Validate(CommandQuery); err != nil {
+		t.Fatalf("Settings.Validate(query) error = %v, want only database URL and query settings required", err)
+	}
+}
+
+func TestSettingsValidateQueryRejectsOutOfBoundsLimitsWithoutValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*QuerySettings)
+		wantName  string
+	}{
+		{name: "entities below minimum", configure: func(settings *QuerySettings) { settings.MaxEntities = 0 }, wantName: QueryMaxEntitiesEnvironmentVariable},
+		{name: "entities above maximum", configure: func(settings *QuerySettings) { settings.MaxEntities = 65 }, wantName: QueryMaxEntitiesEnvironmentVariable},
+		{name: "predicates below minimum", configure: func(settings *QuerySettings) { settings.MaxPredicates = 0 }, wantName: QueryMaxPredicatesEnvironmentVariable},
+		{name: "predicates above maximum", configure: func(settings *QuerySettings) { settings.MaxPredicates = 257 }, wantName: QueryMaxPredicatesEnvironmentVariable},
+		{name: "chronology below minimum", configure: func(settings *QuerySettings) { settings.MaxChronology = 0 }, wantName: QueryMaxChronologyEnvironmentVariable},
+		{name: "chronology above maximum", configure: func(settings *QuerySettings) { settings.MaxChronology = 10001 }, wantName: QueryMaxChronologyEnvironmentVariable},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := Settings{
+				Database: DatabaseSettings{URL: "postgres://app:synthetic@127.0.0.1/stacks", Scopes: []DatabaseScope{DatabaseScopeCore}},
+				Query:    QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+			}
+			testCase.configure(&settings.Query)
+
+			err := settings.Validate(CommandQuery)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantName) {
+				t.Fatalf("Settings.Validate(query) error = %v, want bounded %s rejection", err, testCase.wantName)
+			}
+			if strings.Contains(err.Error(), "10001") || strings.Contains(err.Error(), "257") || strings.Contains(err.Error(), "65") {
+				t.Fatalf("Settings.Validate(query) error exposed configured limit: %v", err)
+			}
+		})
+	}
+}
+
 func validGoogleDirectorySettings() GoogleDirectorySettings {
 	return GoogleDirectorySettings{
 		Enabled: true, OAuthClientFile: "/synthetic/directory-client.json", OAuthTokenFile: "/synthetic/directory-token.json",
