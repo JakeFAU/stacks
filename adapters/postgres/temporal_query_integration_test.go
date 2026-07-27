@@ -30,6 +30,7 @@ const (
 	atlasOwnerPredicate         observation.Predicate = "project.atlas/owner"
 	atlasStatusPredicate        observation.Predicate = "project.atlas/status"
 	atlasCollaborationPredicate observation.Predicate = "project.atlas/collaborates"
+	atlasLateSourcePredicate    observation.Predicate = "project.atlas/late-source"
 	atlasConcurrentPredicate    observation.Predicate = "project.atlas/concurrent"
 
 	atlasSupportingSectionText    = "Alex leads Project Atlas with Blair."
@@ -40,6 +41,10 @@ const (
 	atlasContradictingQuote       = "counterevidence about Atlas"
 	atlasContradictingStartOffset = 20
 	atlasContradictingEndOffset   = 47
+	atlasLateSourceSectionText    = "A later source disputes Project Atlas collaboration."
+	atlasLateSourceQuote          = "disputes Project Atlas"
+	atlasLateSourceStartOffset    = 15
+	atlasLateSourceEndOffset      = 37
 )
 
 var (
@@ -262,6 +267,26 @@ func TestTemporalQueryPostgresEntityMatchAllAndAny(t *testing.T) {
 
 func TestTemporalQueryPostgresRoundTripsExactCitationsAndCanonicalTerms(t *testing.T) {
 	fixture := newTemporalQueryPostgresFixture(t)
+	historical := fixture.loadSnapshot(
+		t,
+		[]identity.EntityID{atlasInitialOwnerID, atlasCollaboratorID},
+		TemporalEntityMatchAll,
+		atlasCollaborationPredicate,
+		&atlasHistoricalCutoff,
+	)
+	if len(historical.Observations) != 0 {
+		t.Fatalf(
+			"historical collaboration observations = %#v, want whole candidate excluded",
+			historical.Observations,
+		)
+	}
+	assertTemporalCoverage(
+		t,
+		historical.Coverage,
+		TemporalCoverageAuthorityExcluded,
+		fixture.collaborationObservation.ID(),
+	)
+
 	snapshot := fixture.loadSnapshot(
 		t,
 		[]identity.EntityID{atlasCurrentOwnerID, atlasCollaboratorID},
@@ -381,6 +406,52 @@ func TestTemporalQueryPostgresRoundTripsExactCitationsAndCanonicalTerms(t *testi
 			)
 		}
 	}
+}
+
+func TestTemporalQueryPostgresSourceVersionCutoffRejectsWholeCitationSet(t *testing.T) {
+	fixture := newTemporalQueryPostgresFixture(t)
+	historical := fixture.loadSnapshot(
+		t,
+		[]identity.EntityID{atlasInitialOwnerID, atlasCollaboratorID},
+		TemporalEntityMatchAll,
+		atlasLateSourcePredicate,
+		&atlasHistoricalCutoff,
+	)
+	current := fixture.loadSnapshot(
+		t,
+		[]identity.EntityID{atlasCurrentOwnerID, atlasCollaboratorID},
+		TemporalEntityMatchAll,
+		atlasLateSourcePredicate,
+		nil,
+	)
+
+	if len(historical.Observations) != 0 {
+		t.Fatalf(
+			"historical late-source observations = %#v, want whole candidate excluded",
+			historical.Observations,
+		)
+	}
+	assertTemporalCoverage(
+		t,
+		historical.Coverage,
+		TemporalCoverageAuthorityExcluded,
+		fixture.lateSourceObservation.ID(),
+	)
+	if len(current.Observations) != 1 ||
+		current.Observations[0].Observation.ID() !=
+			fixture.lateSourceObservation.ID() {
+		t.Fatalf(
+			"current late-source observations = %#v, want %q",
+			current.Observations,
+			fixture.lateSourceObservation.ID(),
+		)
+	}
+	assertTemporalEvidenceIDsExactlyOnce(
+		t,
+		current.Observations[0].Evidence,
+		fixture.supportingSpan.ID(),
+		fixture.lateSourceSpan.ID(),
+	)
 }
 
 func TestTemporalQueryPostgresUsesOneCoherentSnapshotDuringConcurrentAuthorityChange(t *testing.T) {
@@ -537,6 +608,7 @@ type temporalQueryPostgresFixture struct {
 	sections          []evidence.Section
 	supportingSpan    evidence.EvidenceSpan
 	contradictingSpan evidence.EvidenceSpan
+	lateSourceSpan    evidence.EvidenceSpan
 
 	ownerMention        identity.MentionRecord
 	collaboratorMention identity.MentionRecord
@@ -544,6 +616,7 @@ type temporalQueryPostgresFixture struct {
 	ownerObservation         observation.Observation
 	statusObservation        observation.Observation
 	collaborationObservation observation.Observation
+	lateSourceObservation    observation.Observation
 	concurrentObservation    observation.Observation
 	concurrentAdmission      admission.Decision
 
@@ -649,7 +722,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 		atlasContradictingStartOffset,
 		atlasContradictingEndOffset,
 		atlasContradictingQuote,
-		atlasDocumentRecordedAt.Add(2*time.Minute),
+		atlasHistoricalCutoff.Add(time.Minute),
 	)
 	if err := fixture.database.InTransaction(
 		fixture.ctx,
@@ -677,6 +750,70 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 		},
 	); err != nil {
 		t.Fatalf("persist Project Atlas document evidence: %v", err)
+	}
+	lateSourceTime := atlasSourceTime.Add(time.Minute)
+	lateSourceSection := mustTemporalSection(t, evidence.SectionInput{
+		ID:    "section:project-atlas/late-source",
+		Title: "Project Atlas later source",
+		Path:  []string{"Project Atlas", "Later source"},
+		Order: 0,
+		Role:  "review-note",
+		Text:  atlasLateSourceSectionText,
+	})
+	lateSourceDocument := mustTemporalDocument(t, evidence.DocumentVersionInput{
+		Provider:           "synthetic-project-atlas",
+		ProviderDocumentID: "project-atlas-late-source",
+		Title:              "Synthetic Project Atlas later source",
+		Locator:            "synthetic://project-atlas/late-source",
+		ProviderVersion:    "synthetic-v1",
+		ModifiedAt:         lateSourceTime,
+		RecordedAt:         atlasHistoricalCutoff.Add(time.Minute),
+		SourceTime:         &lateSourceTime,
+		Sections:           []evidence.Section{lateSourceSection},
+	})
+	lateSourceRef, err := fixture.database.PutDocumentVersion(
+		fixture.ctx,
+		lateSourceDocument,
+	)
+	if err != nil {
+		t.Fatalf("PutDocumentVersion(late source) error = %v", err)
+	}
+	fixture.lateSourceSpan = mustTemporalSpan(
+		t,
+		lateSourceDocument,
+		lateSourceSection,
+		atlasLateSourceStartOffset,
+		atlasLateSourceEndOffset,
+		atlasLateSourceQuote,
+		atlasHistoricalCutoff.Add(-time.Minute),
+	)
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *Transaction) error {
+			if err := transaction.SetCurrentDocumentVersion(
+				fixture.ctx,
+				lateSourceRef.Ref.SourceDocumentID,
+				lateSourceRef.Ref.VersionID,
+			); err != nil {
+				return err
+			}
+			created, err := transaction.PutEvidenceSpan(
+				fixture.ctx,
+				fixture.lateSourceSpan,
+			)
+			if err != nil {
+				return err
+			}
+			if !created {
+				return fmt.Errorf(
+					"late-source evidence span %q was not created",
+					fixture.lateSourceSpan.ID(),
+				)
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("persist Project Atlas late-source evidence: %v", err)
 	}
 
 	initialOwner := mustTemporalEntity(
@@ -956,6 +1093,34 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 			Status: observation.StatusValidatedEmpirically,
 		},
 	)
+	fixture.lateSourceObservation = mustTemporalObservation(
+		t,
+		observation.ObservationInput{
+			ID: "observation:project-atlas/late-source",
+			Statement: observation.Statement{
+				Subject:   subject,
+				Predicate: atlasLateSourcePredicate,
+				Object:    groundedCollaborator,
+			},
+			ValidTime:  mustTemporalInstant(t, atlasValidAt),
+			RecordedAt: atlasCollaborationObservationAt.Add(time.Minute),
+			Evidence: []observation.EvidenceLink{
+				{
+					EvidenceID: fixture.supportingSpan.ID(),
+					Role:       observation.EvidenceSupporting,
+				},
+				{
+					EvidenceID: fixture.lateSourceSpan.ID(),
+					Role:       observation.EvidenceContradicting,
+				},
+			},
+			Derivation: observation.Derivation{
+				Method:  "synthetic-review",
+				Version: "project-atlas-v1",
+			},
+			Status: observation.StatusObserved,
+		},
+	)
 	fixture.concurrentObservation = mustTemporalObservation(
 		t,
 		observation.ObservationInput{
@@ -1018,6 +1183,18 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 			RecordedAt: atlasCollaborationObservationAt.Add(4 * time.Minute),
 		},
 	)
+	lateSourceAdmission := mustTemporalAdmissionDecision(
+		t,
+		admission.DecisionInput{
+			ID:         "admission:project-atlas/late-source",
+			TargetKind: admission.TargetObservation,
+			TargetID:   string(fixture.lateSourceObservation.ID()),
+			Outcome:    admission.Admitted,
+			ReasonCode: "reviewed_observation",
+			Authority:  admission.AuthorityReviewer,
+			RecordedAt: atlasCollaborationObservationAt.Add(5 * time.Minute),
+		},
+	)
 	fixture.concurrentAdmission = mustTemporalAdmissionDecision(
 		t,
 		admission.DecisionInput{
@@ -1037,6 +1214,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 				fixture.ownerObservation,
 				fixture.statusObservation,
 				fixture.collaborationObservation,
+				fixture.lateSourceObservation,
 				fixture.concurrentObservation,
 			} {
 				if _, err := transaction.PutObservation(
@@ -1051,6 +1229,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 				statusAdmission,
 				statusRetired,
 				collaborationAdmission,
+				lateSourceAdmission,
 				fixture.concurrentAdmission,
 			} {
 				if err := transaction.AppendAdmissionDecision(
@@ -1510,6 +1689,30 @@ func assertNoTemporalCoverageForObservation(
 				"coverage = %#v, want no exclusion for observation %q",
 				records,
 				observationID,
+			)
+		}
+	}
+}
+
+func assertTemporalEvidenceIDsExactlyOnce(
+	t testing.TB,
+	records []TemporalEvidenceRecord,
+	want ...evidence.EvidenceID,
+) {
+	t.Helper()
+	if len(records) != len(want) {
+		t.Fatalf("citation count = %d, want %d", len(records), len(want))
+	}
+	counts := make(map[evidence.EvidenceID]int, len(records))
+	for _, record := range records {
+		counts[record.EvidenceID]++
+	}
+	for _, evidenceID := range want {
+		if counts[evidenceID] != 1 {
+			t.Fatalf(
+				"citation evidence ID %q occurred %d times, want exactly once",
+				evidenceID,
+				counts[evidenceID],
 			)
 		}
 	}

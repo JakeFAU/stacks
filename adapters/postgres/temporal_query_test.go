@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/admission"
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/observation"
@@ -230,6 +232,8 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 		temporalQueryRowsResult(nil),
 		temporalQueryRowsResult(nil),
 		temporalQueryRowsResult(nil),
+		temporalQueryRowsResult(nil),
+		temporalQueryRowsResult(nil),
 	)
 	inputCutoff := time.Date(
 		2026,
@@ -260,8 +264,8 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 	if len(pool.options) != 1 || pool.options[0] != wantOptions {
 		t.Fatalf("BeginTx options = %#v, want %#v", pool.options, wantOptions)
 	}
-	if len(pool.transaction.queries) != 4 {
-		t.Fatalf("transaction queries = %d, want 4", len(pool.transaction.queries))
+	if len(pool.transaction.queries) != 6 {
+		t.Fatalf("transaction queries = %d, want 6", len(pool.transaction.queries))
 	}
 	wantCutoff := timepoint.Normalize(inputCutoff)
 	for index, query := range pool.transaction.queries {
@@ -282,7 +286,38 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 			t.Fatalf("query %d interpolated a selected private value", index)
 		}
 	}
-	authoritySQL := pool.transaction.queries[1].sql
+	canonicalAuthoritySQL := pool.transaction.queries[1].sql
+	for _, required := range []string{
+		"relevant_observations AS",
+		"relevant_resolution_decisions AS",
+		"relevant_admission_decisions AS",
+		"resolution_successor.supersedes_id = resolution_predecessor.id",
+		"admission_successor.supersedes_id = admission_predecessor.id",
+		"decision.digest_version",
+		"decision.digest",
+	} {
+		if !strings.Contains(canonicalAuthoritySQL, required) {
+			t.Fatalf(
+				"canonical authority SQL does not contain required boundary %q",
+				required,
+			)
+		}
+	}
+	for _, forbidden := range []string{
+		"AND resolution_successor.proposal_id = resolution_predecessor.proposal_id",
+		"AND resolution_successor.recorded_at >= resolution_predecessor.recorded_at",
+		"AND admission_successor.target_kind = admission_predecessor.target_kind",
+		"AND admission_successor.target_id = admission_predecessor.target_id",
+		"AND admission_successor.recorded_at >= admission_predecessor.recorded_at",
+	} {
+		if strings.Contains(canonicalAuthoritySQL, forbidden) {
+			t.Fatalf(
+				"canonical authority SQL filters malformed successor before validation with %q",
+				forbidden,
+			)
+		}
+	}
+	authoritySQL := pool.transaction.queries[2].sql
 	for _, required := range []string{
 		"WITH RECURSIVE",
 		"visible_entities AS",
@@ -331,14 +366,30 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 			)
 		}
 	}
-	evidenceSQL := pool.transaction.queries[3].sql
+	evidenceSQL := pool.transaction.queries[4].sql
 	for _, required := range []string{
 		"JOIN stacks_core.source_documents AS source",
 		"source.created_at <= parameters.cutoff",
+		"version.content_digest",
+		"span.digest_version",
+		"span.recorded_at",
 	} {
 		if !strings.Contains(evidenceSQL, required) {
 			t.Fatalf(
 				"evidence projection SQL does not contain required cutoff boundary %q",
+				required,
+			)
+		}
+	}
+	sectionSQL := pool.transaction.queries[5].sql
+	for _, required := range []string{
+		"section.content",
+		"section.parent_id",
+		"section.document_version_id = ANY($2::text[])",
+	} {
+		if !strings.Contains(sectionSQL, required) {
+			t.Fatalf(
+				"canonical section SQL does not contain required boundary %q",
 				required,
 			)
 		}
@@ -349,7 +400,17 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 }
 
 func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceReads(t *testing.T) {
-	value := temporalTestObservation(t, observation.StatusObserved, nil)
+	evidenceRows, sectionRows := temporalCanonicalEvidenceRows(
+		t,
+		temporalTestObservationID,
+	)
+	evidenceID := evidence.EvidenceID(evidenceRows[0][14].(string))
+	value := temporalTestObservationWithEvidenceID(
+		t,
+		observation.StatusObserved,
+		nil,
+		evidenceID,
+	)
 	selection := temporalTestSelection(t)
 	selection.EntityIDs = []identity.EntityID{
 		temporalTestEntityID,
@@ -361,6 +422,7 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 			{string(temporalTestEntityID), true},
 			{string(temporalTestSecondEntityID), false},
 		}),
+		temporalQueryRowsResult(nil),
 		temporalQueryRowsResult([][]any{
 			temporalQualificationRow(value, "retained"),
 			temporalExcludedQualificationRow(
@@ -385,7 +447,8 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 			),
 		}),
 		temporalQueryRowsResult([][]any{temporalObservationRow(t, value)}),
-		temporalQueryRowsResult([][]any{temporalEvidenceRow(value.ID())}),
+		temporalQueryRowsResult(evidenceRows),
+		temporalQueryRowsResult(sectionRows),
 	)
 
 	snapshot, err := loadTemporalQuerySnapshot(
@@ -403,6 +466,8 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 		"query-2",
 		"query-3",
 		"query-4",
+		"query-5",
+		"query-6",
 		"commit",
 		"rollback",
 	}
@@ -428,7 +493,7 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 		record.SubjectGroundingMentionID != "" ||
 		record.ObjectGroundingMentionID != "" ||
 		len(record.Evidence) != 1 ||
-		record.Evidence[0].EvidenceID != temporalTestEvidenceID {
+		record.Evidence[0].EvidenceID != evidenceID {
 		t.Fatalf("snapshot observation = %#v", record)
 	}
 	subjectID, _, subjectIsEntity := record.Subject.Entity()
@@ -472,6 +537,7 @@ func TestTemporalQuerySnapshotRejectsDuplicateRetainedAuthorityRows(t *testing.T
 	duplicate := temporalQualificationRow(value, temporalCoverageRetained)
 	pool := newTemporalQueryFakePool(
 		temporalQueryRowsResult([][]any{{string(temporalTestEntityID), true}}),
+		temporalQueryRowsResult(nil),
 		temporalQueryRowsResult([][]any{duplicate, duplicate}),
 	)
 
@@ -496,6 +562,309 @@ func TestTemporalQuerySnapshotRejectsDuplicateRetainedAuthorityRows(t *testing.T
 	}
 }
 
+func TestTemporalQuerySnapshotRejectsMalformedCanonicalAuthorityChain(t *testing.T) {
+	resolutionRows := temporalResolutionAuthorityRows(t)
+	admissionRows := temporalAdmissionAuthorityRows(t)
+	tests := []struct {
+		name       string
+		baseRows   [][]any
+		rowIndex   int
+		fieldIndex int
+		corrupt    any
+	}{
+		{
+			name:       "resolution predecessor digest version",
+			baseRows:   resolutionRows,
+			rowIndex:   0,
+			fieldIndex: 11,
+			corrupt:    "stacks.identity-resolution-decision.invalid",
+		},
+		{
+			name:       "resolution predecessor digest",
+			baseRows:   resolutionRows,
+			rowIndex:   0,
+			fieldIndex: 12,
+			corrupt:    temporalCorruptDigest("corrupt-resolution-predecessor"),
+		},
+		{
+			name:       "resolution successor digest version",
+			baseRows:   resolutionRows,
+			rowIndex:   1,
+			fieldIndex: 11,
+			corrupt:    "stacks.identity-resolution-decision.invalid",
+		},
+		{
+			name:       "resolution successor digest",
+			baseRows:   resolutionRows,
+			rowIndex:   1,
+			fieldIndex: 12,
+			corrupt:    temporalCorruptDigest("corrupt-resolution-successor"),
+		},
+		{
+			name:       "admission predecessor digest version",
+			baseRows:   admissionRows,
+			rowIndex:   0,
+			fieldIndex: 11,
+			corrupt:    "stacks.admission-decision.invalid",
+		},
+		{
+			name:       "admission predecessor digest",
+			baseRows:   admissionRows,
+			rowIndex:   0,
+			fieldIndex: 12,
+			corrupt:    temporalCorruptDigest("corrupt-admission-predecessor"),
+		},
+		{
+			name:       "admission successor digest version",
+			baseRows:   admissionRows,
+			rowIndex:   1,
+			fieldIndex: 11,
+			corrupt:    "stacks.admission-decision.invalid",
+		},
+		{
+			name:       "admission successor digest",
+			baseRows:   admissionRows,
+			rowIndex:   1,
+			fieldIndex: 12,
+			corrupt:    temporalCorruptDigest("corrupt-admission-successor"),
+		},
+		{
+			name: "resolution successor proposal mismatch",
+			baseRows: temporalResolutionAuthorityRowsWithSuccessor(
+				t,
+				"proposal:synthetic/other",
+				temporalTestRecordedAt.Add(time.Minute),
+			),
+			rowIndex: -1,
+		},
+		{
+			name: "resolution successor precedes predecessor",
+			baseRows: temporalResolutionAuthorityRowsWithSuccessor(
+				t,
+				"proposal:synthetic/temporal",
+				temporalTestRecordedAt.Add(-time.Minute),
+			),
+			rowIndex: -1,
+		},
+		{
+			name: "admission successor target mismatch",
+			baseRows: temporalAdmissionAuthorityRowsWithSuccessor(
+				t,
+				"observation:synthetic/other",
+				temporalTestRecordedAt.Add(time.Minute),
+			),
+			rowIndex: -1,
+		},
+		{
+			name: "admission successor precedes predecessor",
+			baseRows: temporalAdmissionAuthorityRowsWithSuccessor(
+				t,
+				string(temporalTestObservationID),
+				temporalTestRecordedAt.Add(-time.Minute),
+			),
+			rowIndex: -1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rows := cloneTemporalQueryRows(test.baseRows)
+			if test.rowIndex >= 0 {
+				rows[test.rowIndex][test.fieldIndex] = test.corrupt
+			}
+			pool := newTemporalQueryFakePool(
+				temporalQueryRowsResult([][]any{{
+					string(temporalTestEntityID),
+					true,
+				}}),
+				temporalQueryRowsResult(rows),
+				temporalQueryRowsResult(nil),
+				temporalQueryRowsResult(nil),
+				temporalQueryRowsResult(nil),
+			)
+
+			_, err := loadTemporalQuerySnapshot(
+				context.Background(),
+				pool,
+				temporalTestSelection(t),
+				nil,
+			)
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("loadTemporalQuerySnapshot() error = %v, want ErrConflict", err)
+			}
+			if err.Error() != "load temporal query snapshot: validate canonical authority failed" {
+				t.Fatalf("loadTemporalQuerySnapshot() error = %q, want bounded authority conflict", err)
+			}
+			if len(pool.transaction.queries) != 2 {
+				t.Fatalf(
+					"transaction queries = %d, want authority validation to stop qualification",
+					len(pool.transaction.queries),
+				)
+			}
+			if pool.transaction.commitCalls != 0 ||
+				pool.transaction.rollbackCalls != 1 {
+				t.Fatalf(
+					"commit/rollback calls = %d/%d, want 0/1",
+					pool.transaction.commitCalls,
+					pool.transaction.rollbackCalls,
+				)
+			}
+		})
+	}
+}
+
+func TestTemporalQuerySnapshotVerifiesCanonicalAuthorityBeforeQualification(t *testing.T) {
+	authorityRows := append(
+		temporalResolutionAuthorityRows(t),
+		temporalAdmissionAuthorityRows(t)...,
+	)
+	pool := newTemporalQueryFakePool(
+		temporalQueryRowsResult([][]any{{
+			string(temporalTestEntityID),
+			true,
+		}}),
+		temporalQueryRowsResult(authorityRows),
+		temporalQueryRowsResult(nil),
+		temporalQueryRowsResult(nil),
+		temporalQueryRowsResult(nil),
+		temporalQueryRowsResult(nil),
+	)
+
+	_, err := loadTemporalQuerySnapshot(
+		context.Background(),
+		pool,
+		temporalTestSelection(t),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("loadTemporalQuerySnapshot() error = %v", err)
+	}
+	if len(pool.transaction.queries) != 6 ||
+		pool.transaction.commitCalls != 1 ||
+		pool.transaction.rollbackCalls != 1 {
+		t.Fatalf(
+			"queries/commit/rollback = %d/%d/%d, want 6/1/1",
+			len(pool.transaction.queries),
+			pool.transaction.commitCalls,
+			pool.transaction.rollbackCalls,
+		)
+	}
+}
+
+func TestTemporalQuerySnapshotRejectsMalformedCanonicalEvidence(t *testing.T) {
+	tests := []struct {
+		name    string
+		corrupt func(evidenceRows, sectionRows [][]any)
+	}{
+		{
+			name: "document version ID",
+			corrupt: func(evidenceRows, _ [][]any) {
+				evidenceRows[0][5] = "document-version:synthetic/corrupt"
+			},
+		},
+		{
+			name: "document version digest",
+			corrupt: func(evidenceRows, _ [][]any) {
+				evidenceRows[0][7] = temporalCorruptDigest("corrupt-document")
+			},
+		},
+		{
+			name: "document version recorded time",
+			corrupt: func(evidenceRows, _ [][]any) {
+				evidenceRows[0][13] = temporalTestRecordedAt.Add(time.Nanosecond)
+			},
+		},
+		{
+			name: "evidence span ID",
+			corrupt: func(evidenceRows, _ [][]any) {
+				evidenceRows[0][14] = "evidence:synthetic/corrupt"
+			},
+		},
+		{
+			name: "evidence span digest",
+			corrupt: func(evidenceRows, _ [][]any) {
+				evidenceRows[0][18] = temporalCorruptDigest("corrupt-span")
+			},
+		},
+		{
+			name: "evidence span recorded time",
+			corrupt: func(evidenceRows, _ [][]any) {
+				evidenceRows[0][22] = temporalTestRecordedAt.Add(time.Nanosecond)
+			},
+		},
+		{
+			name: "section content",
+			corrupt: func(_ [][]any, sectionRows [][]any) {
+				sectionRows[0][7] = "synthetic quote was altered"
+			},
+		},
+		{
+			name: "quote bounds",
+			corrupt: func(evidenceRows, _ [][]any) {
+				evidenceRows[0][20] = len("synthetic quot")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidenceRows, sectionRows := temporalCanonicalEvidenceRows(
+				t,
+				temporalTestObservationID,
+			)
+			value := temporalTestObservationWithEvidenceID(
+				t,
+				observation.StatusObserved,
+				nil,
+				evidence.EvidenceID(evidenceRows[0][14].(string)),
+			)
+			test.corrupt(evidenceRows, sectionRows)
+			pool := newTemporalQueryFakePool(
+				temporalQueryRowsResult([][]any{{
+					string(temporalTestEntityID),
+					true,
+				}}),
+				temporalQueryRowsResult(nil),
+				temporalQueryRowsResult([][]any{
+					temporalQualificationRow(value, temporalCoverageRetained),
+				}),
+				temporalQueryRowsResult([][]any{
+					temporalObservationRow(t, value),
+				}),
+				temporalQueryRowsResult(evidenceRows),
+				temporalQueryRowsResult(sectionRows),
+			)
+
+			_, err := loadTemporalQuerySnapshot(
+				context.Background(),
+				pool,
+				temporalTestSelection(t),
+				nil,
+			)
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("loadTemporalQuerySnapshot() error = %v, want ErrConflict", err)
+			}
+			if err.Error() != "load temporal query snapshot: validate canonical evidence failed" {
+				t.Fatalf("loadTemporalQuerySnapshot() error = %q, want bounded evidence conflict", err)
+			}
+			if len(pool.transaction.queries) != 6 {
+				t.Fatalf(
+					"transaction queries = %d, want complete batch evidence validation",
+					len(pool.transaction.queries),
+				)
+			}
+			if pool.transaction.commitCalls != 0 ||
+				pool.transaction.rollbackCalls != 1 {
+				t.Fatalf(
+					"commit/rollback calls = %d/%d, want 0/1",
+					pool.transaction.commitCalls,
+					pool.transaction.rollbackCalls,
+				)
+			}
+		})
+	}
+}
+
 func TestTemporalQuerySnapshotRollsBackAndPreservesCancellation(t *testing.T) {
 	privateFailure := fmt.Errorf(
 		"private-id predicate SQL https://private.invalid: %w",
@@ -503,6 +872,7 @@ func TestTemporalQuerySnapshotRollsBackAndPreservesCancellation(t *testing.T) {
 	)
 	pool := newTemporalQueryFakePool(
 		temporalQueryRowsResult([][]any{{string(temporalTestEntityID), true}}),
+		temporalQueryRowsResult(nil),
 		temporalQueryRowsError(privateFailure),
 	)
 	ctx := context.WithValue(
@@ -543,15 +913,26 @@ func TestTemporalQuerySnapshotDoesNotApplyValidTimeOrConfidencePolicy(t *testing
 	if err != nil {
 		t.Fatalf("observation.NewUnitIntervalConfidence() error = %v", err)
 	}
-	value := temporalTestObservation(t, observation.StatusRejected, &confidence)
+	evidenceRows, sectionRows := temporalCanonicalEvidenceRows(
+		t,
+		temporalTestObservationID,
+	)
+	value := temporalTestObservationWithEvidenceID(
+		t,
+		observation.StatusRejected,
+		&confidence,
+		evidence.EvidenceID(evidenceRows[0][14].(string)),
+	)
 	pool := newTemporalQueryFakePool(
 		temporalQueryRowsResult([][]any{{string(temporalTestEntityID), true}}),
+		temporalQueryRowsResult(nil),
 		temporalQueryRowsResult([][]any{temporalQualificationRow(
 			value,
 			"retained",
 		)}),
 		temporalQueryRowsResult([][]any{temporalObservationRow(t, value)}),
-		temporalQueryRowsResult([][]any{temporalEvidenceRow(value.ID())}),
+		temporalQueryRowsResult(evidenceRows),
+		temporalQueryRowsResult(sectionRows),
 	)
 
 	snapshot, err := loadTemporalQuerySnapshot(
@@ -585,7 +966,7 @@ func TestTemporalQuerySnapshotDoesNotApplyValidTimeOrConfidencePolicy(t *testing
 			}
 		}
 	}
-	authoritySQL := pool.transaction.queries[1].sql
+	authoritySQL := pool.transaction.queries[2].sql
 	for _, forbidden := range []string{
 		"valid_start",
 		"valid_end",
@@ -596,7 +977,7 @@ func TestTemporalQuerySnapshotDoesNotApplyValidTimeOrConfidencePolicy(t *testing
 			t.Fatalf("authority eligibility SQL contains core policy field %q", forbidden)
 		}
 	}
-	observationSQL := pool.transaction.queries[2].sql
+	observationSQL := pool.transaction.queries[3].sql
 	for _, projected := range []string{
 		"value.valid_start",
 		"value.valid_end",
@@ -635,6 +1016,8 @@ func TestTemporalQuerySnapshotFinishesBoundedObservationOnSuccessAndFailure(t *t
 				{string(temporalTestEntityID), true},
 				{string(temporalTestSecondEntityID), true},
 			}),
+			temporalQueryRowsResult(nil),
+			temporalQueryRowsResult(nil),
 			temporalQueryRowsResult(nil),
 			temporalQueryRowsResult(nil),
 			temporalQueryRowsResult(nil),
@@ -737,6 +1120,21 @@ func temporalTestObservation(
 	confidence *observation.Confidence,
 ) observation.Observation {
 	t.Helper()
+	return temporalTestObservationWithEvidenceID(
+		t,
+		status,
+		confidence,
+		temporalTestEvidenceID,
+	)
+}
+
+func temporalTestObservationWithEvidenceID(
+	t *testing.T,
+	status observation.EpistemicStatus,
+	confidence *observation.Confidence,
+	evidenceID evidence.EvidenceID,
+) observation.Observation {
+	t.Helper()
 	subject, err := observation.NewEntityTerm(string(temporalTestEntityID), "")
 	if err != nil {
 		t.Fatalf("observation.NewEntityTerm() error = %v", err)
@@ -759,7 +1157,7 @@ func temporalTestObservation(
 		ValidTime:  validTime,
 		RecordedAt: temporalTestRecordedAt,
 		Evidence: []observation.EvidenceLink{{
-			EvidenceID: temporalTestEvidenceID,
+			EvidenceID: evidenceID,
 			Role:       observation.EvidenceSupporting,
 		}},
 		Derivation: observation.Derivation{
@@ -880,23 +1278,272 @@ func temporalObservationRow(t *testing.T, value observation.Observation) []any {
 	}
 }
 
-func temporalEvidenceRow(observationID observation.ObservationID) []any {
-	return []any{
-		string(observationID),
-		string(temporalTestEvidenceID),
-		string(observation.EvidenceSupporting),
-		"source-document:synthetic/temporal",
-		"document-version:synthetic/temporal",
-		"section:synthetic/temporal",
-		"Synthetic Section",
-		[]string{"Synthetic Document", "Synthetic Section"},
-		1,
-		"body",
-		0,
-		15,
-		"synthetic://temporal",
-		"synthetic quote",
+func temporalCanonicalEvidenceRows(
+	t *testing.T,
+	observationID observation.ObservationID,
+) ([][]any, [][]any) {
+	t.Helper()
+	section, err := evidence.NewSection(evidence.SectionInput{
+		ID:    "section:synthetic/temporal",
+		Title: "Synthetic Section",
+		Path:  []string{"Synthetic Document", "Synthetic Section"},
+		Order: 1,
+		Role:  "body",
+		Text:  "synthetic quote plus context",
+	})
+	if err != nil {
+		t.Fatalf("evidence.NewSection() error = %v", err)
 	}
+	document, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
+		Provider:           "synthetic",
+		ProviderDocumentID: "temporal",
+		Title:              "Synthetic Document",
+		Locator:            "synthetic://temporal",
+		ProviderVersion:    "synthetic-v1",
+		ModifiedAt:         temporalTestRecordedAt,
+		RecordedAt:         temporalTestRecordedAt,
+		Sections:           []evidence.Section{section},
+	})
+	if err != nil {
+		t.Fatalf("evidence.NewDocumentVersion() error = %v", err)
+	}
+	span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
+		Document:    document,
+		SectionID:   section.ID(),
+		StartOffset: 0,
+		EndOffset:   len("synthetic quote"),
+		Quote:       "synthetic quote",
+		RecordedAt:  temporalTestRecordedAt,
+	})
+	if err != nil {
+		t.Fatalf("evidence.NewEvidenceSpan() error = %v", err)
+	}
+	sourceDocumentID := deriveOpaqueID(
+		sourceDocumentIDVersion,
+		[]byte(document.Provider()),
+		[]byte(document.ProviderDocumentID()),
+	)
+	documentDigest := document.Digest()
+	documentVersionID := deriveOpaqueID(
+		documentVersionIDVersion,
+		[]byte(sourceDocumentID),
+		[]byte(document.DigestVersion()),
+		documentDigest[:],
+	)
+	spanDigest := span.Digest()
+	return [][]any{{
+			string(observationID),
+			string(observation.EvidenceSupporting),
+			sourceDocumentID,
+			document.Provider(),
+			document.ProviderDocumentID(),
+			documentVersionID,
+			document.DigestVersion(),
+			documentDigest[:],
+			document.Title(),
+			document.Locator(),
+			document.ProviderVersion(),
+			document.ModifiedAt(),
+			document.SourceTime(),
+			document.RecordedAt(),
+			string(span.ID()),
+			documentVersionID,
+			span.SectionID(),
+			span.DigestVersion(),
+			spanDigest[:],
+			span.StartOffset(),
+			span.EndOffset(),
+			span.Text(),
+			span.RecordedAt(),
+		}}, [][]any{{
+			documentVersionID,
+			section.ID(),
+			section.Title(),
+			section.ParentID(),
+			section.Path(),
+			section.Order(),
+			section.Role(),
+			section.Text(),
+		}}
+}
+
+func temporalResolutionAuthorityRows(t *testing.T) [][]any {
+	t.Helper()
+	predecessor, err := identity.NewResolutionDecision(identity.ResolutionDecisionInput{
+		ID:         "decision:synthetic/temporal-predecessor",
+		ProposalID: "proposal:synthetic/temporal",
+		Outcome:    identity.DecisionAccepted,
+		EntityID:   temporalTestEntityID,
+		Authority:  identity.AuthorityReviewer,
+		ReasonCode: "synthetic-review",
+		RecordedAt: temporalTestRecordedAt,
+	})
+	if err != nil {
+		t.Fatalf("identity.NewResolutionDecision(predecessor) error = %v", err)
+	}
+	successor, err := identity.NewResolutionDecision(identity.ResolutionDecisionInput{
+		ID:           "decision:synthetic/temporal-successor",
+		ProposalID:   predecessor.ProposalID(),
+		Outcome:      identity.DecisionAccepted,
+		EntityID:     temporalTestSecondEntityID,
+		Authority:    identity.AuthorityReviewer,
+		ReasonCode:   "synthetic-correction",
+		RecordedAt:   temporalTestRecordedAt.Add(time.Minute),
+		SupersedesID: predecessor.ID(),
+	})
+	if err != nil {
+		t.Fatalf("identity.NewResolutionDecision(successor) error = %v", err)
+	}
+	return [][]any{
+		temporalResolutionAuthorityRow(predecessor),
+		temporalResolutionAuthorityRow(successor),
+	}
+}
+
+func temporalResolutionAuthorityRow(value identity.ResolutionDecision) []any {
+	var entityID any
+	if value.EntityID() != "" {
+		entityID = string(value.EntityID())
+	}
+	var supersedesID any
+	if value.SupersedesID() != "" {
+		supersedesID = string(value.SupersedesID())
+	}
+	digest := value.Digest()
+	return []any{
+		"resolution",
+		string(value.ID()),
+		string(value.ProposalID()),
+		nil,
+		nil,
+		string(value.Outcome()),
+		entityID,
+		string(value.Authority()),
+		value.ReasonCode(),
+		value.RecordedAt(),
+		supersedesID,
+		value.DigestVersion(),
+		digest[:],
+	}
+}
+
+func temporalResolutionAuthorityRowsWithSuccessor(
+	t *testing.T,
+	proposalID identity.ProposalID,
+	recordedAt time.Time,
+) [][]any {
+	t.Helper()
+	rows := temporalResolutionAuthorityRows(t)
+	successor, err := identity.NewResolutionDecision(
+		identity.ResolutionDecisionInput{
+			ID:           "decision:synthetic/temporal-successor",
+			ProposalID:   proposalID,
+			Outcome:      identity.DecisionAccepted,
+			EntityID:     temporalTestSecondEntityID,
+			Authority:    identity.AuthorityReviewer,
+			ReasonCode:   "synthetic-correction",
+			RecordedAt:   recordedAt,
+			SupersedesID: identity.DecisionID(rows[0][1].(string)),
+		},
+	)
+	if err != nil {
+		t.Fatalf("identity.NewResolutionDecision(successor) error = %v", err)
+	}
+	rows[1] = temporalResolutionAuthorityRow(successor)
+	return rows
+}
+
+func temporalAdmissionAuthorityRows(t *testing.T) [][]any {
+	t.Helper()
+	predecessor, err := admission.NewDecision(admission.DecisionInput{
+		ID:         "admission:synthetic/temporal-predecessor",
+		TargetKind: admission.TargetObservation,
+		TargetID:   string(temporalTestObservationID),
+		Outcome:    admission.Admitted,
+		ReasonCode: "synthetic-review",
+		Authority:  admission.AuthorityReviewer,
+		RecordedAt: temporalTestRecordedAt,
+	})
+	if err != nil {
+		t.Fatalf("admission.NewDecision(predecessor) error = %v", err)
+	}
+	successor, err := admission.NewDecision(admission.DecisionInput{
+		ID:           "admission:synthetic/temporal-successor",
+		TargetKind:   predecessor.TargetKind(),
+		TargetID:     predecessor.TargetID(),
+		Outcome:      admission.Retired,
+		ReasonCode:   "synthetic-correction",
+		Authority:    admission.AuthorityReviewer,
+		RecordedAt:   temporalTestRecordedAt.Add(time.Minute),
+		SupersedesID: predecessor.ID(),
+	})
+	if err != nil {
+		t.Fatalf("admission.NewDecision(successor) error = %v", err)
+	}
+	return [][]any{
+		temporalAdmissionAuthorityRow(predecessor),
+		temporalAdmissionAuthorityRow(successor),
+	}
+}
+
+func temporalAdmissionAuthorityRow(value admission.Decision) []any {
+	var supersedesID any
+	if value.SupersedesID() != "" {
+		supersedesID = value.SupersedesID()
+	}
+	digest := value.Digest()
+	return []any{
+		"admission",
+		value.ID(),
+		nil,
+		string(value.TargetKind()),
+		value.TargetID(),
+		string(value.Outcome()),
+		nil,
+		string(value.Authority()),
+		value.ReasonCode(),
+		value.RecordedAt(),
+		supersedesID,
+		value.DigestVersion(),
+		digest[:],
+	}
+}
+
+func temporalAdmissionAuthorityRowsWithSuccessor(
+	t *testing.T,
+	targetID string,
+	recordedAt time.Time,
+) [][]any {
+	t.Helper()
+	rows := temporalAdmissionAuthorityRows(t)
+	successor, err := admission.NewDecision(admission.DecisionInput{
+		ID:           "admission:synthetic/temporal-successor",
+		TargetKind:   admission.TargetObservation,
+		TargetID:     targetID,
+		Outcome:      admission.Retired,
+		ReasonCode:   "synthetic-correction",
+		Authority:    admission.AuthorityReviewer,
+		RecordedAt:   recordedAt,
+		SupersedesID: rows[0][1].(string),
+	})
+	if err != nil {
+		t.Fatalf("admission.NewDecision(successor) error = %v", err)
+	}
+	rows[1] = temporalAdmissionAuthorityRow(successor)
+	return rows
+}
+
+func cloneTemporalQueryRows(values [][]any) [][]any {
+	result := make([][]any, len(values))
+	for index, value := range values {
+		result[index] = append([]any(nil), value...)
+	}
+	return result
+}
+
+func temporalCorruptDigest(label string) []byte {
+	value := sha256.Sum256([]byte(label))
+	return value[:]
 }
 
 type temporalObserverContextKey struct{}

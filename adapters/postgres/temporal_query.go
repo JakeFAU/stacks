@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/admission"
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/observation"
@@ -203,6 +204,14 @@ func loadTemporalQuerySnapshot(
 		normalized.EntityIDs,
 	)
 	if err != nil {
+		return TemporalQuerySnapshot{}, err
+	}
+	if err := readTemporalCanonicalAuthority(
+		ctx,
+		transaction,
+		cutoff,
+		normalized.EntityIDs,
+	); err != nil {
 		return TemporalQuerySnapshot{}, err
 	}
 	qualified, coverage, err := readTemporalQualification(
@@ -556,6 +565,381 @@ func readTemporalEntityRecords(
 		}
 	}
 	return records, nil
+}
+
+const temporalCanonicalAuthoritySQL = `
+	WITH RECURSIVE
+	parameters AS (
+		SELECT $1::timestamptz AS cutoff
+	),
+	requested_entities AS (
+		SELECT unnest($2::text[]) AS id
+	),
+	visible_entities AS (
+		SELECT entity.*
+		FROM stacks_core.entities AS entity
+		CROSS JOIN parameters
+		WHERE parameters.cutoff IS NULL
+		   OR entity.recorded_at <= parameters.cutoff
+	),
+	visible_resolution_proposals AS (
+		SELECT proposal.*
+		FROM stacks_core.resolution_proposals AS proposal
+		CROSS JOIN parameters
+		WHERE parameters.cutoff IS NULL
+		   OR proposal.recorded_at <= parameters.cutoff
+	),
+	visible_resolution_decisions AS (
+		SELECT decision.*
+		FROM stacks_core.resolution_decisions AS decision
+		CROSS JOIN parameters
+		WHERE parameters.cutoff IS NULL
+		   OR decision.recorded_at <= parameters.cutoff
+	),
+	reachable_resolution_decisions AS (
+		SELECT
+			root_resolution.*,
+			root_resolution.id AS chain_root_id
+		FROM visible_resolution_decisions AS root_resolution
+		WHERE root_resolution.supersedes_id IS NULL
+		UNION
+		SELECT
+			resolution_successor.*,
+			resolution_predecessor.chain_root_id
+		FROM visible_resolution_decisions AS resolution_successor
+		JOIN reachable_resolution_decisions AS resolution_predecessor
+		  ON resolution_successor.supersedes_id = resolution_predecessor.id
+	),
+	requested_resolution_chains AS (
+		SELECT DISTINCT decision.chain_root_id
+		FROM reachable_resolution_decisions AS decision
+		JOIN visible_entities AS entity
+		  ON entity.id = decision.entity_id
+		JOIN requested_entities AS requested
+		  ON requested.id = decision.entity_id
+		WHERE decision.outcome = 'accepted'
+	),
+	requested_resolution_mentions AS (
+		SELECT DISTINCT proposal.mention_id
+		FROM reachable_resolution_decisions AS decision
+		JOIN requested_resolution_chains AS chain
+		  ON chain.chain_root_id = decision.chain_root_id
+		JOIN visible_resolution_proposals AS proposal
+		  ON proposal.id = decision.proposal_id
+	),
+	visible_observations AS (
+		SELECT value.*
+		FROM stacks_core.observations AS value
+		CROSS JOIN parameters
+		WHERE parameters.cutoff IS NULL
+		   OR value.recorded_at <= parameters.cutoff
+	),
+	relevant_observations AS (
+		SELECT value.*
+		FROM visible_observations AS value
+		WHERE (
+			value.subject_kind IN ('entity', 'grounded_entity')
+			AND value.subject_entity_id IN (
+				SELECT requested.id FROM requested_entities AS requested
+			)
+		) OR (
+			value.object_kind IN ('entity', 'grounded_entity')
+			AND value.object_entity_id IN (
+				SELECT requested.id FROM requested_entities AS requested
+			)
+		) OR (
+			value.subject_kind = 'mention'
+			AND value.subject_mention_id IN (
+				SELECT mention_id FROM requested_resolution_mentions
+			)
+		) OR (
+			value.object_kind = 'mention'
+			AND value.object_mention_id IN (
+				SELECT mention_id FROM requested_resolution_mentions
+			)
+		)
+	),
+	relevant_mentions AS (
+		SELECT subject_mention_id AS id
+		FROM relevant_observations
+		WHERE subject_kind = 'mention'
+		UNION
+		SELECT object_mention_id AS id
+		FROM relevant_observations
+		WHERE object_kind = 'mention'
+	),
+	relevant_resolution_chains AS (
+		SELECT DISTINCT decision.chain_root_id
+		FROM reachable_resolution_decisions AS decision
+		JOIN visible_resolution_proposals AS proposal
+		  ON proposal.id = decision.proposal_id
+		JOIN relevant_mentions AS mention
+		  ON mention.id = proposal.mention_id
+	),
+	relevant_resolution_decisions AS (
+		SELECT decision.*
+		FROM reachable_resolution_decisions AS decision
+		JOIN relevant_resolution_chains AS chain
+		  ON chain.chain_root_id = decision.chain_root_id
+	),
+	visible_admission_targets AS (
+		SELECT target.*
+		FROM stacks_core.admission_targets AS target
+		CROSS JOIN parameters
+		WHERE parameters.cutoff IS NULL
+		   OR target.recorded_at <= parameters.cutoff
+	),
+	visible_admission_decisions AS (
+		SELECT decision.*
+		FROM stacks_core.admission_decisions AS decision
+		JOIN visible_admission_targets AS target
+		  ON target.target_kind = decision.target_kind
+		 AND target.target_id = decision.target_id
+		CROSS JOIN parameters
+		WHERE parameters.cutoff IS NULL
+		   OR decision.recorded_at <= parameters.cutoff
+	),
+	reachable_admission_decisions AS (
+		SELECT
+			root_admission.*,
+			root_admission.id AS chain_root_id
+		FROM visible_admission_decisions AS root_admission
+		WHERE root_admission.supersedes_id IS NULL
+		UNION
+		SELECT
+			admission_successor.*,
+			admission_predecessor.chain_root_id
+		FROM visible_admission_decisions AS admission_successor
+		JOIN reachable_admission_decisions AS admission_predecessor
+		  ON admission_successor.supersedes_id = admission_predecessor.id
+	),
+	relevant_admission_targets AS (
+		SELECT 'observation'::text AS target_kind, id::text AS target_id
+		FROM relevant_observations
+		UNION
+		SELECT 'mention'::text, id::text
+		FROM relevant_mentions
+		UNION
+		SELECT 'identity_decision'::text, id::text
+		FROM relevant_resolution_decisions
+	),
+	relevant_admission_chains AS (
+		SELECT DISTINCT decision.chain_root_id
+		FROM reachable_admission_decisions AS decision
+		JOIN relevant_admission_targets AS target
+		  ON target.target_kind = decision.target_kind
+		 AND target.target_id = decision.target_id
+	),
+	relevant_admission_decisions AS (
+		SELECT decision.*
+		FROM reachable_admission_decisions AS decision
+		JOIN relevant_admission_chains AS chain
+		  ON chain.chain_root_id = decision.chain_root_id
+	)
+	SELECT
+		'resolution'::text AS decision_kind,
+		decision.id,
+		decision.proposal_id,
+		''::text AS target_kind,
+		''::text AS target_id,
+		decision.outcome,
+		COALESCE(decision.entity_id, ''),
+		decision.authority,
+		decision.reason_code,
+		decision.recorded_at,
+		COALESCE(decision.supersedes_id, ''),
+		decision.digest_version,
+		decision.digest
+	FROM relevant_resolution_decisions AS decision
+	UNION ALL
+	SELECT
+		'admission'::text,
+		decision.id,
+		''::text,
+		decision.target_kind,
+		decision.target_id,
+		decision.outcome,
+		''::text,
+		decision.authority,
+		decision.reason_code,
+		decision.recorded_at,
+		COALESCE(decision.supersedes_id, ''),
+		decision.digest_version,
+		decision.digest
+	FROM relevant_admission_decisions AS decision
+	ORDER BY recorded_at, decision_kind, id`
+
+type temporalRawAuthorityDecision struct {
+	kind          string
+	id            string
+	proposalID    string
+	targetKind    string
+	targetID      string
+	outcome       string
+	entityID      string
+	authority     string
+	reasonCode    string
+	recordedAt    time.Time
+	supersedesID  string
+	digestVersion string
+	digest        []byte
+}
+
+func readTemporalCanonicalAuthority(
+	ctx context.Context,
+	transaction pgx.Tx,
+	cutoff any,
+	entityIDs []identity.EntityID,
+) error {
+	rows, err := transaction.Query(
+		ctx,
+		temporalCanonicalAuthoritySQL,
+		cutoff,
+		temporalEntityIDStrings(entityIDs),
+	)
+	if err != nil {
+		return temporalSnapshotError(ctx, "read canonical authority", err)
+	}
+	defer rows.Close()
+
+	seen := make(map[string]struct{})
+	values := make([]temporalRawAuthorityDecision, 0)
+	for rows.Next() {
+		var raw temporalRawAuthorityDecision
+		if err := rows.Scan(
+			&raw.kind,
+			&raw.id,
+			&raw.proposalID,
+			&raw.targetKind,
+			&raw.targetID,
+			&raw.outcome,
+			&raw.entityID,
+			&raw.authority,
+			&raw.reasonCode,
+			&raw.recordedAt,
+			&raw.supersedesID,
+			&raw.digestVersion,
+			&raw.digest,
+		); err != nil {
+			return temporalSnapshotError(ctx, "scan canonical authority", err)
+		}
+		key := raw.kind + "\x00" + raw.id
+		if _, exists := seen[key]; exists {
+			return temporalSnapshotError(
+				ctx,
+				"validate canonical authority",
+				ErrConflict,
+			)
+		}
+		seen[key] = struct{}{}
+		raw.digest = append([]byte(nil), raw.digest...)
+		if err := validateTemporalRawAuthorityDecision(raw); err != nil {
+			return temporalSnapshotError(
+				ctx,
+				"validate canonical authority",
+				ErrConflict,
+			)
+		}
+		values = append(values, raw)
+	}
+	if err := rows.Err(); err != nil {
+		return temporalSnapshotError(ctx, "iterate canonical authority", err)
+	}
+	if err := validateTemporalRawAuthorityChains(values); err != nil {
+		return temporalSnapshotError(
+			ctx,
+			"validate canonical authority",
+			ErrConflict,
+		)
+	}
+	return nil
+}
+
+func validateTemporalRawAuthorityDecision(
+	raw temporalRawAuthorityDecision,
+) error {
+	recordedAt, err := canonicalStoredTime(raw.recordedAt)
+	if err != nil {
+		return ErrConflict
+	}
+	switch raw.kind {
+	case "resolution":
+		if raw.targetKind != "" || raw.targetID != "" {
+			return ErrConflict
+		}
+		decision, err := identity.NewResolutionDecision(
+			identity.ResolutionDecisionInput{
+				ID:           identity.DecisionID(raw.id),
+				ProposalID:   identity.ProposalID(raw.proposalID),
+				Outcome:      identity.DecisionOutcome(raw.outcome),
+				EntityID:     identity.EntityID(raw.entityID),
+				Authority:    identity.DecisionAuthority(raw.authority),
+				ReasonCode:   raw.reasonCode,
+				RecordedAt:   recordedAt,
+				SupersedesID: identity.DecisionID(raw.supersedesID),
+			},
+		)
+		if err != nil ||
+			decision.DigestVersion() != raw.digestVersion ||
+			!sameDigestBytes(decision.Digest(), raw.digest) {
+			return ErrConflict
+		}
+	case "admission":
+		if raw.proposalID != "" || raw.entityID != "" {
+			return ErrConflict
+		}
+		decision, err := admission.NewDecision(admission.DecisionInput{
+			ID:           raw.id,
+			TargetKind:   admission.TargetKind(raw.targetKind),
+			TargetID:     raw.targetID,
+			Outcome:      admission.Outcome(raw.outcome),
+			ReasonCode:   raw.reasonCode,
+			Authority:    admission.Authority(raw.authority),
+			RecordedAt:   recordedAt,
+			SupersedesID: raw.supersedesID,
+		})
+		if err != nil ||
+			decision.DigestVersion() != raw.digestVersion ||
+			!sameDigestBytes(decision.Digest(), raw.digest) {
+			return ErrConflict
+		}
+	default:
+		return ErrConflict
+	}
+	return nil
+}
+
+func validateTemporalRawAuthorityChains(
+	values []temporalRawAuthorityDecision,
+) error {
+	byID := make(map[string]temporalRawAuthorityDecision, len(values))
+	for _, value := range values {
+		byID[value.kind+"\x00"+value.id] = value
+	}
+	for _, successor := range values {
+		if successor.supersedesID == "" {
+			continue
+		}
+		predecessorKey := successor.kind + "\x00" + successor.supersedesID
+		predecessor, exists := byID[predecessorKey]
+		if !exists || successor.recordedAt.Before(predecessor.recordedAt) {
+			return ErrConflict
+		}
+		switch successor.kind {
+		case "resolution":
+			if successor.proposalID != predecessor.proposalID {
+				return ErrConflict
+			}
+		case "admission":
+			if successor.targetKind != predecessor.targetKind ||
+				successor.targetID != predecessor.targetID {
+				return ErrConflict
+			}
+		default:
+			return ErrConflict
+		}
+	}
+	return nil
 }
 
 const temporalQualificationSQL = `
@@ -1283,19 +1667,28 @@ const temporalEvidenceRecordsSQL = `
 	)
 	SELECT
 		link.observation_id,
-		span.id,
 		link.role,
 		source.id,
+		source.provider,
+		source.provider_document_id,
 		version.id,
-		section.section_id,
-		section.title,
-		section.path,
-		section.section_order,
-		section.role,
+		version.digest_version,
+		version.content_digest,
+		version.title,
+		version.locator,
+		version.provider_version,
+		version.modified_at,
+		version.source_time,
+		version.recorded_at,
+		span.id,
+		span.document_version_id,
+		span.section_id,
+		span.digest_version,
+		span.digest,
 		span.start_offset,
 		span.end_offset,
-		version.locator,
-		span.quote
+		span.quote,
+		span.recorded_at
 	FROM stacks_core.observation_evidence AS link
 	JOIN stacks_core.observations AS value
 	  ON value.id = link.observation_id
@@ -1305,9 +1698,6 @@ const temporalEvidenceRecordsSQL = `
 	  ON version.id = span.document_version_id
 	JOIN stacks_core.source_documents AS source
 	  ON source.id = version.source_document_id
-	JOIN stacks_core.document_sections AS section
-	  ON section.document_version_id = span.document_version_id
-	 AND section.section_id = span.section_id
 	CROSS JOIN parameters
 	WHERE link.observation_id = ANY($2::text[])
 	  AND (
@@ -1318,12 +1708,75 @@ const temporalEvidenceRecordsSQL = `
 			AND version.recorded_at <= parameters.cutoff
 			AND source.created_at <= parameters.cutoff
 		)
-	  )
+		  )
 	ORDER BY value.recorded_at, value.id, span.id, link.role`
+
+const temporalDocumentSectionsSQL = `
+	WITH parameters AS (
+		SELECT $1::timestamptz AS cutoff
+	)
+	SELECT
+		section.document_version_id,
+		section.section_id,
+		section.title,
+		section.parent_id,
+		section.path,
+		section.section_order,
+		section.role,
+		section.content
+	FROM stacks_core.document_sections AS section
+	JOIN stacks_core.document_versions AS version
+	  ON version.id = section.document_version_id
+	JOIN stacks_core.source_documents AS source
+	  ON source.id = version.source_document_id
+	CROSS JOIN parameters
+	WHERE section.document_version_id = ANY($2::text[])
+	  AND (
+		parameters.cutoff IS NULL
+		OR (
+			version.recorded_at <= parameters.cutoff
+			AND source.created_at <= parameters.cutoff
+		)
+	  )
+	ORDER BY section.document_version_id, section.section_order, section.section_id`
 
 type temporalEvidenceProjection struct {
 	observationID string
 	record        TemporalEvidenceRecord
+}
+
+type temporalRawEvidenceProjection struct {
+	observationID string
+	role          string
+
+	sourceDocumentID   string
+	provider           string
+	providerDocumentID string
+
+	documentVersionID       string
+	documentDigestVersion   string
+	documentDigest          []byte
+	documentTitle           string
+	documentLocator         string
+	documentProviderVersion string
+	documentModifiedAt      time.Time
+	documentSourceTime      *time.Time
+	documentRecordedAt      time.Time
+
+	evidenceID            string
+	spanDocumentVersionID string
+	sectionID             string
+	spanDigestVersion     string
+	spanDigest            []byte
+	startOffset           int
+	endOffset             int
+	quote                 string
+	spanRecordedAt        time.Time
+}
+
+type temporalRawDocumentSection struct {
+	documentVersionID string
+	input             evidence.SectionInput
 }
 
 func readTemporalEvidenceRecords(
@@ -1348,25 +1801,33 @@ func readTemporalEvidenceRecords(
 	for _, id := range ids {
 		expected[id] = struct{}{}
 	}
-	records := make([]temporalEvidenceProjection, 0)
+	rawValues := make([]temporalRawEvidenceProjection, 0)
 	for rows.Next() {
-		var projection temporalEvidenceProjection
-		var evidenceID, role string
+		var raw temporalRawEvidenceProjection
 		if err := rows.Scan(
-			&projection.observationID,
-			&evidenceID,
-			&role,
-			&projection.record.SourceDocumentID,
-			&projection.record.DocumentVersionID,
-			&projection.record.SectionID,
-			&projection.record.SectionTitle,
-			&projection.record.SectionPath,
-			&projection.record.SectionOrder,
-			&projection.record.SectionRole,
-			&projection.record.StartOffset,
-			&projection.record.EndOffset,
-			&projection.record.Locator,
-			&projection.record.Text,
+			&raw.observationID,
+			&raw.role,
+			&raw.sourceDocumentID,
+			&raw.provider,
+			&raw.providerDocumentID,
+			&raw.documentVersionID,
+			&raw.documentDigestVersion,
+			&raw.documentDigest,
+			&raw.documentTitle,
+			&raw.documentLocator,
+			&raw.documentProviderVersion,
+			&raw.documentModifiedAt,
+			&raw.documentSourceTime,
+			&raw.documentRecordedAt,
+			&raw.evidenceID,
+			&raw.spanDocumentVersionID,
+			&raw.sectionID,
+			&raw.spanDigestVersion,
+			&raw.spanDigest,
+			&raw.startOffset,
+			&raw.endOffset,
+			&raw.quote,
+			&raw.spanRecordedAt,
 		); err != nil {
 			return nil, temporalSnapshotError(
 				ctx,
@@ -1374,27 +1835,16 @@ func readTemporalEvidenceRecords(
 				err,
 			)
 		}
-		if _, exists := expected[projection.observationID]; !exists {
+		if _, exists := expected[raw.observationID]; !exists {
 			return nil, temporalSnapshotError(
 				ctx,
 				"validate observation evidence",
 				ErrConflict,
 			)
 		}
-		projection.record.EvidenceID = evidence.EvidenceID(evidenceID)
-		projection.record.Role = observation.EvidenceRole(role)
-		projection.record.SectionPath = append(
-			[]string(nil),
-			projection.record.SectionPath...,
-		)
-		if err := validateTemporalEvidenceRecord(projection.record); err != nil {
-			return nil, temporalSnapshotError(
-				ctx,
-				"validate observation evidence",
-				err,
-			)
-		}
-		records = append(records, projection)
+		raw.documentDigest = append([]byte(nil), raw.documentDigest...)
+		raw.spanDigest = append([]byte(nil), raw.spanDigest...)
+		rawValues = append(rawValues, raw)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, temporalSnapshotError(
@@ -1403,29 +1853,306 @@ func readTemporalEvidenceRecords(
 			err,
 		)
 	}
+	documentVersionIDs := temporalEvidenceDocumentVersionIDs(rawValues)
+	sectionRows, err := transaction.Query(
+		ctx,
+		temporalDocumentSectionsSQL,
+		cutoff,
+		documentVersionIDs,
+	)
+	if err != nil {
+		return nil, temporalSnapshotError(ctx, "read canonical document sections", err)
+	}
+	defer sectionRows.Close()
+
+	expectedVersions := make(map[string]struct{}, len(documentVersionIDs))
+	for _, versionID := range documentVersionIDs {
+		expectedVersions[versionID] = struct{}{}
+	}
+	rawSections := make([]temporalRawDocumentSection, 0)
+	for sectionRows.Next() {
+		var raw temporalRawDocumentSection
+		if err := sectionRows.Scan(
+			&raw.documentVersionID,
+			&raw.input.ID,
+			&raw.input.Title,
+			&raw.input.ParentID,
+			&raw.input.Path,
+			&raw.input.Order,
+			&raw.input.Role,
+			&raw.input.Text,
+		); err != nil {
+			return nil, temporalSnapshotError(
+				ctx,
+				"scan canonical document sections",
+				err,
+			)
+		}
+		if _, exists := expectedVersions[raw.documentVersionID]; !exists {
+			return nil, temporalSnapshotError(
+				ctx,
+				"validate canonical evidence",
+				ErrConflict,
+			)
+		}
+		raw.input.Path = append([]string(nil), raw.input.Path...)
+		rawSections = append(rawSections, raw)
+	}
+	if err := sectionRows.Err(); err != nil {
+		return nil, temporalSnapshotError(
+			ctx,
+			"iterate canonical document sections",
+			err,
+		)
+	}
+	records, err := buildTemporalEvidenceProjections(rawValues, rawSections)
+	if err != nil {
+		return nil, temporalSnapshotError(
+			ctx,
+			"validate canonical evidence",
+			ErrConflict,
+		)
+	}
 	return records, nil
 }
 
-func validateTemporalEvidenceRecord(value TemporalEvidenceRecord) error {
-	if strings.TrimSpace(string(value.EvidenceID)) == "" ||
-		(value.Role != observation.EvidenceSupporting &&
-			value.Role != observation.EvidenceContradicting) ||
-		strings.TrimSpace(value.SourceDocumentID) == "" ||
-		strings.TrimSpace(value.DocumentVersionID) == "" ||
-		strings.TrimSpace(value.SectionID) == "" ||
-		strings.TrimSpace(value.SectionTitle) == "" ||
-		value.SectionOrder < 0 ||
-		strings.TrimSpace(value.SectionRole) == "" ||
-		value.StartOffset < 0 ||
-		value.EndOffset <= value.StartOffset {
-		return ErrConflict
+func temporalEvidenceDocumentVersionIDs(
+	values []temporalRawEvidenceProjection,
+) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value.documentVersionID]; exists {
+			continue
+		}
+		seen[value.documentVersionID] = struct{}{}
+		result = append(result, value.documentVersionID)
 	}
-	for _, title := range value.SectionPath {
-		if strings.TrimSpace(title) == "" {
-			return ErrConflict
+	slices.Sort(result)
+	return result
+}
+
+func buildTemporalEvidenceProjections(
+	rawValues []temporalRawEvidenceProjection,
+	rawSections []temporalRawDocumentSection,
+) ([]temporalEvidenceProjection, error) {
+	sectionsByVersion := make(
+		map[string][]evidence.Section,
+		len(rawSections),
+	)
+	seenSections := make(map[string]struct{}, len(rawSections))
+	for _, raw := range rawSections {
+		key := raw.documentVersionID + "\x00" + raw.input.ID
+		if _, exists := seenSections[key]; exists {
+			return nil, ErrConflict
+		}
+		seenSections[key] = struct{}{}
+		section, err := evidence.NewSection(raw.input)
+		if err != nil {
+			return nil, ErrConflict
+		}
+		sectionsByVersion[raw.documentVersionID] = append(
+			sectionsByVersion[raw.documentVersionID],
+			section,
+		)
+	}
+	for versionID := range sectionsByVersion {
+		slices.SortFunc(
+			sectionsByVersion[versionID],
+			func(left, right evidence.Section) int {
+				switch {
+				case left.Order() < right.Order():
+					return -1
+				case left.Order() > right.Order():
+					return 1
+				case left.ID() < right.ID():
+					return -1
+				case left.ID() > right.ID():
+					return 1
+				default:
+					return 0
+				}
+			},
+		)
+	}
+
+	documents := make(map[string]evidence.DocumentVersion)
+	records := make([]temporalEvidenceProjection, 0, len(rawValues))
+	seenRecords := make(map[string]struct{}, len(rawValues))
+	for _, raw := range rawValues {
+		document, exists := documents[raw.documentVersionID]
+		if !exists {
+			var err error
+			document, err = decodeTemporalDocumentVersion(
+				raw,
+				sectionsByVersion[raw.documentVersionID],
+			)
+			if err != nil {
+				return nil, ErrConflict
+			}
+			documents[raw.documentVersionID] = document
+		} else if !temporalRawDocumentMatches(raw, document) {
+			return nil, ErrConflict
+		}
+
+		spanRecordedAt, err := canonicalStoredTime(raw.spanRecordedAt)
+		if err != nil || raw.spanDocumentVersionID != raw.documentVersionID {
+			return nil, ErrConflict
+		}
+		span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
+			Document:    document,
+			SectionID:   raw.sectionID,
+			StartOffset: raw.startOffset,
+			EndOffset:   raw.endOffset,
+			Quote:       raw.quote,
+			RecordedAt:  spanRecordedAt,
+		})
+		if err != nil ||
+			span.ID() != evidence.EvidenceID(raw.evidenceID) ||
+			span.DigestVersion() != raw.spanDigestVersion ||
+			!sameDigestBytes(span.Digest(), raw.spanDigest) {
+			return nil, ErrConflict
+		}
+		role := observation.EvidenceRole(raw.role)
+		if role != observation.EvidenceSupporting &&
+			role != observation.EvidenceContradicting {
+			return nil, ErrConflict
+		}
+		section, exists := temporalDocumentSection(document, span.SectionID())
+		if !exists {
+			return nil, ErrConflict
+		}
+		key := raw.observationID + "\x00" + string(span.ID()) + "\x00" + raw.role
+		if _, exists := seenRecords[key]; exists {
+			return nil, ErrConflict
+		}
+		seenRecords[key] = struct{}{}
+		records = append(records, temporalEvidenceProjection{
+			observationID: raw.observationID,
+			record: TemporalEvidenceRecord{
+				EvidenceID:        span.ID(),
+				Role:              role,
+				SourceDocumentID:  raw.sourceDocumentID,
+				DocumentVersionID: raw.documentVersionID,
+				SectionID:         section.ID(),
+				SectionTitle:      section.Title(),
+				SectionPath:       section.Path(),
+				SectionOrder:      section.Order(),
+				SectionRole:       section.Role(),
+				StartOffset:       span.StartOffset(),
+				EndOffset:         span.EndOffset(),
+				Locator:           span.Locator(),
+				Text:              span.Text(),
+			},
+		})
+	}
+	return records, nil
+}
+
+func decodeTemporalDocumentVersion(
+	raw temporalRawEvidenceProjection,
+	sections []evidence.Section,
+) (evidence.DocumentVersion, error) {
+	modifiedAt, err := canonicalStoredTime(raw.documentModifiedAt)
+	if err != nil {
+		return evidence.DocumentVersion{}, ErrConflict
+	}
+	recordedAt, err := canonicalStoredTime(raw.documentRecordedAt)
+	if err != nil {
+		return evidence.DocumentVersion{}, ErrConflict
+	}
+	var sourceTime *time.Time
+	if raw.documentSourceTime != nil {
+		value, err := canonicalStoredTime(*raw.documentSourceTime)
+		if err != nil {
+			return evidence.DocumentVersion{}, ErrConflict
+		}
+		sourceTime = &value
+	}
+	document, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
+		Provider:           raw.provider,
+		ProviderDocumentID: raw.providerDocumentID,
+		Title:              raw.documentTitle,
+		Locator:            raw.documentLocator,
+		ProviderVersion:    raw.documentProviderVersion,
+		ModifiedAt:         modifiedAt,
+		SourceTime:         sourceTime,
+		RecordedAt:         recordedAt,
+		Sections:           sections,
+	})
+	if err != nil {
+		return evidence.DocumentVersion{}, ErrConflict
+	}
+	sourceDocumentID := deriveOpaqueID(
+		sourceDocumentIDVersion,
+		[]byte(document.Provider()),
+		[]byte(document.ProviderDocumentID()),
+	)
+	digest := document.Digest()
+	documentVersionID := deriveOpaqueID(
+		documentVersionIDVersion,
+		[]byte(sourceDocumentID),
+		[]byte(document.DigestVersion()),
+		digest[:],
+	)
+	if sourceDocumentID != raw.sourceDocumentID ||
+		documentVersionID != raw.documentVersionID ||
+		document.DigestVersion() != raw.documentDigestVersion ||
+		!sameDigestBytes(document.Digest(), raw.documentDigest) {
+		return evidence.DocumentVersion{}, ErrConflict
+	}
+	return document, nil
+}
+
+func temporalRawDocumentMatches(
+	raw temporalRawEvidenceProjection,
+	document evidence.DocumentVersion,
+) bool {
+	if raw.sourceDocumentID != deriveOpaqueID(
+		sourceDocumentIDVersion,
+		[]byte(document.Provider()),
+		[]byte(document.ProviderDocumentID()),
+	) ||
+		raw.provider != document.Provider() ||
+		raw.providerDocumentID != document.ProviderDocumentID() ||
+		raw.documentDigestVersion != document.DigestVersion() ||
+		!sameDigestBytes(document.Digest(), raw.documentDigest) ||
+		raw.documentTitle != document.Title() ||
+		raw.documentLocator != document.Locator() ||
+		raw.documentProviderVersion != document.ProviderVersion() {
+		return false
+	}
+	modifiedAt, err := canonicalStoredTime(raw.documentModifiedAt)
+	if err != nil || modifiedAt != document.ModifiedAt() {
+		return false
+	}
+	recordedAt, err := canonicalStoredTime(raw.documentRecordedAt)
+	if err != nil || recordedAt != document.RecordedAt() {
+		return false
+	}
+	rawSourceTime := raw.documentSourceTime
+	documentSourceTime := document.SourceTime()
+	switch {
+	case rawSourceTime == nil && documentSourceTime == nil:
+		return true
+	case rawSourceTime == nil || documentSourceTime == nil:
+		return false
+	default:
+		value, err := canonicalStoredTime(*rawSourceTime)
+		return err == nil && value == *documentSourceTime
+	}
+}
+
+func temporalDocumentSection(
+	document evidence.DocumentVersion,
+	sectionID string,
+) (evidence.Section, bool) {
+	for _, section := range document.Sections() {
+		if section.ID() == sectionID {
+			return section, true
 		}
 	}
-	return nil
+	return evidence.Section{}, false
 }
 
 func buildTemporalObservationRecords(
