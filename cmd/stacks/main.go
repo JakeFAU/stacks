@@ -578,6 +578,17 @@ func commandProviderWithRuntime(
 			if err := settings.Validate(config.CommandQuery); err != nil {
 				return err
 			}
+			if err := cli.ValidateQueryInvocation(invocation); err != nil {
+				return err
+			}
+			limits := query.Limits{
+				MaxEntities:   settings.Query.MaxEntities,
+				MaxPredicates: settings.Query.MaxPredicates,
+				MaxChronology: settings.Query.MaxChronology,
+			}
+			if _, err := query.NormalizeRequest(invocation.Query.Request, limits); err != nil {
+				return err
+			}
 			if runtime.openQueryDatabase == nil {
 				return errors.New("query command dependencies are not configured")
 			}
@@ -593,11 +604,7 @@ func commandProviderWithRuntime(
 						Tracer: tracer,
 					},
 				},
-				Limits: query.Limits{
-					MaxEntities:   settings.Query.MaxEntities,
-					MaxPredicates: settings.Query.MaxPredicates,
-					MaxChronology: settings.Query.MaxChronology,
-				},
+				Limits: limits,
 				Tracer: tracer,
 			}
 			return (cli.QueryCommand{

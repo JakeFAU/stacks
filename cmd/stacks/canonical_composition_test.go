@@ -162,6 +162,134 @@ func TestQueryValidationFailsBeforeDatabaseConstruction(t *testing.T) {
 	}
 }
 
+func TestQueryRequestCardinalityFailsBeforeDatabaseConstruction(t *testing.T) {
+	const (
+		privateEntityA    = identity.EntityID("private-entity-a")
+		privateEntityB    = identity.EntityID("private-entity-b")
+		privatePredicateA = observation.Predicate("private.predicate.a")
+		privatePredicateB = observation.Predicate("private.predicate.b")
+	)
+	tests := []struct {
+		name       string
+		configure  func(*config.Settings, *cli.Invocation)
+		privateIDs []string
+	}{
+		{
+			name: "entities exceed configured maximum",
+			configure: func(settings *config.Settings, invocation *cli.Invocation) {
+				settings.Query.MaxEntities = 1
+				invocation.Query.Request.EntityIDs = []identity.EntityID{privateEntityA, privateEntityB}
+			},
+			privateIDs: []string{string(privateEntityA), string(privateEntityB)},
+		},
+		{
+			name: "predicates exceed configured maximum",
+			configure: func(settings *config.Settings, invocation *cli.Invocation) {
+				settings.Query.MaxPredicates = 1
+				invocation.Query.Request.Predicates = []observation.Predicate{privatePredicateA, privatePredicateB}
+			},
+			privateIDs: []string{string(privatePredicateA), string(privatePredicateB)},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := validQueryCommandSettings()
+			invocation := validQueryTrendInvocation(t)
+			test.configure(&settings, &invocation)
+			var opens int
+			runtime := commandRuntime{
+				openQueryDatabase: func(context.Context, string) (queryDatabase, error) {
+					opens++
+					return &recordingQueryDatabase{}, nil
+				},
+			}
+			commands, err := commandProviderWithRuntime(
+				context.Background(), settings, io.Discard, io.Discard,
+				tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+			)
+			if err != nil {
+				t.Fatalf("commandProviderWithRuntime() error = %v", err)
+			}
+
+			err = commands[string(config.CommandQuery)].Run(context.Background(), invocation)
+			if err == nil {
+				t.Fatal("query trend error = nil, want request cardinality error")
+			}
+			if opens != 0 {
+				t.Fatalf("query database opens before request validation = %d, want 0", opens)
+			}
+			for _, privateID := range test.privateIDs {
+				if strings.Contains(err.Error(), privateID) {
+					t.Fatalf("query trend error %q contains private request value", err)
+				}
+			}
+		})
+	}
+}
+
+func TestQueryMalformedInvocationFailsBeforeDatabaseConstruction(t *testing.T) {
+	tests := []struct {
+		name       string
+		invocation func(*testing.T) cli.Invocation
+	}{
+		{
+			name: "missing query input",
+			invocation: func(*testing.T) cli.Invocation {
+				return cli.Invocation{Command: cli.CommandQuery, Action: cli.ActionTrend}
+			},
+		},
+		{
+			name: "unexpected positional argument",
+			invocation: func(t *testing.T) cli.Invocation {
+				invocation := validQueryTrendInvocation(t)
+				invocation.Arguments = []string{"private-positional-value"}
+				return invocation
+			},
+		},
+		{
+			name: "invalid output",
+			invocation: func(t *testing.T) cli.Invocation {
+				invocation := validQueryTrendInvocation(t)
+				invocation.Query.Output = cli.QueryOutput("private-output-value")
+				return invocation
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var opens int
+			runtime := commandRuntime{
+				openQueryDatabase: func(context.Context, string) (queryDatabase, error) {
+					opens++
+					return &recordingQueryDatabase{}, nil
+				},
+			}
+			commands, err := commandProviderWithRuntime(
+				context.Background(), validQueryCommandSettings(), io.Discard, io.Discard,
+				tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+			)
+			if err != nil {
+				t.Fatalf("commandProviderWithRuntime() error = %v", err)
+			}
+
+			err = commands[string(config.CommandQuery)].Run(context.Background(), test.invocation(t))
+			if err == nil {
+				t.Fatal("query trend error = nil, want invalid invocation error")
+			}
+			if opens != 0 {
+				t.Fatalf("query database opens before invocation validation = %d, want 0", opens)
+			}
+			for _, privateValue := range []string{"private-positional-value", "private-output-value"} {
+				if strings.Contains(err.Error(), privateValue) {
+					t.Fatalf("query trend error %q contains private invocation value", err)
+				}
+			}
+		})
+	}
+}
+
 func TestQueryTrendPreservesCancellationAndBoundedTelemetry(t *testing.T) {
 	const (
 		privateEntity    = identity.EntityID("private-entity-marker-d34")

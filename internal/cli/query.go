@@ -19,11 +19,23 @@ type QueryCommand struct {
 	Output  io.Writer
 }
 
-// Run executes the currently supported trend query leaf.
-func (command QueryCommand) Run(ctx context.Context, invocation Invocation) error {
+// ValidateQueryInvocation validates the currently supported query transport
+// shape without executing the query.
+func ValidateQueryInvocation(invocation Invocation) error {
 	if invocation.Command != CommandQuery || invocation.Action != ActionTrend ||
 		invocation.Query == nil || len(invocation.Arguments) != 0 {
 		return fmt.Errorf("query command: invocation is invalid")
+	}
+	if invocation.Query.Output != QueryOutputText && invocation.Query.Output != QueryOutputJSON {
+		return fmt.Errorf("query command: output is invalid")
+	}
+	return nil
+}
+
+// Run executes the currently supported trend query leaf.
+func (command QueryCommand) Run(ctx context.Context, invocation Invocation) error {
+	if err := ValidateQueryInvocation(invocation); err != nil {
+		return err
 	}
 	if command.Service == nil {
 		return fmt.Errorf("query command: service is not configured")

@@ -112,11 +112,12 @@ stacks query trend \
   [--output text|json]
 ```
 
-Both windows are half-open: `[start, end)`. `before` must end no later than
-`after` starts. Entity IDs and predicates must be unique. `--entity-match`
-defaults to `all`; omit `--predicate` to consider every qualifying predicate;
-and `--output` defaults to `text`. The equivalent Make target loads the ignored
-`ENV_FILE` and forwards only caller-supplied arguments:
+Both windows are half-open: `[start, end)`. The `after` window must start later
+than the `before` window starts; the windows may overlap, so `before` does not
+need to end before `after` starts. Entity IDs and predicates must be unique.
+`--entity-match` defaults to `all`; omit `--predicate` to consider every
+qualifying predicate; and `--output` defaults to `text`. The equivalent Make
+target loads the ignored `ENV_FILE` and forwards only caller-supplied arguments:
 
 ```sh
 make query-trend ARGS="--entity <canonical-entity-id> --before <RFC3339-start>/<RFC3339-end> --after <RFC3339-start>/<RFC3339-end>"
