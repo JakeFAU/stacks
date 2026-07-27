@@ -139,7 +139,7 @@ func TestPointQueryProjectsExactCitationsAndGaps(t *testing.T) {
 		Intent:         temporal.IntentPointInTime,
 		EntityIDs:      []identity.EntityID{" entity-a "},
 		EntityMatch:    EntityMatchAll,
-		Predicates:     []observation.Predicate{" work.location "},
+		Predicates:     []observation.Predicate{" work.location ", "work.owner"},
 		Selections:     []temporal.TemporalSelection{selection},
 		KnowledgeScope: temporal.CurrentKnowledge(),
 	}
@@ -183,7 +183,7 @@ func TestPointQueryProjectsExactCitationsAndGaps(t *testing.T) {
 	if !reflect.DeepEqual(reader.selection, ReadSelection{
 		EntityIDs:      []identity.EntityID{"entity-a"},
 		EntityMatch:    EntityMatchAll,
-		Predicates:     []observation.Predicate{"work.location"},
+		Predicates:     []observation.Predicate{"work.location", "work.owner"},
 		Selections:     []temporal.TemporalSelection{selection},
 		KnowledgeScope: temporal.CurrentKnowledge(),
 	}) {
@@ -354,7 +354,7 @@ func TestTrajectoryQueryProjectsCompleteCitedTransitionsAndGaps(t *testing.T) {
 		Intent:         temporal.IntentTrajectory,
 		EntityIDs:      []identity.EntityID{" entity-a "},
 		EntityMatch:    EntityMatchAll,
-		Predicates:     []observation.Predicate{" work.location "},
+		Predicates:     []observation.Predicate{" work.location ", "work.owner"},
 		Selections:     []temporal.TemporalSelection{selection},
 		KnowledgeScope: temporal.CurrentKnowledge(),
 		Limit:          4,
@@ -1053,6 +1053,7 @@ func TestTrendQueryPreservesConflictHypothesisCounterevidenceAndTemporalUncertai
 func TestTrendQueryCreatesNoEvidenceValidTimeUnresolvedMentionAndAuthorityGaps(t *testing.T) {
 	fixture := newTrendFixture(t)
 	request := fixture.request
+	request.Predicates = nil
 	request.EntityIDs = []identity.EntityID{"entity-a", "entity-b"}
 	request.EntityMatch = EntityMatchAny
 	outside := fixture.readObservation(
@@ -1217,6 +1218,8 @@ func TestTrendQueryPreservesReaderCancellationAndDoesNotRetry(t *testing.T) {
 
 func TestTrendQueryIsIdenticalAcrossReorderedSnapshotInput(t *testing.T) {
 	fixture := newTrendFixture(t)
+	request := fixture.request
+	request.Predicates = nil
 	before := fixture.readObservation("observation-before", fixture.entity("entity-a"), fixture.text("remote"), fixture.instant(2024, time.January, 15), observation.StatusObserved, nil,
 		fixture.citation("evidence-z", observation.EvidenceSupporting),
 		fixture.citation("evidence-a", observation.EvidenceContradicting),
@@ -1237,11 +1240,11 @@ func TestTrendQueryIsIdenticalAcrossReorderedSnapshotInput(t *testing.T) {
 		slices.Reverse(snapshotB.Observations[index].Evidence)
 	}
 
-	resultA, err := (Service{Reader: &recordingTrendReader{snapshot: snapshotA}, Limits: validLimits()}).Query(context.Background(), fixture.request)
+	resultA, err := (Service{Reader: &recordingTrendReader{snapshot: snapshotA}, Limits: validLimits()}).Query(context.Background(), request)
 	if err != nil {
 		t.Fatalf("first Query() error = %v", err)
 	}
-	resultB, err := (Service{Reader: &recordingTrendReader{snapshot: snapshotB}, Limits: validLimits()}).Query(context.Background(), fixture.request)
+	resultB, err := (Service{Reader: &recordingTrendReader{snapshot: snapshotB}, Limits: validLimits()}).Query(context.Background(), request)
 	if err != nil {
 		t.Fatalf("second Query() error = %v", err)
 	}

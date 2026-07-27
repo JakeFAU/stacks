@@ -284,6 +284,96 @@ func TestQueryCommandUsesOneServiceAndOneWriteForEveryRemainingIntent(t *testing
 	}
 }
 
+func TestQueryCommandRejectsUnauthorizedGapContextsWithoutWritingForEveryIntent(t *testing.T) {
+	results := populatedRemainingIntentResults(t)
+	results["trend"] = populatedTrendResult(t, false)
+	actions := map[string]Action{
+		"point": ActionPoint, "trend": ActionTrend, "trajectory": ActionTrajectory, "causal": ActionCausal,
+	}
+	for name, result := range results {
+		t.Run(name, func(t *testing.T) {
+			result.Gaps = []query.Gap{{Kind: query.GapNoEvidence, EntityID: "private-entity"}}
+			service := &recordingQueryService{result: result}
+			writer := &countingQueryWriter{}
+			err := (QueryCommand{Service: service, Output: writer}).Run(t.Context(), Invocation{
+				Command: CommandQuery, Action: actions[name],
+				Query: &QueryInput{Request: requestFromResult(result), Output: QueryOutputJSON},
+			})
+			if err == nil {
+				t.Fatal("Run() error = nil, want invalid result error")
+			}
+			if strings.Contains(err.Error(), "private-entity") {
+				t.Fatalf("Run() error exposed private gap context: %q", err)
+			}
+			if service.calls != 1 || writer.calls != 0 {
+				t.Fatalf("service/writer calls = %d/%d, want 1/0", service.calls, writer.calls)
+			}
+		})
+	}
+}
+
+func TestQueryCommandRejectsChronologyResultsAboveLimitWithoutWriting(t *testing.T) {
+	results := populatedRemainingIntentResults(t)
+	trajectoryResult := results["trajectory"]
+	trajectoryResult.Limit = 1
+	causalResult := results["causal"]
+	causal, ok := causalResult.Payload.Causal()
+	if !ok {
+		t.Fatal("Payload.Causal() = false")
+	}
+	causal.Links = append(causal.Links, query.CausalLink{
+		Cause:  mustQueryText(t, "second-decision"),
+		Effect: mustQueryText(t, "second-delivery"),
+		Contributions: []query.Contribution{testContribution(
+			t,
+			"observation-causal-second",
+			observation.StatusObserved,
+			mustQueryInstant(t, testInstant(2026, time.January, 17)),
+			observation.Derivation{Method: "synthetic", Version: "v1"},
+			"",
+			"",
+		)},
+		SupportingCitations: []query.Citation{
+			testCitation("evidence-causal-second", observation.EvidenceSupporting, false),
+		},
+		ContradictingCitations: []query.Citation{},
+	})
+	payload, err := query.NewCausalPayload(causal)
+	if err != nil {
+		t.Fatalf("query.NewCausalPayload() error = %v", err)
+	}
+	causalResult.Payload = payload
+	causalResult.Limit = 1
+	tests := []struct {
+		name   string
+		action Action
+		result query.Result
+	}{
+		{name: "trajectory", action: ActionTrajectory, result: trajectoryResult},
+		{name: "causal", action: ActionCausal, result: causalResult},
+	}
+	for _, test := range tests {
+		for _, output := range []QueryOutput{QueryOutputText, QueryOutputJSON} {
+			t.Run(test.name+" "+string(output), func(t *testing.T) {
+				result := test.result
+				request := requestFromResult(result)
+				service := &recordingQueryService{result: result}
+				writer := &countingQueryWriter{}
+				err := (QueryCommand{Service: service, Output: writer}).Run(t.Context(), Invocation{
+					Command: CommandQuery, Action: test.action,
+					Query: &QueryInput{Request: request, Output: output},
+				})
+				if err == nil {
+					t.Fatal("Run() error = nil, want invalid chronology result error")
+				}
+				if service.calls != 1 || writer.calls != 0 {
+					t.Fatalf("service/writer calls = %d/%d, want 1/0", service.calls, writer.calls)
+				}
+			})
+		}
+	}
+}
+
 func populatedRemainingIntentResults(t *testing.T) map[string]query.Result {
 	t.Helper()
 	point := mustQueryPoint(t, "point", testInstant(2026, time.January, 16))
@@ -311,6 +401,11 @@ func populatedRemainingIntentResults(t *testing.T) map[string]query.Result {
 	)
 	unresolved := query.UnresolvedItem{
 		Key: unresolvedKey, Reason: temporal.UnresolvedHypothesis, Candidates: []query.Fact{unresolvedFact},
+	}
+	transitionUnresolvedFact := unresolvedFact
+	transitionUnresolvedFact.Key = key
+	transitionUnresolved := query.UnresolvedItem{
+		Key: key, Reason: temporal.UnresolvedHypothesis, Candidates: []query.Fact{transitionUnresolvedFact},
 	}
 	topOnlyFact := testFact(t, topOnlyKey, mustQueryText(t, "expanded"),
 		testContribution(t, "observation-top-only", observation.StatusHypothesized,
@@ -341,7 +436,7 @@ func populatedRemainingIntentResults(t *testing.T) map[string]query.Result {
 			{
 				Kind: temporal.ChangeAdded, Key: key,
 				ValidTime: mustQueryInstant(t, testInstant(2026, time.January, 16)),
-				After:     queryFactPointer(after), Unresolved: []query.UnresolvedItem{unresolved},
+				After:     queryFactPointer(after), Unresolved: []query.UnresolvedItem{transitionUnresolved},
 			},
 			{
 				Kind: temporal.ChangeRemoved, Key: key,
@@ -487,6 +582,12 @@ func expectedRemainingIntentJSON(name string) remainingIntentJSONEnvelope {
 		Key: riskKey, Reason: "hypothesized",
 		Candidates: []queryFactJSON{transitionUnresolvedFact},
 	}
+	ownerTransitionUnresolvedFact := transitionUnresolvedFact
+	ownerTransitionUnresolvedFact.Key = ownerKey
+	ownerTransitionUnresolved := queryUnresolvedJSON{
+		Key: ownerKey, Reason: "hypothesized",
+		Candidates: []queryFactJSON{ownerTransitionUnresolvedFact},
+	}
 	topOnlyUnresolved := queryUnresolvedJSON{
 		Key: scopeKey, Reason: "hypothesized",
 		Candidates: []queryFactJSON{topOnlyFact},
@@ -521,7 +622,7 @@ func expectedRemainingIntentJSON(name string) remainingIntentJSONEnvelope {
 					Kind: "added", Key: ownerKey,
 					ValidTime:  queryExtentJSON{Kind: "instant", At: "2026-01-16T13:09:10.654321Z"},
 					After:      &afterFact,
-					Unresolved: []queryUnresolvedJSON{transitionUnresolved},
+					Unresolved: []queryUnresolvedJSON{ownerTransitionUnresolved},
 				},
 				{
 					Kind: "removed", Key: ownerKey,
@@ -689,9 +790,9 @@ transitions:
         contradicting citations:
           (none)
     unresolved:
-      - key: subject=entity:entity-a predicate=project.atlas/risk reason=hypothesized
+      - key: subject=entity:entity-a predicate=project.atlas/owner reason=hypothesized
         candidates:
-          - key: subject=entity:entity-a predicate=project.atlas/risk value=text:"casey"
+          - key: subject=entity:entity-a predicate=project.atlas/owner value=text:"casey"
             contributions:
               - observation_id=observation-unresolved status=hypothesized valid_time=unknown recorded_at=2026-06-01T09:06:07.123456Z derivation_method=synthetic derivation_version=v1
             supporting citations:

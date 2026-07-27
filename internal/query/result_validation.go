@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/observation"
@@ -32,10 +33,31 @@ func validateTrajectoryResult(value TrajectoryResult) error {
 	if err := validateStateMaterial(nil, value.Unresolved); err != nil {
 		return err
 	}
+	windowStart, windowEnd, ok := value.Selection.Window()
+	if !ok {
+		return fmt.Errorf("result trajectory selection is invalid")
+	}
+	type transitionIdentity struct {
+		key temporal.StateKey
+		at  time.Time
+	}
+	seen := make(map[transitionIdentity]struct{}, len(value.Transitions))
 	for _, transition := range value.Transitions {
 		if err := validateTransition(transition); err != nil {
 			return err
 		}
+		at, ok := transition.ValidTime.Instant()
+		if !ok {
+			return fmt.Errorf("result trajectory transition requires an exact boundary")
+		}
+		if at.Before(windowStart) || !at.Before(windowEnd) {
+			return fmt.Errorf("result trajectory transition is outside its selection")
+		}
+		identity := transitionIdentity{key: transition.Key, at: at}
+		if _, exists := seen[identity]; exists {
+			return fmt.Errorf("result trajectory transitions must have unique key boundaries")
+		}
+		seen[identity] = struct{}{}
 	}
 	return nil
 }
@@ -299,7 +321,43 @@ func validateTransition(value Transition) error {
 	if err := validateFactRelationship("transition", value.Kind, value.Key, value.Before, value.After); err != nil {
 		return err
 	}
-	return validateStateMaterial(nil, value.Unresolved)
+	if err := validateStateMaterial(nil, value.Unresolved); err != nil {
+		return err
+	}
+	for _, item := range value.Unresolved {
+		if temporal.CompareStateKeys(item.Key, value.Key) != 0 {
+			return fmt.Errorf("result transition unresolved key must match its parent")
+		}
+	}
+	return nil
+}
+
+func validateGapAssociation(result Result, gap Gap) error {
+	if gap.EntityID != "" && !slices.Contains(result.EntityIDs, gap.EntityID) {
+		return fmt.Errorf("result gap entity is not requested")
+	}
+	if gap.SelectionLabel != "" && !slices.ContainsFunc(result.Selections, func(selection temporal.TemporalSelection) bool {
+		return selection.Label() == gap.SelectionLabel
+	}) {
+		return fmt.Errorf("result gap selection is not requested")
+	}
+	if gap.Predicate != "" {
+		if _, err := observation.NewPredicate(string(gap.Predicate)); err != nil {
+			return fmt.Errorf("result gap predicate is invalid")
+		}
+		if len(result.Predicates) > 0 && !slices.Contains(result.Predicates, gap.Predicate) {
+			return fmt.Errorf("result gap predicate is not requested")
+		}
+	}
+	if gap.Kind == GapNoCausalEvidence {
+		if result.Intent != temporal.IntentCausalChain {
+			return fmt.Errorf("result causal evidence gap requires causal intent")
+		}
+		if gap.Predicate != "" && gap.Predicate != CausalPredicate {
+			return fmt.Errorf("result causal evidence gap predicate is invalid")
+		}
+	}
+	return nil
 }
 
 func validateFactRelationship(

@@ -33,6 +33,7 @@ func TestProjectAtlasTrendContractPreservesCitedTemporalEvidence(t *testing.T) {
 	wantPredicates := []observation.Predicate{
 		"project.delivery_commitment",
 		"project.delivery_risk",
+		"project.partner",
 		"project.priority",
 		"project.responsible_party",
 		"project.scope",
@@ -1104,6 +1105,7 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 				"project.delivery_commitment",
 				"project.priority",
 				"project.delivery_risk",
+				"project.partner",
 			},
 			Selections:     []temporal.TemporalSelection{before, after},
 			KnowledgeScope: temporal.CurrentKnowledge(),

@@ -265,6 +265,12 @@ func NormalizeResult(result Result) (Result, error) {
 	if payload.intent != result.Intent {
 		return Result{}, fmt.Errorf("result payload intent does not match result intent")
 	}
+	if payload.trajectory != nil && len(payload.trajectory.Transitions) > result.Limit {
+		return Result{}, fmt.Errorf("result trajectory exceeds its requested limit")
+	}
+	if payload.causal != nil && len(payload.causal.Links) > result.Limit {
+		return Result{}, fmt.Errorf("result causal chain exceeds its requested limit")
+	}
 	if selections, err := payloadSelections(payload); err != nil || !slices.Equal(result.Selections, selections) {
 		return Result{}, fmt.Errorf("result selections do not match payload selections")
 	}
@@ -274,6 +280,9 @@ func NormalizeResult(result Result) (Result, error) {
 	for index := range result.Gaps {
 		if !validGapKind(result.Gaps[index].Kind) {
 			return Result{}, fmt.Errorf("result gap kind is invalid")
+		}
+		if err := validateGapAssociation(result, result.Gaps[index]); err != nil {
+			return Result{}, err
 		}
 		if _, exists := seenGaps[result.Gaps[index]]; exists {
 			return Result{}, fmt.Errorf("result gaps must be unique")

@@ -1,6 +1,7 @@
 package query
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -468,6 +469,198 @@ func TestTrajectoryPayloadRequiresTransitionFactsToMatchTransition(t *testing.T)
 	}
 }
 
+func TestTrajectoryPayloadRequiresTransitionsAtUniqueSelectedBoundaries(t *testing.T) {
+	start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(24 * time.Hour)
+	window, err := temporal.Between("window", start, end)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	key := mustStateKey(t, "entity-a", "predicate-a")
+	otherKey := mustStateKey(t, "entity-a", "predicate-b")
+	after := resultValidationFact(t, key, mustText(t, "after"), "selected-boundary-after")
+	before := resultValidationFact(t, key, mustText(t, "before"), "selected-boundary-before")
+	other := resultValidationFact(t, otherKey, mustText(t, "other"), "selected-boundary-other")
+
+	at := func(value time.Time) observation.TemporalExtent {
+		t.Helper()
+		extent, err := observation.AtTime(value)
+		if err != nil {
+			t.Fatalf("observation.AtTime() error = %v", err)
+		}
+		return extent
+	}
+	during, err := observation.During(start, start.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("observation.During() error = %v", err)
+	}
+	uncertain, err := observation.Within(start, start.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("observation.Within() error = %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		transitions []Transition
+	}{
+		{
+			name: "transition unresolved key differs from transition key",
+			transitions: []Transition{{
+				Kind:      temporal.ChangeAdded,
+				Key:       key,
+				ValidTime: at(start),
+				After:     &after,
+				Unresolved: []UnresolvedItem{{
+					Key:        otherKey,
+					Reason:     temporal.UnresolvedHypothesis,
+					Candidates: []Fact{other},
+				}},
+			}},
+		},
+		{
+			name: "duplicate key and boundary",
+			transitions: []Transition{
+				{Kind: temporal.ChangeAdded, Key: key, ValidTime: at(start), After: &after, Unresolved: []UnresolvedItem{}},
+				{Kind: temporal.ChangeRemoved, Key: key, ValidTime: at(start), Before: &before, Unresolved: []UnresolvedItem{}},
+			},
+		},
+		{
+			name:        "boundary before selected start",
+			transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: at(start.Add(-time.Microsecond)), After: &after, Unresolved: []UnresolvedItem{}}},
+		},
+		{
+			name:        "boundary at selected end",
+			transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: at(end), After: &after, Unresolved: []UnresolvedItem{}}},
+		},
+		{
+			name:        "boundary after selected end",
+			transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: at(end.Add(time.Microsecond)), After: &after, Unresolved: []UnresolvedItem{}}},
+		},
+		{
+			name:        "interval is not a transition boundary",
+			transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: during, After: &after, Unresolved: []UnresolvedItem{}}},
+		},
+		{
+			name:        "uncertainty window is not a transition boundary",
+			transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: uncertain, After: &after, Unresolved: []UnresolvedItem{}}},
+		},
+		{
+			name:        "unknown time is not a transition boundary",
+			transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: observation.UnknownTime(), After: &after, Unresolved: []UnresolvedItem{}}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewTrajectoryPayload(TrajectoryResult{
+				Selection:   window,
+				Transitions: test.transitions,
+			}); err == nil {
+				t.Fatal("NewTrajectoryPayload() error = nil, want invalid transition boundary relationship error")
+			}
+		})
+	}
+
+	if _, err := NewTrajectoryPayload(TrajectoryResult{
+		Selection: window,
+		Transitions: []Transition{{
+			Kind:       temporal.ChangeAdded,
+			Key:        key,
+			ValidTime:  at(start),
+			After:      &after,
+			Unresolved: []UnresolvedItem{},
+		}},
+	}); err != nil {
+		t.Fatalf("NewTrajectoryPayload() selected-start transition error = %v", err)
+	}
+}
+
+func TestValidateResultEnforcesChronologyPayloadLimits(t *testing.T) {
+	window := mustWindow(t, "window", 2026, time.January, 1)
+	firstKey := mustStateKey(t, "entity-a", "predicate-a")
+	secondKey := mustStateKey(t, "entity-a", "predicate-b")
+	first := resultValidationFact(t, firstKey, mustText(t, "first"), "limit-first")
+	second := resultValidationFact(t, secondKey, mustText(t, "second"), "limit-second")
+	trajectoryPayload, err := NewTrajectoryPayload(TrajectoryResult{
+		Selection: window,
+		Transitions: []Transition{
+			{Kind: temporal.ChangeAdded, Key: firstKey, ValidTime: mustInstant(t), After: &first, Unresolved: []UnresolvedItem{}},
+			{Kind: temporal.ChangeAdded, Key: secondKey, ValidTime: mustInstant(t), After: &second, Unresolved: []UnresolvedItem{}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewTrajectoryPayload() error = %v", err)
+	}
+	causalPayload, err := NewCausalPayload(CausalChainResult{
+		Selection: window,
+		Links: []CausalLink{
+			{
+				Cause:                  mustText(t, "first-cause"),
+				Effect:                 mustText(t, "first-effect"),
+				Contributions:          []Contribution{resultValidationContribution(t, "limit-causal-first")},
+				SupportingCitations:    []Citation{validCitation("limit-causal-first")},
+				ContradictingCitations: []Citation{},
+			},
+			{
+				Cause:                  mustText(t, "second-cause"),
+				Effect:                 mustText(t, "second-effect"),
+				Contributions:          []Contribution{resultValidationContribution(t, "limit-causal-second")},
+				SupportingCitations:    []Citation{validCitation("limit-causal-second")},
+				ContradictingCitations: []Citation{},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewCausalPayload() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		intent     temporal.Intent
+		predicates []observation.Predicate
+		payload    IntentPayload
+	}{
+		{
+			name:       "trajectory",
+			intent:     temporal.IntentTrajectory,
+			predicates: []observation.Predicate{},
+			payload:    trajectoryPayload,
+		},
+		{
+			name:       "causal",
+			intent:     temporal.IntentCausalChain,
+			predicates: []observation.Predicate{CausalPredicate},
+			payload:    causalPayload,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name+" rejects overflow", func(t *testing.T) {
+			result := resultValidationEnvelope(
+				test.intent,
+				test.predicates,
+				[]temporal.TemporalSelection{window},
+				1,
+				test.payload,
+			)
+			if err := ValidateResult(result); err == nil {
+				t.Fatal("ValidateResult() error = nil, want chronology limit association error")
+			}
+		})
+		t.Run(test.name+" accepts exact limit", func(t *testing.T) {
+			result := resultValidationEnvelope(
+				test.intent,
+				test.predicates,
+				[]temporal.TemporalSelection{window},
+				2,
+				test.payload,
+			)
+			if err := ValidateResult(result); err != nil {
+				t.Fatalf("ValidateResult() exact-limit error = %v", err)
+			}
+		})
+	}
+}
+
 func TestTrajectoryPayloadRejectsInvalidNestedUnresolvedMaterial(t *testing.T) {
 	window := mustWindow(t, "window", 2026, time.January, 1)
 	key := mustStateKey(t, "entity-a", "predicate-a")
@@ -748,6 +941,142 @@ func TestValidateResultRejectsDuplicateGaps(t *testing.T) {
 	}
 	if err := ValidateResult(result); err == nil {
 		t.Fatal("ValidateResult() error = nil, want duplicate gap error")
+	}
+}
+
+func TestValidateResultRejectsUnauthorizedGapContexts(t *testing.T) {
+	privateEntity := identity.EntityID("private-entity")
+	privatePredicate := observation.Predicate("private-predicate")
+	privateLabel := "private-label"
+	point := mustPoint(t, "point", 2026, time.January, 1)
+	before := mustWindow(t, "before", 2026, time.January, 1)
+	after := mustWindow(t, "after", 2026, time.February, 1)
+
+	tests := []struct {
+		name   string
+		result Result
+		gap    Gap
+	}{
+		{
+			name: "entity is not requested",
+			result: resultValidationEnvelope(
+				temporal.IntentPointInTime,
+				[]observation.Predicate{},
+				[]temporal.TemporalSelection{point},
+				0,
+				mustPointPayload(t, point),
+			),
+			gap: Gap{Kind: GapNoEvidence, EntityID: privateEntity},
+		},
+		{
+			name: "selection label is not requested",
+			result: resultValidationEnvelope(
+				temporal.IntentTrendComparison,
+				[]observation.Predicate{},
+				[]temporal.TemporalSelection{before, after},
+				0,
+				mustTrendPayload(t, before, after),
+			),
+			gap: Gap{Kind: GapValidTimeExcluded, SelectionLabel: privateLabel},
+		},
+		{
+			name: "predicate is invalid",
+			result: resultValidationEnvelope(
+				temporal.IntentTrajectory,
+				[]observation.Predicate{},
+				[]temporal.TemporalSelection{before},
+				1,
+				mustTrajectoryPayload(t, before),
+			),
+			gap: Gap{Kind: GapNoEvidence, Predicate: " "},
+		},
+		{
+			name: "predicate is not requested by explicit filter",
+			result: resultValidationEnvelope(
+				temporal.IntentPointInTime,
+				[]observation.Predicate{"requested-predicate"},
+				[]temporal.TemporalSelection{point},
+				0,
+				mustPointPayload(t, point),
+			),
+			gap: Gap{Kind: GapNoEvidence, Predicate: privatePredicate},
+		},
+		{
+			name: "no causal evidence is not a point gap",
+			result: resultValidationEnvelope(
+				temporal.IntentPointInTime,
+				[]observation.Predicate{},
+				[]temporal.TemporalSelection{point},
+				0,
+				mustPointPayload(t, point),
+			),
+			gap: Gap{Kind: GapNoCausalEvidence},
+		},
+		{
+			name: "no causal evidence predicate is not the causal predicate",
+			result: resultValidationEnvelope(
+				temporal.IntentCausalChain,
+				[]observation.Predicate{CausalPredicate},
+				[]temporal.TemporalSelection{before},
+				1,
+				mustCausalPayload(t, before),
+			),
+			gap: Gap{Kind: GapNoCausalEvidence, Predicate: privatePredicate},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.result.Gaps = []Gap{test.gap}
+			err := ValidateResult(test.result)
+			if err == nil {
+				t.Fatal("ValidateResult() error = nil, want unauthorized gap context error")
+			}
+			for _, private := range []string{string(privateEntity), string(privatePredicate), privateLabel} {
+				if strings.Contains(err.Error(), private) {
+					t.Fatalf("ValidateResult() error exposed private gap context: %q", err)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateResultAllowsAuthorizedAndContextualGapPredicates(t *testing.T) {
+	point := mustPoint(t, "point", 2026, time.January, 1)
+	tests := []Result{
+		func() Result {
+			result := resultValidationEnvelope(
+				temporal.IntentPointInTime,
+				[]observation.Predicate{"requested-predicate"},
+				[]temporal.TemporalSelection{point},
+				0,
+				mustPointPayload(t, point),
+			)
+			result.Gaps = []Gap{{
+				Kind:           GapValidTimeExcluded,
+				EntityID:       "entity-a",
+				Predicate:      "requested-predicate",
+				SelectionLabel: "point",
+			}}
+			return result
+		}(),
+		func() Result {
+			result := resultValidationEnvelope(
+				temporal.IntentPointInTime,
+				[]observation.Predicate{},
+				[]temporal.TemporalSelection{point},
+				0,
+				mustPointPayload(t, point),
+			)
+			result.Gaps = []Gap{{Kind: GapNoEvidence, Predicate: "contextual-predicate"}}
+			return result
+		}(),
+	}
+
+	for _, result := range tests {
+		if err := ValidateResult(result); err != nil {
+			t.Fatalf("ValidateResult() authorized gap error = %v", err)
+		}
 	}
 }
 
