@@ -87,6 +87,9 @@ func validateCanonicalTerm(name string, term observation.Term) error {
 	if err := validateTerm(name, term); err != nil {
 		return err
 	}
+	if term.Kind() == observation.TermMention {
+		return fmt.Errorf("%s must not retain a source mention", name)
+	}
 	if _, groundingMentionID, isEntity := term.Entity(); isEntity && groundingMentionID != "" {
 		return fmt.Errorf("%s entity must not retain grounding mention", name)
 	}
@@ -174,9 +177,6 @@ func termMapsToState(stateTerm, sourceTerm observation.Term, groundingMentionID 
 		stateEntityID, _, _ := stateTerm.Entity()
 		return stateEntityID == sourceEntityID
 	case observation.TermMention:
-		if stateTerm.Kind() == observation.TermMention {
-			return CompareTerms(stateTerm, sourceTerm) == 0
-		}
 		if stateTerm.Kind() != observation.TermEntity {
 			return false
 		}

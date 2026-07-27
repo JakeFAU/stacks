@@ -560,6 +560,46 @@ func TestAggregateWindowIgnoresGroundingMentionForEntitySemanticIdentity(t *test
 	}
 }
 
+func TestAggregateWindowRejectsCanonicalMentionState(t *testing.T) {
+	mention := mentionTerm(t, "mention:canonical-state")
+	entity := entityTerm(t, "entity:canonical-state", "")
+	value := textTerm(t, "active")
+	predicate, err := observation.NewPredicate("status")
+	if err != nil {
+		t.Fatalf("NewPredicate() error = %v", err)
+	}
+	validTime := mustDuring(t,
+		time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2025, time.June, 1, 0, 0, 0, 0, time.UTC),
+	)
+	recordedAt := time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC)
+	groundedKey, err := temporal.NewStateKey(entity, predicate)
+	if err != nil {
+		t.Fatalf("NewStateKey(entity) error = %v", err)
+	}
+	groundedCandidate := typedCandidate(
+		t,
+		groundedKey,
+		value,
+		mention,
+		predicate,
+		value,
+		"grounded",
+		validTime,
+		recordedAt,
+		withSubjectGrounding("mention:canonical-state"),
+	)
+	if _, err := temporal.AggregateWindow(aggregationWindow(t), temporal.CurrentKnowledge(), []temporal.StateCandidate{groundedCandidate}); err != nil {
+		t.Fatalf("AggregateWindow(grounded entity) error = %v", err)
+	}
+
+	mentionKey := temporal.StateKey{Subject: mention, Predicate: predicate}
+	mentionCandidate := typedCandidate(t, mentionKey, value, mention, predicate, value, "mention", validTime, recordedAt)
+	if _, err := temporal.AggregateWindow(aggregationWindow(t), temporal.CurrentKnowledge(), []temporal.StateCandidate{mentionCandidate}); err == nil {
+		t.Fatal("AggregateWindow(canonical mention) error = nil, want canonical mention rejection")
+	}
+}
+
 func TestAggregateWindowRejectsCandidateThatDoesNotMatchObservationStatement(t *testing.T) {
 	key := stateKeyFor(t, textTerm(t, "entity-1"), "status")
 	active := textTerm(t, "active")
