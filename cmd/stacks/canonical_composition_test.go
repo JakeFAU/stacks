@@ -290,6 +290,106 @@ func TestQueryMalformedInvocationFailsBeforeDatabaseConstruction(t *testing.T) {
 	}
 }
 
+func TestQueryTrendRejectsD4IntentsBeforeDatabaseConstruction(t *testing.T) {
+	const privateEntity = identity.EntityID("private-d4-intent-entity")
+	point, err := temporal.At(
+		"private-point-selection",
+		time.Date(2024, time.January, 15, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("construct point query selection: %v", err)
+	}
+	window, err := temporal.Between(
+		"private-window-selection",
+		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, time.February, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("construct window query selection: %v", err)
+	}
+	tests := []struct {
+		name    string
+		request query.Request
+	}{
+		{
+			name: "point in time",
+			request: query.Request{
+				Intent:         temporal.IntentPointInTime,
+				EntityIDs:      []identity.EntityID{privateEntity},
+				EntityMatch:    query.EntityMatchAll,
+				Selections:     []temporal.TemporalSelection{point},
+				KnowledgeScope: temporal.CurrentKnowledge(),
+			},
+		},
+		{
+			name: "trajectory",
+			request: query.Request{
+				Intent:         temporal.IntentTrajectory,
+				EntityIDs:      []identity.EntityID{privateEntity},
+				EntityMatch:    query.EntityMatchAll,
+				Selections:     []temporal.TemporalSelection{window},
+				KnowledgeScope: temporal.CurrentKnowledge(),
+				Limit:          10,
+			},
+		},
+		{
+			name: "causal chain",
+			request: query.Request{
+				Intent:         temporal.IntentCausalChain,
+				EntityIDs:      []identity.EntityID{privateEntity},
+				EntityMatch:    query.EntityMatchAll,
+				Predicates:     []observation.Predicate{query.CausalPredicate},
+				Selections:     []temporal.TemporalSelection{window},
+				KnowledgeScope: temporal.CurrentKnowledge(),
+				Limit:          10,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := validQueryCommandSettings()
+			limits := query.Limits{
+				MaxEntities:   settings.Query.MaxEntities,
+				MaxPredicates: settings.Query.MaxPredicates,
+				MaxChronology: settings.Query.MaxChronology,
+			}
+			if _, err := query.NormalizeRequest(test.request, limits); err != nil {
+				t.Fatalf("D4 request fixture is not contract-valid: %v", err)
+			}
+			var opens int
+			runtime := commandRuntime{
+				openQueryDatabase: func(context.Context, string) (queryDatabase, error) {
+					opens++
+					return &recordingQueryDatabase{}, nil
+				},
+			}
+			commands, err := commandProviderWithRuntime(
+				context.Background(), settings, io.Discard, io.Discard,
+				tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+			)
+			if err != nil {
+				t.Fatalf("commandProviderWithRuntime() error = %v", err)
+			}
+			invocation := validQueryTrendInvocation(t)
+			invocation.Query.Request = test.request
+
+			err = commands[string(config.CommandQuery)].Run(context.Background(), invocation)
+			if err == nil || !strings.Contains(err.Error(), "intent") {
+				t.Fatalf("query trend error = %v, want bounded intent mismatch error", err)
+			}
+			if strings.Contains(err.Error(), string(privateEntity)) ||
+				strings.Contains(err.Error(), "private-point-selection") ||
+				strings.Contains(err.Error(), "private-window-selection") {
+				t.Fatalf("query trend error %q contains private request material", err)
+			}
+			if opens != 0 {
+				t.Fatalf("query database opens before intent validation = %d, want 0", opens)
+			}
+		})
+	}
+}
+
 func TestQueryTrendPreservesCancellationAndBoundedTelemetry(t *testing.T) {
 	const (
 		privateEntity    = identity.EntityID("private-entity-marker-d34")

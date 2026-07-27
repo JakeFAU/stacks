@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/JakeFAU/stacks/core/temporal"
+
 	"stacks/internal/query"
 )
 
@@ -28,6 +30,9 @@ func ValidateQueryInvocation(invocation Invocation) error {
 	}
 	if invocation.Query.Output != QueryOutputText && invocation.Query.Output != QueryOutputJSON {
 		return fmt.Errorf("query command: output is invalid")
+	}
+	if invocation.Query.Request.Intent != temporal.IntentTrendComparison {
+		return fmt.Errorf("query command: request intent is invalid")
 	}
 	return nil
 }
