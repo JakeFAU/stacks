@@ -22,7 +22,7 @@ const (
 )
 
 // CausalPredicate is the sole provider-neutral causal predicate in v1.
-const CausalPredicate observation.Predicate = "stacks.causal.v1/causes"
+const CausalPredicate observation.Predicate = temporal.CausalPredicate
 
 const causalPredicate = CausalPredicate
 

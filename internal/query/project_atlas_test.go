@@ -851,6 +851,181 @@ func TestProjectAtlasTrajectoryContractPreservesCitedTransitions(t *testing.T) {
 	}
 }
 
+func TestProjectAtlasCausalContractRequiresExplicitCitedLinks(t *testing.T) {
+	fixture := newProjectAtlasFixture(t)
+	selection, err := temporal.Between(
+		"causal-chain",
+		time.Date(2032, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2032, time.April, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	firstEvidence := newProjectAtlasEvidence(
+		t,
+		"causal-first",
+		"Synthetic supplier delay explicitly causes the Project Atlas schedule impact.",
+		time.Date(2032, time.January, 25, 10, 0, 0, 0, time.UTC),
+	)
+	secondEvidence := newProjectAtlasEvidence(
+		t,
+		"causal-second",
+		"Synthetic Project Atlas schedule impact explicitly causes the delivery revision.",
+		time.Date(2032, time.March, 5, 10, 0, 0, 0, time.UTC),
+	)
+	secondCounterevidence := newProjectAtlasEvidence(
+		t,
+		"causal-second-counter",
+		"Synthetic counterevidence disputes that the schedule impact caused the delivery revision.",
+		time.Date(2032, time.March, 6, 10, 0, 0, 0, time.UTC),
+	)
+	project := atlasEntityTerm(t, "entity:project-atlas")
+	first := atlasReadObservation(t, atlasObservationInput{
+		id:              "observation:atlas/causal-first",
+		predicate:       CausalPredicate,
+		sourceSubject:   atlasTextTerm(t, "supplier delay"),
+		sourceObject:    project,
+		resolvedSubject: atlasTextTerm(t, "supplier delay"),
+		resolvedObject:  project,
+		validTime:       atlasInstant(t, time.Date(2032, time.February, 1, 12, 0, 0, 0, time.UTC)),
+		recordedAt:      time.Date(2032, time.January, 25, 10, 5, 0, 0, time.UTC),
+		status:          observation.StatusObserved,
+		citations: []Citation{
+			firstEvidence.citation(observation.EvidenceSupporting),
+		},
+	})
+	second := atlasReadObservation(t, atlasObservationInput{
+		id:              "observation:atlas/causal-second",
+		predicate:       CausalPredicate,
+		sourceSubject:   project,
+		sourceObject:    atlasTextTerm(t, "delivery revision"),
+		resolvedSubject: project,
+		resolvedObject:  atlasTextTerm(t, "delivery revision"),
+		validTime:       atlasInstant(t, time.Date(2032, time.March, 5, 12, 0, 0, 0, time.UTC)),
+		recordedAt:      time.Date(2032, time.March, 5, 10, 5, 0, 0, time.UTC),
+		status:          observation.StatusValidatedEmpirically,
+		citations: []Citation{
+			secondEvidence.citation(observation.EvidenceSupporting),
+			secondCounterevidence.citation(observation.EvidenceContradicting),
+		},
+	})
+	current := cloneReadSnapshot(fixture.currentSnapshot)
+	current.Observations = append(current.Observations, second, first)
+	historical := cloneReadSnapshot(fixture.historicalSnapshot)
+	historical.Observations = append(historical.Observations, first)
+	reader := &projectAtlasReader{
+		current:    current,
+		historical: historical,
+		cutoff:     fixture.cutoff,
+	}
+	service := Service{
+		Reader: reader,
+		Limits: Limits{MaxEntities: 4, MaxPredicates: 8, MaxChronology: 4},
+	}
+	request := Request{
+		Intent:         temporal.IntentCausalChain,
+		EntityIDs:      []identity.EntityID{"entity:project-atlas"},
+		EntityMatch:    EntityMatchAny,
+		Predicates:     []observation.Predicate{CausalPredicate},
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          2,
+	}
+
+	result, err := service.Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("current Query() error = %v", err)
+	}
+	causal, ok := result.Payload.Causal()
+	if !ok || len(causal.Links) != 2 {
+		t.Fatalf("current causal payload = %#v, want positive two-link explicit chain", causal)
+	}
+	if temporal.CompareTerms(causal.Links[0].Effect, causal.Links[1].Cause) != 0 {
+		t.Fatalf("Project Atlas links do not connect under exact typed equality: %#v", causal.Links)
+	}
+	if !reflect.DeepEqual(causal.Links[0].SupportingCitations, []Citation{
+		firstEvidence.citation(observation.EvidenceSupporting),
+	}) || len(causal.Links[0].ContradictingCitations) != 0 {
+		t.Fatalf("first Project Atlas causal link citations = %#v", causal.Links[0])
+	}
+	if !reflect.DeepEqual(causal.Links[1].SupportingCitations, []Citation{
+		secondEvidence.citation(observation.EvidenceSupporting),
+	}) || !reflect.DeepEqual(causal.Links[1].ContradictingCitations, []Citation{
+		secondCounterevidence.citation(observation.EvidenceContradicting),
+	}) {
+		t.Fatalf("second Project Atlas causal link lost counterevidence: %#v", causal.Links[1])
+	}
+	gotIDs := [][]observation.ObservationID{
+		{causal.Links[0].Contributions[0].ObservationID},
+		{causal.Links[1].Contributions[0].ObservationID},
+	}
+	wantIDs := [][]observation.ObservationID{
+		{"observation:atlas/causal-first"},
+		{"observation:atlas/causal-second"},
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("causal contribution IDs = %v, want %v", gotIDs, wantIDs)
+	}
+
+	historicalRequest := request
+	historicalRequest.KnowledgeScope = fixture.historicalScope
+	historicalResult, err := service.Query(context.Background(), historicalRequest)
+	if err != nil {
+		t.Fatalf("historical Query() error = %v", err)
+	}
+	historicalCausal, ok := historicalResult.Payload.Causal()
+	if !ok || len(historicalCausal.Links) != 1 ||
+		historicalCausal.Links[0].Contributions[0].ObservationID != "observation:atlas/causal-first" {
+		t.Fatalf("historical causal payload = %#v, want inclusive cutoff-visible first link only", historicalCausal)
+	}
+
+	reordered := cloneReadSnapshot(current)
+	slices.Reverse(reordered.Entities)
+	slices.Reverse(reordered.Observations)
+	slices.Reverse(reordered.Coverage)
+	for index := range reordered.Observations {
+		slices.Reverse(reordered.Observations[index].Evidence)
+	}
+	reorderedResult, err := (Service{
+		Reader: &projectAtlasReader{
+			current:    reordered,
+			historical: historical,
+			cutoff:     fixture.cutoff,
+		},
+		Limits: service.Limits,
+	}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("reordered Query() error = %v", err)
+	}
+	if !reflect.DeepEqual(result, reorderedResult) {
+		t.Fatalf("reordered causal result differs:\nresult    %#v\nreordered %#v", result, reorderedResult)
+	}
+
+	chronologyOnlyReader := &projectAtlasReader{
+		current:    fixture.currentSnapshot,
+		historical: fixture.historicalSnapshot,
+		cutoff:     fixture.cutoff,
+	}
+	chronologyOnlyResult, err := (Service{
+		Reader: chronologyOnlyReader,
+		Limits: service.Limits,
+	}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("chronology-only Query() error = %v", err)
+	}
+	chronologyOnly, ok := chronologyOnlyResult.Payload.Causal()
+	if !ok || chronologyOnly.Links == nil || len(chronologyOnly.Links) != 0 {
+		t.Fatalf("chronology-only causal payload = %#v, want no inferred links", chronologyOnly)
+	}
+	if !reflect.DeepEqual(chronologyOnlyResult.Gaps, []Gap{{
+		Kind:           GapNoCausalEvidence,
+		Predicate:      CausalPredicate,
+		SelectionLabel: selection.Label(),
+	}}) {
+		t.Fatalf("chronology-only gaps = %#v, want exact no-causal-evidence gap", chronologyOnlyResult.Gaps)
+	}
+}
+
 type projectAtlasFixture struct {
 	currentRequest           Request
 	currentSnapshot          ReadSnapshot

@@ -42,7 +42,8 @@ func (service Service) Query(ctx context.Context, request Request) (result Resul
 	}
 	if normalized.Intent != temporal.IntentPointInTime &&
 		normalized.Intent != temporal.IntentTrendComparison &&
-		normalized.Intent != temporal.IntentTrajectory {
+		normalized.Intent != temporal.IntentTrajectory &&
+		normalized.Intent != temporal.IntentCausalChain {
 		return Result{}, errors.New("execute temporal query: intent is not implemented")
 	}
 
@@ -108,6 +109,11 @@ func (service Service) Query(ctx context.Context, request Request) (result Resul
 		if err != nil {
 			return Result{}, err
 		}
+	case temporal.IntentCausalChain:
+		payload, gaps, err = executeCausal(normalized, candidates, index)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 
 	result, err = NormalizeResult(Result{
@@ -125,6 +131,50 @@ func (service Service) Query(ctx context.Context, request Request) (result Resul
 		return Result{}, boundedQueryError{operation: "validate temporal query result", cause: err}
 	}
 	return result, nil
+}
+
+func executeCausal(
+	request Request,
+	candidates []temporal.StateCandidate,
+	index projectionIndex,
+) (IntentPayload, []Gap, error) {
+	links, err := temporal.BuildCausalChain(
+		request.Selections[0],
+		request.KnowledgeScope,
+		candidates,
+	)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{
+			operation: "build temporal causal chain",
+			cause:     err,
+		}
+	}
+	if len(links) > request.Limit {
+		return IntentPayload{}, nil, boundedQueryError{
+			operation: "bound temporal causal chain",
+			cause:     ErrLimitExceeded,
+		}
+	}
+	causal, err := projectCausal(request.Selections[0], links, index)
+	if err != nil {
+		return IntentPayload{}, nil, err
+	}
+	payload, err := NewCausalPayload(causal)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{
+			operation: "construct causal result",
+			cause:     err,
+		}
+	}
+	gaps := []Gap{}
+	if len(links) == 0 {
+		gaps = append(gaps, Gap{
+			Kind:           GapNoCausalEvidence,
+			Predicate:      temporal.CausalPredicate,
+			SelectionLabel: request.Selections[0].Label(),
+		})
+	}
+	return payload, gaps, nil
 }
 
 func executeTrajectory(

@@ -329,6 +329,48 @@ func projectTrajectory(
 	}, nil
 }
 
+func projectCausal(
+	selection temporal.TemporalSelection,
+	values []temporal.CausalLink,
+	index projectionIndex,
+) (CausalChainResult, error) {
+	links := make([]CausalLink, len(values))
+	for position, value := range values {
+		contributions := make([]Contribution, len(value.ObservationIDs))
+		for contributionPosition, observationID := range value.ObservationIDs {
+			contribution, exists := index.contributions[observationID]
+			if !exists {
+				return CausalChainResult{}, projectionFailure("causal observation contribution is missing")
+			}
+			contributions[contributionPosition] = contribution
+		}
+		supporting, err := projectCitations(
+			value.SupportingEvidenceIDs,
+			observation.EvidenceSupporting,
+			index,
+		)
+		if err != nil {
+			return CausalChainResult{}, err
+		}
+		contradicting, err := projectCitations(
+			value.ContradictingEvidenceIDs,
+			observation.EvidenceContradicting,
+			index,
+		)
+		if err != nil {
+			return CausalChainResult{}, err
+		}
+		links[position] = CausalLink{
+			Cause:                  value.Cause,
+			Effect:                 value.Effect,
+			Contributions:          contributions,
+			SupportingCitations:    supporting,
+			ContradictingCitations: contradicting,
+		}
+	}
+	return CausalChainResult{Selection: selection, Links: links}, nil
+}
+
 func projectWindow(
 	selection temporal.TemporalSelection,
 	facts []temporal.Fact,

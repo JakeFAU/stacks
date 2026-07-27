@@ -826,6 +826,187 @@ func TestTrajectoryLimitCountsCompleteTransitionsOnly(t *testing.T) {
 	}
 }
 
+func TestCausalQueryProjectsExactTwoLinkChainWithCounterevidence(t *testing.T) {
+	fixture := newTrendFixture(t)
+	selection, err := temporal.Between(
+		"causal",
+		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, time.May, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	middle := fixture.entity("entity-a")
+	firstSupport := fixture.citation("causal-first-support", observation.EvidenceSupporting)
+	secondSupport := fixture.citation("causal-second-support", observation.EvidenceSupporting)
+	secondCounter := fixture.citation("causal-second-counter", observation.EvidenceContradicting)
+	first := fixture.readObservationWithPredicate(
+		"causal-first",
+		CausalPredicate,
+		fixture.text("supplier delay"),
+		middle,
+		fixture.instant(2024, time.February, 1),
+		observation.StatusObserved,
+		nil,
+		firstSupport,
+	)
+	second := fixture.readObservationWithPredicate(
+		"causal-second",
+		CausalPredicate,
+		middle,
+		fixture.text("delivery revision"),
+		fixture.instant(2024, time.March, 1),
+		observation.StatusValidatedEmpirically,
+		nil,
+		secondSupport,
+		secondCounter,
+	)
+	reader := &recordingTrendReader{snapshot: fixture.snapshot(second, first)}
+	request := Request{
+		Intent:         temporal.IntentCausalChain,
+		EntityIDs:      []identity.EntityID{" entity-a "},
+		EntityMatch:    EntityMatchAny,
+		Predicates:     []observation.Predicate{CausalPredicate},
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          2,
+	}
+
+	result, err := (Service{Reader: reader, Limits: validLimits()}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("Reader.Read() calls = %d, want one snapshot read", reader.calls)
+	}
+	causal, ok := result.Payload.Causal()
+	if !ok || causal.Selection != selection || len(causal.Links) != 2 {
+		t.Fatalf("causal payload = %#v, want exact two-link chain", causal)
+	}
+	if temporal.CompareTerms(causal.Links[0].Effect, causal.Links[1].Cause) != 0 {
+		t.Fatalf("causal links do not connect by exact typed term equality: %#v", causal.Links)
+	}
+	if !reflect.DeepEqual(causal.Links[0].Contributions, []Contribution{contributionFromReadObservation(first)}) ||
+		!reflect.DeepEqual(causal.Links[0].SupportingCitations, []Citation{firstSupport}) ||
+		len(causal.Links[0].ContradictingCitations) != 0 {
+		t.Fatalf("first causal link lost exact provenance: %#v", causal.Links[0])
+	}
+	if !reflect.DeepEqual(causal.Links[1].Contributions, []Contribution{contributionFromReadObservation(second)}) ||
+		!reflect.DeepEqual(causal.Links[1].SupportingCitations, []Citation{secondSupport}) ||
+		!reflect.DeepEqual(causal.Links[1].ContradictingCitations, []Citation{secondCounter}) {
+		t.Fatalf("second causal link lost role-separated provenance: %#v", causal.Links[1])
+	}
+	if result.Gaps == nil || len(result.Gaps) != 0 {
+		t.Fatalf("causal gaps = %#v, want non-nil empty gaps for explicit evidence", result.Gaps)
+	}
+	if err := ValidateResult(result); err != nil {
+		t.Fatalf("ValidateResult() error = %v", err)
+	}
+}
+
+func TestCausalQueryReturnsNoCausalEvidenceForChronologyOnlyInput(t *testing.T) {
+	fixture := newTrendFixture(t)
+	selection, err := temporal.Between(
+		"causal",
+		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, time.May, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	chronology := fixture.readObservationWithPredicate(
+		"chronology-only",
+		"project.precedes",
+		fixture.entity("entity-a"),
+		fixture.text("later state"),
+		fixture.instant(2024, time.February, 1),
+		observation.StatusObserved,
+		nil,
+		fixture.citation("chronology-only", observation.EvidenceSupporting),
+	)
+	reader := &recordingTrendReader{snapshot: fixture.snapshot(chronology)}
+	request := Request{
+		Intent:         temporal.IntentCausalChain,
+		EntityIDs:      []identity.EntityID{"entity-a"},
+		EntityMatch:    EntityMatchAny,
+		Predicates:     []observation.Predicate{CausalPredicate},
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          2,
+	}
+
+	result, err := (Service{Reader: reader, Limits: validLimits()}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	causal, ok := result.Payload.Causal()
+	if !ok || causal.Links == nil || len(causal.Links) != 0 {
+		t.Fatalf("causal payload = %#v, want non-nil empty links", causal)
+	}
+	wantGaps := []Gap{{
+		Kind:           GapNoCausalEvidence,
+		Predicate:      CausalPredicate,
+		SelectionLabel: selection.Label(),
+	}}
+	if !reflect.DeepEqual(result.Gaps, wantGaps) {
+		t.Fatalf("causal gaps = %#v, want %#v", result.Gaps, wantGaps)
+	}
+}
+
+func TestCausalQueryReturnsLimitExceededWithoutPartialResult(t *testing.T) {
+	fixture := newTrendFixture(t)
+	selection, err := temporal.Between(
+		"causal",
+		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, time.May, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	reader := &recordingTrendReader{snapshot: fixture.snapshot(
+		fixture.readObservationWithPredicate(
+			"causal-first",
+			CausalPredicate,
+			fixture.text("A"),
+			fixture.entity("entity-a"),
+			fixture.instant(2024, time.February, 1),
+			observation.StatusObserved,
+			nil,
+			fixture.citation("causal-first", observation.EvidenceSupporting),
+		),
+		fixture.readObservationWithPredicate(
+			"causal-second",
+			CausalPredicate,
+			fixture.entity("entity-a"),
+			fixture.text("C"),
+			fixture.instant(2024, time.March, 1),
+			observation.StatusObserved,
+			nil,
+			fixture.citation("causal-second", observation.EvidenceSupporting),
+		),
+	)}
+	request := Request{
+		Intent:         temporal.IntentCausalChain,
+		EntityIDs:      []identity.EntityID{"entity-a"},
+		EntityMatch:    EntityMatchAny,
+		Predicates:     []observation.Predicate{CausalPredicate},
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          1,
+	}
+
+	result, err := (Service{Reader: reader, Limits: validLimits()}).Query(context.Background(), request)
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Query() error = %v, want ErrLimitExceeded", err)
+	}
+	if !reflect.DeepEqual(result, Result{}) {
+		t.Fatalf("Query() result = %#v, want zero result without partial links", result)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("Reader.Read() calls = %d, want one complete snapshot computation", reader.calls)
+	}
+}
+
 func TestTrendQueryPreservesConflictHypothesisCounterevidenceAndTemporalUncertainty(t *testing.T) {
 	fixture := newTrendFixture(t)
 	observations := []ReadObservation{
