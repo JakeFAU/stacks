@@ -170,6 +170,9 @@ func NewPointPayload(value PointInTimeResult) (IntentPayload, error) {
 	if err := normalizePointResult(&value); err != nil {
 		return IntentPayload{}, err
 	}
+	if err := validatePointResult(value); err != nil {
+		return IntentPayload{}, err
+	}
 	return IntentPayload{intent: temporal.IntentPointInTime, point: &value}, nil
 }
 
@@ -180,6 +183,9 @@ func NewTrendPayload(value TrendResult) (IntentPayload, error) {
 		return IntentPayload{}, err
 	}
 	if err := normalizeTrendResult(&value); err != nil {
+		return IntentPayload{}, err
+	}
+	if err := validateTrendResult(value); err != nil {
 		return IntentPayload{}, err
 	}
 	return IntentPayload{intent: temporal.IntentTrendComparison, trend: &value}, nil
@@ -194,6 +200,9 @@ func NewTrajectoryPayload(value TrajectoryResult) (IntentPayload, error) {
 	if err := normalizeTrajectoryResult(&value); err != nil {
 		return IntentPayload{}, err
 	}
+	if err := validateTrajectoryResult(value); err != nil {
+		return IntentPayload{}, err
+	}
 	return IntentPayload{intent: temporal.IntentTrajectory, trajectory: &value}, nil
 }
 
@@ -204,6 +213,9 @@ func NewCausalPayload(value CausalChainResult) (IntentPayload, error) {
 		return IntentPayload{}, err
 	}
 	if err := normalizeCausalResult(&value); err != nil {
+		return IntentPayload{}, err
+	}
+	if err := validateCausalResult(value); err != nil {
 		return IntentPayload{}, err
 	}
 	return IntentPayload{intent: temporal.IntentCausalChain, causal: &value}, nil
@@ -256,10 +268,15 @@ func NormalizeResult(result Result) (Result, error) {
 	}
 	result.Payload = payload
 	result.Gaps = append([]Gap{}, result.Gaps...)
+	seenGaps := make(map[Gap]struct{}, len(result.Gaps))
 	for index := range result.Gaps {
 		if !validGapKind(result.Gaps[index].Kind) {
 			return Result{}, fmt.Errorf("result gap kind is invalid")
 		}
+		if _, exists := seenGaps[result.Gaps[index]]; exists {
+			return Result{}, fmt.Errorf("result gaps must be unique")
+		}
+		seenGaps[result.Gaps[index]] = struct{}{}
 	}
 	orderGaps(result.Gaps)
 	return result, nil

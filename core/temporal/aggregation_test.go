@@ -560,6 +560,109 @@ func TestAggregateWindowIgnoresGroundingMentionForEntitySemanticIdentity(t *test
 	}
 }
 
+func TestAggregateWindowRequiresDirectEntityGroundingToMatchSource(t *testing.T) {
+	validTime := mustDuring(t,
+		time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2025, time.June, 1, 0, 0, 0, 0, time.UTC),
+	)
+	recordedAt := time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC)
+	predicate, err := observation.NewPredicate("assignment")
+	if err != nil {
+		t.Fatalf("NewPredicate() error = %v", err)
+	}
+	canonicalSubject := entityTerm(t, "entity-a", "")
+	canonicalObject := entityTerm(t, "entity-b", "")
+
+	tests := []struct {
+		name      string
+		candidate func(*testing.T, string) temporal.StateCandidate
+		assert    func(*testing.T, temporal.Fact)
+	}{
+		{
+			name: "subject",
+			candidate: func(t *testing.T, groundingMentionID string) temporal.StateCandidate {
+				return typedCandidate(
+					t,
+					stateKeyFor(t, canonicalSubject, string(predicate)),
+					textTerm(t, "owner"),
+					entityTerm(t, "entity-a", "mention-subject"),
+					predicate,
+					textTerm(t, "owner"),
+					"subject-grounding",
+					validTime,
+					recordedAt,
+					withSubjectGrounding(groundingMentionID),
+				)
+			},
+			assert: func(t *testing.T, fact temporal.Fact) {
+				_, groundingMentionID, ok := fact.Key.Subject.Entity()
+				if !ok || groundingMentionID != "" {
+					t.Fatalf("fact subject grounding = %q, want ungrounded canonical entity", groundingMentionID)
+				}
+			},
+		},
+		{
+			name: "object",
+			candidate: func(t *testing.T, groundingMentionID string) temporal.StateCandidate {
+				candidate := typedCandidate(
+					t,
+					stateKeyFor(t, canonicalSubject, string(predicate)),
+					canonicalObject,
+					canonicalSubject,
+					predicate,
+					entityTerm(t, "entity-b", "mention-object"),
+					"object-grounding",
+					validTime,
+					recordedAt,
+				)
+				candidate.ObjectGroundingMentionID = groundingMentionID
+				return candidate
+			},
+			assert: func(t *testing.T, fact temporal.Fact) {
+				_, groundingMentionID, ok := fact.Value.Entity()
+				if !ok || groundingMentionID != "" {
+					t.Fatalf("fact value grounding = %q, want ungrounded canonical entity", groundingMentionID)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name+" matching", func(t *testing.T) {
+			summary, err := temporal.AggregateWindow(
+				aggregationWindow(t),
+				temporal.CurrentKnowledge(),
+				[]temporal.StateCandidate{test.candidate(t, "mention-"+test.name)},
+			)
+			if err != nil {
+				t.Fatalf("AggregateWindow() error = %v", err)
+			}
+			if len(summary.Facts) != 1 {
+				t.Fatalf("facts = %d, want 1", len(summary.Facts))
+			}
+			test.assert(t, summary.Facts[0])
+		})
+		t.Run(test.name+" missing", func(t *testing.T) {
+			if _, err := temporal.AggregateWindow(
+				aggregationWindow(t),
+				temporal.CurrentKnowledge(),
+				[]temporal.StateCandidate{test.candidate(t, "")},
+			); err == nil {
+				t.Fatal("AggregateWindow() error = nil, want missing direct grounding rejection")
+			}
+		})
+		t.Run(test.name+" disagrees", func(t *testing.T) {
+			if _, err := temporal.AggregateWindow(
+				aggregationWindow(t),
+				temporal.CurrentKnowledge(),
+				[]temporal.StateCandidate{test.candidate(t, "different-mention")},
+			); err == nil {
+				t.Fatal("AggregateWindow() error = nil, want mismatched direct grounding rejection")
+			}
+		})
+	}
+}
+
 func TestAggregateWindowRejectsCanonicalMentionState(t *testing.T) {
 	mention := mentionTerm(t, "mention:canonical-state")
 	entity := entityTerm(t, "entity:canonical-state", "")

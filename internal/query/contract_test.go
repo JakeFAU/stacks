@@ -216,7 +216,7 @@ func TestResultCollectionsAreNonNilAndCanonicallyOrdered(t *testing.T) {
 	valueA := mustText(t, "a")
 	valueB := mustText(t, "b")
 	window := mustWindow(t, "window", 2026, time.January, 1)
-	payload, err := NewTrajectoryPayload(TrajectoryResult{Selection: window, Transitions: []Transition{{Kind: temporal.ChangeAdded, Key: keyB, ValidTime: mustInstant(t), After: &Fact{Key: keyB, Value: valueB, Contributions: []Contribution{}, SupportingCitations: []Citation{validCitation("evidence-b")}, ContradictingCitations: []Citation{}}}, {Kind: temporal.ChangeAdded, Key: keyA, ValidTime: mustInstant(t), After: &Fact{Key: keyA, Value: valueA, Contributions: []Contribution{}, SupportingCitations: []Citation{validCitation("evidence-a")}, ContradictingCitations: []Citation{}}}}})
+	payload, err := NewTrajectoryPayload(TrajectoryResult{Selection: window, Transitions: []Transition{{Kind: temporal.ChangeAdded, Key: keyB, ValidTime: mustInstant(t), After: &Fact{Key: keyB, Value: valueB, Contributions: []Contribution{validContractContribution(t, "observation-b")}, SupportingCitations: []Citation{validCitation("evidence-b")}, ContradictingCitations: []Citation{}}}, {Kind: temporal.ChangeAdded, Key: keyA, ValidTime: mustInstant(t), After: &Fact{Key: keyA, Value: valueA, Contributions: []Contribution{validContractContribution(t, "observation-a")}, SupportingCitations: []Citation{validCitation("evidence-a")}, ContradictingCitations: []Citation{}}}}})
 	if err != nil {
 		t.Fatalf("NewTrajectoryPayload() error = %v", err)
 	}
@@ -265,7 +265,7 @@ func TestTypedErrorsDoNotContainSuppliedEntityIDsOrPrivatePayloads(t *testing.T)
 func TestPayloadConstructorsAndAccessorsDefensivelyCopyNestedSlices(t *testing.T) {
 	window := mustWindow(t, "window", 2026, time.January, 1)
 	key := mustStateKey(t, "entity-a", "predicate-a")
-	input := TrajectoryResult{Selection: window, Transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: mustInstant(t), After: &Fact{Key: key, Value: mustText(t, "value"), Contributions: []Contribution{}, SupportingCitations: []Citation{{EvidenceID: "evidence-a", Role: observation.EvidenceSupporting, SourceDocumentID: "document", DocumentVersionID: "version", SectionID: "section", SectionTitle: "title", SectionPath: []string{"parent"}, SectionOrder: 0, SectionRole: "body", StartOffset: 0, EndOffset: 1}}, ContradictingCitations: []Citation{}}}}}
+	input := TrajectoryResult{Selection: window, Transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: mustInstant(t), After: &Fact{Key: key, Value: mustText(t, "value"), Contributions: []Contribution{validContractContribution(t, "observation-a")}, SupportingCitations: []Citation{{EvidenceID: "evidence-a", Role: observation.EvidenceSupporting, SourceDocumentID: "document", DocumentVersionID: "version", SectionID: "section", SectionTitle: "title", SectionPath: []string{"parent"}, SectionOrder: 0, SectionRole: "body", StartOffset: 0, EndOffset: 1}}, ContradictingCitations: []Citation{}}}}}
 	payload, err := NewTrajectoryPayload(input)
 	if err != nil {
 		t.Fatalf("NewTrajectoryPayload() error = %v", err)
@@ -433,7 +433,18 @@ func validCitation(id evidence.EvidenceID) Citation {
 
 func validFact(t *testing.T, key temporal.StateKey, value string) Fact {
 	t.Helper()
-	return Fact{Key: key, Value: mustText(t, value), Contributions: []Contribution{}, SupportingCitations: []Citation{validCitation("evidence")}, ContradictingCitations: []Citation{}}
+	return Fact{Key: key, Value: mustText(t, value), Contributions: []Contribution{validContractContribution(t, "observation")}, SupportingCitations: []Citation{validCitation("evidence")}, ContradictingCitations: []Citation{}}
+}
+
+func validContractContribution(t *testing.T, id observation.ObservationID) Contribution {
+	t.Helper()
+	return Contribution{
+		ObservationID: id,
+		Status:        observation.StatusObserved,
+		ValidTime:     mustInstant(t),
+		RecordedAt:    time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		Derivation:    observation.Derivation{Method: "synthetic", Version: "v1"},
+	}
 }
 
 func mustPointPayload(t *testing.T, selection temporal.TemporalSelection) IntentPayload {

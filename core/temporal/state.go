@@ -173,9 +173,9 @@ func termMapsToState(stateTerm, sourceTerm observation.Term, groundingMentionID 
 		if stateTerm.Kind() != observation.TermEntity {
 			return false
 		}
-		sourceEntityID, _, _ := sourceTerm.Entity()
+		sourceEntityID, sourceGroundingMentionID, _ := sourceTerm.Entity()
 		stateEntityID, _, _ := stateTerm.Entity()
-		return stateEntityID == sourceEntityID
+		return stateEntityID == sourceEntityID && groundingMentionID == sourceGroundingMentionID
 	case observation.TermMention:
 		if stateTerm.Kind() != observation.TermEntity {
 			return false

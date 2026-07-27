@@ -209,6 +209,95 @@ func TestTrendQueryCreatesNoEvidenceValidTimeUnresolvedMentionAndAuthorityGaps(t
 	}
 }
 
+func TestTrendQueryCreatesNoEvidenceGapForFilteredOnlyCoverage(t *testing.T) {
+	tests := []struct {
+		name     string
+		coverage Coverage
+	}{
+		{
+			name: "entity filtered",
+			coverage: Coverage{
+				Reason:        CoverageEntityFiltered,
+				EntityID:      "entity-a",
+				Predicate:     "work.location",
+				ObservationID: "filtered-entity",
+			},
+		},
+		{
+			name: "predicate filtered",
+			coverage: Coverage{
+				Reason:        CoveragePredicateFiltered,
+				EntityID:      "entity-a",
+				Predicate:     "work.other",
+				ObservationID: "filtered-predicate",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTrendFixture(t)
+			snapshot := fixture.snapshot()
+			snapshot.Coverage = []Coverage{test.coverage}
+			result, err := (Service{
+				Reader: &recordingTrendReader{snapshot: snapshot},
+				Limits: validLimits(),
+			}).Query(context.Background(), fixture.request)
+			if err != nil {
+				t.Fatalf("Query() error = %v", err)
+			}
+			want := []Gap{{Kind: GapNoEvidence, EntityID: "entity-a"}}
+			if !reflect.DeepEqual(result.Gaps, want) {
+				t.Fatalf("Query() gaps = %#v, want %#v", result.Gaps, want)
+			}
+		})
+	}
+}
+
+func TestTrendQueryCreatesNoEvidenceGapForRejectedOnlyObservations(t *testing.T) {
+	tests := []struct {
+		name      string
+		validTime observation.TemporalExtent
+	}{
+		{name: "inside selection", validTime: newTrendFixture(t).instant(2024, time.January, 15)},
+		{name: "outside selections", validTime: newTrendFixture(t).instant(2024, time.June, 1)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTrendFixture(t)
+			rejected := fixture.readObservation(
+				"rejected-only",
+				fixture.entity("entity-a"),
+				fixture.text("remote"),
+				test.validTime,
+				observation.StatusRejected,
+				nil,
+				fixture.citation("evidence-rejected", observation.EvidenceSupporting),
+			)
+			result, err := (Service{
+				Reader: &recordingTrendReader{snapshot: fixture.snapshot(rejected)},
+				Limits: validLimits(),
+			}).Query(context.Background(), fixture.request)
+			if err != nil {
+				t.Fatalf("Query() error = %v", err)
+			}
+			want := []Gap{{Kind: GapNoEvidence, EntityID: "entity-a"}}
+			if !reflect.DeepEqual(result.Gaps, want) {
+				t.Fatalf("Query() gaps = %#v, want %#v", result.Gaps, want)
+			}
+			trend, ok := result.Payload.Trend()
+			if !ok {
+				t.Fatal("Trend() ok = false")
+			}
+			if len(trend.Before.Facts)+len(trend.Before.Unresolved)+
+				len(trend.After.Facts)+len(trend.After.Unresolved) != 0 {
+				t.Fatalf("rejected observation emitted trend material: %#v", trend)
+			}
+		})
+	}
+}
+
 func TestTrendQueryReturnsUnknownEntityErrorWithoutEchoingID(t *testing.T) {
 	fixture := newTrendFixture(t)
 	const privateID = "entity-private-do-not-echo"

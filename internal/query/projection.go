@@ -122,12 +122,12 @@ func resolvedTermMatchesSource(resolved, source observation.Term, groundingMenti
 	case observation.TermAbsent, observation.TermText:
 		return groundingMentionID == "" && temporal.CompareTerms(resolved, source) == 0
 	case observation.TermEntity:
-		if groundingMentionID != "" || resolved.Kind() != observation.TermEntity {
+		if resolved.Kind() != observation.TermEntity {
 			return false
 		}
-		sourceID, _, _ := source.Entity()
+		sourceID, sourceGroundingMentionID, _ := source.Entity()
 		resolvedID, _, _ := resolved.Entity()
-		return sourceID == resolvedID
+		return sourceID == resolvedID && groundingMentionID == sourceGroundingMentionID
 	case observation.TermMention:
 		if resolved.Kind() != observation.TermEntity {
 			return false
@@ -366,15 +366,7 @@ func projectTrendGaps(
 	}
 	gaps := make(map[Gap]struct{})
 	hasMaterial := make(map[identity.EntityID]bool, len(request.EntityIDs))
-	for _, candidate := range candidates {
-		for _, entityID := range candidateEntityIDs(candidate) {
-			hasMaterial[entityID] = true
-		}
-	}
 	for _, coverage := range snapshot.Coverage {
-		if coverage.EntityID != "" {
-			hasMaterial[coverage.EntityID] = true
-		}
 		switch coverage.Reason {
 		case CoverageUnresolvedMention:
 			gaps[Gap{Kind: GapUnresolvedMention, EntityID: coverage.EntityID, Predicate: coverage.Predicate}] = struct{}{}
@@ -383,13 +375,20 @@ func projectTrendGaps(
 		case CoverageEntityFiltered, CoveragePredicateFiltered:
 		}
 	}
+	addValidTimeGaps(gaps, request, candidates, before)
+	addValidTimeGaps(gaps, request, candidates, after)
+	addWindowSummaryMaterial(hasMaterial, before)
+	addWindowSummaryMaterial(hasMaterial, after)
+	for gap := range gaps {
+		if gap.EntityID != "" {
+			hasMaterial[gap.EntityID] = true
+		}
+	}
 	for _, entityID := range request.EntityIDs {
 		if !hasMaterial[entityID] {
 			gaps[Gap{Kind: GapNoEvidence, EntityID: entityID}] = struct{}{}
 		}
 	}
-	addValidTimeGaps(gaps, request, candidates, before)
-	addValidTimeGaps(gaps, request, candidates, after)
 
 	result := make([]Gap, 0, len(gaps))
 	for gap := range gaps {
@@ -401,6 +400,9 @@ func projectTrendGaps(
 
 func addValidTimeGaps(gaps map[Gap]struct{}, request Request, candidates []temporal.StateCandidate, summary temporal.WindowSummary) {
 	for _, candidate := range candidates {
+		if candidate.Observation.Status() == observation.StatusRejected {
+			continue
+		}
 		if !definitelyOutsideSelection(candidate.Observation.ValidTime(), summary.Selection) {
 			continue
 		}
@@ -415,6 +417,27 @@ func addValidTimeGaps(gaps map[Gap]struct{}, request Request, candidates []tempo
 		if !added {
 			gaps[Gap{Kind: GapValidTimeExcluded, Predicate: candidate.Key.Predicate, SelectionLabel: summary.Selection.Label()}] = struct{}{}
 		}
+	}
+}
+
+func addWindowSummaryMaterial(hasMaterial map[identity.EntityID]bool, summary temporal.WindowSummary) {
+	for _, fact := range summary.Facts {
+		addStateMaterialEntityIDs(hasMaterial, fact.Key, fact.Value)
+	}
+	for _, item := range summary.Unresolved {
+		for _, candidate := range item.Candidates {
+			addStateMaterialEntityIDs(hasMaterial, candidate.Key, candidate.Value)
+		}
+	}
+}
+
+func addStateMaterialEntityIDs(
+	hasMaterial map[identity.EntityID]bool,
+	key temporal.StateKey,
+	value observation.Term,
+) {
+	for _, entityID := range stateEntityIDs(key, value) {
+		hasMaterial[entityID] = true
 	}
 }
 
@@ -436,8 +459,12 @@ func definitelyOutsideSelection(extent observation.TemporalExtent, selection tem
 }
 
 func candidateEntityIDs(candidate temporal.StateCandidate) []identity.EntityID {
+	return stateEntityIDs(candidate.Key, candidate.Value)
+}
+
+func stateEntityIDs(key temporal.StateKey, value observation.Term) []identity.EntityID {
 	result := make([]identity.EntityID, 0, 2)
-	for _, term := range []observation.Term{candidate.Key.Subject, candidate.Value} {
+	for _, term := range []observation.Term{key.Subject, value} {
 		entityID, _, ok := term.Entity()
 		if !ok {
 			continue

@@ -154,6 +154,162 @@ func TestTrendQueryAcceptsDirectTermsAndMatchingMentionGrounding(t *testing.T) {
 	}
 }
 
+func TestTrendQueryPreservesDirectEntityGroundingForSubjectAndObject(t *testing.T) {
+	fixture := newTrendFixture(t)
+	canonicalSubject := fixture.entity("entity-a")
+	canonicalObject := fixture.entity("entity-b")
+
+	subject := fixture.readObservationWithPredicate(
+		"direct-grounded-subject",
+		"work.owner",
+		mustGroundedEntityTerm(t, "entity-a", "mention-subject"),
+		fixture.text("owner"),
+		fixture.instant(2024, time.January, 15),
+		observation.StatusObserved,
+		nil,
+		fixture.citation("evidence-direct-subject", observation.EvidenceSupporting),
+	)
+	subject.Subject = canonicalSubject
+	subject.SubjectGroundingMentionID = "mention-subject"
+
+	object := fixture.readObservationWithPredicate(
+		"direct-grounded-object",
+		"work.assignment",
+		canonicalSubject,
+		mustGroundedEntityTerm(t, "entity-b", "mention-object"),
+		fixture.instant(2024, time.January, 16),
+		observation.StatusObserved,
+		nil,
+		fixture.citation("evidence-direct-object", observation.EvidenceSupporting),
+	)
+	object.Object = canonicalObject
+	object.ObjectGroundingMentionID = "mention-object"
+
+	request := fixture.request
+	request.Predicates = nil
+	result, err := (Service{
+		Reader: &recordingTrendReader{snapshot: fixture.snapshot(subject, object)},
+		Limits: validLimits(),
+	}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	trend, ok := result.Payload.Trend()
+	if !ok {
+		t.Fatal("Trend() ok = false")
+	}
+
+	found := make(map[observation.ObservationID]bool)
+	for _, fact := range trend.Before.Facts {
+		for _, contribution := range fact.Contributions {
+			switch contribution.ObservationID {
+			case "direct-grounded-subject":
+				_, groundingMentionID, isEntity := fact.Key.Subject.Entity()
+				found[contribution.ObservationID] =
+					contribution.SubjectGroundingMentionID == "mention-subject" &&
+						isEntity &&
+						groundingMentionID == ""
+			case "direct-grounded-object":
+				_, groundingMentionID, isEntity := fact.Value.Entity()
+				found[contribution.ObservationID] =
+					contribution.ObjectGroundingMentionID == "mention-object" &&
+						isEntity &&
+						groundingMentionID == ""
+			}
+		}
+	}
+	for _, observationID := range []observation.ObservationID{"direct-grounded-subject", "direct-grounded-object"} {
+		if !found[observationID] {
+			t.Fatalf("direct grounding for %q was not preserved outside canonical state", observationID)
+		}
+	}
+}
+
+func TestTrendQueryRejectsDirectEntityGroundingDisagreement(t *testing.T) {
+	tests := []struct {
+		name   string
+		source func(*testing.T, trendFixture) ReadObservation
+	}{
+		{
+			name: "subject missing",
+			source: func(t *testing.T, fixture trendFixture) ReadObservation {
+				read := fixture.readObservation(
+					"direct-subject-missing",
+					mustGroundedEntityTerm(t, "entity-a", "private-subject-mention"),
+					fixture.text("owner"),
+					fixture.instant(2024, time.January, 15),
+					observation.StatusObserved,
+					nil,
+					fixture.citation("evidence-direct-subject-missing", observation.EvidenceSupporting),
+				)
+				read.Subject = fixture.entity("entity-a")
+				return read
+			},
+		},
+		{
+			name: "subject differs",
+			source: func(t *testing.T, fixture trendFixture) ReadObservation {
+				read := fixture.readObservation(
+					"direct-subject-differs",
+					mustGroundedEntityTerm(t, "entity-a", "private-subject-mention"),
+					fixture.text("owner"),
+					fixture.instant(2024, time.January, 15),
+					observation.StatusObserved,
+					nil,
+					fixture.citation("evidence-direct-subject-differs", observation.EvidenceSupporting),
+				)
+				read.Subject = fixture.entity("entity-a")
+				read.SubjectGroundingMentionID = "different-subject-mention"
+				return read
+			},
+		},
+		{
+			name: "object missing",
+			source: func(t *testing.T, fixture trendFixture) ReadObservation {
+				read := fixture.readObservation(
+					"direct-object-missing",
+					fixture.entity("entity-a"),
+					mustGroundedEntityTerm(t, "entity-b", "private-object-mention"),
+					fixture.instant(2024, time.January, 15),
+					observation.StatusObserved,
+					nil,
+					fixture.citation("evidence-direct-object-missing", observation.EvidenceSupporting),
+				)
+				read.Object = fixture.entity("entity-b")
+				return read
+			},
+		},
+		{
+			name: "object differs",
+			source: func(t *testing.T, fixture trendFixture) ReadObservation {
+				read := fixture.readObservation(
+					"direct-object-differs",
+					fixture.entity("entity-a"),
+					mustGroundedEntityTerm(t, "entity-b", "private-object-mention"),
+					fixture.instant(2024, time.January, 15),
+					observation.StatusObserved,
+					nil,
+					fixture.citation("evidence-direct-object-differs", observation.EvidenceSupporting),
+				)
+				read.Object = fixture.entity("entity-b")
+				read.ObjectGroundingMentionID = "different-object-mention"
+				return read
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTrendFixture(t)
+			_, err := (Service{
+				Reader: &recordingTrendReader{snapshot: fixture.snapshot(test.source(t, fixture))},
+				Limits: validLimits(),
+			}).Query(context.Background(), fixture.request)
+			assertBoundedProjectionError(t, err, "private-subject-mention", "private-object-mention")
+		})
+	}
+}
+
 func assertBoundedProjectionError(t *testing.T, err error, privateValues ...string) {
 	t.Helper()
 	if err == nil {
