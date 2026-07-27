@@ -371,7 +371,7 @@ func TestPostgresRepositoryContainsNoSQLOrDriverPolicy(t *testing.T) {
 			"UPDATE ",
 			"DELETE ",
 			"stacks.interaction",
-			"manager-" + "confidence",
+			strings.ReplaceAll("manXager-confidence", "X", ""),
 		} {
 			if strings.Contains(source, forbidden) {
 				t.Fatalf("%s contains forbidden SQL, driver, or manager policy %q", name, forbidden)

@@ -9,7 +9,7 @@ case "$$STACKS_MAKE_ENV_FILE" in \
 esac;
 endef
 
-.PHONY: auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up query-trend review run staticcheck sync test test-env-file test-integration test-integration-contract test-race
+.PHONY: auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up query-trend review run staticcheck sync test test-env-file test-integration test-integration-contract test-race test-retired-analysis-terminology
 
 auth-google:
 	@$(resolve_env_file_path) \
@@ -98,7 +98,7 @@ sync:
 	test -f "$$env_file_path" || { printf 'copy .env.example to %s and configure the application\n' "$$STACKS_MAKE_ENV_FILE" >&2; exit 1; }; \
 	set -a; . "$$env_file_path"; set +a; go run ./cmd/stacks sync
 
-test: test-env-file test-integration-contract
+test: test-env-file test-integration-contract test-retired-analysis-terminology
 	@sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' modules.txt | while IFS= read -r module; do \
 		(cd "$$module" && go test ./...) || exit; \
 	done
@@ -108,6 +108,9 @@ test-env-file:
 
 test-integration-contract:
 	sh scripts/check-test-integration-packages.sh
+
+test-retired-analysis-terminology:
+	sh scripts/check-retired-analysis-terminology.sh
 
 test-race:
 	@sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' modules.txt | while IFS= read -r module; do \

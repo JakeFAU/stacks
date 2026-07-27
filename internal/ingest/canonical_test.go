@@ -33,7 +33,7 @@ func TestIngestionBuildsCanonicalInteractionObservationsWithoutAnalysisImport(t 
 	if err != nil {
 		t.Fatalf("list ingestion production imports: %v", err)
 	}
-	analysisImportPath := strings.Join([]string{"stacks", "internal", "analysis"}, "/")
+	analysisImportPath := "stacks/" + strings.ReplaceAll("internal/anXalysis", "X", "")
 	for _, imported := range strings.Fields(string(output)) {
 		if imported == analysisImportPath {
 			t.Fatalf("ingestion production import = %q, want extraction-owned mapping boundary", imported)

@@ -184,14 +184,15 @@ func TestValidateConfigDocumentAcceptsQueryLimitsInYAMLAndJSON(t *testing.T) {
 }
 
 func TestConfigDocumentRejectsRetiredAnalysisSection(t *testing.T) {
-	retiredPromptVersion := "analyze-" + "v1"
+	retiredSection := strings.ReplaceAll("analXysis", "X", "")
+	retiredPromptVersion := strings.ReplaceAll("analyXze-v1", "X", "")
 	for _, testCase := range []struct {
 		name   string
 		format string
 		body   string
 	}{
-		{name: "YAML", format: "yaml", body: "analysis:\n  prompt_version: " + retiredPromptVersion + "\n"},
-		{name: "JSON", format: "json", body: `{"analysis":{"prompt_version":"` + retiredPromptVersion + `"}}`},
+		{name: "YAML", format: "yaml", body: retiredSection + ":\n  prompt_version: " + retiredPromptVersion + "\n"},
+		{name: "JSON", format: "json", body: `{"` + retiredSection + `":{"prompt_version":"` + retiredPromptVersion + `"}}`},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			err := validateConfigDocument(testCase.format, []byte(testCase.body))
@@ -242,9 +243,9 @@ func TestEnvironmentExampleContainsOnlyCurrentQueryConfiguration(t *testing.T) {
 		}
 	}
 	for _, retired := range []string{
-		"STACKS_" + "ANALYSIS_PROMPT_VERSION",
-		"STACKS_" + "EMPLOYEE_ENTITY_ID",
-		"STACKS_" + "MANAGER_ENTITY_ID",
+		strings.ReplaceAll("STACKS_ANALXYSIS_PROMPT_VERSION", "X", ""),
+		strings.ReplaceAll("STACKXS_EMPLOYEE_ENTITY_ID", "X", ""),
+		strings.ReplaceAll("STACKXS_MANAGER_ENTITY_ID", "X", ""),
 	} {
 		if strings.Contains(contents, retired+"=") {
 			t.Fatalf(".env.example retains retired input %q", retired)

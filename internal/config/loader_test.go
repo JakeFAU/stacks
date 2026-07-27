@@ -202,9 +202,9 @@ func TestLoadDoesNotBindRetiredAnalysisEnvironmentInputs(t *testing.T) {
 	}
 
 	retired := []string{
-		"STACKS_" + "ANALYSIS_PROMPT_VERSION",
-		"STACKS_" + "EMPLOYEE_ENTITY_ID",
-		"STACKS_" + "MANAGER_ENTITY_ID",
+		strings.ReplaceAll("STACKS_ANALXYSIS_PROMPT_VERSION", "X", ""),
+		strings.ReplaceAll("STACKXS_EMPLOYEE_ENTITY_ID", "X", ""),
+		strings.ReplaceAll("STACKXS_MANAGER_ENTITY_ID", "X", ""),
 	}
 	for _, binding := range configurationEnvironmentBindings() {
 		for _, name := range retired {
@@ -421,9 +421,9 @@ func clearConfigurationEnvironment(t *testing.T) {
 		QueryMaxEntitiesEnvironmentVariable,
 		QueryMaxPredicatesEnvironmentVariable,
 		QueryMaxChronologyEnvironmentVariable,
-		"STACKS_" + "ANALYSIS_PROMPT_VERSION",
-		"STACKS_" + "EMPLOYEE_ENTITY_ID",
-		"STACKS_" + "MANAGER_ENTITY_ID",
+		strings.ReplaceAll("STACKS_ANALXYSIS_PROMPT_VERSION", "X", ""),
+		strings.ReplaceAll("STACKXS_EMPLOYEE_ENTITY_ID", "X", ""),
+		strings.ReplaceAll("STACKXS_MANAGER_ENTITY_ID", "X", ""),
 	} {
 		t.Setenv(name, "")
 	}

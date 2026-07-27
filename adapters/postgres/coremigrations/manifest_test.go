@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -532,8 +533,11 @@ func TestDocumentsMigrationContainsNoVerticalOrProviderObjects(t *testing.T) {
 		t.Fatalf("installed core tables = %v, want only %v", gotTables, wantTables)
 	}
 
-	forbiddenPattern := "(manager|" +
-		"confidence|directory|drive|google|bedrock|anthropic|openai|vector|embedding|model)"
+	forbiddenPattern := strings.ReplaceAll(
+		"(manXager|confidence|directory|drive|google|bedrock|anthropic|openai|vector|embedding|model)",
+		"X",
+		"",
+	)
 	var forbiddenObjects int
 	if err := connection.QueryRow(ctx, `
 		SELECT count(*)

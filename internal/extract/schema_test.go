@@ -37,7 +37,7 @@ func TestPromptContractSupportsExtractionOnly(t *testing.T) {
 		len(contract.JSONSchema) == 0 {
 		t.Fatalf("PromptContract(%q) = %+v, want complete extraction contract", ExtractionPromptVersion, contract)
 	}
-	retiredPromptVersion := "analyze-" + "v1"
+	retiredPromptVersion := strings.ReplaceAll("analyXze-v1", "X", "")
 	if _, err := PromptContract(retiredPromptVersion); err == nil {
 		t.Fatalf("PromptContract(%q) error = nil, want retired prompt rejection", retiredPromptVersion)
 	}
