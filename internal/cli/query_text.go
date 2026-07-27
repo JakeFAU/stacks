@@ -204,8 +204,11 @@ func renderTextUnresolved(
 			return err
 		}
 		fmt.Fprintf(output, "%s- key: %s reason=%s\n", indent, key, value.Reason)
-		if err := renderTextFacts(output, "candidates", value.Candidates, indent+"  "); err != nil {
-			return err
+		fmt.Fprintf(output, "%s  candidates:\n", indent)
+		for _, candidate := range value.Candidates {
+			if err := renderTextFact(output, candidate, indent+"    "); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
