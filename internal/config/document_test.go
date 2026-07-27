@@ -226,6 +226,32 @@ func TestConfigurationExamplesPassStrictValidation(t *testing.T) {
 	}
 }
 
+func TestEnvironmentExampleContainsOnlyCurrentQueryConfiguration(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".env.example"))
+	if err != nil {
+		t.Fatalf("read environment example: %v", err)
+	}
+	contents := string(data)
+	for _, name := range []string{
+		QueryMaxEntitiesEnvironmentVariable,
+		QueryMaxPredicatesEnvironmentVariable,
+		QueryMaxChronologyEnvironmentVariable,
+	} {
+		if !strings.Contains(contents, name+"=") {
+			t.Fatalf(".env.example is missing current query input %q", name)
+		}
+	}
+	for _, retired := range []string{
+		"STACKS_" + "ANALYSIS_PROMPT_VERSION",
+		"STACKS_" + "EMPLOYEE_ENTITY_ID",
+		"STACKS_" + "MANAGER_ENTITY_ID",
+	} {
+		if strings.Contains(contents, retired+"=") {
+			t.Fatalf(".env.example retains retired input %q", retired)
+		}
+	}
+}
+
 func TestValidateConfigDocumentRejectsUnknownAndWrongTypedQueryLimits(t *testing.T) {
 	for _, testCase := range []struct {
 		name       string

@@ -6,6 +6,7 @@ repository_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 dry_run=$(
 	make -C "$repository_root" -n test-integration ENV_FILE=.env.example
 )
+retired_package="./internal/""analysis"
 
 case "$dry_run" in
 	*"go test "*"./internal/query"*) ;;
@@ -16,8 +17,8 @@ case "$dry_run" in
 esac
 
 case "$dry_run" in
-	*"go test "*"./internal/analysis"*)
-		echo "test-integration still executes retired ./internal/analysis" >&2
+	*"go test "*"$retired_package"*)
+		echo "test-integration still executes the retired analysis package" >&2
 		exit 1
 		;;
 	*)

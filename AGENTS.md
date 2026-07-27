@@ -35,7 +35,7 @@ internal/app/                      application lifecycle, command dispatch, and 
 internal/cli/                      Cobra command tree, operator syntax, output, and consumer-owned ports
 internal/config/                   environment loading, defaults, and command-specific validation
 internal/ingest/                   resumable canonical ingestion orchestration
-internal/analysis/                 read-only temporal analysis use case over canonical observations
+internal/query/                    provider-free cited temporal queries over canonical observations
 internal/directory/                optional directory enrichment orchestration and persistence mapping
 internal/source/                   provider-neutral document source boundary and Drive adapter
 internal/extract/                  structured extraction contracts, validation, and versioned prompts
