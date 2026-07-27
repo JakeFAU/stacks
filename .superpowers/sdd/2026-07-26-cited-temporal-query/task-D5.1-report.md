@@ -4,8 +4,9 @@
 
 - Baseline: `4daa8af1f323ee36bdd458c50ca835d8a1999527` on
   `codex/plan-d-temporal-query-design`.
-- Scope: test-only parity evidence. No production behavior, schema, migration,
-  configuration, documentation, provider, push, or pull-request change.
+- Scope: test-only parity evidence and the mandatory integration-gate wiring
+  needed to execute it. No runtime behavior, schema, migration, configuration,
+  provider, push, or pull-request change.
 - PostgreSQL test placement is intentionally split:
   `adapters/postgres/temporal_query_integration_test.go` owns canonical
   adapter write/projection acceptance, while
@@ -32,7 +33,9 @@ It preserves:
 - deterministic trajectory ordering, a competing-value conflict, unknown-time
   temporal uncertainty, unresolved-mention coverage, and authority coverage;
 - a later admission successor that hides one observation currently while the
-  earlier admitted observation remains visible as of the cutoff; and
+  earlier admitted observation remains visible as of the cutoff, with exact
+  authority-excluded coverage for both requested `EntityMatchAny` endpoints;
+  and
 - `EntityMatchAll` acceptance across the two reviewed generic entities.
 
 The fixture contains no vertical roles, scoring vocabulary, derived
@@ -84,10 +87,20 @@ canonical writes, executes public `query.Service` through
 structural equality with independently assembled in-memory snapshots after
 canonical normalization and ordering.
 
-The first full integration run rejected the test fixture because its direct
+The first adapter integration run rejected the test fixture because its direct
 adapter predicate list was not in canonical order. The test input was corrected
-to the adapter's public normalized contract. The subsequent full integration
-run passed:
+to the adapter's public normalized contract.
+
+Follow-up review then found that the root PostgreSQL parity test had not been
+included in `make test-integration`, and direct execution exposed a missing
+reviewer-scoped authority coverage row in the independently assembled current
+oracle. Canonical SQL correctly emits authority-excluded coverage for both
+requested `EntityMatchAny` endpoints of the retired observation. The oracle now
+includes both endpoints and the test asserts those exact entity IDs.
+
+`test-integration` now retains `internal/analysis` and also executes
+`internal/query`. An executable Make dry-run contract test keeps both packages
+mandatory. The corrected full integration run passed:
 
 ```text
 make test-integration ENV_FILE=.env
@@ -97,6 +110,7 @@ ok stacks/internal/directory
 ok stacks/internal/analysis
 ok stacks/internal/app
 ok stacks/internal/doctor
+ok stacks/internal/query
 ```
 
 This is synthetic local PostgreSQL acceptance only. It does not establish
@@ -134,6 +148,7 @@ ok stacks/internal/cli
 All completed successfully:
 
 - `make fmt`
+- `sh scripts/check-test-integration-packages.sh`
 - focused typed, CLI, root PostgreSQL, and adapter PostgreSQL parity tests
 - `make test-integration ENV_FILE=.env`
 - `make test`
@@ -157,6 +172,7 @@ a06de5237eb4d36af0c8c261a31131c9514b5afe26b032e18219b0ea83f5fde5  directory 0000
 
 ## Delivery boundary
 
-The change is committed locally as `Prove generic temporal evidence parity`.
-It is not pushed and no pull request is created. Specialized runtime removal
-remains a later gated D5 task.
+The initial change is committed locally as
+`Prove generic temporal evidence parity`. The deletion-gate review fix is a
+separate local follow-up commit. Neither commit is pushed and no pull request
+is created. Specialized runtime removal remains a later gated D5 task.

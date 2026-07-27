@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -414,6 +415,24 @@ func TestPostgresRepositoryPreservesGenericTemporalEvidenceParity(t *testing.T) 
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("PostgreSQL parity mismatch\n got: %#v\nwant: %#v", got, want)
 			}
+			if test.name == "current" {
+				var authorityEntities []identity.EntityID
+				for _, gap := range got.Gaps {
+					if gap.Kind == GapAuthorityExcluded &&
+						gap.Predicate == genericAdmissionPredicate {
+						authorityEntities = append(authorityEntities, gap.EntityID)
+					}
+				}
+				if !slices.Equal(authorityEntities, []identity.EntityID{
+					genericOwnerID,
+					genericReviewerID,
+				}) {
+					t.Fatalf(
+						"current admission authority gaps = %v, want exact owner and reviewer endpoints",
+						authorityEntities,
+					)
+				}
+			}
 		})
 	}
 
@@ -748,6 +767,11 @@ func seedGenericParityPostgresFixture(t *testing.T, database *postgres.Database)
 			},
 			{
 				Reason: CoverageAuthorityExcluded, EntityID: genericOwnerID,
+				Predicate: genericAdmissionPredicate, ObservationID: observations[5].ID(),
+				ValidTime: observations[5].ValidTime(),
+			},
+			{
+				Reason: CoverageAuthorityExcluded, EntityID: genericReviewerID,
 				Predicate: genericAdmissionPredicate, ObservationID: observations[5].ID(),
 				ValidTime: observations[5].ValidTime(),
 			},
