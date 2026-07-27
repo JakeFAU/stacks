@@ -559,7 +559,7 @@ func readTemporalEntityRecords(
 }
 
 const temporalQualificationSQL = `
-	WITH
+	WITH RECURSIVE
 	parameters AS (
 		SELECT
 			$1::timestamptz AS cutoff,
@@ -597,12 +597,24 @@ const temporalQualificationSQL = `
 		WHERE parameters.cutoff IS NULL
 		   OR decision.recorded_at <= parameters.cutoff
 	),
+	reachable_resolution_decisions AS (
+		SELECT root_resolution.*
+		FROM visible_resolution_decisions AS root_resolution
+		WHERE root_resolution.supersedes_id IS NULL
+		UNION
+		SELECT resolution_successor.*
+		FROM visible_resolution_decisions AS resolution_successor
+		JOIN reachable_resolution_decisions AS resolution_predecessor
+		  ON resolution_successor.supersedes_id = resolution_predecessor.id
+		 AND resolution_successor.proposal_id = resolution_predecessor.proposal_id
+		 AND resolution_successor.recorded_at >= resolution_predecessor.recorded_at
+	),
 	effective_resolution_decisions AS (
 		SELECT
 			decision.id,
 			proposal.mention_id,
 			decision.entity_id
-		FROM visible_resolution_decisions AS decision
+		FROM reachable_resolution_decisions AS decision
 		JOIN visible_resolution_proposals AS proposal
 		  ON proposal.id = decision.proposal_id
 		JOIN visible_mentions AS mention
@@ -612,27 +624,50 @@ const temporalQualificationSQL = `
 		WHERE decision.outcome = 'accepted'
 		  AND NOT EXISTS (
 			SELECT 1
-			FROM visible_resolution_decisions AS successor
-			WHERE successor.supersedes_id = decision.id
-			  AND successor.proposal_id = decision.proposal_id
+			FROM reachable_resolution_decisions AS resolution_successor
+			WHERE resolution_successor.supersedes_id = decision.id
+			  AND resolution_successor.proposal_id = decision.proposal_id
 		  )
+	),
+	visible_admission_targets AS (
+		SELECT target.*
+		FROM stacks_core.admission_targets AS target
+		CROSS JOIN parameters
+		WHERE parameters.cutoff IS NULL
+		   OR target.recorded_at <= parameters.cutoff
 	),
 	visible_admission_decisions AS (
 		SELECT decision.*
 		FROM stacks_core.admission_decisions AS decision
+		JOIN visible_admission_targets AS target
+		  ON target.target_kind = decision.target_kind
+		 AND target.target_id = decision.target_id
 		CROSS JOIN parameters
 		WHERE parameters.cutoff IS NULL
 		   OR decision.recorded_at <= parameters.cutoff
 	),
+	reachable_admission_decisions AS (
+		SELECT root_admission.*
+		FROM visible_admission_decisions AS root_admission
+		WHERE root_admission.supersedes_id IS NULL
+		UNION
+		SELECT admission_successor.*
+		FROM visible_admission_decisions AS admission_successor
+		JOIN reachable_admission_decisions AS admission_predecessor
+		  ON admission_successor.supersedes_id = admission_predecessor.id
+		 AND admission_successor.target_kind = admission_predecessor.target_kind
+		 AND admission_successor.target_id = admission_predecessor.target_id
+		 AND admission_successor.recorded_at >= admission_predecessor.recorded_at
+	),
 	effective_admissions AS (
 		SELECT decision.*
-		FROM visible_admission_decisions AS decision
+		FROM reachable_admission_decisions AS decision
 		WHERE NOT EXISTS (
 			SELECT 1
-			FROM visible_admission_decisions AS successor
-			WHERE successor.supersedes_id = decision.id
-			  AND successor.target_kind = decision.target_kind
-			  AND successor.target_id = decision.target_id
+			FROM reachable_admission_decisions AS admission_successor
+			WHERE admission_successor.supersedes_id = decision.id
+			  AND admission_successor.target_kind = decision.target_kind
+			  AND admission_successor.target_id = decision.target_id
 		)
 	),
 	admitted_resolution_edges AS (
@@ -713,12 +748,15 @@ const temporalQualificationSQL = `
 				  ON span.id = link.evidence_id
 				JOIN stacks_core.document_versions AS version
 				  ON version.id = span.document_version_id
+				JOIN stacks_core.source_documents AS source
+				  ON source.id = version.source_document_id
 				CROSS JOIN parameters
 				WHERE link.observation_id = value.id
 				  AND parameters.cutoff IS NOT NULL
 				  AND (
 					span.recorded_at > parameters.cutoff
 					OR version.recorded_at > parameters.cutoff
+					OR source.created_at > parameters.cutoff
 				  )
 			) AS evidence_visible
 		FROM visible_observations AS value
@@ -907,6 +945,7 @@ func readTemporalQualification(
 	qualified := make([]temporalQualifiedObservation, 0)
 	coverage := make([]TemporalCoverageRecord, 0)
 	classifications := make(map[observation.ObservationID]string)
+	retainedObservationIDs := make(map[observation.ObservationID]struct{})
 	seenCoverage := make(map[TemporalCoverageRecord]struct{})
 	for rows.Next() {
 		var (
@@ -957,18 +996,14 @@ func readTemporalQualification(
 
 		switch classification {
 		case temporalCoverageRetained:
-			if slices.ContainsFunc(
-				qualified,
-				func(value temporalQualifiedObservation) bool {
-					return value.id == observationID
-				},
-			) {
+			if _, exists := retainedObservationIDs[observationID]; exists {
 				return nil, nil, temporalSnapshotError(
 					ctx,
 					"validate observation authority",
 					ErrConflict,
 				)
 			}
+			retainedObservationIDs[observationID] = struct{}{}
 			subject, decodeErr := decodeTemporalResolvedTerm(
 				subjectKind,
 				subjectText,
@@ -1281,6 +1316,7 @@ const temporalEvidenceRecordsSQL = `
 			value.recorded_at <= parameters.cutoff
 			AND span.recorded_at <= parameters.cutoff
 			AND version.recorded_at <= parameters.cutoff
+			AND source.created_at <= parameters.cutoff
 		)
 	  )
 	ORDER BY value.recorded_at, value.id, span.id, link.role`

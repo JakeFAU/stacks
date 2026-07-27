@@ -284,14 +284,31 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 	}
 	authoritySQL := pool.transaction.queries[1].sql
 	for _, required := range []string{
+		"WITH RECURSIVE",
 		"visible_entities AS",
+		"reachable_resolution_decisions AS",
+		"root_resolution.supersedes_id IS NULL",
+		"resolution_successor.supersedes_id = resolution_predecessor.id",
+		"resolution_successor.proposal_id = resolution_predecessor.proposal_id",
+		"resolution_successor.recorded_at >= resolution_predecessor.recorded_at",
 		"effective_resolution_decisions AS",
-		"FROM visible_resolution_decisions AS successor",
-		"successor.proposal_id = decision.proposal_id",
+		"FROM reachable_resolution_decisions AS resolution_successor",
+		"resolution_successor.proposal_id = decision.proposal_id",
+		"visible_admission_targets AS",
+		"target.recorded_at <= parameters.cutoff",
+		"JOIN visible_admission_targets AS target",
+		"target.target_kind = decision.target_kind",
+		"target.target_id = decision.target_id",
+		"reachable_admission_decisions AS",
+		"root_admission.supersedes_id IS NULL",
+		"admission_successor.supersedes_id = admission_predecessor.id",
+		"admission_successor.target_kind = admission_predecessor.target_kind",
+		"admission_successor.target_id = admission_predecessor.target_id",
+		"admission_successor.recorded_at >= admission_predecessor.recorded_at",
 		"effective_admissions AS",
-		"FROM visible_admission_decisions AS successor",
-		"successor.target_kind = decision.target_kind",
-		"successor.target_id = decision.target_id",
+		"FROM reachable_admission_decisions AS admission_successor",
+		"admission_successor.target_kind = decision.target_kind",
+		"admission_successor.target_id = decision.target_id",
 		"mention_admission.target_kind = 'mention'",
 		"decision_admission.target_kind = 'identity_decision'",
 		"observation_admission.target_kind = 'observation'",
@@ -301,6 +318,29 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 	} {
 		if !strings.Contains(authoritySQL, required) {
 			t.Fatalf("authority SQL does not contain required boundary %q", required)
+		}
+	}
+	for _, required := range []string{
+		"JOIN stacks_core.source_documents AS source",
+		"source.created_at > parameters.cutoff",
+	} {
+		if !strings.Contains(authoritySQL, required) {
+			t.Fatalf(
+				"authority evidence SQL does not contain required cutoff boundary %q",
+				required,
+			)
+		}
+	}
+	evidenceSQL := pool.transaction.queries[3].sql
+	for _, required := range []string{
+		"JOIN stacks_core.source_documents AS source",
+		"source.created_at <= parameters.cutoff",
+	} {
+		if !strings.Contains(evidenceSQL, required) {
+			t.Fatalf(
+				"evidence projection SQL does not contain required cutoff boundary %q",
+				required,
+			)
 		}
 	}
 	if strings.Contains(authoritySQL, "extraction_run") {
@@ -325,6 +365,10 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 			temporalQualificationRow(value, "retained"),
 			temporalExcludedQualificationRow(
 				"observation:synthetic/authority-excluded",
+				string(TemporalCoverageAuthorityExcluded),
+			),
+			temporalExcludedQualificationRow(
+				"observation:synthetic/admission-target-after-cutoff",
 				string(TemporalCoverageAuthorityExcluded),
 			),
 			temporalExcludedQualificationRow(
@@ -393,15 +437,24 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 	}
 	wantCoverageReasons := []TemporalCoverageReason{
 		TemporalCoverageAuthorityExcluded,
+		TemporalCoverageAuthorityExcluded,
 		TemporalCoverageUnresolvedMention,
 		TemporalCoverageEntityFiltered,
 		TemporalCoveragePredicateFiltered,
 	}
+	wantCoverageObservationIDs := []observation.ObservationID{
+		"observation:synthetic/authority-excluded",
+		"observation:synthetic/admission-target-after-cutoff",
+		"observation:synthetic/unresolved",
+		"observation:synthetic/entity-filtered",
+		"observation:synthetic/predicate-filtered",
+	}
 	if len(snapshot.Coverage) != len(wantCoverageReasons) {
-		t.Fatalf("snapshot coverage = %#v, want four closed exclusions", snapshot.Coverage)
+		t.Fatalf("snapshot coverage = %#v, want five closed exclusions", snapshot.Coverage)
 	}
 	for index, reason := range wantCoverageReasons {
 		if snapshot.Coverage[index].Reason != reason ||
+			snapshot.Coverage[index].ObservationID != wantCoverageObservationIDs[index] ||
 			snapshot.Coverage[index].EntityID != temporalTestEntityID ||
 			snapshot.Coverage[index].Predicate != temporalTestPredicate {
 			t.Fatalf(
@@ -411,6 +464,35 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 				reason,
 			)
 		}
+	}
+}
+
+func TestTemporalQuerySnapshotRejectsDuplicateRetainedAuthorityRows(t *testing.T) {
+	value := temporalTestObservation(t, observation.StatusObserved, nil)
+	duplicate := temporalQualificationRow(value, temporalCoverageRetained)
+	pool := newTemporalQueryFakePool(
+		temporalQueryRowsResult([][]any{{string(temporalTestEntityID), true}}),
+		temporalQueryRowsResult([][]any{duplicate, duplicate}),
+	)
+
+	_, err := loadTemporalQuerySnapshot(
+		context.Background(),
+		pool,
+		temporalTestSelection(t),
+		nil,
+	)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("loadTemporalQuerySnapshot() error = %v, want ErrConflict", err)
+	}
+	if err.Error() != "load temporal query snapshot: validate observation authority failed" {
+		t.Fatalf("loadTemporalQuerySnapshot() error = %q, want bounded conflict", err)
+	}
+	if pool.transaction.commitCalls != 0 || pool.transaction.rollbackCalls != 1 {
+		t.Fatalf(
+			"commit/rollback calls = %d/%d, want 0/1",
+			pool.transaction.commitCalls,
+			pool.transaction.rollbackCalls,
+		)
 	}
 }
 
