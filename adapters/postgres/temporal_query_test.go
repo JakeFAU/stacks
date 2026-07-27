@@ -1,0 +1,1103 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/JakeFAU/stacks/core/evidence"
+	"github.com/JakeFAU/stacks/core/identity"
+	"github.com/JakeFAU/stacks/core/observation"
+	"github.com/JakeFAU/stacks/core/temporal"
+	"github.com/JakeFAU/stacks/core/timepoint"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const (
+	temporalTestEntityID       = identity.EntityID("entity:synthetic/alpha")
+	temporalTestSecondEntityID = identity.EntityID("entity:synthetic/beta")
+	temporalTestPredicate      = observation.Predicate("project.synthetic/state")
+	temporalTestObservationID  = observation.ObservationID("observation:synthetic/temporal")
+	temporalTestEvidenceID     = evidence.EvidenceID("evidence:synthetic/temporal")
+)
+
+var temporalTestRecordedAt = time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+
+func TestTemporalQuerySnapshotRequiresNormalizedBoundedSelection(t *testing.T) {
+	window := mustTemporalTestWindow(t)
+	base := TemporalQuerySelection{
+		EntityIDs:   []identity.EntityID{temporalTestEntityID},
+		EntityMatch: TemporalEntityMatchAll,
+		Predicates:  []observation.Predicate{temporalTestPredicate},
+		Selections:  []temporal.TemporalSelection{window},
+	}
+
+	tests := []struct {
+		name      string
+		context   context.Context
+		selection func() TemporalQuerySelection
+	}{
+		{
+			name:    "nil context",
+			context: nil,
+			selection: func() TemporalQuerySelection {
+				return base
+			},
+		},
+		{
+			name:    "missing entity",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.EntityIDs = nil
+				return value
+			},
+		},
+		{
+			name:    "unnormalized entity",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.EntityIDs = []identity.EntityID{" entity:synthetic/alpha "}
+				return value
+			},
+		},
+		{
+			name:    "unordered entity",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.EntityIDs = []identity.EntityID{
+					temporalTestSecondEntityID,
+					temporalTestEntityID,
+				}
+				return value
+			},
+		},
+		{
+			name:    "duplicate entity",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.EntityIDs = []identity.EntityID{
+					temporalTestEntityID,
+					temporalTestEntityID,
+				}
+				return value
+			},
+		},
+		{
+			name:    "too many entities",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.EntityIDs = make([]identity.EntityID, 65)
+				for index := range value.EntityIDs {
+					value.EntityIDs[index] = identity.EntityID(
+						fmt.Sprintf("entity:synthetic/%03d", index),
+					)
+				}
+				return value
+			},
+		},
+		{
+			name:    "invalid entity match",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.EntityMatch = 0
+				return value
+			},
+		},
+		{
+			name:    "unnormalized predicate",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.Predicates = []observation.Predicate{" project.synthetic/state "}
+				return value
+			},
+		},
+		{
+			name:    "unordered predicates",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.Predicates = []observation.Predicate{
+					"project.synthetic/z",
+					"project.synthetic/a",
+				}
+				return value
+			},
+		},
+		{
+			name:    "duplicate predicates",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.Predicates = []observation.Predicate{
+					temporalTestPredicate,
+					temporalTestPredicate,
+				}
+				return value
+			},
+		},
+		{
+			name:    "too many predicates",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.Predicates = make([]observation.Predicate, 257)
+				for index := range value.Predicates {
+					value.Predicates[index] = observation.Predicate(
+						fmt.Sprintf("project.synthetic/%03d", index),
+					)
+				}
+				return value
+			},
+		},
+		{
+			name:    "missing temporal selection",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.Selections = nil
+				return value
+			},
+		},
+		{
+			name:    "too many temporal selections",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.Selections = []temporal.TemporalSelection{
+					window,
+					window,
+					window,
+				}
+				return value
+			},
+		},
+		{
+			name:    "invalid temporal selection",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				value.Selections = []temporal.TemporalSelection{{}}
+				return value
+			},
+		},
+		{
+			name:    "zero knowledge cutoff",
+			context: context.Background(),
+			selection: func() TemporalQuerySelection {
+				value := base
+				cutoff := time.Time{}
+				value.KnowledgeAsOf = &cutoff
+				return value
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool := newTemporalQueryFakePool()
+			_, err := loadTemporalQuerySnapshot(
+				test.context,
+				pool,
+				test.selection(),
+				nil,
+			)
+			if err == nil {
+				t.Fatal("loadTemporalQuerySnapshot() error = nil, want validation error")
+			}
+			if len(pool.options) != 0 {
+				t.Fatalf("BeginTx calls = %d, want 0 before validation", len(pool.options))
+			}
+		})
+	}
+}
+
+func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) {
+	pool := newTemporalQueryFakePool(
+		temporalQueryRowsResult([][]any{{string(temporalTestEntityID), true}}),
+		temporalQueryRowsResult(nil),
+		temporalQueryRowsResult(nil),
+		temporalQueryRowsResult(nil),
+	)
+	inputCutoff := time.Date(
+		2026,
+		time.July,
+		26,
+		8,
+		30,
+		0,
+		987654321,
+		time.FixedZone("synthetic-zone", -4*60*60),
+	)
+	selection := temporalTestSelection(t)
+	selection.KnowledgeAsOf = &inputCutoff
+
+	_, err := loadTemporalQuerySnapshot(
+		context.Background(),
+		pool,
+		selection,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("loadTemporalQuerySnapshot() error = %v", err)
+	}
+	wantOptions := pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	}
+	if len(pool.options) != 1 || pool.options[0] != wantOptions {
+		t.Fatalf("BeginTx options = %#v, want %#v", pool.options, wantOptions)
+	}
+	if len(pool.transaction.queries) != 4 {
+		t.Fatalf("transaction queries = %d, want 4", len(pool.transaction.queries))
+	}
+	wantCutoff := timepoint.Normalize(inputCutoff)
+	for index, query := range pool.transaction.queries {
+		if len(query.arguments) == 0 {
+			t.Fatalf("query %d arguments = nil, want normalized cutoff", index)
+		}
+		gotCutoff, ok := query.arguments[0].(time.Time)
+		if !ok || !gotCutoff.Equal(wantCutoff) || gotCutoff.Location() != time.UTC {
+			t.Fatalf(
+				"query %d cutoff = %#v, want canonical %s",
+				index,
+				query.arguments[0],
+				wantCutoff,
+			)
+		}
+		if strings.Contains(query.sql, string(temporalTestEntityID)) ||
+			strings.Contains(query.sql, string(temporalTestPredicate)) {
+			t.Fatalf("query %d interpolated a selected private value", index)
+		}
+	}
+	authoritySQL := pool.transaction.queries[1].sql
+	for _, required := range []string{
+		"visible_entities AS",
+		"effective_resolution_decisions AS",
+		"FROM visible_resolution_decisions AS successor",
+		"successor.proposal_id = decision.proposal_id",
+		"effective_admissions AS",
+		"FROM visible_admission_decisions AS successor",
+		"successor.target_kind = decision.target_kind",
+		"successor.target_id = decision.target_id",
+		"mention_admission.target_kind = 'mention'",
+		"decision_admission.target_kind = 'identity_decision'",
+		"observation_admission.target_kind = 'observation'",
+		"cardinality(parameters.predicates)",
+		"parameters.entity_match = 1",
+		"parameters.entity_match = 2",
+	} {
+		if !strings.Contains(authoritySQL, required) {
+			t.Fatalf("authority SQL does not contain required boundary %q", required)
+		}
+	}
+	if strings.Contains(authoritySQL, "extraction_run") {
+		t.Fatal("observation projection introduced an extraction-run admission gate")
+	}
+}
+
+func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceReads(t *testing.T) {
+	value := temporalTestObservation(t, observation.StatusObserved, nil)
+	selection := temporalTestSelection(t)
+	selection.EntityIDs = []identity.EntityID{
+		temporalTestEntityID,
+		temporalTestSecondEntityID,
+	}
+	selection.EntityMatch = TemporalEntityMatchAny
+	pool := newTemporalQueryFakePool(
+		temporalQueryRowsResult([][]any{
+			{string(temporalTestEntityID), true},
+			{string(temporalTestSecondEntityID), false},
+		}),
+		temporalQueryRowsResult([][]any{
+			temporalQualificationRow(value, "retained"),
+			temporalExcludedQualificationRow(
+				"observation:synthetic/authority-excluded",
+				string(TemporalCoverageAuthorityExcluded),
+			),
+			temporalExcludedQualificationRow(
+				"observation:synthetic/unresolved",
+				string(TemporalCoverageUnresolvedMention),
+			),
+			temporalExcludedQualificationRow(
+				"observation:synthetic/entity-filtered",
+				string(TemporalCoverageEntityFiltered),
+			),
+			temporalExcludedQualificationRow(
+				"observation:synthetic/predicate-filtered",
+				string(TemporalCoveragePredicateFiltered),
+			),
+		}),
+		temporalQueryRowsResult([][]any{temporalObservationRow(t, value)}),
+		temporalQueryRowsResult([][]any{temporalEvidenceRow(value.ID())}),
+	)
+
+	snapshot, err := loadTemporalQuerySnapshot(
+		context.Background(),
+		pool,
+		selection,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("loadTemporalQuerySnapshot() error = %v", err)
+	}
+	wantEvents := []string{
+		"begin",
+		"query-1",
+		"query-2",
+		"query-3",
+		"query-4",
+		"commit",
+		"rollback",
+	}
+	if !slices.Equal(pool.events, wantEvents) {
+		t.Fatalf("transaction events = %v, want %v", pool.events, wantEvents)
+	}
+	if len(snapshot.Entities) != 2 ||
+		snapshot.Entities[0] != (TemporalEntityRecord{
+			EntityID: temporalTestEntityID,
+			Known:    true,
+		}) ||
+		snapshot.Entities[1] != (TemporalEntityRecord{
+			EntityID: temporalTestSecondEntityID,
+			Known:    false,
+		}) {
+		t.Fatalf("snapshot entities = %#v", snapshot.Entities)
+	}
+	if len(snapshot.Observations) != 1 {
+		t.Fatalf("snapshot observations = %#v, want one", snapshot.Observations)
+	}
+	record := snapshot.Observations[0]
+	if record.Observation.ID() != value.ID() ||
+		record.SubjectGroundingMentionID != "" ||
+		record.ObjectGroundingMentionID != "" ||
+		len(record.Evidence) != 1 ||
+		record.Evidence[0].EvidenceID != temporalTestEvidenceID {
+		t.Fatalf("snapshot observation = %#v", record)
+	}
+	subjectID, _, subjectIsEntity := record.Subject.Entity()
+	if !subjectIsEntity || identity.EntityID(subjectID) != temporalTestEntityID {
+		t.Fatalf("resolved subject = %#v, want selected direct entity", record.Subject)
+	}
+	wantCoverageReasons := []TemporalCoverageReason{
+		TemporalCoverageAuthorityExcluded,
+		TemporalCoverageUnresolvedMention,
+		TemporalCoverageEntityFiltered,
+		TemporalCoveragePredicateFiltered,
+	}
+	if len(snapshot.Coverage) != len(wantCoverageReasons) {
+		t.Fatalf("snapshot coverage = %#v, want four closed exclusions", snapshot.Coverage)
+	}
+	for index, reason := range wantCoverageReasons {
+		if snapshot.Coverage[index].Reason != reason ||
+			snapshot.Coverage[index].EntityID != temporalTestEntityID ||
+			snapshot.Coverage[index].Predicate != temporalTestPredicate {
+			t.Fatalf(
+				"snapshot coverage %d = %#v, want reason %q",
+				index,
+				snapshot.Coverage[index],
+				reason,
+			)
+		}
+	}
+}
+
+func TestTemporalQuerySnapshotRollsBackAndPreservesCancellation(t *testing.T) {
+	privateFailure := fmt.Errorf(
+		"private-id predicate SQL https://private.invalid: %w",
+		context.Canceled,
+	)
+	pool := newTemporalQueryFakePool(
+		temporalQueryRowsResult([][]any{{string(temporalTestEntityID), true}}),
+		temporalQueryRowsError(privateFailure),
+	)
+	ctx := context.WithValue(
+		context.Background(),
+		temporalObserverContextKey{},
+		"caller",
+	)
+
+	_, err := loadTemporalQuerySnapshot(
+		ctx,
+		pool,
+		temporalTestSelection(t),
+		nil,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("loadTemporalQuerySnapshot() error = %v, want context.Canceled", err)
+	}
+	assertTemporalSnapshotErrorIsBounded(t, err)
+	if pool.transaction.commitCalls != 0 || pool.transaction.rollbackCalls != 1 {
+		t.Fatalf(
+			"commit/rollback calls = %d/%d, want 0/1",
+			pool.transaction.commitCalls,
+			pool.transaction.rollbackCalls,
+		)
+	}
+	for index, query := range pool.transaction.queries {
+		if query.context != ctx {
+			t.Fatalf("query %d context was replaced", index)
+		}
+	}
+	if pool.transaction.rollbackContexts[0] != ctx {
+		t.Fatal("rollback context was replaced")
+	}
+}
+
+func TestTemporalQuerySnapshotDoesNotApplyValidTimeOrConfidencePolicy(t *testing.T) {
+	confidence, err := observation.NewUnitIntervalConfidence(0.01)
+	if err != nil {
+		t.Fatalf("observation.NewUnitIntervalConfidence() error = %v", err)
+	}
+	value := temporalTestObservation(t, observation.StatusRejected, &confidence)
+	pool := newTemporalQueryFakePool(
+		temporalQueryRowsResult([][]any{{string(temporalTestEntityID), true}}),
+		temporalQueryRowsResult([][]any{temporalQualificationRow(
+			value,
+			"retained",
+		)}),
+		temporalQueryRowsResult([][]any{temporalObservationRow(t, value)}),
+		temporalQueryRowsResult([][]any{temporalEvidenceRow(value.ID())}),
+	)
+
+	snapshot, err := loadTemporalQuerySnapshot(
+		context.Background(),
+		pool,
+		temporalTestSelection(t),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("loadTemporalQuerySnapshot() error = %v", err)
+	}
+	if len(snapshot.Observations) != 1 {
+		t.Fatalf("snapshot observations = %#v, want rejected out-of-window candidate", snapshot.Observations)
+	}
+	got := snapshot.Observations[0].Observation
+	gotConfidence, hasConfidence := got.Confidence()
+	if got.Status() != observation.StatusRejected ||
+		!hasConfidence ||
+		gotConfidence.Value() != confidence.Value() {
+		t.Fatalf(
+			"retained status/confidence = %q/(%v,%v), want rejected/(0.01,true)",
+			got.Status(),
+			gotConfidence.Value(),
+			hasConfidence,
+		)
+	}
+	for _, query := range pool.transaction.queries {
+		for _, argument := range query.arguments {
+			if argument == temporalTestRecordedAt.Add(365*24*time.Hour) {
+				t.Fatal("valid-time selection leaked into PostgreSQL query arguments")
+			}
+		}
+	}
+	authoritySQL := pool.transaction.queries[1].sql
+	for _, forbidden := range []string{
+		"valid_start",
+		"valid_end",
+		"confidence_value",
+		"epistemic_status",
+	} {
+		if strings.Contains(authoritySQL, forbidden) {
+			t.Fatalf("authority eligibility SQL contains core policy field %q", forbidden)
+		}
+	}
+	observationSQL := pool.transaction.queries[2].sql
+	for _, projected := range []string{
+		"value.valid_start",
+		"value.valid_end",
+		"value.confidence_value",
+		"value.epistemic_status",
+	} {
+		if !strings.Contains(observationSQL, projected) {
+			t.Fatalf("canonical observation projection omitted %q", projected)
+		}
+	}
+}
+
+func TestTemporalQuerySnapshotFinishesBoundedObservationOnSuccessAndFailure(t *testing.T) {
+	selection := temporalTestSelection(t)
+	selection.EntityIDs = []identity.EntityID{
+		temporalTestEntityID,
+		temporalTestSecondEntityID,
+	}
+	selection.Predicates = []observation.Predicate{
+		"project.synthetic/a",
+		"project.synthetic/b",
+		"project.synthetic/c",
+	}
+	cutoff := temporalTestRecordedAt.Add(time.Minute)
+	selection.KnowledgeAsOf = &cutoff
+	wantAttributes := TemporalSnapshotAttributes{
+		HasKnowledgeCutoff:   true,
+		EntityCountBucket:    TemporalSnapshotCountTwoToFive,
+		PredicateCountBucket: TemporalSnapshotCountTwoToFive,
+		SelectionCountBucket: TemporalSnapshotCountOne,
+	}
+
+	t.Run("success", func(t *testing.T) {
+		pool := newTemporalQueryFakePool(
+			temporalQueryRowsResult([][]any{
+				{string(temporalTestEntityID), true},
+				{string(temporalTestSecondEntityID), true},
+			}),
+			temporalQueryRowsResult(nil),
+			temporalQueryRowsResult(nil),
+			temporalQueryRowsResult(nil),
+		)
+		observer := &recordingTemporalSnapshotObserver{}
+
+		_, err := loadTemporalQuerySnapshot(
+			context.Background(),
+			pool,
+			selection,
+			observer,
+		)
+		if err != nil {
+			t.Fatalf("loadTemporalQuerySnapshot() error = %v", err)
+		}
+		if observer.starts != 1 ||
+			observer.finishes != 1 ||
+			observer.finishErrors[0] != nil ||
+			observer.attributes[0] != wantAttributes {
+			t.Fatalf("observer = %#v, want one bounded successful observation", observer)
+		}
+		if pool.beginContexts[0].Value(temporalObserverContextKey{}) != "observed" {
+			t.Fatal("observer context was not propagated into transaction")
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		pool := newTemporalQueryFakePool()
+		pool.beginErr = fmt.Errorf("private database URL: %w", context.DeadlineExceeded)
+		observer := &recordingTemporalSnapshotObserver{}
+
+		_, err := loadTemporalQuerySnapshot(
+			context.Background(),
+			pool,
+			selection,
+			observer,
+		)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("loadTemporalQuerySnapshot() error = %v, want deadline", err)
+		}
+		assertTemporalSnapshotErrorIsBounded(t, err)
+		if observer.starts != 1 ||
+			observer.finishes != 1 ||
+			!errors.Is(observer.finishErrors[0], context.DeadlineExceeded) ||
+			observer.attributes[0] != wantAttributes {
+			t.Fatalf("observer = %#v, want one bounded failed observation", observer)
+		}
+		assertTemporalSnapshotErrorIsBounded(t, observer.finishErrors[0])
+	})
+}
+
+func assertTemporalSnapshotErrorIsBounded(t *testing.T, err error) {
+	t.Helper()
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		message := current.Error()
+		for _, privateValue := range []string{
+			"private-id",
+			"predicate",
+			"SQL",
+			"https://",
+			"private database URL",
+		} {
+			if strings.Contains(message, privateValue) {
+				t.Fatalf(
+					"bounded error chain leaked private failure %q: %q",
+					privateValue,
+					message,
+				)
+			}
+		}
+	}
+}
+
+func temporalTestSelection(t *testing.T) TemporalQuerySelection {
+	t.Helper()
+	return TemporalQuerySelection{
+		EntityIDs:   []identity.EntityID{temporalTestEntityID},
+		EntityMatch: TemporalEntityMatchAll,
+		Predicates:  []observation.Predicate{temporalTestPredicate},
+		Selections:  []temporal.TemporalSelection{mustTemporalTestWindow(t)},
+	}
+}
+
+func mustTemporalTestWindow(t *testing.T) temporal.TemporalSelection {
+	t.Helper()
+	selection, err := temporal.Between(
+		"synthetic-window",
+		temporalTestRecordedAt.Add(365*24*time.Hour),
+		temporalTestRecordedAt.Add(366*24*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	return selection
+}
+
+func temporalTestObservation(
+	t *testing.T,
+	status observation.EpistemicStatus,
+	confidence *observation.Confidence,
+) observation.Observation {
+	t.Helper()
+	subject, err := observation.NewEntityTerm(string(temporalTestEntityID), "")
+	if err != nil {
+		t.Fatalf("observation.NewEntityTerm() error = %v", err)
+	}
+	object, err := observation.NewTextTerm("synthetic-state")
+	if err != nil {
+		t.Fatalf("observation.NewTextTerm() error = %v", err)
+	}
+	validTime, err := observation.AtTime(temporalTestRecordedAt)
+	if err != nil {
+		t.Fatalf("observation.AtTime() error = %v", err)
+	}
+	value, err := observation.NewObservation(observation.ObservationInput{
+		ID: temporalTestObservationID,
+		Statement: observation.Statement{
+			Subject:   subject,
+			Predicate: temporalTestPredicate,
+			Object:    object,
+		},
+		ValidTime:  validTime,
+		RecordedAt: temporalTestRecordedAt,
+		Evidence: []observation.EvidenceLink{{
+			EvidenceID: temporalTestEvidenceID,
+			Role:       observation.EvidenceSupporting,
+		}},
+		Derivation: observation.Derivation{
+			Method:  "synthetic",
+			Version: "synthetic-v1",
+		},
+		Status:     status,
+		Confidence: confidence,
+	})
+	if err != nil {
+		t.Fatalf("observation.NewObservation() error = %v", err)
+	}
+	return value
+}
+
+func temporalQualificationRow(
+	value observation.Observation,
+	classification string,
+) []any {
+	subjectID, _, _ := value.Statement().Subject.Entity()
+	objectText, _ := value.Statement().Object.Text()
+	return []any{
+		string(value.ID()),
+		string(value.Statement().Predicate),
+		termKindEntity,
+		nil,
+		subjectID,
+		nil,
+		termKindText,
+		objectText,
+		nil,
+		nil,
+		classification,
+		string(temporalTestEntityID),
+	}
+}
+
+func temporalExcludedQualificationRow(
+	id string,
+	classification string,
+) []any {
+	return []any{
+		id,
+		string(temporalTestPredicate),
+		termKindEntity,
+		nil,
+		string(temporalTestEntityID),
+		nil,
+		termKindText,
+		"synthetic-state",
+		nil,
+		nil,
+		classification,
+		string(temporalTestEntityID),
+	}
+}
+
+func temporalObservationRow(t *testing.T, value observation.Observation) []any {
+	t.Helper()
+	subject, err := encodeObservationTerm(value.Statement().Subject)
+	if err != nil {
+		t.Fatalf("encodeObservationTerm(subject) error = %v", err)
+	}
+	object, err := encodeObservationTerm(value.Statement().Object)
+	if err != nil {
+		t.Fatalf("encodeObservationTerm(object) error = %v", err)
+	}
+	validTime, err := encodeTemporalExtent(value.ValidTime())
+	if err != nil {
+		t.Fatalf("encodeTemporalExtent() error = %v", err)
+	}
+	derivation := value.Derivation()
+	var derivationRunID, derivationModel, derivationPromptVersion any
+	if derivation.RunID != "" {
+		derivationRunID = derivation.RunID
+	}
+	if derivation.Model != "" {
+		derivationModel = derivation.Model
+		derivationPromptVersion = derivation.PromptVersion
+	}
+	var confidenceValue, confidenceScale any
+	if confidence, ok := value.Confidence(); ok {
+		confidenceValueValue := confidence.Value()
+		confidenceScaleValue := string(confidence.Scale())
+		confidenceValue = &confidenceValueValue
+		confidenceScale = &confidenceScaleValue
+	}
+	digest := value.Digest()
+	return []any{
+		string(value.ID()),
+		subject.kind,
+		subject.text,
+		subject.mentionID,
+		subject.entityID,
+		subject.groundingMentionID,
+		string(value.Statement().Predicate),
+		object.kind,
+		object.text,
+		object.mentionID,
+		object.entityID,
+		object.groundingMentionID,
+		validTime.kind,
+		validTime.hasStart,
+		validTime.start,
+		validTime.hasEnd,
+		validTime.end,
+		value.RecordedAt(),
+		derivation.Method,
+		derivation.Version,
+		derivationRunID,
+		derivationModel,
+		derivationPromptVersion,
+		string(value.Status()),
+		confidenceValue,
+		confidenceScale,
+		value.DigestVersion(),
+		digest[:],
+	}
+}
+
+func temporalEvidenceRow(observationID observation.ObservationID) []any {
+	return []any{
+		string(observationID),
+		string(temporalTestEvidenceID),
+		string(observation.EvidenceSupporting),
+		"source-document:synthetic/temporal",
+		"document-version:synthetic/temporal",
+		"section:synthetic/temporal",
+		"Synthetic Section",
+		[]string{"Synthetic Document", "Synthetic Section"},
+		1,
+		"body",
+		0,
+		15,
+		"synthetic://temporal",
+		"synthetic quote",
+	}
+}
+
+type temporalObserverContextKey struct{}
+
+type recordingTemporalSnapshotObserver struct {
+	starts       int
+	finishes     int
+	attributes   []TemporalSnapshotAttributes
+	finishErrors []error
+}
+
+func (observer *recordingTemporalSnapshotObserver) StartTemporalSnapshot(
+	ctx context.Context,
+	attributes TemporalSnapshotAttributes,
+) (context.Context, func(error)) {
+	observer.starts++
+	observer.attributes = append(observer.attributes, attributes)
+	observedContext := context.WithValue(ctx, temporalObserverContextKey{}, "observed")
+	return observedContext, func(err error) {
+		observer.finishes++
+		observer.finishErrors = append(observer.finishErrors, err)
+	}
+}
+
+type temporalQueryResult struct {
+	rows pgx.Rows
+	err  error
+}
+
+func temporalQueryRowsResult(values [][]any) temporalQueryResult {
+	return temporalQueryResult{rows: &temporalQueryFakeRows{values: values}}
+}
+
+func temporalQueryRowsError(err error) temporalQueryResult {
+	return temporalQueryResult{rows: &temporalQueryFakeRows{err: err}}
+}
+
+type temporalQueryFakePool struct {
+	transaction   *temporalQueryFakeTransaction
+	options       []pgx.TxOptions
+	beginContexts []context.Context
+	beginErr      error
+	events        []string
+}
+
+func newTemporalQueryFakePool(results ...temporalQueryResult) *temporalQueryFakePool {
+	pool := &temporalQueryFakePool{}
+	pool.transaction = &temporalQueryFakeTransaction{
+		results: results,
+		events:  &pool.events,
+	}
+	return pool
+}
+
+func (pool *temporalQueryFakePool) BeginTx(
+	ctx context.Context,
+	options pgx.TxOptions,
+) (pgx.Tx, error) {
+	pool.beginContexts = append(pool.beginContexts, ctx)
+	pool.options = append(pool.options, options)
+	pool.events = append(pool.events, "begin")
+	if pool.beginErr != nil {
+		return nil, pool.beginErr
+	}
+	return pool.transaction, nil
+}
+
+type temporalQueryCall struct {
+	context   context.Context
+	sql       string
+	arguments []any
+}
+
+type temporalQueryFakeTransaction struct {
+	results          []temporalQueryResult
+	queries          []temporalQueryCall
+	commitCalls      int
+	rollbackCalls    int
+	commitContexts   []context.Context
+	rollbackContexts []context.Context
+	events           *[]string
+}
+
+func (transaction *temporalQueryFakeTransaction) Begin(context.Context) (pgx.Tx, error) {
+	return nil, errors.New("synthetic nested transaction is unsupported")
+}
+
+func (transaction *temporalQueryFakeTransaction) Commit(ctx context.Context) error {
+	transaction.commitCalls++
+	transaction.commitContexts = append(transaction.commitContexts, ctx)
+	*transaction.events = append(*transaction.events, "commit")
+	return nil
+}
+
+func (transaction *temporalQueryFakeTransaction) Rollback(ctx context.Context) error {
+	transaction.rollbackCalls++
+	transaction.rollbackContexts = append(transaction.rollbackContexts, ctx)
+	*transaction.events = append(*transaction.events, "rollback")
+	return pgx.ErrTxClosed
+}
+
+func (transaction *temporalQueryFakeTransaction) CopyFrom(
+	context.Context,
+	pgx.Identifier,
+	[]string,
+	pgx.CopyFromSource,
+) (int64, error) {
+	return 0, errors.New("synthetic copy is unsupported")
+}
+
+func (transaction *temporalQueryFakeTransaction) SendBatch(
+	context.Context,
+	*pgx.Batch,
+) pgx.BatchResults {
+	return temporalQueryFakeBatchResults{}
+}
+
+func (transaction *temporalQueryFakeTransaction) LargeObjects() pgx.LargeObjects {
+	return pgx.LargeObjects{}
+}
+
+func (transaction *temporalQueryFakeTransaction) Prepare(
+	context.Context,
+	string,
+	string,
+) (*pgconn.StatementDescription, error) {
+	return nil, errors.New("synthetic prepare is unsupported")
+}
+
+func (transaction *temporalQueryFakeTransaction) Exec(
+	context.Context,
+	string,
+	...any,
+) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, errors.New("synthetic exec is unsupported")
+}
+
+func (transaction *temporalQueryFakeTransaction) Query(
+	ctx context.Context,
+	sql string,
+	arguments ...any,
+) (pgx.Rows, error) {
+	transaction.queries = append(transaction.queries, temporalQueryCall{
+		context:   ctx,
+		sql:       sql,
+		arguments: append([]any(nil), arguments...),
+	})
+	queryNumber := len(transaction.queries)
+	*transaction.events = append(
+		*transaction.events,
+		fmt.Sprintf("query-%d", queryNumber),
+	)
+	if queryNumber > len(transaction.results) {
+		return nil, errors.New("synthetic query result is missing")
+	}
+	result := transaction.results[queryNumber-1]
+	return result.rows, result.err
+}
+
+func (transaction *temporalQueryFakeTransaction) QueryRow(
+	context.Context,
+	string,
+	...any,
+) pgx.Row {
+	return temporalQueryFakeRow{err: errors.New("synthetic query row is unsupported")}
+}
+
+func (transaction *temporalQueryFakeTransaction) Conn() *pgx.Conn {
+	return nil
+}
+
+type temporalQueryFakeBatchResults struct{}
+
+func (temporalQueryFakeBatchResults) Exec() (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, errors.New("synthetic batch is unsupported")
+}
+
+func (temporalQueryFakeBatchResults) Query() (pgx.Rows, error) {
+	return nil, errors.New("synthetic batch is unsupported")
+}
+
+func (temporalQueryFakeBatchResults) QueryRow() pgx.Row {
+	return temporalQueryFakeRow{err: errors.New("synthetic batch is unsupported")}
+}
+
+func (temporalQueryFakeBatchResults) Close() error {
+	return nil
+}
+
+type temporalQueryFakeRow struct {
+	err error
+}
+
+func (row temporalQueryFakeRow) Scan(...any) error {
+	return row.err
+}
+
+type temporalQueryFakeRows struct {
+	values  [][]any
+	index   int
+	err     error
+	closed  bool
+	current []any
+}
+
+func (rows *temporalQueryFakeRows) Close() {
+	rows.closed = true
+}
+
+func (rows *temporalQueryFakeRows) Err() error {
+	return rows.err
+}
+
+func (rows *temporalQueryFakeRows) CommandTag() pgconn.CommandTag {
+	return pgconn.CommandTag{}
+}
+
+func (rows *temporalQueryFakeRows) FieldDescriptions() []pgconn.FieldDescription {
+	return nil
+}
+
+func (rows *temporalQueryFakeRows) Next() bool {
+	if rows.closed || rows.index >= len(rows.values) {
+		return false
+	}
+	rows.current = rows.values[rows.index]
+	rows.index++
+	return true
+}
+
+func (rows *temporalQueryFakeRows) Scan(destinations ...any) error {
+	if rows.current == nil {
+		return errors.New("synthetic row has no current values")
+	}
+	if len(destinations) != len(rows.current) {
+		return fmt.Errorf(
+			"synthetic scan destinations = %d, want %d",
+			len(destinations),
+			len(rows.current),
+		)
+	}
+	for index, destination := range destinations {
+		if err := assignTemporalQueryValue(destination, rows.current[index]); err != nil {
+			return fmt.Errorf("synthetic scan column %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func (rows *temporalQueryFakeRows) Values() ([]any, error) {
+	return append([]any(nil), rows.current...), nil
+}
+
+func (rows *temporalQueryFakeRows) RawValues() [][]byte {
+	return nil
+}
+
+func (rows *temporalQueryFakeRows) Conn() *pgx.Conn {
+	return nil
+}
+
+func assignTemporalQueryValue(destination, source any) error {
+	target := reflect.ValueOf(destination)
+	if target.Kind() != reflect.Pointer || target.IsNil() {
+		return errors.New("scan destination must be a non-nil pointer")
+	}
+	target = target.Elem()
+	if source == nil {
+		target.Set(reflect.Zero(target.Type()))
+		return nil
+	}
+	value := reflect.ValueOf(source)
+	if value.Type().AssignableTo(target.Type()) {
+		target.Set(value)
+		return nil
+	}
+	if value.Type().ConvertibleTo(target.Type()) {
+		target.Set(value.Convert(target.Type()))
+		return nil
+	}
+	return fmt.Errorf(
+		"value type %s cannot assign to %s",
+		value.Type(),
+		target.Type(),
+	)
+}

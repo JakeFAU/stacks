@@ -185,7 +185,7 @@ func TestDatabaseCancellationDoesNotPoisonFutureUse(t *testing.T) {
 	}
 }
 
-func TestPostgresAdapterProductionImportsStayWithinBoundary(t *testing.T) {
+func TestDependencyPostgresAdapterProductionImportsStayWithinBoundary(t *testing.T) {
 	t.Parallel()
 
 	command := exec.Command("go", "list", "-json", "./...")
