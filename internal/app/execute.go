@@ -118,5 +118,8 @@ func shutdownExecution(ctx context.Context, shutdown func(context.Context) error
 		runtimeShutdownTimeout,
 	)
 	defer cancel()
-	return shutdown(shutdownContext)
+	if err := shutdown(shutdownContext); err != nil {
+		return fmt.Errorf("shut down runtime: %w", err)
+	}
+	return nil
 }

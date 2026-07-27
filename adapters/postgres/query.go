@@ -83,27 +83,16 @@ func (database *Database) LoadRelationshipSnapshot(
 	defer transaction.Rollback(ctx) //nolint:errcheck // committed transactions are already closed.
 
 	snapshot := RelationshipSnapshot{}
-	snapshot.SubjectAccepted, err = hasCurrentAcceptedIdentityAuthority(
+	snapshot.SubjectAccepted, snapshot.ObjectAccepted, err = loadCurrentAcceptedIdentityAuthorities(
 		ctx,
 		transaction,
 		subjectEntityID,
-	)
-	if err != nil {
-		return RelationshipSnapshot{}, wrapIdentityError(
-			ctx,
-			"load relationship subject authority",
-			err,
-		)
-	}
-	snapshot.ObjectAccepted, err = hasCurrentAcceptedIdentityAuthority(
-		ctx,
-		transaction,
 		objectEntityID,
 	)
 	if err != nil {
 		return RelationshipSnapshot{}, wrapIdentityError(
 			ctx,
-			"load relationship object authority",
+			"load relationship identity authority",
 			err,
 		)
 	}
@@ -332,12 +321,13 @@ func resolveObservationTerm(
 	return entityIDs[0], true, nil
 }
 
-func hasCurrentAcceptedIdentityAuthority(
+func loadCurrentAcceptedIdentityAuthorities(
 	ctx context.Context,
 	reader documentReader,
-	entityID identity.EntityID,
-) (bool, error) {
-	var accepted bool
+	subjectEntityID identity.EntityID,
+	objectEntityID identity.EntityID,
+) (bool, bool, error) {
+	var subjectAccepted, objectAccepted bool
 	if err := reader.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1
@@ -352,12 +342,27 @@ func hasCurrentAcceptedIdentityAuthority(
 				FROM stacks_core.resolution_decisions AS successor
 				WHERE successor.supersedes_id = decision.id
 			  )
+		),
+		EXISTS (
+			SELECT 1
+			FROM stacks_core.entities AS entity
+			JOIN stacks_core.resolution_decisions AS decision
+			  ON decision.entity_id = entity.id
+			 AND decision.outcome = 'accepted'
+			WHERE entity.id = $2
+			  AND entity.kind = 'person'
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM stacks_core.resolution_decisions AS successor
+				WHERE successor.supersedes_id = decision.id
+			  )
 		)`,
-		entityID,
-	).Scan(&accepted); err != nil {
-		return false, err
+		subjectEntityID,
+		objectEntityID,
+	).Scan(&subjectAccepted, &objectAccepted); err != nil {
+		return false, false, err
 	}
-	return accepted, nil
+	return subjectAccepted, objectAccepted, nil
 }
 
 func loadObservationEvidenceRecords(
