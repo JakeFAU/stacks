@@ -2,6 +2,9 @@ package ingest
 
 import (
 	"crypto/sha256"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,7 +16,7 @@ import (
 	"stacks/internal/extract"
 )
 
-func TestCanonicalCompletionPersistsInteractionObservationsWithoutSignalDTO(t *testing.T) {
+func TestIngestionBuildsCanonicalInteractionObservationsWithoutAnalysisImport(t *testing.T) {
 	completion := canonicalInteractionCompletion(t, "2026-07-25")
 
 	if len(completion.Observations) != 1 {
@@ -22,6 +25,19 @@ func TestCanonicalCompletionPersistsInteractionObservationsWithoutSignalDTO(t *t
 	predicate := completion.Observations[0].Predicate
 	if predicate != "stacks.interaction.v1/future_responsibility/strengthening" {
 		t.Fatalf("canonical predicate = %q", predicate)
+	}
+
+	command := exec.Command("go", "list", "-f", `{{join .Imports "\n"}}`, ".")
+	command.Env = append(os.Environ(), "GOWORK=off")
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("list ingestion production imports: %v", err)
+	}
+	analysisImportPath := strings.Join([]string{"stacks", "internal", "analysis"}, "/")
+	for _, imported := range strings.Fields(string(output)) {
+		if imported == analysisImportPath {
+			t.Fatalf("ingestion production import = %q, want extraction-owned mapping boundary", imported)
+		}
 	}
 }
 

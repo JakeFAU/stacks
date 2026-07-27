@@ -23,7 +23,6 @@ import (
 
 	"github.com/JakeFAU/stacks/core/admission"
 	coreidentity "github.com/JakeFAU/stacks/core/identity"
-	"stacks/internal/analysis"
 	"stacks/internal/directory"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
@@ -494,10 +493,7 @@ func (service *Service) completion(
 	}
 	for _, signal := range output.Signals {
 		observationID := stableDerivationID(derivation.Digest, "observation", signal.ID)
-		predicate, err := analysis.InteractionObservationPredicate(
-			analysis.Category(signal.Category),
-			analysis.Direction(signal.Direction),
-		)
+		predicate, err := extract.InteractionObservationPredicate(signal.Category, signal.Direction)
 		if err != nil {
 			return Completion{}, err
 		}
