@@ -381,6 +381,407 @@ func TestPostgresRepositoryExecutesAllTemporalIntentsOverSyntheticAtlas(t *testi
 	}
 }
 
+func TestPostgresRepositoryPreservesGenericTemporalEvidenceParity(t *testing.T) {
+	base := newAllIntentPostgresFixture(t)
+	fixture := seedGenericParityPostgresFixture(t, base.database)
+	postgresService := Service{
+		Reader: PostgresRepository{Database: base.database},
+		Limits: Limits{MaxEntities: 4, MaxPredicates: 8, MaxChronology: 32},
+	}
+	memoryService := Service{
+		Reader: fixture.reader,
+		Limits: Limits{MaxEntities: 4, MaxPredicates: 8, MaxChronology: 32},
+	}
+
+	for _, test := range []struct {
+		name  string
+		scope temporal.KnowledgeScope
+	}{
+		{name: "current", scope: temporal.CurrentKnowledge()},
+		{name: "as-of", scope: fixture.historicalScope},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := fixture.currentRequest
+			request.KnowledgeScope = test.scope
+			want, err := memoryService.Query(t.Context(), request)
+			if err != nil {
+				t.Fatalf("in-memory Query() error = %v", err)
+			}
+			got, err := postgresService.Query(t.Context(), request)
+			if err != nil {
+				t.Fatalf("PostgresRepository Query() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("PostgreSQL parity mismatch\n got: %#v\nwant: %#v", got, want)
+			}
+		})
+	}
+
+	allRequest := fixture.currentRequest
+	allRequest.EntityMatch = EntityMatchAll
+	allRequest.Predicates = []observation.Predicate{genericPairPredicate}
+	allRequest.KnowledgeScope = fixture.historicalScope
+	all, err := postgresService.Query(t.Context(), allRequest)
+	if err != nil {
+		t.Fatalf("EntityMatchAll Query() error = %v", err)
+	}
+	trajectory, ok := all.Payload.Trajectory()
+	if !ok || len(trajectory.Transitions) != 1 ||
+		trajectory.Transitions[0].After == nil ||
+		trajectory.Transitions[0].After.Contributions[0].ObservationID != "observation:generic/pair" {
+		t.Fatalf("EntityMatchAll trajectory = %#v, want the reviewed generic pair", trajectory)
+	}
+}
+
+func seedGenericParityPostgresFixture(t *testing.T, database *postgres.Database) genericParityFixture {
+	t.Helper()
+	recordedBase := time.Date(2034, time.January, 2, 9, 0, 0, 0, time.UTC)
+	type storedEvidence struct {
+		document evidence.DocumentVersion
+		section  evidence.Section
+		span     evidence.EvidenceSpan
+		ref      postgres.DocumentVersionRef
+		citation Citation
+	}
+	newEvidence := func(id, text, quote string, role observation.EvidenceRole) storedEvidence {
+		t.Helper()
+		section, err := evidence.NewSection(evidence.SectionInput{
+			ID: "section:generic/" + id, Title: "Generic Atlas record",
+			Path: []string{"Generic Atlas", "Responsibility"}, Order: 0,
+			Role: "synthetic-record", Text: text,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		document, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
+			Provider: "synthetic", ProviderDocumentID: "document:generic/" + id,
+			Title: "Generic Atlas fixture", Locator: "synthetic://generic-atlas/" + id,
+			ProviderVersion: "v1", ModifiedAt: recordedBase, RecordedAt: recordedBase,
+			Sections: []evidence.Section{section},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref, err := database.PutDocumentVersion(t.Context(), document)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := strings.Index(text, quote)
+		if start < 0 {
+			t.Fatalf("quote %q is absent from generic evidence", quote)
+		}
+		span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
+			Document: document, SectionID: section.ID(), StartOffset: start,
+			EndOffset: start + len(quote), Quote: quote, RecordedAt: recordedBase.Add(time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return storedEvidence{
+			document: document, section: section, span: span, ref: ref.Ref,
+			citation: Citation{
+				EvidenceID: span.ID(), Role: role,
+				SourceDocumentID: ref.Ref.SourceDocumentID, DocumentVersionID: ref.Ref.VersionID,
+				SectionID: section.ID(), SectionTitle: section.Title(), SectionPath: section.Path(),
+				SectionOrder: section.Order(), SectionRole: section.Role(),
+				StartOffset: span.StartOffset(), EndOffset: span.EndOffset(),
+				Locator: span.Locator(), Text: span.Text(),
+			},
+		}
+	}
+	support := newEvidence(
+		"support",
+		"Generic Atlas record assigns a reviewed responsibility state.",
+		"assigns a reviewed responsibility",
+		observation.EvidenceSupporting,
+	)
+	counter := newEvidence(
+		"counter",
+		"Generic Atlas record disputes the earlier responsibility state.",
+		"disputes the earlier responsibility",
+		observation.EvidenceContradicting,
+	)
+
+	mustEntity := func(id identity.EntityID, displayName string) identity.Entity {
+		t.Helper()
+		value, err := identity.NewEntity(identity.EntityInput{
+			ID: id, Kind: identity.KindPerson, DisplayName: displayName,
+			RecordedAt: recordedBase.Add(2 * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	mustMention := func(id identity.MentionID, surface string) identity.MentionRecord {
+		t.Helper()
+		value, err := identity.NewMention(identity.MentionInput{
+			ID: id, EvidenceID: support.span.ID(), DerivationRunID: "run:generic/identity",
+			Surface: surface, NormalizedName: identity.NormalizeName(surface),
+			Role: "participant", RecordedAt: recordedBase.Add(3 * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	mustProposal := func(id identity.ProposalID, mentionID identity.MentionID) identity.ResolutionProposal {
+		t.Helper()
+		value, err := identity.NewResolutionProposal(identity.ResolutionProposalInput{
+			ID: id, MentionID: mentionID, ReasonCode: "reviewed_identity",
+			EvidenceIDs: []evidence.EvidenceID{support.span.ID()},
+			RecordedAt:  recordedBase.Add(4 * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	mustDecision := func(id identity.DecisionID, proposalID identity.ProposalID, entityID identity.EntityID) identity.ResolutionDecision {
+		t.Helper()
+		value, err := identity.NewResolutionDecision(identity.ResolutionDecisionInput{
+			ID: id, ProposalID: proposalID, Outcome: identity.DecisionAccepted,
+			EntityID: entityID, Authority: identity.AuthorityReviewer,
+			ReasonCode: "reviewed_identity", RecordedAt: recordedBase.Add(5 * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	mustAdmission := func(
+		id string,
+		targetKind admission.TargetKind,
+		targetID string,
+		outcome admission.Outcome,
+		recordedAt time.Time,
+		supersedes string,
+	) admission.Decision {
+		t.Helper()
+		value, err := admission.NewDecision(admission.DecisionInput{
+			ID: id, TargetKind: targetKind, TargetID: targetID, Outcome: outcome,
+			ReasonCode: "reviewed_authority", Authority: admission.AuthorityReviewer,
+			RecordedAt: recordedAt, SupersedesID: supersedes,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+
+	ownerEntity := mustEntity(genericOwnerID, "Generic Atlas Owner")
+	reviewerEntity := mustEntity(genericReviewerID, "Generic Atlas Reviewer")
+	ownerMention := mustMention("mention:atlas-owner", "Generic Atlas Owner")
+	reviewerMention := mustMention("mention:atlas-reviewer", "Generic Atlas Reviewer")
+	gapMention := mustMention("mention:atlas-gap", "Generic Atlas Participant")
+	ownerProposal := mustProposal("proposal:atlas-owner", ownerMention.ID())
+	reviewerProposal := mustProposal("proposal:atlas-reviewer", reviewerMention.ID())
+	ownerDecision := mustDecision("decision:atlas-owner", ownerProposal.ID(), ownerEntity.ID())
+	reviewerDecision := mustDecision("decision:atlas-reviewer", reviewerProposal.ID(), reviewerEntity.ID())
+
+	ownerMentionTerm := genericMentionTerm(t, ownerMention.ID())
+	reviewerMentionTerm := genericMentionTerm(t, reviewerMention.ID())
+	gapMentionTerm := genericMentionTerm(t, gapMention.ID())
+	ownerTerm := genericEntityTerm(t, genericOwnerID)
+	reviewerTerm := genericEntityTerm(t, genericReviewerID)
+	inputs := []genericObservationInput{
+		{
+			id: "observation:generic/initial", subject: ownerMentionTerm, predicate: genericStatePredicate,
+			object: genericTextTerm(t, "queued"), resolvedSubject: ownerTerm, resolvedObject: genericTextTerm(t, "queued"),
+			subjectGrounding: string(ownerMention.ID()),
+			validTime:        genericDuring(t, genericWindowStart, genericBoundary),
+			recordedAt:       time.Date(2034, time.January, 2, 9, 20, 0, 0, time.UTC),
+			citations:        []Citation{counter.citation, support.citation},
+		},
+		{
+			id: "observation:generic/transfer", subject: ownerMentionTerm, predicate: genericStatePredicate,
+			object: genericTextTerm(t, "active"), resolvedSubject: ownerTerm, resolvedObject: genericTextTerm(t, "active"),
+			subjectGrounding: string(ownerMention.ID()),
+			validTime:        genericDuring(t, genericBoundary, genericWindowEnd),
+			recordedAt:       time.Date(2034, time.January, 3, 9, 20, 0, 0, time.UTC),
+			citations:        []Citation{support.citation},
+		},
+		{
+			id: "observation:generic/conflict", subject: ownerMentionTerm, predicate: genericStatePredicate,
+			object: genericTextTerm(t, "paused"), resolvedSubject: ownerTerm, resolvedObject: genericTextTerm(t, "paused"),
+			subjectGrounding: string(ownerMention.ID()),
+			validTime:        genericDuring(t, genericBoundary, genericConflictEnd),
+			recordedAt:       time.Date(2034, time.January, 3, 9, 21, 0, 0, time.UTC),
+			citations:        []Citation{counter.citation, support.citation},
+		},
+		{
+			id: "observation:generic/pair", subject: ownerMentionTerm, predicate: genericPairPredicate,
+			object: reviewerMentionTerm, resolvedSubject: ownerTerm, resolvedObject: reviewerTerm,
+			subjectGrounding: string(ownerMention.ID()), objectGrounding: string(reviewerMention.ID()),
+			validTime:  genericDuring(t, genericWindowStart, genericWindowEnd),
+			recordedAt: time.Date(2034, time.January, 2, 9, 22, 0, 0, time.UTC),
+			citations:  []Citation{support.citation},
+		},
+		{
+			id: "observation:generic/unknown", subject: ownerMentionTerm, predicate: genericUnknownPredicate,
+			object: reviewerMentionTerm, resolvedSubject: ownerTerm, resolvedObject: reviewerTerm,
+			subjectGrounding: string(ownerMention.ID()), objectGrounding: string(reviewerMention.ID()),
+			validTime:  observation.UnknownTime(),
+			recordedAt: time.Date(2034, time.January, 2, 9, 23, 0, 0, time.UTC),
+			citations:  []Citation{support.citation},
+		},
+		{
+			id: "observation:generic/admission", subject: ownerMentionTerm, predicate: genericAdmissionPredicate,
+			object: reviewerMentionTerm, resolvedSubject: ownerTerm, resolvedObject: reviewerTerm,
+			subjectGrounding: string(ownerMention.ID()), objectGrounding: string(reviewerMention.ID()),
+			validTime:  genericDuring(t, genericWindowStart, genericWindowEnd),
+			recordedAt: time.Date(2034, time.January, 2, 9, 24, 0, 0, time.UTC),
+			citations:  []Citation{support.citation},
+		},
+		{
+			id: "observation:generic/gap", subject: ownerMentionTerm, predicate: genericGapPredicate,
+			object: gapMentionTerm, resolvedSubject: ownerTerm, resolvedObject: gapMentionTerm,
+			subjectGrounding: string(ownerMention.ID()),
+			validTime:        observation.UnknownTime(),
+			recordedAt:       time.Date(2034, time.January, 2, 9, 25, 0, 0, time.UTC),
+			citations:        []Citation{support.citation},
+		},
+	}
+	readObservations := make([]ReadObservation, len(inputs))
+	observations := make([]observation.Observation, len(inputs))
+	for index, input := range inputs {
+		read := genericReadObservation(t, input)
+		readObservations[index] = read
+		observations[index] = read.Observation
+	}
+
+	identityAdmissions := []admission.Decision{
+		mustAdmission("admission:mention:atlas-owner", admission.TargetMention, string(ownerMention.ID()), admission.Admitted, recordedBase.Add(6*time.Minute), ""),
+		mustAdmission("admission:mention:atlas-reviewer", admission.TargetMention, string(reviewerMention.ID()), admission.Admitted, recordedBase.Add(7*time.Minute), ""),
+		mustAdmission("admission:mention:atlas-gap", admission.TargetMention, string(gapMention.ID()), admission.Admitted, recordedBase.Add(8*time.Minute), ""),
+		mustAdmission("admission:decision:atlas-owner", admission.TargetIdentityDecision, string(ownerDecision.ID()), admission.Admitted, recordedBase.Add(9*time.Minute), ""),
+		mustAdmission("admission:decision:atlas-reviewer", admission.TargetIdentityDecision, string(reviewerDecision.ID()), admission.Admitted, recordedBase.Add(10*time.Minute), ""),
+	}
+	observationAdmissions := make([]admission.Decision, len(observations))
+	for index, value := range observations {
+		observationAdmissions[index] = mustAdmission(
+			"admission:"+string(value.ID()), admission.TargetObservation, string(value.ID()),
+			admission.Admitted, value.RecordedAt().Add(time.Minute), "",
+		)
+	}
+	retiredAdmission := mustAdmission(
+		"admission:observation:generic/admission#retired",
+		admission.TargetObservation,
+		"observation:generic/admission",
+		admission.Retired,
+		time.Date(2034, time.January, 25, 9, 0, 0, 0, time.UTC),
+		"admission:observation:generic/admission",
+	)
+
+	if err := database.InTransaction(t.Context(), func(transaction *postgres.Transaction) error {
+		for _, item := range []storedEvidence{support, counter} {
+			if err := transaction.SetCurrentDocumentVersion(t.Context(), item.ref.SourceDocumentID, item.ref.VersionID); err != nil {
+				return err
+			}
+			if _, err := transaction.PutEvidenceSpan(t.Context(), item.span); err != nil {
+				return err
+			}
+		}
+		for _, entity := range []identity.Entity{ownerEntity, reviewerEntity} {
+			if _, err := transaction.PutEntity(t.Context(), entity); err != nil {
+				return err
+			}
+		}
+		for _, mention := range []identity.MentionRecord{ownerMention, reviewerMention, gapMention} {
+			if _, err := transaction.PutMention(t.Context(), mention); err != nil {
+				return err
+			}
+		}
+		for _, proposal := range []identity.ResolutionProposal{ownerProposal, reviewerProposal} {
+			if _, err := transaction.PutResolutionProposal(t.Context(), proposal); err != nil {
+				return err
+			}
+		}
+		for _, decision := range []identity.ResolutionDecision{ownerDecision, reviewerDecision} {
+			if err := transaction.AppendResolutionDecision(t.Context(), decision, nil); err != nil {
+				return err
+			}
+		}
+		for _, decision := range identityAdmissions {
+			if err := transaction.AppendAdmissionDecision(t.Context(), decision); err != nil {
+				return err
+			}
+		}
+		for _, value := range observations {
+			if _, err := transaction.PutObservation(t.Context(), value); err != nil {
+				return err
+			}
+		}
+		for _, decision := range observationAdmissions {
+			if err := transaction.AppendAdmissionDecision(t.Context(), decision); err != nil {
+				return err
+			}
+		}
+		return transaction.AppendAdmissionDecision(t.Context(), retiredAdmission)
+	}); err != nil {
+		t.Fatalf("seed generic parity PostgreSQL fixture: %v", err)
+	}
+
+	window, err := temporal.Between("responsibility-window", genericWindowStart, genericWindowEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalScope, err := temporal.KnownAsOf(genericHistoricalCutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentRead := []ReadObservation{
+		readObservations[4], readObservations[2], readObservations[1],
+		readObservations[0], readObservations[3],
+	}
+	current := ReadSnapshot{
+		Entities: []EntityAuthority{
+			{EntityID: genericOwnerID, Known: true},
+			{EntityID: genericReviewerID, Known: true},
+		},
+		Observations: currentRead,
+		Coverage: []Coverage{
+			{
+				Reason: CoverageUnresolvedMention, EntityID: genericOwnerID,
+				Predicate: genericGapPredicate, ObservationID: observations[6].ID(),
+				ValidTime: observation.UnknownTime(),
+			},
+			{
+				Reason: CoverageAuthorityExcluded, EntityID: genericOwnerID,
+				Predicate: genericAdmissionPredicate, ObservationID: observations[5].ID(),
+				ValidTime: observations[5].ValidTime(),
+			},
+		},
+	}
+	historical := ReadSnapshot{
+		Entities:     append([]EntityAuthority{}, current.Entities...),
+		Observations: append(append([]ReadObservation{}, currentRead...), readObservations[5]),
+		Coverage: []Coverage{{
+			Reason: CoverageUnresolvedMention, EntityID: genericOwnerID,
+			Predicate: genericGapPredicate, ObservationID: observations[6].ID(),
+			ValidTime: observation.UnknownTime(),
+		}},
+	}
+	return genericParityFixture{
+		currentRequest: Request{
+			Intent:      temporal.IntentTrajectory,
+			EntityIDs:   []identity.EntityID{genericReviewerID, genericOwnerID},
+			EntityMatch: EntityMatchAny,
+			Predicates: []observation.Predicate{
+				genericUnknownPredicate, genericStatePredicate, genericPairPredicate,
+				genericAdmissionPredicate, genericGapPredicate,
+			},
+			Selections:     []temporal.TemporalSelection{window},
+			KnowledgeScope: temporal.CurrentKnowledge(), Limit: 32,
+		},
+		historicalScope: historicalScope, window: window,
+		reader: &genericParityReader{
+			current: current, historical: historical, cutoff: genericHistoricalCutoff,
+		},
+		supportCitation: support.citation, counterCitation: counter.citation,
+	}
+}
+
 func queryPointForPredicate(
 	t *testing.T,
 	service Service,

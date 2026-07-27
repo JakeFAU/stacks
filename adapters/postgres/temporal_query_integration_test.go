@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -762,6 +763,283 @@ func TestTemporalQueryPostgresProjectsAllIntentSyntheticCandidates(t *testing.T)
 	}
 	if counterevidence != 2 {
 		t.Fatalf("contradicting citations = %d, want 2", counterevidence)
+	}
+}
+
+func TestTemporalQueryPostgresProjectsGenericParityCandidates(t *testing.T) {
+	fixture := newTemporalQueryPostgresFixture(t)
+	const (
+		ownerID            identity.EntityID     = "entity:atlas-owner"
+		reviewerID         identity.EntityID     = "entity:atlas-reviewer"
+		statePredicate     observation.Predicate = "atlas.responsibility/state"
+		pairPredicate      observation.Predicate = "atlas.responsibility/pair"
+		unknownPredicate   observation.Predicate = "atlas.responsibility/unknown"
+		admissionPredicate observation.Predicate = "atlas.responsibility/admission"
+	)
+	windowStart := time.Date(2034, time.January, 1, 0, 0, 0, 0, time.UTC)
+	boundary := time.Date(2034, time.January, 15, 0, 0, 0, 0, time.UTC)
+	conflictEnd := time.Date(2034, time.January, 20, 0, 0, 0, 0, time.UTC)
+	windowEnd := time.Date(2034, time.February, 1, 0, 0, 0, 0, time.UTC)
+	cutoff := time.Date(2034, time.January, 10, 12, 0, 0, 0, time.UTC)
+	recordedBase := time.Date(2034, time.January, 2, 9, 0, 0, 0, time.UTC)
+
+	supportText := "Generic Atlas record assigns a reviewed responsibility state."
+	counterText := "Generic Atlas record disputes the earlier responsibility state."
+	supportQuote := "assigns a reviewed responsibility"
+	counterQuote := "disputes the earlier responsibility"
+	supportSection, err := evidence.NewSection(evidence.SectionInput{
+		ID: "section:generic/support", Title: "Generic Atlas record",
+		Path: []string{"Generic Atlas", "Responsibility"}, Order: 0,
+		Role: "synthetic-record", Text: supportText,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counterSection, err := evidence.NewSection(evidence.SectionInput{
+		ID: "section:generic/counter", Title: "Generic Atlas record",
+		Path: []string{"Generic Atlas", "Responsibility"}, Order: 1,
+		Role: "synthetic-record", Text: counterText,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
+		Provider: "synthetic", ProviderDocumentID: "document:generic/parity",
+		Title: "Generic Atlas fixture", Locator: "synthetic://generic-atlas/parity",
+		ProviderVersion: "v1", ModifiedAt: recordedBase, RecordedAt: recordedBase,
+		Sections: []evidence.Section{supportSection, counterSection},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	documentRef, err := fixture.database.PutDocumentVersion(t.Context(), document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSpan := func(section evidence.Section, text, quote string, recordedAt time.Time) evidence.EvidenceSpan {
+		t.Helper()
+		start := strings.Index(text, quote)
+		if start < 0 {
+			t.Fatalf("quote %q is absent from generic fixture", quote)
+		}
+		value, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
+			Document: document, SectionID: section.ID(), StartOffset: start,
+			EndOffset: start + len(quote), Quote: quote, RecordedAt: recordedAt,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	supportSpan := newSpan(supportSection, supportText, supportQuote, recordedBase.Add(time.Minute))
+	counterSpan := newSpan(counterSection, counterText, counterQuote, recordedBase.Add(2*time.Minute))
+
+	owner := mustTemporalEntity(t, ownerID, "Generic Atlas Owner")
+	reviewer := mustTemporalEntity(t, reviewerID, "Generic Atlas Reviewer")
+	ownerTerm := mustTemporalEntityTerm(t, ownerID, "")
+	reviewerTerm := mustTemporalEntityTerm(t, reviewerID, "")
+	textTerm := func(text string) observation.Term {
+		t.Helper()
+		value, err := observation.NewTextTerm(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	during := func(start, end time.Time) observation.TemporalExtent {
+		t.Helper()
+		value, err := observation.During(start, end)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	newObservation := func(
+		id observation.ObservationID,
+		predicate observation.Predicate,
+		object observation.Term,
+		validTime observation.TemporalExtent,
+		recordedAt time.Time,
+		counter bool,
+	) observation.Observation {
+		t.Helper()
+		links := []observation.EvidenceLink{{
+			EvidenceID: supportSpan.ID(), Role: observation.EvidenceSupporting,
+		}}
+		if counter {
+			links = append(links, observation.EvidenceLink{
+				EvidenceID: counterSpan.ID(), Role: observation.EvidenceContradicting,
+			})
+		}
+		return mustTemporalObservation(t, observation.ObservationInput{
+			ID: id,
+			Statement: observation.Statement{
+				Subject: ownerTerm, Predicate: predicate, Object: object,
+			},
+			ValidTime: validTime, RecordedAt: recordedAt, Evidence: links,
+			Derivation: observation.Derivation{
+				Method: "synthetic-review", Version: "generic-parity-v1",
+			},
+			Status: observation.StatusObserved,
+		})
+	}
+	observations := []observation.Observation{
+		newObservation(
+			"observation:generic/initial", statePredicate, textTerm("queued"),
+			during(windowStart, boundary), recordedBase.Add(20*time.Minute), true,
+		),
+		newObservation(
+			"observation:generic/transfer", statePredicate, textTerm("active"),
+			during(boundary, windowEnd), recordedBase.Add(21*time.Minute), false,
+		),
+		newObservation(
+			"observation:generic/conflict", statePredicate, textTerm("paused"),
+			during(boundary, conflictEnd), recordedBase.Add(22*time.Minute), true,
+		),
+		newObservation(
+			"observation:generic/pair", pairPredicate, reviewerTerm,
+			during(windowStart, windowEnd), recordedBase.Add(23*time.Minute), false,
+		),
+		newObservation(
+			"observation:generic/unknown", unknownPredicate, reviewerTerm,
+			observation.UnknownTime(), recordedBase.Add(24*time.Minute), false,
+		),
+		newObservation(
+			"observation:generic/admission", admissionPredicate, reviewerTerm,
+			during(windowStart, windowEnd), recordedBase.Add(25*time.Minute), false,
+		),
+	}
+	admissions := make([]admission.Decision, len(observations))
+	for index, value := range observations {
+		admissions[index] = mustTemporalAdmissionDecision(t, admission.DecisionInput{
+			ID: "admission:" + string(value.ID()), TargetKind: admission.TargetObservation,
+			TargetID: string(value.ID()), Outcome: admission.Admitted,
+			ReasonCode: "reviewed_authority", Authority: admission.AuthorityReviewer,
+			RecordedAt: value.RecordedAt().Add(time.Minute),
+		})
+	}
+	retired := mustTemporalAdmissionDecision(t, admission.DecisionInput{
+		ID:         "admission:observation:generic/admission#retired",
+		TargetKind: admission.TargetObservation, TargetID: "observation:generic/admission",
+		Outcome: admission.Retired, ReasonCode: "reviewed_authority_change",
+		Authority:    admission.AuthorityReviewer,
+		RecordedAt:   time.Date(2034, time.January, 25, 9, 0, 0, 0, time.UTC),
+		SupersedesID: "admission:observation:generic/admission",
+	})
+	if err := fixture.database.InTransaction(t.Context(), func(transaction *Transaction) error {
+		if err := transaction.SetCurrentDocumentVersion(
+			t.Context(), documentRef.Ref.SourceDocumentID, documentRef.Ref.VersionID,
+		); err != nil {
+			return err
+		}
+		for _, span := range []evidence.EvidenceSpan{supportSpan, counterSpan} {
+			if _, err := transaction.PutEvidenceSpan(t.Context(), span); err != nil {
+				return err
+			}
+		}
+		for _, entity := range []identity.Entity{owner, reviewer} {
+			if _, err := transaction.PutEntity(t.Context(), entity); err != nil {
+				return err
+			}
+		}
+		for _, value := range observations {
+			if _, err := transaction.PutObservation(t.Context(), value); err != nil {
+				return err
+			}
+		}
+		for _, decision := range admissions {
+			if err := transaction.AppendAdmissionDecision(t.Context(), decision); err != nil {
+				return err
+			}
+		}
+		return transaction.AppendAdmissionDecision(t.Context(), retired)
+	}); err != nil {
+		t.Fatalf("seed generic adapter parity fixture: %v", err)
+	}
+
+	window, err := temporal.Between("responsibility-window", windowStart, windowEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := func(match TemporalEntityMatch, asOf *time.Time, predicates ...observation.Predicate) TemporalQuerySelection {
+		return TemporalQuerySelection{
+			EntityIDs: []identity.EntityID{ownerID, reviewerID}, EntityMatch: match,
+			Predicates: predicates, Selections: []temporal.TemporalSelection{window},
+			KnowledgeAsOf: asOf,
+		}
+	}
+	predicates := []observation.Predicate{
+		admissionPredicate, pairPredicate, statePredicate, unknownPredicate,
+	}
+	current, err := fixture.database.LoadTemporalQuerySnapshot(
+		t.Context(), selection(TemporalEntityMatchAny, nil, predicates...), nil,
+	)
+	if err != nil {
+		t.Fatalf("current LoadTemporalQuerySnapshot() error = %v", err)
+	}
+	historical, err := fixture.database.LoadTemporalQuerySnapshot(
+		t.Context(), selection(TemporalEntityMatchAny, &cutoff, predicates...), nil,
+	)
+	if err != nil {
+		t.Fatalf("as-of LoadTemporalQuerySnapshot() error = %v", err)
+	}
+	observationIDs := func(snapshot TemporalQuerySnapshot) []observation.ObservationID {
+		ids := make([]observation.ObservationID, len(snapshot.Observations))
+		for index, record := range snapshot.Observations {
+			ids[index] = record.Observation.ID()
+		}
+		slices.Sort(ids)
+		return ids
+	}
+	wantCurrent := []observation.ObservationID{
+		"observation:generic/conflict",
+		"observation:generic/initial",
+		"observation:generic/pair",
+		"observation:generic/transfer",
+		"observation:generic/unknown",
+	}
+	wantHistorical := append(
+		[]observation.ObservationID{"observation:generic/admission"},
+		wantCurrent...,
+	)
+	slices.Sort(wantHistorical)
+	if got := observationIDs(current); !slices.Equal(got, wantCurrent) {
+		t.Fatalf("current observation IDs = %v, want %v", got, wantCurrent)
+	}
+	if got := observationIDs(historical); !slices.Equal(got, wantHistorical) {
+		t.Fatalf("as-of observation IDs = %v, want %v", got, wantHistorical)
+	}
+	assertTemporalCoverage(
+		t,
+		current.Coverage,
+		TemporalCoverageAuthorityExcluded,
+		"observation:generic/admission",
+	)
+	assertNoTemporalCoverageForObservation(
+		t,
+		historical.Coverage,
+		"observation:generic/admission",
+	)
+	all, err := fixture.database.LoadTemporalQuerySnapshot(
+		t.Context(), selection(TemporalEntityMatchAll, &cutoff, pairPredicate), nil,
+	)
+	if err != nil {
+		t.Fatalf("EntityMatchAll LoadTemporalQuerySnapshot() error = %v", err)
+	}
+	if !slices.Equal(observationIDs(all), []observation.ObservationID{"observation:generic/pair"}) {
+		t.Fatalf("EntityMatchAll observation IDs = %v, want generic pair", observationIDs(all))
+	}
+	var initial *TemporalObservationRecord
+	for index := range historical.Observations {
+		if historical.Observations[index].Observation.ID() == "observation:generic/initial" {
+			initial = &historical.Observations[index]
+		}
+	}
+	if initial == nil || len(initial.Evidence) != 2 ||
+		initial.Evidence[0].Role != observation.EvidenceSupporting ||
+		initial.Evidence[1].Role != observation.EvidenceContradicting ||
+		initial.Observation.ValidTime().Kind() != observation.TemporalInterval {
+		t.Fatalf("generic initial projection = %#v, want exact valid time and role-separated evidence", initial)
 	}
 }
 

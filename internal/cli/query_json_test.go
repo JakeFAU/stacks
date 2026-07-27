@@ -8,7 +8,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/JakeFAU/stacks/core/temporal"
 
@@ -371,6 +373,89 @@ func TestQueryJSONPreservesExactTrendAssociationsWithoutExtras(t *testing.T) {
 	}
 }
 
+func TestQueryCommandJSONPreservesGenericTemporalEvidenceParity(t *testing.T) {
+	result := genericTemporalParityCLIResult(t)
+	service := &recordingQueryService{result: result}
+	var output bytes.Buffer
+	err := (QueryCommand{Service: service, Output: &output}).Run(t.Context(), Invocation{
+		Command: CommandQuery,
+		Action:  ActionTrajectory,
+		Query: &QueryInput{
+			Request: requestFromResult(result),
+			Output:  QueryOutputJSON,
+		},
+	})
+	if err != nil {
+		t.Fatalf("QueryCommand.Run() error = %v", err)
+	}
+	if service.calls != 1 || !reflect.DeepEqual(service.request, requestFromResult(result)) {
+		t.Fatalf("service calls/request = %d/%#v, want one exact public request", service.calls, service.request)
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
+	decoder.DisallowUnknownFields()
+	var got queryJSONTestEnvelope
+	if err := decoder.Decode(&got); err != nil {
+		t.Fatalf("strict v1 JSON decode error = %v", err)
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		t.Fatalf("strict v1 JSON trailing decode error = %v, want EOF", err)
+	}
+	if got.SchemaVersion != temporalQuerySchemaVersion ||
+		got.Intent != string(temporal.IntentTrajectory) ||
+		!slices.Equal(got.Request.EntityIDs, []string{"entity:atlas-owner", "entity:atlas-reviewer"}) ||
+		got.Request.EntityMatch != string(query.EntityMatchAny) ||
+		got.Request.KnowledgeScope.Kind != "as-of" ||
+		got.Request.KnowledgeScope.At == nil ||
+		*got.Request.KnowledgeScope.At != "2034-01-10T12:00:00Z" {
+		t.Fatalf("strict v1 envelope/request = %#v, want exact generic as-of request", got)
+	}
+	trajectory := got.Result.Trajectory
+	if trajectory == nil || len(trajectory.Transitions) != 2 || len(trajectory.Unresolved) != 2 {
+		t.Fatalf("trajectory shape = %#v, want exact chronology plus conflict and uncertainty", trajectory)
+	}
+	first := trajectory.Transitions[0]
+	if first.Kind != "added" || first.After == nil ||
+		len(first.After.Contributions) != 1 ||
+		first.After.Contributions[0].ObservationID != "observation:generic/initial" ||
+		first.After.Contributions[0].SubjectGroundingMentionID == nil ||
+		*first.After.Contributions[0].SubjectGroundingMentionID != "mention:atlas-owner" ||
+		first.After.Contributions[0].ValidTime.Kind != "interval" {
+		t.Fatalf("first chronology item = %#v, want exact contribution and valid time", first)
+	}
+	if len(first.After.SupportingCitations) != 1 ||
+		len(first.After.ContradictingCitations) != 1 ||
+		first.After.SupportingCitations[0].Role != "supporting" ||
+		first.After.ContradictingCitations[0].Role != "contradicting" ||
+		first.After.SupportingCitations[0].StartOffset != 7 ||
+		first.After.SupportingCitations[0].EndOffset != 26 ||
+		first.After.SupportingCitations[0].Text == nil ||
+		*first.After.SupportingCitations[0].Text != "generic exact span" {
+		t.Fatalf("first chronology citations = %#v/%#v, want exact support and counterevidence", first.After.SupportingCitations, first.After.ContradictingCitations)
+	}
+	if trajectory.Unresolved[0].Reason != "conflicting-values" ||
+		trajectory.Unresolved[1].Reason != "temporal-uncertainty" ||
+		len(trajectory.Unresolved[1].Candidates) != 1 ||
+		trajectory.Unresolved[1].Candidates[0].Contributions[0].ValidTime.Kind != "unknown" {
+		t.Fatalf("trajectory unresolved = %#v, want conflict and unknown-time uncertainty", trajectory.Unresolved)
+	}
+	if !reflect.DeepEqual(got.Gaps, []queryJSONTestGap{
+		{
+			Kind:      "authority-excluded",
+			EntityID:  testStringPointer("entity:atlas-owner"),
+			Predicate: testStringPointer("atlas.responsibility/admission"),
+		},
+		{
+			Kind:      "unresolved-mention",
+			EntityID:  testStringPointer("entity:atlas-reviewer"),
+			Predicate: testStringPointer("atlas.responsibility/gap"),
+		},
+	}) {
+		t.Fatalf("strict v1 gaps = %#v, want exact authority and identity gaps", got.Gaps)
+	}
+}
+
 func TestQueryJSONEncodesEveryClosedTermAndExtentShape(t *testing.T) {
 	terms := []struct {
 		name string
@@ -549,7 +634,8 @@ type queryJSONTestKnowledge struct {
 }
 
 type queryJSONTestResult struct {
-	Trend queryJSONTestTrend `json:"trend"`
+	Trend      queryJSONTestTrend       `json:"trend"`
+	Trajectory *queryJSONTestTrajectory `json:"trajectory"`
 }
 
 type queryJSONTestTrend struct {
@@ -639,6 +725,21 @@ type queryJSONTestChange struct {
 	After  *queryJSONTestFact    `json:"after"`
 }
 
+type queryJSONTestTrajectory struct {
+	Selection   queryJSONTestSelection    `json:"selection"`
+	Transitions []queryJSONTestTransition `json:"transitions"`
+	Unresolved  []queryJSONTestUnresolved `json:"unresolved"`
+}
+
+type queryJSONTestTransition struct {
+	Kind       string                    `json:"kind"`
+	Key        queryJSONTestStateKey     `json:"key"`
+	ValidTime  queryJSONTestExtent       `json:"valid_time"`
+	Before     *queryJSONTestFact        `json:"before"`
+	After      *queryJSONTestFact        `json:"after"`
+	Unresolved []queryJSONTestUnresolved `json:"unresolved"`
+}
+
 type queryJSONTestGap struct {
 	Kind           string  `json:"kind"`
 	EntityID       *string `json:"entity_id"`
@@ -648,4 +749,144 @@ type queryJSONTestGap struct {
 
 func testStringPointer(value string) *string {
 	return &value
+}
+
+func genericTemporalParityCLIResult(t *testing.T) query.Result {
+	t.Helper()
+	window := mustQueryWindow(
+		t,
+		"responsibility-window",
+		time.Date(2034, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2034, time.February, 1, 0, 0, 0, 0, time.UTC),
+	)
+	asOf, err := temporal.KnownAsOf(time.Date(2034, time.January, 10, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateKey := mustQueryKey(t, mustQueryEntity(t, "entity:atlas-owner"), "atlas.responsibility/state")
+	unknownKey := mustQueryKey(t, mustQueryEntity(t, "entity:atlas-owner"), "atlas.responsibility/unknown")
+	support := query.Citation{
+		EvidenceID: "evidence:generic/support", Role: observation.EvidenceSupporting,
+		SourceDocumentID: "document:generic", DocumentVersionID: "version:generic",
+		SectionID: "section:generic", SectionTitle: "Generic Atlas record",
+		SectionPath: []string{"Generic Atlas"}, SectionOrder: 0, SectionRole: "synthetic-record",
+		StartOffset: 7, EndOffset: 26, Locator: "synthetic://generic-atlas",
+		Text: "generic exact span",
+	}
+	counter := support
+	counter.EvidenceID = "evidence:generic/counter"
+	counter.Role = observation.EvidenceContradicting
+	initial := query.Fact{
+		Key: stateKey, Value: mustQueryText(t, "queued"),
+		Contributions: []query.Contribution{{
+			ObservationID: "observation:generic/initial", Status: observation.StatusObserved,
+			ValidTime: mustQueryDuring(
+				t,
+				time.Date(2034, time.January, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(2034, time.January, 15, 0, 0, 0, 0, time.UTC),
+			),
+			RecordedAt:                time.Date(2034, time.January, 2, 9, 20, 0, 0, time.UTC),
+			Derivation:                observation.Derivation{Method: "synthetic-review", Version: "generic-parity-v1"},
+			SubjectGroundingMentionID: "mention:atlas-owner",
+		}},
+		SupportingCitations: []query.Citation{support}, ContradictingCitations: []query.Citation{counter},
+	}
+	transfer := query.Fact{
+		Key: stateKey, Value: mustQueryText(t, "active"),
+		Contributions: []query.Contribution{{
+			ObservationID: "observation:generic/transfer", Status: observation.StatusObserved,
+			ValidTime: mustQueryDuring(
+				t,
+				time.Date(2034, time.January, 15, 0, 0, 0, 0, time.UTC),
+				time.Date(2034, time.February, 1, 0, 0, 0, 0, time.UTC),
+			),
+			RecordedAt:                time.Date(2034, time.January, 3, 9, 20, 0, 0, time.UTC),
+			Derivation:                observation.Derivation{Method: "synthetic-review", Version: "generic-parity-v1"},
+			SubjectGroundingMentionID: "mention:atlas-owner",
+		}},
+		SupportingCitations: []query.Citation{support}, ContradictingCitations: []query.Citation{},
+	}
+	conflict := transfer
+	conflict.Value = mustQueryText(t, "paused")
+	conflict.Contributions = []query.Contribution{{
+		ObservationID: "observation:generic/conflict", Status: observation.StatusObserved,
+		ValidTime: mustQueryDuring(
+			t,
+			time.Date(2034, time.January, 15, 0, 0, 0, 0, time.UTC),
+			time.Date(2034, time.January, 20, 0, 0, 0, 0, time.UTC),
+		),
+		RecordedAt:                time.Date(2034, time.January, 3, 9, 21, 0, 0, time.UTC),
+		Derivation:                observation.Derivation{Method: "synthetic-review", Version: "generic-parity-v1"},
+		SubjectGroundingMentionID: "mention:atlas-owner",
+	}}
+	conflict.ContradictingCitations = []query.Citation{counter}
+	unknown := query.Fact{
+		Key: unknownKey, Value: mustQueryEntity(t, "entity:atlas-reviewer"),
+		Contributions: []query.Contribution{{
+			ObservationID: "observation:generic/unknown", Status: observation.StatusObserved,
+			ValidTime:                 observation.UnknownTime(),
+			RecordedAt:                time.Date(2034, time.January, 2, 9, 23, 0, 0, time.UTC),
+			Derivation:                observation.Derivation{Method: "synthetic-review", Version: "generic-parity-v1"},
+			SubjectGroundingMentionID: "mention:atlas-owner",
+			ObjectGroundingMentionID:  "mention:atlas-reviewer",
+		}},
+		SupportingCitations: []query.Citation{support}, ContradictingCitations: []query.Citation{},
+	}
+	conflictItem := query.UnresolvedItem{
+		Key: stateKey, Reason: temporal.UnresolvedConflict, Candidates: []query.Fact{transfer, conflict},
+	}
+	payload, err := query.NewTrajectoryPayload(query.TrajectoryResult{
+		Selection: window,
+		Transitions: []query.Transition{
+			{
+				Kind: temporal.ChangeAdded, Key: stateKey,
+				ValidTime: mustQueryInstant(t, time.Date(2034, time.January, 1, 0, 0, 0, 0, time.UTC)),
+				After:     queryFactPointer(initial), Unresolved: []query.UnresolvedItem{},
+			},
+			{
+				Kind: temporal.ChangeRemoved, Key: stateKey,
+				ValidTime: mustQueryInstant(t, time.Date(2034, time.January, 15, 0, 0, 0, 0, time.UTC)),
+				Before:    queryFactPointer(initial), Unresolved: []query.UnresolvedItem{conflictItem},
+			},
+		},
+		Unresolved: []query.UnresolvedItem{
+			{
+				Key: stateKey, Reason: temporal.UnresolvedConflict,
+				Candidates: []query.Fact{initial, transfer, conflict},
+			},
+			{
+				Key: unknownKey, Reason: temporal.UnresolvedTemporalUncertainty,
+				Candidates: []query.Fact{unknown},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("query.NewTrajectoryPayload() error = %v", err)
+	}
+	return query.Result{
+		Intent: temporal.IntentTrajectory,
+		EntityIDs: []identity.EntityID{
+			"entity:atlas-owner",
+			"entity:atlas-reviewer",
+		},
+		EntityMatch: query.EntityMatchAny,
+		Predicates: []observation.Predicate{
+			"atlas.responsibility/admission",
+			"atlas.responsibility/gap",
+			"atlas.responsibility/state",
+			"atlas.responsibility/unknown",
+		},
+		Selections: []temporal.TemporalSelection{window}, KnowledgeScope: asOf,
+		Limit: 32, Payload: payload,
+		Gaps: []query.Gap{
+			{
+				Kind: query.GapAuthorityExcluded, EntityID: "entity:atlas-owner",
+				Predicate: "atlas.responsibility/admission",
+			},
+			{
+				Kind: query.GapUnresolvedMention, EntityID: "entity:atlas-reviewer",
+				Predicate: "atlas.responsibility/gap",
+			},
+		},
+	}
 }
