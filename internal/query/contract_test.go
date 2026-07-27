@@ -213,10 +213,21 @@ func TestPayloadsRejectUnknownChangeKindsAndImpossibleShapes(t *testing.T) {
 func TestResultCollectionsAreNonNilAndCanonicallyOrdered(t *testing.T) {
 	keyA := mustStateKey(t, "entity-a", "predicate-a")
 	keyB := mustStateKey(t, "entity-b", "predicate-b")
+	keyC := mustStateKey(t, "entity-c", "predicate-c")
+	keyD := mustStateKey(t, "entity-d", "predicate-d")
 	valueA := mustText(t, "a")
 	valueB := mustText(t, "b")
 	window := mustWindow(t, "window", 2026, time.January, 1)
-	payload, err := NewTrajectoryPayload(TrajectoryResult{Selection: window, Transitions: []Transition{{Kind: temporal.ChangeAdded, Key: keyB, ValidTime: mustInstant(t), After: &Fact{Key: keyB, Value: valueB, Contributions: []Contribution{validContractContribution(t, "observation-b")}, SupportingCitations: []Citation{validCitation("evidence-b")}, ContradictingCitations: []Citation{}}}, {Kind: temporal.ChangeAdded, Key: keyA, ValidTime: mustInstant(t), After: &Fact{Key: keyA, Value: valueA, Contributions: []Contribution{validContractContribution(t, "observation-a")}, SupportingCitations: []Citation{validCitation("evidence-a")}, ContradictingCitations: []Citation{}}}}})
+	unresolvedC := validFact(t, keyC, "c")
+	unresolvedD := validFact(t, keyD, "d")
+	payload, err := NewTrajectoryPayload(TrajectoryResult{
+		Selection:   window,
+		Transitions: []Transition{{Kind: temporal.ChangeAdded, Key: keyB, ValidTime: mustInstant(t), After: &Fact{Key: keyB, Value: valueB, Contributions: []Contribution{validContractContribution(t, "observation-b")}, SupportingCitations: []Citation{validCitation("evidence-b")}, ContradictingCitations: []Citation{}}}, {Kind: temporal.ChangeAdded, Key: keyA, ValidTime: mustInstant(t), After: &Fact{Key: keyA, Value: valueA, Contributions: []Contribution{validContractContribution(t, "observation-a")}, SupportingCitations: []Citation{validCitation("evidence-a")}, ContradictingCitations: []Citation{}}}},
+		Unresolved: []UnresolvedItem{
+			{Key: keyD, Reason: temporal.UnresolvedHypothesis, Candidates: []Fact{unresolvedD}},
+			{Key: keyC, Reason: temporal.UnresolvedTemporalUncertainty, Candidates: []Fact{unresolvedC}},
+		},
+	})
 	if err != nil {
 		t.Fatalf("NewTrajectoryPayload() error = %v", err)
 	}
@@ -232,8 +243,9 @@ func TestResultCollectionsAreNonNilAndCanonicallyOrdered(t *testing.T) {
 		t.Errorf("NormalizeResult() gaps = %#v, want ordered non-nil gaps", normalized.Gaps)
 	}
 	trajectory, ok := normalized.Payload.Trajectory()
-	if !ok || trajectory.Transitions == nil || trajectory.Transitions[0].Key != keyA {
-		t.Errorf("NormalizeResult() trajectory = %#v, want ordered non-nil transitions", trajectory)
+	if !ok || trajectory.Transitions == nil || trajectory.Transitions[0].Key != keyA ||
+		trajectory.Unresolved == nil || trajectory.Unresolved[0].Key != keyC {
+		t.Errorf("NormalizeResult() trajectory = %#v, want ordered non-nil transitions and unresolved material", trajectory)
 	}
 }
 
@@ -265,19 +277,29 @@ func TestTypedErrorsDoNotContainSuppliedEntityIDsOrPrivatePayloads(t *testing.T)
 func TestPayloadConstructorsAndAccessorsDefensivelyCopyNestedSlices(t *testing.T) {
 	window := mustWindow(t, "window", 2026, time.January, 1)
 	key := mustStateKey(t, "entity-a", "predicate-a")
-	input := TrajectoryResult{Selection: window, Transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: mustInstant(t), After: &Fact{Key: key, Value: mustText(t, "value"), Contributions: []Contribution{validContractContribution(t, "observation-a")}, SupportingCitations: []Citation{{EvidenceID: "evidence-a", Role: observation.EvidenceSupporting, SourceDocumentID: "document", DocumentVersionID: "version", SectionID: "section", SectionTitle: "title", SectionPath: []string{"parent"}, SectionOrder: 0, SectionRole: "body", StartOffset: 0, EndOffset: 1}}, ContradictingCitations: []Citation{}}}}}
+	unresolvedFact := validFact(t, key, "unresolved-value")
+	unresolvedFact.SupportingCitations[0].SectionPath = []string{"unresolved-parent"}
+	input := TrajectoryResult{
+		Selection:   window,
+		Transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: mustInstant(t), After: &Fact{Key: key, Value: mustText(t, "value"), Contributions: []Contribution{validContractContribution(t, "observation-a")}, SupportingCitations: []Citation{{EvidenceID: "evidence-a", Role: observation.EvidenceSupporting, SourceDocumentID: "document", DocumentVersionID: "version", SectionID: "section", SectionTitle: "title", SectionPath: []string{"parent"}, SectionOrder: 0, SectionRole: "body", StartOffset: 0, EndOffset: 1}}, ContradictingCitations: []Citation{}}}},
+		Unresolved:  []UnresolvedItem{{Key: key, Reason: temporal.UnresolvedHypothesis, Candidates: []Fact{unresolvedFact}}},
+	}
 	payload, err := NewTrajectoryPayload(input)
 	if err != nil {
 		t.Fatalf("NewTrajectoryPayload() error = %v", err)
 	}
 	input.Transitions[0].After.SupportingCitations[0].SectionPath[0] = "mutated-input"
+	input.Unresolved[0].Candidates[0].SupportingCitations[0].SectionPath[0] = "mutated-unresolved-input"
 	first, ok := payload.Trajectory()
-	if !ok || first.Transitions[0].After.SupportingCitations[0].SectionPath[0] != "parent" {
+	if !ok || first.Transitions[0].After.SupportingCitations[0].SectionPath[0] != "parent" ||
+		first.Unresolved[0].Candidates[0].SupportingCitations[0].SectionPath[0] != "unresolved-parent" {
 		t.Fatalf("payload stored input mutation: %#v", first)
 	}
 	first.Transitions[0].After.SupportingCitations[0].SectionPath[0] = "mutated-output"
+	first.Unresolved[0].Candidates[0].SupportingCitations[0].SectionPath[0] = "mutated-unresolved-output"
 	second, ok := payload.Trajectory()
-	if !ok || second.Transitions[0].After.SupportingCitations[0].SectionPath[0] != "parent" {
+	if !ok || second.Transitions[0].After.SupportingCitations[0].SectionPath[0] != "parent" ||
+		second.Unresolved[0].Candidates[0].SupportingCitations[0].SectionPath[0] != "unresolved-parent" {
 		t.Errorf("payload stored accessor mutation: %#v", second)
 	}
 }

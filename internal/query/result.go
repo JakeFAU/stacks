@@ -126,10 +126,12 @@ type TrendResult struct {
 	UnresolvedKeys []temporal.StateKey
 }
 
-// TrajectoryResult contains chronologically ordered state transitions.
+// TrajectoryResult contains chronologically ordered state transitions and
+// selected-window unresolved material.
 type TrajectoryResult struct {
 	Selection   temporal.TemporalSelection
 	Transitions []Transition
+	Unresolved  []UnresolvedItem
 }
 
 // CausalChainResult contains chronologically ordered explicit causal links.
@@ -371,6 +373,7 @@ func normalizeTrajectoryResult(value *TrajectoryResult) error {
 		}
 	}
 	orderTransitions(value.Transitions)
+	value.Unresolved = normalizeUnresolved(value.Unresolved)
 	return nil
 }
 func normalizeCausalResult(value *CausalChainResult) error {
@@ -541,6 +544,7 @@ func cloneTrajectoryResult(value TrajectoryResult) TrajectoryResult {
 		value.Transitions[index].After = cloneFactPointer(value.Transitions[index].After)
 		value.Transitions[index].Unresolved = cloneUnresolved(value.Transitions[index].Unresolved)
 	}
+	value.Unresolved = cloneUnresolved(value.Unresolved)
 	return value
 }
 func cloneCausalResult(value CausalChainResult) CausalChainResult {
@@ -642,6 +646,9 @@ func validateTrendCitations(value TrendResult) error {
 }
 
 func validateTrajectoryCitations(value TrajectoryResult) error {
+	if err := validateFactsCitations(nil, value.Unresolved); err != nil {
+		return err
+	}
 	for _, transition := range value.Transitions {
 		if err := validateFactPointerCitations(transition.Before); err != nil {
 			return err

@@ -150,17 +150,6 @@ func executeTrajectory(
 			cause:     ErrLimitExceeded,
 		}
 	}
-	trajectory, err := projectTrajectory(request.Selections[0], transitions, index)
-	if err != nil {
-		return IntentPayload{}, nil, err
-	}
-	payload, err := NewTrajectoryPayload(trajectory)
-	if err != nil {
-		return IntentPayload{}, nil, boundedQueryError{
-			operation: "construct trajectory result",
-			cause:     err,
-		}
-	}
 	summary, err := temporal.AggregateWindow(
 		request.Selections[0],
 		request.KnowledgeScope,
@@ -169,6 +158,22 @@ func executeTrajectory(
 	if err != nil {
 		return IntentPayload{}, nil, boundedQueryError{
 			operation: "aggregate trajectory window",
+			cause:     err,
+		}
+	}
+	trajectory, err := projectTrajectory(
+		request.Selections[0],
+		transitions,
+		summary.Unresolved,
+		index,
+	)
+	if err != nil {
+		return IntentPayload{}, nil, err
+	}
+	payload, err := NewTrajectoryPayload(trajectory)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{
+			operation: "construct trajectory result",
 			cause:     err,
 		}
 	}

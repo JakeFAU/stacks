@@ -29,6 +29,9 @@ func validateTrendResult(value TrendResult) error {
 }
 
 func validateTrajectoryResult(value TrajectoryResult) error {
+	if err := validateStateMaterial(nil, value.Unresolved); err != nil {
+		return err
+	}
 	for _, transition := range value.Transitions {
 		if err := validateTransition(transition); err != nil {
 			return err

@@ -292,6 +292,7 @@ func projectPoint(summary temporal.PointSummary, index projectionIndex) (PointIn
 func projectTrajectory(
 	selection temporal.TemporalSelection,
 	values []temporal.Transition,
+	unresolved []temporal.UnresolvedFact,
 	index projectionIndex,
 ) (TrajectoryResult, error) {
 	transitions := make([]Transition, len(values))
@@ -317,7 +318,15 @@ func projectTrajectory(
 			Unresolved: projected.unresolved,
 		}
 	}
-	return TrajectoryResult{Selection: selection, Transitions: transitions}, nil
+	projected, err := projectStateMaterial(nil, unresolved, index)
+	if err != nil {
+		return TrajectoryResult{}, err
+	}
+	return TrajectoryResult{
+		Selection:   selection,
+		Transitions: transitions,
+		Unresolved:  projected.unresolved,
+	}, nil
 }
 
 func projectWindow(

@@ -490,6 +490,7 @@ type TrendResult struct {
 type TrajectoryResult struct {
     Selection   temporal.TemporalSelection
     Transitions []Transition
+    Unresolved  []UnresolvedItem
 }
 
 type CausalChainResult struct {
@@ -1266,7 +1267,7 @@ git commit -m "Expose cited temporal trends"
 
 1. All intents reuse the D1-D3 request/result/snapshot contract; no intent-specific repository or schema is added.
 2. Point reconstructs state at one instant without turning absence into a negative fact.
-3. Trajectory partitions only at canonical valid-time boundaries, orders transitions deterministically, preserves unresolved material, and fails atomically above limit.
+3. Trajectory partitions only at canonical valid-time boundaries, orders transitions deterministically, preserves exact cited unresolved material both at transition boundaries and across the selected window without fabricating a boundary, and fails atomically above a transition-only limit.
 4. Causal output uses only admitted `stacks.causal.v1/causes` observations. Chronology, shared entity, confidence, or similarity never manufactures a link.
 5. Every new CLI leaf has exact parser, text, JSON, unit, PostgreSQL, and cancellation acceptance.
 
@@ -1320,6 +1321,7 @@ git commit -m "Reconstruct cited temporal state"
 - Modify: `internal/query/service.go`
 - Modify: `internal/query/result.go`
 - Modify: `internal/query/order.go`
+- Modify: `internal/query/result_validation.go`
 - Modify: `internal/query/service_test.go`
 - Modify: `internal/query/project_atlas_test.go`
 
@@ -1343,6 +1345,12 @@ func BuildTrajectory(
 ```
 
 - [ ] Write failing tests for boundary partitioning, added/removed/changed states, overlapping conflict, uncertainty, identical instants, stable ties, and no confidence ordering.
+- [ ] Write failing result/service acceptance for top-level ordered unresolved
+  material covering conflict, temporal uncertainty, hypothesis,
+  counterevidence-only evidence, multiple states in the selected window, and
+  unknown valid time. Isolated unresolved-only evidence must return zero
+  transitions, exact cited unresolved material, and no `no-evidence` gap.
+  Reordered snapshot input must produce the same result.
 - [ ] Prove red:
 
 ```bash
@@ -1350,7 +1358,12 @@ func BuildTrajectory(
 ```
 
 - [ ] Implement deterministic partition/aggregate/diff/order from canonical temporal extents.
-- [ ] In the service, calculate the complete transitions, compare count to requested/configured limits, and return `ErrLimitExceeded` with no partial result.
+- [ ] In the service, calculate the complete transitions, compare count to
+  requested/configured limits, and return `ErrLimitExceeded` with a zero result
+  and no partial material. The limit counts complete transitions only. On
+  success, reuse the selected-window aggregation over the already-read
+  snapshot to project exact top-level unresolved material; do not add a read,
+  SQL, schema, migration, CLI, or provider path.
 - [ ] Run reviews and commit:
 
 ```bash
@@ -1435,7 +1448,11 @@ Assert missing/zero/negative/over-maximum limits and causal predicate flags fail
 
 - [ ] **Step 2: Add text/JSON payload tests**
 
-Assert exact point, trajectory, and causal union members; before/after omission rules; non-null arrays; transition valid time; causal contributions/citations; gap placement only at envelope level; and renderer parity.
+Assert exact point, trajectory, and causal union members; before/after omission
+rules; non-null arrays; trajectory top-level unresolved material in addition to
+transition-level unresolved material; transition valid time; causal
+contributions/citations; gap placement only at envelope level; and renderer
+parity.
 
 - [ ] **Step 3: Implement leaves using the existing query service**
 
@@ -1492,7 +1509,9 @@ git commit -m "Expose all cited temporal intents"
 
 - Point, trend, trajectory, and causal intents execute through the same typed service and historical snapshot.
 - All four exact CLI leaves and normative text/JSON payloads pass.
-- Trajectory/causal limits fail atomically; causality is explicit-predicate-only.
+- Trajectory exposes exact cited selected-window unresolved material without
+  fabricated transitions, and trajectory/causal limits fail atomically;
+  causality is explicit-predicate-only.
 - Deterministic and PostgreSQL acceptance plus whole-branch review pass.
 - Specialized manager-confidence code still exists pending D5 parity/removal.
 

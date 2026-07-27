@@ -515,6 +515,46 @@ func TestTrajectoryPayloadRejectsInvalidNestedUnresolvedMaterial(t *testing.T) {
 	}
 }
 
+func TestTrajectoryPayloadRejectsInvalidTopLevelUnresolvedMaterial(t *testing.T) {
+	window := mustWindow(t, "window", 2026, time.January, 1)
+	key := mustStateKey(t, "entity-a", "predicate-a")
+	otherKey := mustStateKey(t, "entity-b", "predicate-a")
+	fact := resultValidationFact(t, key, mustText(t, "value"), "trajectory-top-level")
+
+	tests := []struct {
+		name       string
+		unresolved UnresolvedItem
+	}{
+		{
+			name: "unknown unresolved reason",
+			unresolved: UnresolvedItem{
+				Key:        key,
+				Reason:     temporal.UnresolvedReason("unknown"),
+				Candidates: []Fact{fact},
+			},
+		},
+		{
+			name: "candidate key differs from unresolved key",
+			unresolved: UnresolvedItem{
+				Key:        otherKey,
+				Reason:     temporal.UnresolvedHypothesis,
+				Candidates: []Fact{fact},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewTrajectoryPayload(TrajectoryResult{
+				Selection:  window,
+				Unresolved: []UnresolvedItem{test.unresolved},
+			}); err == nil {
+				t.Fatal("NewTrajectoryPayload() error = nil, want invalid top-level unresolved material error")
+			}
+		})
+	}
+}
+
 func TestCausalPayloadRejectsInvalidNestedContributionAndCitationMaterial(t *testing.T) {
 	window := mustWindow(t, "window", 2026, time.January, 1)
 	tests := []struct {
@@ -634,7 +674,7 @@ func TestValidateResultRevalidatesMutatedNestedPayloadForEveryNonPointIntent(t *
 				if err != nil {
 					t.Fatalf("NewTrajectoryPayload() error = %v", err)
 				}
-				payload.trajectory.Transitions[0].Unresolved = []UnresolvedItem{{
+				payload.trajectory.Unresolved = []UnresolvedItem{{
 					Key:        key,
 					Reason:     temporal.UnresolvedReason("unknown"),
 					Candidates: []Fact{fact},

@@ -484,6 +484,16 @@ func TestTrajectoryQueryReturnsLimitExceededWithoutPartialResult(t *testing.T) {
 			nil,
 			fixture.citation("trajectory-limit-after", observation.EvidenceSupporting),
 		),
+		fixture.readObservationWithPredicate(
+			"trajectory-limit-unresolved",
+			"work.risk",
+			fixture.entity("entity-a"),
+			fixture.text("unknown"),
+			observation.UnknownTime(),
+			observation.StatusObserved,
+			nil,
+			fixture.citation("trajectory-limit-unresolved", observation.EvidenceSupporting),
+		),
 	)}
 
 	result, err := (Service{Reader: reader, Limits: validLimits()}).Query(context.Background(), request)
@@ -564,6 +574,255 @@ func TestTrajectoryQueryProjectsUnresolvedConflictWithExactCitations(t *testing.
 		[]Citation{pausedCitation},
 	) {
 		t.Fatalf("conflict citations = %#v, want exact candidate citations", conflict.Unresolved)
+	}
+}
+
+func TestTrajectoryQueryPreservesUnresolvedOnlyEvidenceWithoutFabricatedTransitions(t *testing.T) {
+	tests := []struct {
+		name          string
+		wantReason    temporal.UnresolvedReason
+		build         func(trendFixture) []ReadObservation
+		wantCandidate []observation.ObservationID
+	}{
+		{
+			name:       "conflict",
+			wantReason: temporal.UnresolvedConflict,
+			build: func(fixture trendFixture) []ReadObservation {
+				return []ReadObservation{
+					fixture.readObservation("unresolved-conflict-active", fixture.entity("entity-a"), fixture.text("active"), fixture.interval(2024, time.January, 1, time.March, 1), observation.StatusObserved, nil, fixture.citation("unresolved-conflict-active", observation.EvidenceSupporting)),
+					fixture.readObservation("unresolved-conflict-paused", fixture.entity("entity-a"), fixture.text("paused"), fixture.interval(2024, time.January, 1, time.March, 1), observation.StatusObserved, nil, fixture.citation("unresolved-conflict-paused", observation.EvidenceSupporting)),
+				}
+			},
+			wantCandidate: []observation.ObservationID{"unresolved-conflict-active", "unresolved-conflict-paused"},
+		},
+		{
+			name:       "unknown valid time",
+			wantReason: temporal.UnresolvedTemporalUncertainty,
+			build: func(fixture trendFixture) []ReadObservation {
+				return []ReadObservation{
+					fixture.readObservation("unresolved-unknown", fixture.entity("entity-a"), fixture.text("unknown"), observation.UnknownTime(), observation.StatusObserved, nil, fixture.citation("unresolved-unknown", observation.EvidenceSupporting)),
+				}
+			},
+			wantCandidate: []observation.ObservationID{"unresolved-unknown"},
+		},
+		{
+			name:       "uncertainty window",
+			wantReason: temporal.UnresolvedTemporalUncertainty,
+			build: func(fixture trendFixture) []ReadObservation {
+				uncertain, err := observation.Within(
+					time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+					time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC),
+				)
+				if err != nil {
+					t.Fatalf("observation.Within() error = %v", err)
+				}
+				return []ReadObservation{
+					fixture.readObservation("unresolved-window", fixture.entity("entity-a"), fixture.text("window"), uncertain, observation.StatusObserved, nil, fixture.citation("unresolved-window", observation.EvidenceSupporting)),
+				}
+			},
+			wantCandidate: []observation.ObservationID{"unresolved-window"},
+		},
+		{
+			name:       "hypothesis",
+			wantReason: temporal.UnresolvedHypothesis,
+			build: func(fixture trendFixture) []ReadObservation {
+				return []ReadObservation{
+					fixture.readObservation("unresolved-hypothesis", fixture.entity("entity-a"), fixture.text("hypothesis"), fixture.interval(2024, time.January, 1, time.March, 1), observation.StatusHypothesized, nil, fixture.citation("unresolved-hypothesis", observation.EvidenceSupporting)),
+				}
+			},
+			wantCandidate: []observation.ObservationID{"unresolved-hypothesis"},
+		},
+		{
+			name:       "counterevidence only",
+			wantReason: temporal.UnresolvedCounterevidenceOnly,
+			build: func(fixture trendFixture) []ReadObservation {
+				return []ReadObservation{
+					fixture.readObservation("unresolved-counter", fixture.entity("entity-a"), fixture.text("counter"), fixture.interval(2024, time.January, 1, time.March, 1), observation.StatusObserved, nil, fixture.citation("unresolved-counter", observation.EvidenceContradicting)),
+				}
+			},
+			wantCandidate: []observation.ObservationID{"unresolved-counter"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTrendFixture(t)
+			selection, err := temporal.Between(
+				"unresolved-only",
+				time.Date(2024, time.January, 15, 0, 0, 0, 0, time.UTC),
+				time.Date(2024, time.February, 15, 0, 0, 0, 0, time.UTC),
+			)
+			if err != nil {
+				t.Fatalf("temporal.Between() error = %v", err)
+			}
+			request := Request{
+				Intent:         temporal.IntentTrajectory,
+				EntityIDs:      []identity.EntityID{"entity-a"},
+				EntityMatch:    EntityMatchAll,
+				Predicates:     []observation.Predicate{"work.location"},
+				Selections:     []temporal.TemporalSelection{selection},
+				KnowledgeScope: temporal.CurrentKnowledge(),
+				Limit:          1,
+			}
+			observations := test.build(fixture)
+			reader := &recordingTrendReader{snapshot: fixture.snapshot(observations...)}
+			service := Service{Reader: reader, Limits: validLimits()}
+
+			result, err := service.Query(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Query() error = %v", err)
+			}
+			trajectory, ok := result.Payload.Trajectory()
+			if !ok {
+				t.Fatal("Payload.Trajectory() = false")
+			}
+			if len(trajectory.Transitions) != 0 {
+				t.Fatalf("trajectory transitions = %#v, want no fabricated boundary", trajectory.Transitions)
+			}
+			if len(trajectory.Unresolved) != 1 || trajectory.Unresolved[0].Reason != test.wantReason {
+				t.Fatalf("trajectory unresolved = %#v, want one %q item", trajectory.Unresolved, test.wantReason)
+			}
+			if len(result.Gaps) != 0 {
+				t.Fatalf("trajectory gaps = %#v, want unresolved material to suppress no-evidence", result.Gaps)
+			}
+
+			item := trajectory.Unresolved[0]
+			if item.Key.Subject != fixture.entity("entity-a") || item.Key.Predicate != "work.location" ||
+				len(item.Candidates) != len(test.wantCandidate) {
+				t.Fatalf("trajectory unresolved item = %#v, want exact key and candidates", item)
+			}
+			for index, observationID := range test.wantCandidate {
+				candidate := item.Candidates[index]
+				if len(candidate.Contributions) != 1 ||
+					candidate.Contributions[0].ObservationID != observationID {
+					t.Fatalf("candidate %d contributions = %#v, want %q", index, candidate.Contributions, observationID)
+				}
+				var source ReadObservation
+				for _, value := range observations {
+					if value.Observation.ID() == observationID {
+						source = value
+						break
+					}
+				}
+				contribution := candidate.Contributions[0]
+				if contribution.Status != source.Observation.Status() ||
+					contribution.ValidTime != source.Observation.ValidTime() ||
+					!contribution.RecordedAt.Equal(source.Observation.RecordedAt()) ||
+					contribution.Derivation != source.Observation.Derivation() {
+					t.Fatalf("candidate %d contribution = %#v, want exact source provenance", index, contribution)
+				}
+				wantSupporting := make([]Citation, 0, len(source.Evidence))
+				wantContradicting := make([]Citation, 0, len(source.Evidence))
+				for _, citation := range source.Evidence {
+					if citation.Role == observation.EvidenceSupporting {
+						wantSupporting = append(wantSupporting, citation)
+					} else {
+						wantContradicting = append(wantContradicting, citation)
+					}
+				}
+				if !reflect.DeepEqual(candidate.SupportingCitations, wantSupporting) ||
+					!reflect.DeepEqual(candidate.ContradictingCitations, wantContradicting) {
+					t.Fatalf("candidate %d citations = %#v / %#v, want exact role-separated citations", index, candidate.SupportingCitations, candidate.ContradictingCitations)
+				}
+			}
+
+			reordered := fixture.snapshot(observations...)
+			slices.Reverse(reordered.Observations)
+			for index := range reordered.Observations {
+				slices.Reverse(reordered.Observations[index].Evidence)
+			}
+			reorderedResult, err := (Service{
+				Reader: &recordingTrendReader{snapshot: reordered},
+				Limits: validLimits(),
+			}).Query(context.Background(), request)
+			if err != nil {
+				t.Fatalf("reordered Query() error = %v", err)
+			}
+			if !reflect.DeepEqual(result, reorderedResult) {
+				t.Fatalf("reordered result differs:\nresult    %#v\nreordered %#v", result, reorderedResult)
+			}
+		})
+	}
+}
+
+func TestTrajectoryQueryPreservesMultipleStatesAcrossSelectedWindow(t *testing.T) {
+	fixture := newTrendFixture(t)
+	selection, err := temporal.Between(
+		"multiple-states",
+		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	request := Request{
+		Intent:         temporal.IntentTrajectory,
+		EntityIDs:      []identity.EntityID{"entity-a"},
+		EntityMatch:    EntityMatchAll,
+		Predicates:     []observation.Predicate{"work.location"},
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          4,
+	}
+	remoteCitation := fixture.citation("multiple-remote", observation.EvidenceSupporting)
+	officeCitation := fixture.citation("multiple-office", observation.EvidenceSupporting)
+	reader := &recordingTrendReader{snapshot: fixture.snapshot(
+		fixture.readObservation("multiple-remote", fixture.entity("entity-a"), fixture.text("remote"), fixture.interval(2024, time.January, 1, time.February, 1), observation.StatusObserved, nil, remoteCitation),
+		fixture.readObservation("multiple-office", fixture.entity("entity-a"), fixture.text("office"), fixture.interval(2024, time.February, 1, time.March, 1), observation.StatusObserved, nil, officeCitation),
+	)}
+
+	result, err := (Service{
+		Reader: reader,
+		Limits: Limits{MaxEntities: 2, MaxPredicates: 2, MaxChronology: 4},
+	}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	trajectory, ok := result.Payload.Trajectory()
+	if !ok || len(trajectory.Transitions) != 2 || len(trajectory.Unresolved) != 1 {
+		t.Fatalf("trajectory = %#v, want transitions plus one selected-window unresolved item", trajectory)
+	}
+	unresolved := trajectory.Unresolved[0]
+	if unresolved.Reason != temporal.UnresolvedTransition || len(unresolved.Candidates) != 2 ||
+		unresolved.Candidates[0].Contributions[0].ObservationID != "multiple-office" ||
+		unresolved.Candidates[1].Contributions[0].ObservationID != "multiple-remote" ||
+		!reflect.DeepEqual(unresolved.Candidates[0].SupportingCitations, []Citation{officeCitation}) ||
+		!reflect.DeepEqual(unresolved.Candidates[1].SupportingCitations, []Citation{remoteCitation}) {
+		t.Fatalf("trajectory unresolved = %#v, want exact ordered cited multiple states", trajectory.Unresolved)
+	}
+}
+
+func TestTrajectoryLimitCountsCompleteTransitionsOnly(t *testing.T) {
+	fixture := newTrendFixture(t)
+	selection, err := temporal.Between(
+		"unresolved-limit",
+		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	request := Request{
+		Intent:         temporal.IntentTrajectory,
+		EntityIDs:      []identity.EntityID{"entity-a"},
+		EntityMatch:    EntityMatchAll,
+		Predicates:     []observation.Predicate{},
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          1,
+	}
+	reader := &recordingTrendReader{snapshot: fixture.snapshot(
+		fixture.readObservation("limit-unresolved-unknown", fixture.entity("entity-a"), fixture.text("unknown"), observation.UnknownTime(), observation.StatusObserved, nil, fixture.citation("limit-unresolved-unknown", observation.EvidenceSupporting)),
+		fixture.readObservationWithPredicate("limit-unresolved-hypothesis", "work.mode", fixture.entity("entity-a"), fixture.text("hybrid"), fixture.interval(2024, time.January, 1, time.March, 1), observation.StatusHypothesized, nil, fixture.citation("limit-unresolved-hypothesis", observation.EvidenceSupporting)),
+	)}
+
+	result, err := (Service{Reader: reader, Limits: validLimits()}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	trajectory, ok := result.Payload.Trajectory()
+	if !ok || len(trajectory.Transitions) != 0 || len(trajectory.Unresolved) != 2 {
+		t.Fatalf("trajectory = %#v, want two unresolved items under a one-transition limit", trajectory)
 	}
 }
 

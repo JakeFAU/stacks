@@ -631,7 +631,7 @@ The four result payloads are exactly:
 ```json
 {"point":{"selection":<point-selection>,"facts":[],"unresolved":[]}}
 {"trend":{"before":{"selection":<window-selection>,"facts":[],"unresolved":[]},"after":{"selection":<window-selection>,"facts":[],"unresolved":[]},"changes":[],"unresolved_keys":[]}}
-{"trajectory":{"selection":<window-selection>,"transitions":[]}}
+{"trajectory":{"selection":<window-selection>,"transitions":[],"unresolved":[]}}
 {"causal":{"selection":<window-selection>,"links":[]}}
 ```
 
@@ -658,11 +658,19 @@ the first implemented intent.
 
 ### Trajectory result
 
-`TrajectoryResult` contains one selected window and a chronologically ordered,
-bounded list of transitions. Each transition has a valid-time boundary or
-interval, before/after cited state where available, and unresolved material.
-Gaps are top-level envelope material. If the number of transitions exceeds
-`Limit`, the service returns a limit error without a partial result.
+`TrajectoryResult` contains one selected window, a chronologically ordered,
+bounded list of transitions, and an ordered `unresolved` collection containing
+the exact cited unresolved material across that selected window. Each
+transition has a valid-time boundary or interval, before/after cited state
+where available, and its existing transition-level unresolved material. A
+conflict, temporal uncertainty, hypothesis, counterevidence-only candidate,
+multiple states in the selected window, or unknown valid time remains visible
+in top-level `unresolved` even when no defensible transition boundary exists;
+the service never fabricates a transition merely to carry unresolved evidence.
+Gaps are top-level envelope material, and unresolved material suppresses a
+false `no-evidence` gap. `Limit` counts complete transitions only. If the
+number of transitions exceeds `Limit`, the service returns a limit error with
+a zero result and no partial transitions or unresolved material.
 
 ### Causal-chain result
 
@@ -844,8 +852,10 @@ to telemetry, a model provider, or a background service.
 - Add point-in-time, trajectory, and causal leaves using the already-approved
   request/result contract.
 - Implement each only after its deterministic core operation and synthetic
-  acceptance rules are proven. Causal chains remain restricted to explicit
-  causal observations.
+  acceptance rules are proven. Trajectory acceptance preserves exact cited
+  unresolved material across the selected window without inventing a
+  transition boundary, including unresolved-only results. Causal chains remain
+  restricted to explicit causal observations.
 
 ### Phase D5: generic parity and manager-confidence removal
 
@@ -881,7 +891,11 @@ Unit tests must cover:
 - deterministic output across reordered repository input;
 - exact supporting versus contradicting citation ordering;
 - conflicts, hypotheses, counterevidence-only material, temporal uncertainty,
-  no-evidence gaps, authority gaps, and limit failures;
+  unknown valid time, multiple states in one trajectory window, no-evidence
+  gaps, authority gaps, and limit failures;
+- trajectory results with exact cited top-level unresolved material,
+  deterministic ordering across reordered input, no fabricated transition for
+  unresolved-only evidence, and no false no-evidence gap;
 - no confidence-based state selection;
 - causal rejection when input has chronology but no explicit causal observation;
 - positive causal-chain linkage, counterevidence, historical cutoff behavior,

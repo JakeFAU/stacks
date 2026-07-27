@@ -608,6 +608,218 @@ func TestProjectAtlasTrajectoryContractPreservesCitedTransitions(t *testing.T) {
 	}) {
 		t.Fatalf("commitment transitions lost exact evidence roles: %#v", trajectory.Transitions)
 	}
+	project := atlasEntityTerm(t, "entity:project-atlas")
+	derivation := observation.Derivation{
+		Method:  "synthetic-acceptance",
+		Version: "d1-v1",
+		RunID:   "run:project-atlas",
+	}
+	wantContribution := map[observation.ObservationID]Contribution{
+		"observation:atlas/initial-hypothesis": {
+			ObservationID: "observation:atlas/initial-hypothesis",
+			Status:        observation.StatusHypothesized,
+			ValidTime:     atlasInstant(t, time.Date(2032, time.January, 15, 12, 0, 0, 0, time.UTC)),
+			RecordedAt:    time.Date(2032, time.January, 16, 10, 5, 0, 0, time.UTC),
+			Derivation:    derivation,
+		},
+		"observation:atlas/initial-observed": {
+			ObservationID: "observation:atlas/initial-observed",
+			Status:        observation.StatusObserved,
+			ValidTime: atlasInterval(
+				t,
+				time.Date(2032, time.January, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(2032, time.February, 1, 0, 0, 0, 0, time.UTC),
+			),
+			RecordedAt: time.Date(2032, time.April, 2, 10, 0, 0, 0, time.UTC),
+			Derivation: derivation,
+		},
+		"observation:atlas/revised-observed": {
+			ObservationID: "observation:atlas/revised-observed",
+			Status:        observation.StatusObserved,
+			ValidTime:     atlasSince(t, time.Date(2032, time.March, 1, 0, 0, 0, 0, time.UTC)),
+			RecordedAt:    time.Date(2032, time.March, 2, 10, 5, 0, 0, time.UTC),
+			Derivation:    derivation,
+		},
+		"observation:atlas/risk-window": {
+			ObservationID: "observation:atlas/risk-window",
+			Status:        observation.StatusObserved,
+			ValidTime: atlasWindow(
+				t,
+				time.Date(2032, time.March, 15, 0, 0, 0, 0, time.UTC),
+				time.Date(2032, time.March, 20, 0, 0, 0, 0, time.UTC),
+			),
+			RecordedAt: time.Date(2032, time.March, 16, 10, 5, 0, 0, time.UTC),
+			Derivation: derivation,
+		},
+		"observation:atlas/risk-unknown": {
+			ObservationID: "observation:atlas/risk-unknown",
+			Status:        observation.StatusObserved,
+			ValidTime:     observation.UnknownTime(),
+			RecordedAt:    time.Date(2032, time.January, 18, 10, 5, 0, 0, time.UTC),
+			Derivation:    derivation,
+		},
+		"observation:atlas/priority-critical": {
+			ObservationID: "observation:atlas/priority-critical",
+			Status:        observation.StatusObserved,
+			ValidTime:     atlasInstant(t, time.Date(2032, time.January, 20, 12, 0, 0, 0, time.UTC)),
+			RecordedAt:    time.Date(2032, time.January, 20, 11, 5, 0, 0, time.UTC),
+			Derivation:    derivation,
+		},
+		"observation:atlas/priority-routine": {
+			ObservationID: "observation:atlas/priority-routine",
+			Status:        observation.StatusObserved,
+			ValidTime:     atlasInstant(t, time.Date(2032, time.January, 20, 12, 0, 0, 0, time.UTC)),
+			RecordedAt:    time.Date(2032, time.January, 20, 10, 5, 0, 0, time.UTC),
+			Derivation:    derivation,
+		},
+		"observation:atlas/owner-alpha": {
+			ObservationID: "observation:atlas/owner-alpha",
+			Status:        observation.StatusObserved,
+			ValidTime: atlasInterval(
+				t,
+				time.Date(2032, time.January, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(2032, time.February, 1, 0, 0, 0, 0, time.UTC),
+			),
+			RecordedAt: time.Date(2032, time.January, 12, 10, 5, 0, 0, time.UTC),
+			Derivation: derivation,
+		},
+		"observation:atlas/owner-beta": {
+			ObservationID:            "observation:atlas/owner-beta",
+			Status:                   observation.StatusObserved,
+			ValidTime:                atlasSince(t, time.Date(2032, time.March, 1, 0, 0, 0, 0, time.UTC)),
+			RecordedAt:               time.Date(2032, time.March, 3, 10, 5, 0, 0, time.UTC),
+			Derivation:               derivation,
+			ObjectGroundingMentionID: "mention:delivery-unit-beta",
+		},
+		"observation:atlas/scope-hypothesis": {
+			ObservationID: "observation:atlas/scope-hypothesis",
+			Status:        observation.StatusHypothesized,
+			ValidTime:     atlasInstant(t, time.Date(2032, time.March, 18, 12, 0, 0, 0, time.UTC)),
+			RecordedAt:    time.Date(2032, time.March, 18, 10, 5, 0, 0, time.UTC),
+			Derivation:    derivation,
+		},
+	}
+	type expectedUnresolvedCandidate struct {
+		value         observation.Term
+		observationID []observation.ObservationID
+		supporting    []Citation
+		contradicting []Citation
+	}
+	type expectedUnresolvedItem struct {
+		predicate  observation.Predicate
+		reason     temporal.UnresolvedReason
+		candidates []expectedUnresolvedCandidate
+	}
+	wantUnresolved := []expectedUnresolvedItem{
+		{
+			predicate: "project.delivery_commitment",
+			reason:    temporal.UnresolvedTransition,
+			candidates: []expectedUnresolvedCandidate{
+				{
+					value:         atlasTextTerm(t, "2032-06-15"),
+					observationID: []observation.ObservationID{"observation:atlas/initial-hypothesis", "observation:atlas/initial-observed"},
+					supporting:    []Citation{fixture.initialEvidence.citation(observation.EvidenceSupporting)},
+					contradicting: []Citation{fixture.revisionEvidence.citation(observation.EvidenceContradicting)},
+				},
+				{
+					value:         atlasTextTerm(t, "2032-07-01"),
+					observationID: []observation.ObservationID{"observation:atlas/revised-observed"},
+					supporting:    []Citation{fixture.revisionEvidence.citation(observation.EvidenceSupporting)},
+					contradicting: []Citation{fixture.initialEvidence.citation(observation.EvidenceContradicting)},
+				},
+			},
+		},
+		{
+			predicate: "project.delivery_risk",
+			reason:    temporal.UnresolvedTemporalUncertainty,
+			candidates: []expectedUnresolvedCandidate{
+				{
+					value:         atlasTextTerm(t, "elevated"),
+					observationID: []observation.ObservationID{"observation:atlas/risk-window"},
+					supporting:    []Citation{fixture.riskWindowEvidence.citation(observation.EvidenceSupporting)},
+					contradicting: []Citation{},
+				},
+				{
+					value:         atlasTextTerm(t, "watch"),
+					observationID: []observation.ObservationID{"observation:atlas/risk-unknown"},
+					supporting:    []Citation{fixture.riskUnknownEvidence.citation(observation.EvidenceSupporting)},
+					contradicting: []Citation{},
+				},
+			},
+		},
+		{
+			predicate: "project.priority",
+			reason:    temporal.UnresolvedConflict,
+			candidates: []expectedUnresolvedCandidate{
+				{
+					value:         atlasTextTerm(t, "critical"),
+					observationID: []observation.ObservationID{"observation:atlas/priority-critical"},
+					supporting:    []Citation{fixture.priorityCriticalEvidence.citation(observation.EvidenceSupporting)},
+					contradicting: []Citation{},
+				},
+				{
+					value:         atlasTextTerm(t, "routine"),
+					observationID: []observation.ObservationID{"observation:atlas/priority-routine"},
+					supporting:    []Citation{fixture.priorityRoutineEvidence.citation(observation.EvidenceSupporting)},
+					contradicting: []Citation{},
+				},
+			},
+		},
+		{
+			predicate: "project.responsible_party",
+			reason:    temporal.UnresolvedTransition,
+			candidates: []expectedUnresolvedCandidate{
+				{
+					value:         atlasEntityTerm(t, "entity:delivery-unit-alpha"),
+					observationID: []observation.ObservationID{"observation:atlas/owner-alpha"},
+					supporting:    []Citation{fixture.ownerAlphaEvidence.citation(observation.EvidenceSupporting)},
+					contradicting: []Citation{},
+				},
+				{
+					value:         atlasEntityTerm(t, "entity:delivery-unit-beta"),
+					observationID: []observation.ObservationID{"observation:atlas/owner-beta"},
+					supporting:    []Citation{fixture.ownerBetaEvidence.citation(observation.EvidenceSupporting)},
+					contradicting: []Citation{},
+				},
+			},
+		},
+		{
+			predicate: "project.scope",
+			reason:    temporal.UnresolvedHypothesis,
+			candidates: []expectedUnresolvedCandidate{{
+				value:         atlasTextTerm(t, "expanded"),
+				observationID: []observation.ObservationID{"observation:atlas/scope-hypothesis"},
+				supporting:    []Citation{fixture.scopeEvidence.citation(observation.EvidenceSupporting)},
+				contradicting: []Citation{},
+			}},
+		},
+	}
+	if len(trajectory.Unresolved) != len(wantUnresolved) {
+		t.Fatalf("trajectory unresolved = %#v, want %d exact selected-window items", trajectory.Unresolved, len(wantUnresolved))
+	}
+	for itemIndex, wantItem := range wantUnresolved {
+		item := trajectory.Unresolved[itemIndex]
+		if item.Key.Subject != project || item.Key.Predicate != wantItem.predicate ||
+			item.Reason != wantItem.reason || len(item.Candidates) != len(wantItem.candidates) {
+			t.Fatalf("trajectory unresolved[%d] = %#v, want predicate %q reason %q", itemIndex, item, wantItem.predicate, wantItem.reason)
+		}
+		for candidateIndex, wantCandidate := range wantItem.candidates {
+			candidate := item.Candidates[candidateIndex]
+			gotObservationIDs := make([]observation.ObservationID, len(candidate.Contributions))
+			for index, contribution := range candidate.Contributions {
+				gotObservationIDs[index] = contribution.ObservationID
+				if !reflect.DeepEqual(contribution, wantContribution[contribution.ObservationID]) {
+					t.Fatalf("trajectory unresolved[%d].Candidates[%d].Contributions[%d] = %#v, want exact Project Atlas provenance", itemIndex, candidateIndex, index, contribution)
+				}
+			}
+			if candidate.Value != wantCandidate.value ||
+				!slices.Equal(gotObservationIDs, wantCandidate.observationID) ||
+				!reflect.DeepEqual(candidate.SupportingCitations, wantCandidate.supporting) ||
+				!reflect.DeepEqual(candidate.ContradictingCitations, wantCandidate.contradicting) {
+				t.Fatalf("trajectory unresolved[%d].Candidates[%d] = %#v, want exact value, provenance, and citations", itemIndex, candidateIndex, candidate)
+			}
+		}
+	}
 	if !reflect.DeepEqual(result.Gaps, []Gap{{
 		Kind:      GapUnresolvedMention,
 		EntityID:  "entity:project-atlas",
