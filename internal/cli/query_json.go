@@ -43,21 +43,58 @@ type queryKnowledgeJSON struct {
 	At   string `json:"at,omitempty"`
 }
 
-// queryResultJSON is the only custom map-like wire behavior. D3.3 supports
-// exactly the trend member; later intents extend this closed union.
+// queryResultJSON is the only custom map-like wire behavior.
 type queryResultJSON struct {
-	Intent temporal.Intent
-	Trend  *queryTrendJSON
+	Intent     temporal.Intent
+	Point      *queryPointJSON
+	Trend      *queryTrendJSON
+	Trajectory *queryTrajectoryJSON
+	Causal     *queryCausalJSON
 }
 
 func (value queryResultJSON) MarshalJSON() ([]byte, error) {
-	if value.Intent != temporal.IntentTrendComparison || value.Trend == nil {
+	switch value.Intent {
+	case temporal.IntentPointInTime:
+		if value.Point == nil || value.Trend != nil || value.Trajectory != nil || value.Causal != nil {
+			return nil, fmt.Errorf("query JSON result union is invalid")
+		}
+		type result struct {
+			Point *queryPointJSON `json:"point"`
+		}
+		return json.Marshal(result{Point: value.Point})
+	case temporal.IntentTrendComparison:
+		if value.Point != nil || value.Trend == nil || value.Trajectory != nil || value.Causal != nil {
+			return nil, fmt.Errorf("query JSON result union is invalid")
+		}
+		type result struct {
+			Trend *queryTrendJSON `json:"trend"`
+		}
+		return json.Marshal(result{Trend: value.Trend})
+	case temporal.IntentTrajectory:
+		if value.Point != nil || value.Trend != nil || value.Trajectory == nil || value.Causal != nil {
+			return nil, fmt.Errorf("query JSON result union is invalid")
+		}
+		type result struct {
+			Trajectory *queryTrajectoryJSON `json:"trajectory"`
+		}
+		return json.Marshal(result{Trajectory: value.Trajectory})
+	case temporal.IntentCausalChain:
+		if value.Point != nil || value.Trend != nil || value.Trajectory != nil || value.Causal == nil {
+			return nil, fmt.Errorf("query JSON result union is invalid")
+		}
+		type result struct {
+			Causal *queryCausalJSON `json:"causal"`
+		}
+		return json.Marshal(result{Causal: value.Causal})
+	default:
 		return nil, fmt.Errorf("query JSON result union is invalid")
 	}
-	type trendResult struct {
-		Trend *queryTrendJSON `json:"trend"`
-	}
-	return json.Marshal(trendResult{Trend: value.Trend})
+}
+
+type queryPointJSON struct {
+	Selection  querySelectionJSON    `json:"selection"`
+	Facts      []queryFactJSON       `json:"facts"`
+	Unresolved []queryUnresolvedJSON `json:"unresolved"`
 }
 
 type queryTrendJSON struct {
@@ -147,6 +184,34 @@ type queryChangeJSON struct {
 	After  *queryFactJSON    `json:"after,omitempty"`
 }
 
+type queryTrajectoryJSON struct {
+	Selection   querySelectionJSON    `json:"selection"`
+	Transitions []queryTransitionJSON `json:"transitions"`
+	Unresolved  []queryUnresolvedJSON `json:"unresolved"`
+}
+
+type queryTransitionJSON struct {
+	Kind       string                `json:"kind"`
+	Key        queryStateKeyJSON     `json:"key"`
+	ValidTime  queryExtentJSON       `json:"valid_time"`
+	Before     *queryFactJSON        `json:"before,omitempty"`
+	After      *queryFactJSON        `json:"after,omitempty"`
+	Unresolved []queryUnresolvedJSON `json:"unresolved"`
+}
+
+type queryCausalJSON struct {
+	Selection querySelectionJSON    `json:"selection"`
+	Links     []queryCausalLinkJSON `json:"links"`
+}
+
+type queryCausalLinkJSON struct {
+	Cause                  queryTermJSONDTO        `json:"cause"`
+	Effect                 queryTermJSONDTO        `json:"effect"`
+	Contributions          []queryContributionJSON `json:"contributions"`
+	SupportingCitations    []queryCitationJSON     `json:"supporting_citations"`
+	ContradictingCitations []queryCitationJSON     `json:"contradicting_citations"`
+}
+
 type queryGapJSON struct {
 	Kind           string `json:"kind"`
 	EntityID       string `json:"entity_id,omitempty"`
@@ -158,23 +223,60 @@ func renderQueryJSON(result query.Result) ([]byte, error) {
 	if err := query.ValidateResult(result); err != nil {
 		return nil, fmt.Errorf("render query JSON: invalid result: %w", err)
 	}
-	trend, ok := result.Payload.Trend()
-	if !ok || result.Intent != temporal.IntentTrendComparison {
-		return nil, fmt.Errorf("render query JSON: trend result is required")
-	}
 	request, err := queryRequestToJSON(result)
 	if err != nil {
 		return nil, err
 	}
-	trendJSON, err := queryTrendToJSON(trend)
-	if err != nil {
-		return nil, err
+	union := queryResultJSON{Intent: result.Intent}
+	switch result.Intent {
+	case temporal.IntentPointInTime:
+		point, ok := result.Payload.Point()
+		if !ok {
+			return nil, fmt.Errorf("render query JSON: point result is required")
+		}
+		converted, err := queryPointToJSON(point)
+		if err != nil {
+			return nil, err
+		}
+		union.Point = &converted
+	case temporal.IntentTrendComparison:
+		trend, ok := result.Payload.Trend()
+		if !ok {
+			return nil, fmt.Errorf("render query JSON: trend result is required")
+		}
+		converted, err := queryTrendToJSON(trend)
+		if err != nil {
+			return nil, err
+		}
+		union.Trend = &converted
+	case temporal.IntentTrajectory:
+		trajectory, ok := result.Payload.Trajectory()
+		if !ok {
+			return nil, fmt.Errorf("render query JSON: trajectory result is required")
+		}
+		converted, err := queryTrajectoryToJSON(trajectory)
+		if err != nil {
+			return nil, err
+		}
+		union.Trajectory = &converted
+	case temporal.IntentCausalChain:
+		causal, ok := result.Payload.Causal()
+		if !ok {
+			return nil, fmt.Errorf("render query JSON: causal result is required")
+		}
+		converted, err := queryCausalToJSON(causal)
+		if err != nil {
+			return nil, err
+		}
+		union.Causal = &converted
+	default:
+		return nil, fmt.Errorf("render query JSON: result intent is invalid")
 	}
 	envelope := queryEnvelopeJSON{
 		SchemaVersion: temporalQuerySchemaVersion,
 		Intent:        string(result.Intent),
 		Request:       request,
-		Result:        queryResultJSON{Intent: result.Intent, Trend: &trendJSON},
+		Result:        union,
 		Gaps:          queryGapsToJSON(result.Gaps),
 	}
 	rendered, err := json.Marshal(envelope)
@@ -182,6 +284,22 @@ func renderQueryJSON(result query.Result) ([]byte, error) {
 		return nil, fmt.Errorf("render query JSON: %w", err)
 	}
 	return append(rendered, '\n'), nil
+}
+
+func queryPointToJSON(value query.PointInTimeResult) (queryPointJSON, error) {
+	selection, err := querySelectionToJSON(value.Selection)
+	if err != nil {
+		return queryPointJSON{}, err
+	}
+	facts, err := queryFactsToJSON(value.Facts)
+	if err != nil {
+		return queryPointJSON{}, err
+	}
+	unresolved, err := queryUnresolvedToJSON(value.Unresolved)
+	if err != nil {
+		return queryPointJSON{}, err
+	}
+	return queryPointJSON{Selection: selection, Facts: facts, Unresolved: unresolved}, nil
 }
 
 func queryRequestToJSON(result query.Result) (queryRequestJSON, error) {
@@ -460,6 +578,93 @@ func queryChangeToJSON(value query.Change) (queryChangeJSON, error) {
 		result.After = &after
 	}
 	return result, nil
+}
+
+func queryTrajectoryToJSON(value query.TrajectoryResult) (queryTrajectoryJSON, error) {
+	selection, err := querySelectionToJSON(value.Selection)
+	if err != nil {
+		return queryTrajectoryJSON{}, err
+	}
+	transitions := make([]queryTransitionJSON, len(value.Transitions))
+	for index, transition := range value.Transitions {
+		converted, err := queryTransitionToJSON(transition)
+		if err != nil {
+			return queryTrajectoryJSON{}, err
+		}
+		transitions[index] = converted
+	}
+	unresolved, err := queryUnresolvedToJSON(value.Unresolved)
+	if err != nil {
+		return queryTrajectoryJSON{}, err
+	}
+	return queryTrajectoryJSON{
+		Selection: selection, Transitions: transitions, Unresolved: unresolved,
+	}, nil
+}
+
+func queryTransitionToJSON(value query.Transition) (queryTransitionJSON, error) {
+	key, err := queryStateKeyToJSON(value.Key)
+	if err != nil {
+		return queryTransitionJSON{}, err
+	}
+	validTime, err := queryExtentToJSON(value.ValidTime)
+	if err != nil {
+		return queryTransitionJSON{}, err
+	}
+	unresolved, err := queryUnresolvedToJSON(value.Unresolved)
+	if err != nil {
+		return queryTransitionJSON{}, err
+	}
+	result := queryTransitionJSON{
+		Kind: string(value.Kind), Key: key, ValidTime: validTime, Unresolved: unresolved,
+	}
+	if value.Before != nil {
+		before, err := queryFactToJSON(*value.Before)
+		if err != nil {
+			return queryTransitionJSON{}, err
+		}
+		result.Before = &before
+	}
+	if value.After != nil {
+		after, err := queryFactToJSON(*value.After)
+		if err != nil {
+			return queryTransitionJSON{}, err
+		}
+		result.After = &after
+	}
+	return result, nil
+}
+
+func queryCausalToJSON(value query.CausalChainResult) (queryCausalJSON, error) {
+	selection, err := querySelectionToJSON(value.Selection)
+	if err != nil {
+		return queryCausalJSON{}, err
+	}
+	links := make([]queryCausalLinkJSON, len(value.Links))
+	for index, link := range value.Links {
+		cause, err := queryTermJSON(link.Cause)
+		if err != nil {
+			return queryCausalJSON{}, err
+		}
+		effect, err := queryTermJSON(link.Effect)
+		if err != nil {
+			return queryCausalJSON{}, err
+		}
+		contributions := make([]queryContributionJSON, len(link.Contributions))
+		for contributionIndex, contribution := range link.Contributions {
+			converted, err := queryContributionToJSON(contribution)
+			if err != nil {
+				return queryCausalJSON{}, err
+			}
+			contributions[contributionIndex] = converted
+		}
+		links[index] = queryCausalLinkJSON{
+			Cause: cause, Effect: effect, Contributions: contributions,
+			SupportingCitations:    queryCitationsToJSON(link.SupportingCitations),
+			ContradictingCitations: queryCitationsToJSON(link.ContradictingCitations),
+		}
+	}
+	return queryCausalJSON{Selection: selection, Links: links}, nil
 }
 
 func queryGapsToJSON(values []query.Gap) []queryGapJSON {

@@ -15,44 +15,78 @@ func renderQueryText(result query.Result) ([]byte, error) {
 	if err := query.ValidateResult(result); err != nil {
 		return nil, fmt.Errorf("render query text: invalid result: %w", err)
 	}
-	trend, ok := result.Payload.Trend()
-	if !ok || result.Intent != temporal.IntentTrendComparison {
-		return nil, fmt.Errorf("render query text: trend result is required")
-	}
 
 	var rendered strings.Builder
 	fmt.Fprintf(&rendered, "intent: %s\n", result.Intent)
 	fmt.Fprintf(&rendered, "entities: %s\n", textList(entityIDStrings(result)))
 	fmt.Fprintf(&rendered, "entity match: %s\n", result.EntityMatch)
 	fmt.Fprintf(&rendered, "predicates: %s\n", textList(predicateStrings(result)))
-	if err := renderTextSelection(&rendered, trend.Before.Selection); err != nil {
-		return nil, err
-	}
-	if err := renderTextSelection(&rendered, trend.After.Selection); err != nil {
-		return nil, err
+	for _, selection := range result.Selections {
+		if err := renderTextSelection(&rendered, selection); err != nil {
+			return nil, err
+		}
 	}
 	if err := renderTextKnowledge(&rendered, result.KnowledgeScope); err != nil {
 		return nil, err
 	}
 	fmt.Fprintf(&rendered, "limit: %d\n", result.Limit)
 
-	if err := renderTextFacts(&rendered, "before facts", trend.Before.Facts, "  "); err != nil {
-		return nil, err
-	}
-	if err := renderTextUnresolved(&rendered, "before unresolved", trend.Before.Unresolved, "  "); err != nil {
-		return nil, err
-	}
-	if err := renderTextFacts(&rendered, "after facts", trend.After.Facts, "  "); err != nil {
-		return nil, err
-	}
-	if err := renderTextUnresolved(&rendered, "after unresolved", trend.After.Unresolved, "  "); err != nil {
-		return nil, err
-	}
-	if err := renderTextChanges(&rendered, trend.Changes); err != nil {
-		return nil, err
-	}
-	if err := renderTextStateKeys(&rendered, trend.UnresolvedKeys); err != nil {
-		return nil, err
+	switch result.Intent {
+	case temporal.IntentPointInTime:
+		point, ok := result.Payload.Point()
+		if !ok {
+			return nil, fmt.Errorf("render query text: point result is required")
+		}
+		if err := renderTextFacts(&rendered, "facts", point.Facts, "  "); err != nil {
+			return nil, err
+		}
+		if err := renderTextUnresolved(&rendered, "unresolved", point.Unresolved, "  "); err != nil {
+			return nil, err
+		}
+	case temporal.IntentTrendComparison:
+		trend, ok := result.Payload.Trend()
+		if !ok {
+			return nil, fmt.Errorf("render query text: trend result is required")
+		}
+		if err := renderTextFacts(&rendered, "before facts", trend.Before.Facts, "  "); err != nil {
+			return nil, err
+		}
+		if err := renderTextUnresolved(&rendered, "before unresolved", trend.Before.Unresolved, "  "); err != nil {
+			return nil, err
+		}
+		if err := renderTextFacts(&rendered, "after facts", trend.After.Facts, "  "); err != nil {
+			return nil, err
+		}
+		if err := renderTextUnresolved(&rendered, "after unresolved", trend.After.Unresolved, "  "); err != nil {
+			return nil, err
+		}
+		if err := renderTextChanges(&rendered, trend.Changes); err != nil {
+			return nil, err
+		}
+		if err := renderTextStateKeys(&rendered, trend.UnresolvedKeys); err != nil {
+			return nil, err
+		}
+	case temporal.IntentTrajectory:
+		trajectory, ok := result.Payload.Trajectory()
+		if !ok {
+			return nil, fmt.Errorf("render query text: trajectory result is required")
+		}
+		if err := renderTextTransitions(&rendered, trajectory.Transitions); err != nil {
+			return nil, err
+		}
+		if err := renderTextUnresolved(&rendered, "unresolved", trajectory.Unresolved, "  "); err != nil {
+			return nil, err
+		}
+	case temporal.IntentCausalChain:
+		causal, ok := result.Payload.Causal()
+		if !ok {
+			return nil, fmt.Errorf("render query text: causal result is required")
+		}
+		if err := renderTextCausalLinks(&rendered, causal.Links); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("render query text: result intent is invalid")
 	}
 	renderTextGaps(&rendered, result.Gaps)
 	return []byte(rendered.String()), nil
@@ -118,15 +152,28 @@ func renderTextFact(output *strings.Builder, value query.Fact, indent string) er
 		return err
 	}
 	fmt.Fprintf(output, "%s- key: %s value=%s\n", indent, key, factValue)
-	fmt.Fprintf(output, "%s  contributions:\n", indent)
-	for _, contribution := range value.Contributions {
+	if err := renderTextContributions(output, value.Contributions, indent+"  "); err != nil {
+		return err
+	}
+	renderTextCitations(output, "supporting citations", value.SupportingCitations, indent+"  ")
+	renderTextCitations(output, "contradicting citations", value.ContradictingCitations, indent+"  ")
+	return nil
+}
+
+func renderTextContributions(
+	output *strings.Builder,
+	values []query.Contribution,
+	indent string,
+) error {
+	fmt.Fprintf(output, "%scontributions:\n", indent)
+	for _, contribution := range values {
 		validTime, err := textExtent(contribution.ValidTime)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(
 			output,
-			"%s    - observation_id=%s status=%s valid_time=%s recorded_at=%s derivation_method=%s derivation_version=%s",
+			"%s  - observation_id=%s status=%s valid_time=%s recorded_at=%s derivation_method=%s derivation_version=%s",
 			indent,
 			contribution.ObservationID,
 			contribution.Status,
@@ -149,8 +196,6 @@ func renderTextFact(output *strings.Builder, value query.Fact, indent string) er
 		}
 		output.WriteByte('\n')
 	}
-	renderTextCitations(output, "supporting citations", value.SupportingCitations, indent+"  ")
-	renderTextCitations(output, "contradicting citations", value.ContradictingCitations, indent+"  ")
 	return nil
 }
 
@@ -238,6 +283,66 @@ func renderTextChanges(output *strings.Builder, values []query.Change) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func renderTextTransitions(output *strings.Builder, values []query.Transition) error {
+	output.WriteString("transitions:\n")
+	if len(values) == 0 {
+		output.WriteString("  (none)\n")
+		return nil
+	}
+	for _, value := range values {
+		key, err := textStateKey(value.Key)
+		if err != nil {
+			return err
+		}
+		validTime, err := textExtent(value.ValidTime)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(output, "  - kind=%s key: %s valid_time=%s\n", value.Kind, key, validTime)
+		if value.Before != nil {
+			output.WriteString("    before:\n")
+			if err := renderTextFact(output, *value.Before, "      "); err != nil {
+				return err
+			}
+		}
+		if value.After != nil {
+			output.WriteString("    after:\n")
+			if err := renderTextFact(output, *value.After, "      "); err != nil {
+				return err
+			}
+		}
+		if err := renderTextUnresolved(output, "    unresolved", value.Unresolved, "      "); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func renderTextCausalLinks(output *strings.Builder, values []query.CausalLink) error {
+	output.WriteString("links:\n")
+	if len(values) == 0 {
+		output.WriteString("  (none)\n")
+		return nil
+	}
+	for _, value := range values {
+		cause, err := textTerm(value.Cause)
+		if err != nil {
+			return err
+		}
+		effect, err := textTerm(value.Effect)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(output, "  - cause=%s effect=%s\n", cause, effect)
+		if err := renderTextContributions(output, value.Contributions, "    "); err != nil {
+			return err
+		}
+		renderTextCitations(output, "supporting citations", value.SupportingCitations, "    ")
+		renderTextCitations(output, "contradicting citations", value.ContradictingCitations, "    ")
 	}
 	return nil
 }

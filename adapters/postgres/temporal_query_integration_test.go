@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -714,6 +715,168 @@ func TestTemporalQueryPostgresPerformsNoWritesOrLeaseClaims(t *testing.T) {
 			after,
 		)
 	}
+}
+
+func TestTemporalQueryPostgresProjectsAllIntentSyntheticCandidates(t *testing.T) {
+	fixture := newTemporalQueryPostgresFixture(t)
+	wantIDs := seedTemporalAllIntentCandidates(t, fixture)
+	window, err := temporal.Between(
+		"between",
+		atlasValidAt.Add(-30*24*time.Hour),
+		atlasValidAt.Add(30*24*time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := fixture.database.LoadTemporalQuerySnapshot(
+		fixture.ctx,
+		TemporalQuerySelection{
+			EntityIDs:   []identity.EntityID{atlasCurrentOwnerID},
+			EntityMatch: TemporalEntityMatchAll,
+			Predicates: []observation.Predicate{
+				"project.atlas/responsibility",
+				"project.atlas/uncertainty",
+				temporal.CausalPredicate,
+			},
+			Selections: []temporal.TemporalSelection{window},
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("LoadTemporalQuerySnapshot() error = %v", err)
+	}
+	gotIDs := make([]observation.ObservationID, len(snapshot.Observations))
+	counterevidence := 0
+	for index, record := range snapshot.Observations {
+		gotIDs[index] = record.Observation.ID()
+		for _, citation := range record.Evidence {
+			if citation.Role == observation.EvidenceContradicting {
+				counterevidence++
+			}
+		}
+	}
+	slices.Sort(gotIDs)
+	slices.Sort(wantIDs)
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Fatalf("observation IDs = %v, want %v", gotIDs, wantIDs)
+	}
+	if counterevidence != 2 {
+		t.Fatalf("contradicting citations = %d, want 2", counterevidence)
+	}
+}
+
+func seedTemporalAllIntentCandidates(
+	t testing.TB,
+	fixture temporalQueryPostgresFixture,
+) []observation.ObservationID {
+	t.Helper()
+	owner := mustTemporalEntityTerm(t, atlasCurrentOwnerID, "")
+	text := func(value string) observation.Term {
+		t.Helper()
+		term, err := observation.NewTextTerm(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return term
+	}
+	during := func(start, end time.Time) observation.TemporalExtent {
+		t.Helper()
+		value, err := observation.During(start, end)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	start := atlasValidAt.Add(-20 * 24 * time.Hour)
+	boundary := atlasValidAt.Add(-10 * 24 * time.Hour)
+	conflictEnd := atlasValidAt.Add(-5 * 24 * time.Hour)
+	end := atlasValidAt.Add(20 * 24 * time.Hour)
+	recordedAt := atlasTopologyFutureAt.Add(time.Hour)
+	newObservation := func(
+		id string,
+		subject observation.Term,
+		predicate observation.Predicate,
+		object observation.Term,
+		validTime observation.TemporalExtent,
+		counter bool,
+	) observation.Observation {
+		t.Helper()
+		links := []observation.EvidenceLink{{
+			EvidenceID: fixture.supportingSpan.ID(),
+			Role:       observation.EvidenceSupporting,
+		}}
+		if counter {
+			links = append(links, observation.EvidenceLink{
+				EvidenceID: fixture.contradictingSpan.ID(),
+				Role:       observation.EvidenceContradicting,
+			})
+		}
+		value := mustTemporalObservation(t, observation.ObservationInput{
+			ID: observation.ObservationID(id),
+			Statement: observation.Statement{
+				Subject: subject, Predicate: predicate, Object: object,
+			},
+			ValidTime: validTime, RecordedAt: recordedAt,
+			Evidence: links,
+			Derivation: observation.Derivation{
+				Method: "synthetic-review", Version: "project-atlas-all-intents-v1",
+			},
+			Status: observation.StatusObserved,
+		})
+		recordedAt = recordedAt.Add(time.Minute)
+		return value
+	}
+	responsibility := observation.Predicate("project.atlas/responsibility")
+	uncertainty := observation.Predicate("project.atlas/uncertainty")
+	observations := []observation.Observation{
+		newObservation("observation:project-atlas/responsibility-initial", owner,
+			responsibility, text("Alex"), during(start, boundary), false),
+		newObservation("observation:project-atlas/responsibility-transfer", owner,
+			responsibility, text("Blair"), during(boundary, end), false),
+		newObservation("observation:project-atlas/responsibility-conflict", owner,
+			responsibility, text("Casey"), during(boundary, conflictEnd), true),
+		newObservation("observation:project-atlas/uncertainty", owner,
+			uncertainty, text("uncertain"), observation.UnknownTime(), false),
+		newObservation("observation:project-atlas/cause-one", owner,
+			temporal.CausalPredicate, text("handoff"), mustTemporalInstant(t, boundary), true),
+		newObservation("observation:project-atlas/cause-two", text("handoff"),
+			temporal.CausalPredicate, owner, mustTemporalInstant(t, conflictEnd), false),
+	}
+	admissions := make([]admission.Decision, len(observations))
+	for index, value := range observations {
+		admissions[index] = mustTemporalAdmissionDecision(t, admission.DecisionInput{
+			ID:         "admission:" + string(value.ID()),
+			TargetKind: admission.TargetObservation,
+			TargetID:   string(value.ID()),
+			Outcome:    admission.Admitted,
+			ReasonCode: "synthetic_all_intents",
+			Authority:  admission.AuthorityReviewer,
+			RecordedAt: value.RecordedAt().Add(time.Minute),
+		})
+	}
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *Transaction) error {
+			for _, value := range observations {
+				if _, err := transaction.PutObservation(fixture.ctx, value); err != nil {
+					return err
+				}
+			}
+			for _, value := range admissions {
+				if err := transaction.AppendAdmissionDecision(fixture.ctx, value); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("persist all-intent observations: %v", err)
+	}
+	result := make([]observation.ObservationID, len(observations))
+	for index, value := range observations {
+		result[index] = value.ID()
+	}
+	return result
 }
 
 type temporalQueryPostgresFixture struct {

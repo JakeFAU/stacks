@@ -3,9 +3,9 @@
 Stacks builds provenance-backed temporal knowledge from personal source
 documents. The current application reads tabbed Gemini meeting Docs from one
 Google Drive folder and can analyze one explicitly configured employee-manager
-pair for changes in observable interaction patterns. It can also compare two
-valid-time windows over canonical observations and return deterministic cited
-facts, unresolved material, changes, and evidence gaps.
+pair for changes in observable interaction patterns. It can also reconstruct
+point state, compare valid-time windows, build cited trajectories, and retrieve
+explicit causal chains over canonical observations.
 
 The analysis does not claim access to a manager's private beliefs or mental
 state. It reports dated, transcript-backed signals such as delegation,
@@ -83,7 +83,10 @@ stacks
 │   └── correct <effective-decision-id> <entity-id>
 ├── analyze
 ├── query
-│   └── trend --entity <id> --before <start>/<end> --after <start>/<end>
+│   ├── point --entity <id> --at <instant>
+│   ├── trend --entity <id> --before <start>/<end> --after <start>/<end>
+│   ├── trajectory --entity <id> --between <start>/<end> --limit <positive-integer>
+│   └── causal --entity <id> --between <start>/<end> --limit <positive-integer>
 ├── db-migrate
 ├── db-status
 └── db-reset <confirmation>
@@ -92,16 +95,24 @@ stacks
 `analyze` runs the currently configured cited temporal analysis for the
 accepted employee-manager pair; it does not select or install a provider.
 
-### Cited temporal trend queries
+### Cited temporal queries
 
-`query trend` is the only executable general temporal-query intent in this
-phase. It reads canonical PostgreSQL observations through the least-privileged
-application database URL. It does not construct Drive, Workspace Directory,
-disclosure, model, or model-provider clients.
+All four temporal-query intents read canonical PostgreSQL observations through
+the least-privileged application database URL and the same typed query service
+and historical snapshot. Query execution does not construct Drive, Workspace
+Directory, disclosure, model, or model-provider clients.
 
 The exact syntax is:
 
 ```text
+stacks query point \
+  --entity <canonical-entity-id> [--entity <canonical-entity-id> ...] \
+  --at <RFC3339-valid-time-instant> \
+  [--entity-match all|any] \
+  [--predicate <exact-observation-predicate> ...] \
+  [--known-as-of <RFC3339-recorded-time-cutoff>] \
+  [--output text|json]
+
 stacks query trend \
   --entity <canonical-entity-id> [--entity <canonical-entity-id> ...] \
   [--entity-match all|any] \
@@ -110,25 +121,56 @@ stacks query trend \
   --after <RFC3339-start>/<RFC3339-end> \
   [--known-as-of <RFC3339-recorded-time-cutoff>] \
   [--output text|json]
+
+stacks query trajectory \
+  --entity <canonical-entity-id> [--entity <canonical-entity-id> ...] \
+  --between <RFC3339-start>/<RFC3339-end> \
+  --limit <positive-integer> \
+  [--entity-match all|any] \
+  [--predicate <exact-observation-predicate> ...] \
+  [--known-as-of <RFC3339-recorded-time-cutoff>] \
+  [--output text|json]
+
+stacks query causal \
+  --entity <canonical-entity-id> [--entity <canonical-entity-id> ...] \
+  --between <RFC3339-start>/<RFC3339-end> \
+  --limit <positive-integer> \
+  [--entity-match all|any] \
+  [--known-as-of <RFC3339-recorded-time-cutoff>] \
+  [--output text|json]
 ```
 
-Both windows are half-open: `[start, end)`. The `after` window must start later
-than the `before` window starts; the windows may overlap, so `before` does not
-need to end before `after` starts. Entity IDs and predicates must be unique.
-`--entity-match` defaults to `all`; omit `--predicate` to consider every
-qualifying predicate; and `--output` defaults to `text`. The equivalent Make
-target loads the ignored `ENV_FILE` and forwards only caller-supplied arguments:
+Every window is half-open: `[start, end)`. For trend, the `after` window must
+start later than the `before` window starts; the windows may overlap, so
+`before` does not need to end before `after` starts. Entity IDs and predicates
+must be unique. `--entity-match` defaults to `all`; omit `--predicate` where
+available to consider every qualifying predicate; and `--output` defaults to
+`text`. Trajectory and causal always require a positive `--limit`; a result
+that exceeds it fails without returning a partial prefix. Causal deliberately
+does not accept `--predicate`: it supplies the sole v1 causal predicate
+`stacks.causal.v1/causes` internally.
+
+The existing trend Make target loads the ignored `ENV_FILE` and forwards only
+caller-supplied arguments:
 
 ```sh
 make query-trend ARGS="--entity <canonical-entity-id> --before <RFC3339-start>/<RFC3339-end> --after <RFC3339-start>/<RFC3339-end>"
 ```
 
 Text and JSON render the same deterministically ordered result. JSON uses the
-normative `stacks.temporal-query.v1` envelope. Each window separates resolved
-facts from unresolved candidates, the comparison reports added, removed, and
-changed state, and every fact preserves observation contributions plus
-role-separated supporting and contradicting citations. An empty result or gap
-never asserts that a fact is false.
+normative `stacks.temporal-query.v1` envelope with exactly one `point`, `trend`,
+`trajectory`, or `causal` result member and non-null arrays. Point reconstructs
+state at one exact valid-time instant. Trend separates the two windows'
+resolved facts and unresolved candidates and reports added, removed, and
+changed state. Trajectory returns bounded, dated transitions plus exact cited
+top-level unresolved material that has no defensible transition boundary; it
+never fabricates a transition to carry conflict or uncertainty. Causal returns
+only admitted explicit `stacks.causal.v1/causes` observations, preserves
+counterevidence, and never infers causality from chronology, shared entities,
+confidence, or similarity. Every fact, transition, unresolved candidate, and
+causal link preserves its exact observation contributions and role-separated
+supporting and contradicting citations. An empty result or gap never asserts
+that a fact is false.
 
 Successful results can report these evidence gaps:
 
@@ -138,6 +180,8 @@ Successful results can report these evidence gaps:
 - `unresolved-mention`: relevant material could not cross identity authority;
 - `authority-excluded`: material was excluded by the selected recorded-time
   authority or admission state.
+- `no-causal-evidence`: no admitted explicit causal observation qualified;
+  ordinary chronology is not promoted to a causal chain.
 
 An unknown canonical entity is an error rather than a gap. Unresolved facts
 remain visible with their cited candidates and uncertainty reason; confidence
@@ -146,14 +190,16 @@ alone never chooses a winner.
 Without `--known-as-of`, `knowledge scope: current` uses the current
 recorded-time authority and canonical knowledge. With `--known-as-of`, the
 query reconstructs only what Stacks had recorded by that inclusive cutoff.
-Recorded-time scope and the two valid-time windows are independent filters.
+Recorded-time scope and point/window valid time are independent filters; a
+later review can change current authority without changing what a requested
+valid-time instant means.
 
 Query configuration defaults to 16 entities, 32 predicates, and a chronology
 ceiling of 1000. `STACKS_QUERY_MAX_ENTITIES` accepts 1–64,
 `STACKS_QUERY_MAX_PREDICATES` accepts 1–256, and
-`STACKS_QUERY_MAX_CHRONOLOGY` accepts 1–10000. The chronology ceiling is
-validated and wired now but trend does not consume it; it bounds later
-trajectory/causal expansion.
+`STACKS_QUERY_MAX_CHRONOLOGY` accepts 1–10000. The chronology ceiling bounds
+the required trajectory and causal limits; point and trend always use limit
+zero.
 
 Query output is explicit private operator output. Citations can disclose source
 document/version identifiers, section titles and paths, locators, exact quote
@@ -163,10 +209,11 @@ or shared reports. Query telemetry contains only bounded intent, cutoff,
 count-bucket, and outcome fields.
 
 Local query acceptance is provider-free: help, configuration validation,
-deterministic tests, and PostgreSQL integration require no Google, Directory,
-Bedrock, Anthropic, OpenAI, disclosure, or model construction. Point-in-time,
-trajectory, and explicit-causal CLI execution are not implemented in this
-phase; those command forms remain invalid until D4.
+deterministic tests, and synthetic PostgreSQL integration require no Google,
+Directory, Bedrock, Anthropic, OpenAI, disclosure, model construction, or
+private corpus. It validates the local canonical query boundary only; it does
+not validate live source, directory, model-provider, cloud, web, or cache
+behavior.
 
 ## Configure the local environment
 
@@ -374,7 +421,7 @@ and model quality.
 | `STACKS_ANALYSIS_PROMPT_VERSION` | `analyze-v1` | Versioned pair-analysis prompt |
 | `STACKS_QUERY_MAX_ENTITIES` | `16` | Maximum unique entity IDs per temporal query, from `1` to `64` |
 | `STACKS_QUERY_MAX_PREDICATES` | `32` | Maximum unique predicates per temporal query, from `1` to `256` |
-| `STACKS_QUERY_MAX_CHRONOLOGY` | `1000` | Maximum later chronology expansion, from `1` to `10000`; trend does not consume it |
+| `STACKS_QUERY_MAX_CHRONOLOGY` | `1000` | Maximum trajectory/causal chronology bound, from `1` to `10000`; point and trend use zero |
 | `STACKS_EMPLOYEE_ENTITY_ID` | no default | Accepted employee entity used by `analyze` |
 | `STACKS_MANAGER_ENTITY_ID` | no default | Accepted manager entity used by `analyze` |
 

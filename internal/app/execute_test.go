@@ -274,6 +274,76 @@ func TestExecuteRoutesTypedTrendThroughLazyQueryCommand(t *testing.T) {
 	}
 }
 
+func TestExecuteRoutesEveryTemporalQueryLeafThroughOneQueryCommand(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		action cli.Action
+		intent temporal.Intent
+	}{
+		{
+			name: "point", action: cli.ActionPoint, intent: temporal.IntentPointInTime,
+			args: []string{"query", "point", "--entity", "entity-a", "--at", "2025-01-15T00:00:00Z"},
+		},
+		{
+			name: "trend", action: cli.ActionTrend, intent: temporal.IntentTrendComparison,
+			args: []string{
+				"query", "trend", "--entity", "entity-a",
+				"--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z",
+				"--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z",
+			},
+		},
+		{
+			name: "trajectory", action: cli.ActionTrajectory, intent: temporal.IntentTrajectory,
+			args: []string{
+				"query", "trajectory", "--entity", "entity-a",
+				"--between", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z", "--limit", "10",
+			},
+		},
+		{
+			name: "causal", action: cli.ActionCausal, intent: temporal.IntentCausalChain,
+			args: []string{
+				"query", "causal", "--entity", "entity-a",
+				"--between", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z", "--limit", "10",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := config.Settings{
+				Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+				Query: config.QuerySettings{
+					MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000,
+				},
+			}
+			var got cli.Invocation
+			providerCalls := 0
+			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+				providerCalls++
+				return map[string]cli.Command{"query": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
+					got = invocation
+					return nil
+				})}, nil
+			})
+			err := executeWithSettings(
+				t.Context(), test.args, settings,
+				RuntimeFunc(func(context.Context, config.Settings) error {
+					return errors.New("serve must not run")
+				}),
+				provider, io.Discard, io.Discard,
+			)
+			if err != nil {
+				t.Fatalf("executeWithSettings() error = %v", err)
+			}
+			if providerCalls != 1 || got.Command != cli.CommandQuery ||
+				got.Action != test.action || got.Query == nil ||
+				got.Query.Request.Intent != test.intent {
+				t.Fatalf("provider calls/invocation = %d/%#v", providerCalls, got)
+			}
+		})
+	}
+}
+
 func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *testing.T) {
 	tests := []struct {
 		name      string

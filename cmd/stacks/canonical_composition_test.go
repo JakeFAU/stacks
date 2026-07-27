@@ -390,6 +390,87 @@ func TestQueryTrendRejectsD4IntentsBeforeDatabaseConstruction(t *testing.T) {
 	}
 }
 
+func TestQueryChronologyAndCausalValidationFailsBeforeDatabaseConstruction(t *testing.T) {
+	window, err := temporal.Between(
+		"between",
+		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, time.February, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name       string
+		action     cli.Action
+		intent     temporal.Intent
+		predicates []observation.Predicate
+		limit      int
+	}{
+		{name: "trajectory missing limit", action: cli.ActionTrajectory, intent: temporal.IntentTrajectory},
+		{name: "trajectory negative limit", action: cli.ActionTrajectory, intent: temporal.IntentTrajectory, limit: -1},
+		{name: "trajectory over maximum", action: cli.ActionTrajectory, intent: temporal.IntentTrajectory, limit: 1001},
+		{
+			name: "causal missing limit", action: cli.ActionCausal, intent: temporal.IntentCausalChain,
+			predicates: []observation.Predicate{query.CausalPredicate},
+		},
+		{
+			name: "causal negative limit", action: cli.ActionCausal, intent: temporal.IntentCausalChain,
+			predicates: []observation.Predicate{query.CausalPredicate}, limit: -1,
+		},
+		{
+			name: "causal over maximum", action: cli.ActionCausal, intent: temporal.IntentCausalChain,
+			predicates: []observation.Predicate{query.CausalPredicate}, limit: 1001,
+		},
+		{
+			name: "causal wrong predicate", action: cli.ActionCausal, intent: temporal.IntentCausalChain,
+			predicates: []observation.Predicate{"private.causal-predicate"}, limit: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invocation := cli.Invocation{
+				Command: cli.CommandQuery, Action: test.action,
+				Query: &cli.QueryInput{
+					Request: query.Request{
+						Intent: test.intent, EntityIDs: []identity.EntityID{"private-entity"},
+						EntityMatch: query.EntityMatchAll, Predicates: test.predicates,
+						Selections:     []temporal.TemporalSelection{window},
+						KnowledgeScope: temporal.CurrentKnowledge(), Limit: test.limit,
+					},
+					Output: cli.QueryOutputText,
+				},
+			}
+			var opens int
+			runtime := commandRuntime{
+				openQueryDatabase: func(context.Context, string) (queryDatabase, error) {
+					opens++
+					return &recordingQueryDatabase{}, nil
+				},
+			}
+			commands, err := commandProviderWithRuntime(
+				context.Background(), validQueryCommandSettings(), io.Discard, io.Discard,
+				tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = commands[string(config.CommandQuery)].Run(context.Background(), invocation)
+			if err == nil {
+				t.Fatal("query error = nil, want validation failure")
+			}
+			if opens != 0 {
+				t.Fatalf("database opens = %d, want 0", opens)
+			}
+			for _, privateValue := range []string{"private-entity", "private.causal-predicate"} {
+				if strings.Contains(err.Error(), privateValue) {
+					t.Fatalf("error %q contains private request material", err)
+				}
+			}
+		})
+	}
+}
+
 func TestQueryTrendPreservesCancellationAndBoundedTelemetry(t *testing.T) {
 	const (
 		privateEntity    = identity.EntityID("private-entity-marker-d34")

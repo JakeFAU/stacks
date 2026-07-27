@@ -60,7 +60,7 @@ func targetForInvocation(invocation cli.Invocation) (validationTarget, error) {
 
 	target := validationTarget{Command: config.Command(invocation.Command)}
 	if invocation.Command == cli.CommandQuery {
-		if invocation.Action != cli.ActionTrend || invocation.Query == nil || len(invocation.Arguments) != 0 {
+		if err := cli.ValidateQueryInvocation(invocation); err != nil {
 			return validationTarget{}, fmt.Errorf("query invocation is invalid")
 		}
 		return target, nil
