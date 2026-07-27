@@ -3,6 +3,7 @@ package query
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -250,6 +251,9 @@ func NormalizeResult(result Result) (Result, error) {
 	if payload.intent != result.Intent {
 		return Result{}, fmt.Errorf("result payload intent does not match result intent")
 	}
+	if selections, err := payloadSelections(payload); err != nil || !slices.Equal(result.Selections, selections) {
+		return Result{}, fmt.Errorf("result selections do not match payload selections")
+	}
 	result.Payload = payload
 	result.Gaps = append([]Gap{}, result.Gaps...)
 	for index := range result.Gaps {
@@ -330,7 +334,11 @@ func normalizeTrendResult(value *TrendResult) error {
 	}
 	value.Before = normalizeWindow(value.Before)
 	value.After = normalizeWindow(value.After)
-	value.Changes = normalizeChanges(value.Changes)
+	changes, err := normalizeChanges(value.Changes)
+	if err != nil {
+		return err
+	}
+	value.Changes = changes
 	value.UnresolvedKeys = append([]temporal.StateKey{}, value.UnresolvedKeys...)
 	orderStateKeys(value.UnresolvedKeys)
 	return nil
@@ -380,9 +388,12 @@ func normalizeUnresolved(values []UnresolvedItem) []UnresolvedItem {
 	orderUnresolvedItems(values)
 	return values
 }
-func normalizeChanges(values []Change) []Change {
+func normalizeChanges(values []Change) ([]Change, error) {
 	values = append([]Change{}, values...)
 	for index := range values {
+		if err := validateChangeShape(values[index].Kind, values[index].Before, values[index].After); err != nil {
+			return nil, err
+		}
 		if values[index].Before != nil {
 			value := normalizeFact(*values[index].Before)
 			values[index].Before = &value
@@ -393,11 +404,11 @@ func normalizeChanges(values []Change) []Change {
 		}
 	}
 	orderChanges(values)
-	return values
+	return values, nil
 }
 func normalizeTransition(value *Transition) error {
-	if !validChange(value.Kind) {
-		return fmt.Errorf("transition kind is invalid")
+	if err := validateChangeShape(value.Kind, value.Before, value.After); err != nil {
+		return err
 	}
 	if value.Before != nil {
 		fact := normalizeFact(*value.Before)
@@ -447,8 +458,51 @@ func validGapKind(value GapKind) bool {
 		return false
 	}
 }
-func validChange(value temporal.ChangeKind) bool {
-	return value == temporal.ChangeAdded || value == temporal.ChangeRemoved || value == temporal.ChangeChanged
+func validateChangeShape(kind temporal.ChangeKind, before, after *Fact) error {
+	switch kind {
+	case temporal.ChangeAdded:
+		if before != nil || after == nil {
+			return fmt.Errorf("added change requires only an after fact")
+		}
+	case temporal.ChangeRemoved:
+		if before == nil || after != nil {
+			return fmt.Errorf("removed change requires only a before fact")
+		}
+	case temporal.ChangeChanged:
+		if before == nil || after == nil {
+			return fmt.Errorf("changed change requires before and after facts")
+		}
+	default:
+		return fmt.Errorf("change kind is invalid")
+	}
+	return nil
+}
+
+func payloadSelections(payload IntentPayload) ([]temporal.TemporalSelection, error) {
+	switch payload.intent {
+	case temporal.IntentPointInTime:
+		if payload.point == nil {
+			return nil, fmt.Errorf("point payload is missing")
+		}
+		return []temporal.TemporalSelection{payload.point.Selection}, nil
+	case temporal.IntentTrendComparison:
+		if payload.trend == nil {
+			return nil, fmt.Errorf("trend payload is missing")
+		}
+		return []temporal.TemporalSelection{payload.trend.Before.Selection, payload.trend.After.Selection}, nil
+	case temporal.IntentTrajectory:
+		if payload.trajectory == nil {
+			return nil, fmt.Errorf("trajectory payload is missing")
+		}
+		return []temporal.TemporalSelection{payload.trajectory.Selection}, nil
+	case temporal.IntentCausalChain:
+		if payload.causal == nil {
+			return nil, fmt.Errorf("causal payload is missing")
+		}
+		return []temporal.TemporalSelection{payload.causal.Selection}, nil
+	default:
+		return nil, fmt.Errorf("payload intent is invalid")
+	}
 }
 
 func clonePointResult(value PointInTimeResult) PointInTimeResult {

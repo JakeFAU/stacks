@@ -3,6 +3,7 @@ package query
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -143,6 +144,72 @@ func TestValidateResultRequiresExactlyOneMatchingPayload(t *testing.T) {
 	}
 }
 
+func TestValidateResultRequiresPayloadSelectionsToMatchRequest(t *testing.T) {
+	point := mustPoint(t, "point", 2026, time.January, 1)
+	otherPoint := mustPoint(t, "other-point", 2026, time.February, 1)
+	before := mustWindow(t, "before", 2026, time.January, 1)
+	after := mustWindow(t, "after", 2026, time.February, 1)
+	otherWindow := mustWindow(t, "other", 2026, time.March, 1)
+
+	pointPayload := mustPointPayload(t, otherPoint)
+	trendPayload := mustTrendPayload(t, otherWindow, after)
+	trajectoryPayload := mustTrajectoryPayload(t, otherWindow)
+	causalPayload := mustCausalPayload(t, otherWindow)
+	tests := []struct {
+		name       string
+		intent     temporal.Intent
+		selections []temporal.TemporalSelection
+		limit      int
+		payload    IntentPayload
+		predicates []observation.Predicate
+	}{
+		{"point", temporal.IntentPointInTime, []temporal.TemporalSelection{point}, 0, pointPayload, []observation.Predicate{}},
+		{"trend", temporal.IntentTrendComparison, []temporal.TemporalSelection{before, after}, 0, trendPayload, []observation.Predicate{}},
+		{"trajectory", temporal.IntentTrajectory, []temporal.TemporalSelection{before}, 1, trajectoryPayload, []observation.Predicate{}},
+		{"causal", temporal.IntentCausalChain, []temporal.TemporalSelection{before}, 1, causalPayload, []observation.Predicate{CausalPredicate}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := Result{Intent: test.intent, EntityIDs: []identity.EntityID{"entity-a"}, EntityMatch: EntityMatchAll, Predicates: test.predicates, Selections: test.selections, KnowledgeScope: temporal.CurrentKnowledge(), Limit: test.limit, Payload: test.payload, Gaps: []Gap{}}
+			if err := ValidateResult(result); err == nil {
+				t.Fatal("ValidateResult() error = nil, want payload selection mismatch")
+			}
+		})
+	}
+}
+
+func TestPayloadsRejectUnknownChangeKindsAndImpossibleShapes(t *testing.T) {
+	before := mustWindow(t, "before", 2026, time.January, 1)
+	after := mustWindow(t, "after", 2026, time.February, 1)
+	key := mustStateKey(t, "entity-a", "predicate-a")
+	fact := validFact(t, key, "value")
+	tests := []struct {
+		name   string
+		change Change
+	}{
+		{"unknown kind", Change{Kind: "unknown", Key: key, After: &fact}},
+		{"added with before", Change{Kind: temporal.ChangeAdded, Key: key, Before: &fact, After: &fact}},
+		{"added without after", Change{Kind: temporal.ChangeAdded, Key: key}},
+		{"removed with after", Change{Kind: temporal.ChangeRemoved, Key: key, Before: &fact, After: &fact}},
+		{"removed without before", Change{Kind: temporal.ChangeRemoved, Key: key}},
+		{"changed without before", Change{Kind: temporal.ChangeChanged, Key: key, After: &fact}},
+		{"changed without after", Change{Kind: temporal.ChangeChanged, Key: key, Before: &fact}},
+	}
+	for _, test := range tests {
+		t.Run("trend "+test.name, func(t *testing.T) {
+			if _, err := NewTrendPayload(TrendResult{Before: WindowResult{Selection: before}, After: WindowResult{Selection: after}, Changes: []Change{test.change}}); err == nil {
+				t.Fatal("NewTrendPayload() error = nil, want invalid change error")
+			}
+		})
+		t.Run("trajectory "+test.name, func(t *testing.T) {
+			transition := Transition{Kind: test.change.Kind, Key: test.change.Key, ValidTime: mustInstant(t), Before: test.change.Before, After: test.change.After}
+			if _, err := NewTrajectoryPayload(TrajectoryResult{Selection: before, Transitions: []Transition{transition}}); err == nil {
+				t.Fatal("NewTrajectoryPayload() error = nil, want invalid transition error")
+			}
+		})
+	}
+}
+
 func TestResultCollectionsAreNonNilAndCanonicallyOrdered(t *testing.T) {
 	keyA := mustStateKey(t, "entity-a", "predicate-a")
 	keyB := mustStateKey(t, "entity-b", "predicate-b")
@@ -179,6 +246,114 @@ func TestTypedErrorsDoNotContainSuppliedEntityIDsOrPrivatePayloads(t *testing.T)
 		if strings.Contains(err.Error(), private) {
 			t.Errorf("error %q contains supplied private payload", err)
 		}
+	}
+	point := mustPoint(t, "at", 2026, time.January, 1)
+	for _, request := range []Request{
+		{Intent: temporal.IntentPointInTime, EntityIDs: []identity.EntityID{identity.EntityID(private), identity.EntityID(private)}, EntityMatch: EntityMatchAll, Selections: []temporal.TemporalSelection{point}, KnowledgeScope: temporal.CurrentKnowledge()},
+		{Intent: temporal.IntentPointInTime, EntityIDs: []identity.EntityID{"entity-a"}, EntityMatch: EntityMatchAll, Predicates: []observation.Predicate{observation.Predicate(private), observation.Predicate(private)}, Selections: []temporal.TemporalSelection{point}, KnowledgeScope: temporal.CurrentKnowledge()},
+	} {
+		_, err := NormalizeRequest(request, validLimits())
+		if err == nil {
+			t.Fatal("NormalizeRequest() error = nil, want privacy-safe validation error")
+		}
+		if strings.Contains(err.Error(), private) {
+			t.Errorf("NormalizeRequest() error %q contains supplied private payload", err)
+		}
+	}
+}
+
+func TestPayloadConstructorsAndAccessorsDefensivelyCopyNestedSlices(t *testing.T) {
+	window := mustWindow(t, "window", 2026, time.January, 1)
+	key := mustStateKey(t, "entity-a", "predicate-a")
+	input := TrajectoryResult{Selection: window, Transitions: []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: mustInstant(t), After: &Fact{Key: key, Value: mustText(t, "value"), Contributions: []Contribution{}, SupportingCitations: []Citation{{EvidenceID: "evidence-a", Role: observation.EvidenceSupporting, SourceDocumentID: "document", DocumentVersionID: "version", SectionID: "section", SectionTitle: "title", SectionPath: []string{"parent"}, SectionOrder: 0, SectionRole: "body", StartOffset: 0, EndOffset: 1}}, ContradictingCitations: []Citation{}}}}}
+	payload, err := NewTrajectoryPayload(input)
+	if err != nil {
+		t.Fatalf("NewTrajectoryPayload() error = %v", err)
+	}
+	input.Transitions[0].After.SupportingCitations[0].SectionPath[0] = "mutated-input"
+	first, ok := payload.Trajectory()
+	if !ok || first.Transitions[0].After.SupportingCitations[0].SectionPath[0] != "parent" {
+		t.Fatalf("payload stored input mutation: %#v", first)
+	}
+	first.Transitions[0].After.SupportingCitations[0].SectionPath[0] = "mutated-output"
+	second, ok := payload.Trajectory()
+	if !ok || second.Transitions[0].After.SupportingCitations[0].SectionPath[0] != "parent" {
+		t.Errorf("payload stored accessor mutation: %#v", second)
+	}
+}
+
+func TestOrderingIsTotalAcrossEarlierKeyTies(t *testing.T) {
+	key := mustStateKey(t, "entity-a", "predicate-a")
+	firstFact := validFact(t, key, "value")
+	secondFact := validFact(t, key, "value")
+	firstFact.Contributions = []Contribution{{ObservationID: "observation", Status: observation.StatusObserved, ValidTime: mustInstant(t), RecordedAt: time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), Derivation: observation.Derivation{Method: "method-a", Version: "v1"}}}
+	secondFact.Contributions = append([]Contribution{}, firstFact.Contributions...)
+	secondFact.Contributions[0].Derivation.Method = "method-b"
+	first := []Fact{firstFact, secondFact}
+	second := []Fact{secondFact, firstFact}
+	orderFacts(first)
+	orderFacts(second)
+	if !slices.EqualFunc(first, second, func(left, right Fact) bool { return reflect.DeepEqual(left, right) }) {
+		t.Errorf("orderFacts() differs after reverse: %#v and %#v", first, second)
+	}
+
+	firstContribution := Contribution{ObservationID: "observation", Status: observation.StatusObserved, ValidTime: mustInstant(t), RecordedAt: time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), Derivation: observation.Derivation{Method: "method-a", Version: "v1"}}
+	secondContribution := firstContribution
+	secondContribution.Derivation.Method = "method-b"
+	contributionsA, contributionsB := []Contribution{firstContribution, secondContribution}, []Contribution{secondContribution, firstContribution}
+	orderContributions(contributionsA)
+	orderContributions(contributionsB)
+	if !slices.EqualFunc(contributionsA, contributionsB, func(left, right Contribution) bool { return reflect.DeepEqual(left, right) }) {
+		t.Errorf("orderContributions() differs after reverse")
+	}
+
+	firstCitation := validCitation("evidence")
+	secondCitation := firstCitation
+	secondCitation.SectionTitle = "later title"
+	citationsA, citationsB := []Citation{firstCitation, secondCitation}, []Citation{secondCitation, firstCitation}
+	orderCitations(citationsA)
+	orderCitations(citationsB)
+	if !slices.EqualFunc(citationsA, citationsB, func(left, right Citation) bool { return reflect.DeepEqual(left, right) }) {
+		t.Errorf("orderCitations() differs after reverse")
+	}
+
+	firstChange, secondChange := Change{Kind: temporal.ChangeAdded, Key: key, After: &firstFact}, Change{Kind: temporal.ChangeAdded, Key: key, After: &secondFact}
+	changesA, changesB := []Change{firstChange, secondChange}, []Change{secondChange, firstChange}
+	orderChanges(changesA)
+	orderChanges(changesB)
+	if !reflect.DeepEqual(changesA, changesB) {
+		t.Errorf("orderChanges() differs after reverse")
+	}
+
+	firstUnresolved, secondUnresolved := UnresolvedItem{Key: key, Reason: temporal.UnresolvedHypothesis, Candidates: []Fact{firstFact}}, UnresolvedItem{Key: key, Reason: temporal.UnresolvedHypothesis, Candidates: []Fact{secondFact}}
+	unresolvedA, unresolvedB := []UnresolvedItem{firstUnresolved, secondUnresolved}, []UnresolvedItem{secondUnresolved, firstUnresolved}
+	orderUnresolvedItems(unresolvedA)
+	orderUnresolvedItems(unresolvedB)
+	if !reflect.DeepEqual(unresolvedA, unresolvedB) {
+		t.Errorf("orderUnresolvedItems() differs after reverse")
+	}
+
+	firstTransition, secondTransition := Transition{Kind: temporal.ChangeAdded, Key: key, ValidTime: mustInstant(t), After: &firstFact}, Transition{Kind: temporal.ChangeAdded, Key: key, ValidTime: mustInstant(t), After: &secondFact}
+	transitionsA, transitionsB := []Transition{firstTransition, secondTransition}, []Transition{secondTransition, firstTransition}
+	orderTransitions(transitionsA)
+	orderTransitions(transitionsB)
+	if !reflect.DeepEqual(transitionsA, transitionsB) {
+		t.Errorf("orderTransitions() differs after reverse")
+	}
+
+	firstLink, secondLink := CausalLink{Cause: mustText(t, "cause"), Effect: mustText(t, "effect"), Contributions: firstFact.Contributions, SupportingCitations: firstFact.SupportingCitations, ContradictingCitations: []Citation{}}, CausalLink{Cause: mustText(t, "cause"), Effect: mustText(t, "effect"), Contributions: secondFact.Contributions, SupportingCitations: secondFact.SupportingCitations, ContradictingCitations: []Citation{}}
+	linksA, linksB := []CausalLink{firstLink, secondLink}, []CausalLink{secondLink, firstLink}
+	orderCausalLinks(linksA)
+	orderCausalLinks(linksB)
+	if !reflect.DeepEqual(linksA, linksB) {
+		t.Errorf("orderCausalLinks() differs after reverse")
+	}
+
+	gapsA, gapsB := []Gap{{Kind: GapNoEvidence, EntityID: "entity", SelectionLabel: "selection", Predicate: "predicate-a"}, {Kind: GapNoEvidence, EntityID: "entity", SelectionLabel: "selection", Predicate: "predicate-b"}}, []Gap{{Kind: GapNoEvidence, EntityID: "entity", SelectionLabel: "selection", Predicate: "predicate-b"}, {Kind: GapNoEvidence, EntityID: "entity", SelectionLabel: "selection", Predicate: "predicate-a"}}
+	orderGaps(gapsA)
+	orderGaps(gapsB)
+	if !reflect.DeepEqual(gapsA, gapsB) {
+		t.Errorf("orderGaps() differs after reverse")
 	}
 }
 
@@ -236,6 +411,47 @@ func mustInstant(t *testing.T) observation.TemporalExtent {
 
 func validCitation(id evidence.EvidenceID) Citation {
 	return Citation{EvidenceID: id, Role: observation.EvidenceSupporting, SourceDocumentID: "document", DocumentVersionID: "version", SectionID: "section", SectionTitle: "section", SectionPath: []string{}, SectionOrder: 0, SectionRole: "body", StartOffset: 0, EndOffset: 1}
+}
+
+func validFact(t *testing.T, key temporal.StateKey, value string) Fact {
+	t.Helper()
+	return Fact{Key: key, Value: mustText(t, value), Contributions: []Contribution{}, SupportingCitations: []Citation{validCitation("evidence")}, ContradictingCitations: []Citation{}}
+}
+
+func mustPointPayload(t *testing.T, selection temporal.TemporalSelection) IntentPayload {
+	t.Helper()
+	payload, err := NewPointPayload(PointInTimeResult{Selection: selection})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func mustTrendPayload(t *testing.T, before, after temporal.TemporalSelection) IntentPayload {
+	t.Helper()
+	payload, err := NewTrendPayload(TrendResult{Before: WindowResult{Selection: before}, After: WindowResult{Selection: after}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func mustTrajectoryPayload(t *testing.T, selection temporal.TemporalSelection) IntentPayload {
+	t.Helper()
+	payload, err := NewTrajectoryPayload(TrajectoryResult{Selection: selection})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func mustCausalPayload(t *testing.T, selection temporal.TemporalSelection) IntentPayload {
+	t.Helper()
+	payload, err := NewCausalPayload(CausalChainResult{Selection: selection})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
 }
 
 func equalRequest(left, right Request) bool {
