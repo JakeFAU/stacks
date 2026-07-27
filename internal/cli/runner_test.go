@@ -7,6 +7,13 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/JakeFAU/stacks/core/identity"
+	"github.com/JakeFAU/stacks/core/observation"
+	"github.com/JakeFAU/stacks/core/temporal"
+
+	"stacks/internal/query"
 )
 
 func TestRunnerPreservesSelectedCommandErrorIdentity(t *testing.T) {
@@ -105,6 +112,7 @@ func TestRunnerParsesConfigValidationTargets(t *testing.T) {
 		{[]string{"config", "validate", "entities"}, CommandEntities, ""},
 		{[]string{"config", "validate", "review"}, CommandReview, ""},
 		{[]string{"config", "validate", "analyze"}, CommandAnalyze, ""},
+		{[]string{"config", "validate", "query"}, CommandQuery, ""},
 		{[]string{"config", "validate", "db-migrate"}, CommandDBMigrate, ""},
 		{[]string{"config", "validate", "db-status"}, CommandDBStatus, ""},
 		{[]string{"config", "validate", "db-reset"}, CommandDBReset, ""},
@@ -129,6 +137,217 @@ func TestRunnerParsesConfigValidationTargets(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunnerParsesTrendQueryIntoTypedNormalizedInvocation(t *testing.T) {
+	var got Invocation
+	args := []string{
+		"query", "trend",
+		"--entity", "entity-b",
+		"--entity", "entity-a",
+		"--entity-match", "any",
+		"--predicate", "stacks.example.v1/manages",
+		"--predicate", "stacks.example.v1/reports-to",
+		"--before", "2025-01-01T00:00:00-05:00/2025-02-01T00:00:00-05:00",
+		"--after", "2025-03-01T00:00:00+02:00/2025-04-01T00:00:00+02:00",
+		"--known-as-of", "2025-05-01T00:00:00-04:00",
+		"--output", "json",
+	}
+	err := (Runner{Execute: func(_ context.Context, invocation Invocation) error {
+		got = invocation
+		return nil
+	}}).Run(t.Context(), args)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got.Command != CommandQuery || got.Action != ActionTrend || len(got.Arguments) != 0 || got.Query == nil {
+		t.Fatalf("invocation = %#v, want typed query trend", got)
+	}
+	wantRequest := query.Request{
+		Intent:         temporal.IntentTrendComparison,
+		EntityIDs:      []identity.EntityID{"entity-b", "entity-a"},
+		EntityMatch:    query.EntityMatchAny,
+		Predicates:     []observation.Predicate{"stacks.example.v1/manages", "stacks.example.v1/reports-to"},
+		Selections:     got.Query.Request.Selections,
+		KnowledgeScope: got.Query.Request.KnowledgeScope,
+	}
+	if !reflect.DeepEqual(got.Query.Request, wantRequest) || got.Query.Output != QueryOutputJSON {
+		t.Fatalf("Query = %#v, want %#v with JSON output", got.Query, wantRequest)
+	}
+	assertQueryWindow(t, got.Query.Request.Selections[0], "before",
+		"2025-01-01T05:00:00Z", "2025-02-01T05:00:00Z")
+	assertQueryWindow(t, got.Query.Request.Selections[1], "after",
+		"2025-02-28T22:00:00Z", "2025-03-31T22:00:00Z")
+	cutoff, ok := got.Query.Request.KnowledgeScope.AsOf()
+	if !ok || cutoff.Location() != time.UTC || cutoff.Format(time.RFC3339) != "2025-05-01T04:00:00Z" {
+		t.Fatalf("knowledge cutoff = %v/%t, want normalized UTC", cutoff, ok)
+	}
+}
+
+func TestRunnerDefaultsTrendQueryMatchOutputAndKnowledgeScope(t *testing.T) {
+	var got Invocation
+	err := (Runner{Execute: func(_ context.Context, invocation Invocation) error {
+		got = invocation
+		return nil
+	}}).Run(t.Context(), []string{
+		"query", "trend",
+		"--entity", "entity-a",
+		"--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z",
+		"--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got.Query == nil || got.Query.Request.EntityMatch != query.EntityMatchAll ||
+		got.Query.Output != QueryOutputText ||
+		got.Query.Request.KnowledgeScope.Kind() != temporal.KnowledgeCurrent ||
+		got.Query.Request.Predicates == nil || len(got.Query.Request.Predicates) != 0 {
+		t.Fatalf("default Query = %#v, want all/text/current with empty predicates", got.Query)
+	}
+}
+
+func TestRunnerRejectsInvalidTrendSyntaxBeforeExecution(t *testing.T) {
+	valid := []string{
+		"query", "trend",
+		"--entity", "entity-a",
+		"--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z",
+		"--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z",
+	}
+	tests := []struct {
+		name         string
+		args         []string
+		privateInput string
+	}{
+		{name: "query group", args: []string{"query"}},
+		{name: "unsupported action", args: []string{"query", "trajectory"}},
+		{name: "positional input", args: append(append([]string{}, valid...), "synthetic-private-position"), privateInput: "synthetic-private-position"},
+		{name: "unknown flag", args: append(append([]string{}, valid...), "--synthetic-private-flag", "value"), privateInput: "synthetic-private-flag"},
+		{name: "missing entity", args: withoutQueryFlag(valid, "--entity")},
+		{name: "blank entity", args: replaceQueryFlag(valid, "--entity", " \t ")},
+		{name: "duplicate entity", args: append(append([]string{}, valid...), "--entity", "synthetic-private-entity", "--entity", "synthetic-private-entity"), privateInput: "synthetic-private-entity"},
+		{name: "blank predicate", args: append(append([]string{}, valid...), "--predicate", " \t ")},
+		{name: "duplicate predicate", args: append(append([]string{}, valid...), "--predicate", "synthetic-private-predicate", "--predicate", "synthetic-private-predicate"), privateInput: "synthetic-private-predicate"},
+		{name: "invalid match", args: append(append([]string{}, valid...), "--entity-match", "synthetic-private-match"), privateInput: "synthetic-private-match"},
+		{name: "invalid output", args: append(append([]string{}, valid...), "--output", "synthetic-private-output"), privateInput: "synthetic-private-output"},
+		{name: "before without slash", args: replaceQueryFlag(valid, "--before", "2025-01-01T00:00:00Z")},
+		{name: "before multiple slashes", args: replaceQueryFlag(valid, "--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z/synthetic-private-window"), privateInput: "synthetic-private-window"},
+		{name: "blank window bound", args: replaceQueryFlag(valid, "--before", "/2025-02-01T00:00:00Z")},
+		{name: "non RFC3339", args: replaceQueryFlag(valid, "--before", "2025-01-01/2025-02-01")},
+		{name: "empty half open window", args: replaceQueryFlag(valid, "--before", "2025-01-01T00:00:00Z/2025-01-01T00:00:00Z")},
+		{name: "reversed half open window", args: replaceQueryFlag(valid, "--before", "2025-02-01T00:00:00Z/2025-01-01T00:00:00Z")},
+		{name: "unordered windows", args: replaceQueryFlag(valid, "--after", "2024-03-01T00:00:00Z/2024-04-01T00:00:00Z")},
+		{name: "invalid cutoff", args: append(append([]string{}, valid...), "--known-as-of", "synthetic-private-cutoff"), privateInput: "synthetic-private-cutoff"},
+		{name: "duplicate before flag", args: append(append([]string{}, valid...), "--before", "2026-01-01T00:00:00Z/2026-02-01T00:00:00Z")},
+		{name: "duplicate match flag", args: append(append([]string{}, valid...), "--entity-match", "any", "--entity-match", "all")},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			var stderr strings.Builder
+			calls := 0
+			err := (Runner{
+				Error: &stderr,
+				Execute: func(context.Context, Invocation) error {
+					calls++
+					return nil
+				},
+			}).Run(t.Context(), testCase.args)
+			if err == nil {
+				t.Fatal("Run() error = nil, want syntax rejection")
+			}
+			if calls != 0 {
+				t.Fatalf("Execute calls = %d, want 0", calls)
+			}
+			if testCase.privateInput != "" &&
+				(strings.Contains(err.Error(), testCase.privateInput) || strings.Contains(stderr.String(), testCase.privateInput)) {
+				t.Fatalf("syntax failure exposed private input: error=%q stderr=%q", err, stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunnerUsesFreshTrendFlagsForEachExecution(t *testing.T) {
+	var got []Invocation
+	runner := Runner{Execute: func(_ context.Context, invocation Invocation) error {
+		got = append(got, invocation)
+		return nil
+	}}
+	first := []string{
+		"query", "trend", "--entity", "entity-a", "--entity-match", "any",
+		"--predicate", "predicate-a",
+		"--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z",
+		"--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z",
+		"--known-as-of", "2025-05-01T00:00:00Z", "--output", "json",
+	}
+	second := []string{
+		"query", "trend", "--entity", "entity-b",
+		"--before", "2026-01-01T00:00:00Z/2026-02-01T00:00:00Z",
+		"--after", "2026-03-01T00:00:00Z/2026-04-01T00:00:00Z",
+	}
+	if err := runner.Run(t.Context(), first); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	if err := runner.Run(t.Context(), second); err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+	if len(got) != 2 || got[1].Query == nil ||
+		!reflect.DeepEqual(got[1].Query.Request.EntityIDs, []identity.EntityID{"entity-b"}) ||
+		len(got[1].Query.Request.Predicates) != 0 ||
+		got[1].Query.Request.EntityMatch != query.EntityMatchAll ||
+		got[1].Query.Request.KnowledgeScope.Kind() != temporal.KnowledgeCurrent ||
+		got[1].Query.Output != QueryOutputText {
+		t.Fatalf("second invocation = %#v, want isolated default query flags", got)
+	}
+}
+
+func TestRunnerCarriesConfigAtExactTrendCommandPlacements(t *testing.T) {
+	for _, args := range [][]string{
+		{"--config", "/synthetic/stacks.yaml", "query", "trend", "--entity", "entity-a", "--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z", "--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z"},
+		{"query", "--config", "/synthetic/stacks.yaml", "trend", "--entity", "entity-a", "--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z", "--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z"},
+		{"query", "trend", "--config", "/synthetic/stacks.yaml", "--entity", "entity-a", "--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z", "--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z"},
+	} {
+		var got Invocation
+		err := (Runner{Execute: func(_ context.Context, invocation Invocation) error {
+			got = invocation
+			return nil
+		}}).Run(t.Context(), args)
+		if err != nil {
+			t.Fatalf("Run(%q) error = %v", args, err)
+		}
+		if got.ConfigFile == nil || *got.ConfigFile != "/synthetic/stacks.yaml" || got.Query == nil {
+			t.Fatalf("Run(%q) invocation = %#v, want config on typed query", args, got)
+		}
+	}
+}
+
+func assertQueryWindow(t *testing.T, selection temporal.TemporalSelection, label, start, end string) {
+	t.Helper()
+	gotStart, gotEnd, ok := selection.Window()
+	if !ok || selection.Label() != label ||
+		gotStart.Location() != time.UTC || gotEnd.Location() != time.UTC ||
+		gotStart.Format(time.RFC3339) != start || gotEnd.Format(time.RFC3339) != end {
+		t.Fatalf("selection = %q %v/%v/%t, want %q %s/%s UTC", selection.Label(), gotStart, gotEnd, ok, label, start, end)
+	}
+}
+
+func withoutQueryFlag(args []string, name string) []string {
+	result := append([]string{}, args...)
+	for index := 0; index < len(result)-1; index++ {
+		if result[index] == name {
+			return append(result[:index], result[index+2:]...)
+		}
+	}
+	return result
+}
+
+func replaceQueryFlag(args []string, name, value string) []string {
+	result := append([]string{}, args...)
+	for index := 0; index < len(result)-1; index++ {
+		if result[index] == name {
+			result[index+1] = value
+			return result
+		}
+	}
+	return result
 }
 
 func TestRunnerRejectsInvalidConfigValidationTargetsWithoutPrivateInput(t *testing.T) {

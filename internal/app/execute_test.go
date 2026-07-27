@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/temporal"
+
 	"stacks/internal/cli"
 	"stacks/internal/config"
 )
@@ -237,6 +239,38 @@ func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
 	}
 	if providerCalls != 1 || analyzeCalls != 1 {
 		t.Fatalf("provider/analyze calls = %d/%d, want 1/1", providerCalls, analyzeCalls)
+	}
+}
+
+func TestExecuteRoutesTypedTrendThroughLazyQueryCommand(t *testing.T) {
+	settings := config.Settings{
+		Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+		Query:    config.QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+	}
+	var got cli.Invocation
+	providerCalls := 0
+	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+		providerCalls++
+		return map[string]cli.Command{"query": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
+			got = invocation
+			return nil
+		})}, nil
+	})
+
+	err := executeWithSettings(t.Context(), []string{
+		"query", "trend",
+		"--entity", "entity-a",
+		"--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z",
+		"--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z",
+	}, settings, RuntimeFunc(func(context.Context, config.Settings) error {
+		return errors.New("serve must not run")
+	}), provider, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if providerCalls != 1 || got.Command != cli.CommandQuery || got.Action != cli.ActionTrend ||
+		got.Query == nil || got.Query.Request.Intent != temporal.IntentTrendComparison {
+		t.Fatalf("provider calls/invocation = %d/%#v, want one typed trend dispatch", providerCalls, got)
 	}
 }
 

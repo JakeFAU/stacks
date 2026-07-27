@@ -9,11 +9,20 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"stacks/internal/query"
 )
 
 const (
 	rootCommandUse                = "stacks"
 	configFlagName                = "config"
+	queryEntityFlagName           = "entity"
+	queryEntityMatchFlagName      = "entity-match"
+	queryPredicateFlagName        = "predicate"
+	queryBeforeFlagName           = "before"
+	queryAfterFlagName            = "after"
+	queryKnownAsOfFlagName        = "known-as-of"
+	queryOutputFlagName           = "output"
 	reviewCreateNameFlagName      = "name"
 	reviewCreateEmailFlagName     = "email"
 	acceptDirectoryEntityFlagName = "entity"
@@ -32,6 +41,7 @@ const (
 	CommandEntities  CommandName = "entities"
 	CommandReview    CommandName = "review"
 	CommandAnalyze   CommandName = "analyze"
+	CommandQuery     CommandName = "query"
 	CommandDBMigrate CommandName = "db-migrate"
 	CommandDBStatus  CommandName = "db-status"
 	CommandDBReset   CommandName = "db-reset"
@@ -51,6 +61,7 @@ const (
 	ActionReject              Action = "reject"
 	ActionCreate              Action = "create"
 	ActionCorrect             Action = "correct"
+	ActionTrend               Action = "trend"
 )
 
 // Invocation is the validated, provider-neutral CLI input for one application command.
@@ -62,6 +73,7 @@ type Invocation struct {
 	ConfigValidation *ConfigValidationInput
 	CreatePerson     *CreatePersonInput
 	AcceptDirectory  *AcceptDirectoryInput
+	Query            *QueryInput
 }
 
 // Command executes a typed application invocation.
@@ -193,6 +205,7 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 		CommandEntities,
 		CommandReview,
 		CommandAnalyze,
+		CommandQuery,
 		CommandDBMigrate,
 		CommandDBStatus,
 		CommandDBReset,
@@ -210,6 +223,35 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	auth.AddCommand(leaf(string(ActionAuthGoogle), CommandAuth, ActionAuthGoogle, cobra.NoArgs))
 	auth.AddCommand(leaf(string(ActionAuthGoogleDirectory), CommandAuth, ActionAuthGoogleDirectory, cobra.NoArgs))
 	root.AddCommand(auth)
+
+	queryCommand := invalidGroup(string(CommandQuery))
+	trend := &cobra.Command{
+		Use:  string(ActionTrend),
+		Args: cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			input, err := parseTrendQuery(command)
+			if err != nil {
+				return err
+			}
+			return execute(command, Invocation{
+				Command: CommandQuery,
+				Action:  ActionTrend,
+				Query:   &input,
+			})
+		},
+	}
+	trend.Flags().StringArray(queryEntityFlagName, nil, "canonical entity ID")
+	trend.Flags().Var(newSingleStringFlag(string(query.EntityMatchAll)), queryEntityMatchFlagName, "entity matching policy")
+	trend.Flags().StringArray(queryPredicateFlagName, nil, "exact observation predicate")
+	trend.Flags().Var(newSingleStringFlag(""), queryBeforeFlagName, "before half-open RFC3339 window")
+	trend.Flags().Var(newSingleStringFlag(""), queryAfterFlagName, "after half-open RFC3339 window")
+	trend.Flags().Var(newSingleStringFlag(""), queryKnownAsOfFlagName, "recorded-time RFC3339 cutoff")
+	trend.Flags().Var(newSingleStringFlag(string(QueryOutputText)), queryOutputFlagName, "output format")
+	_ = trend.MarkFlagRequired(queryEntityFlagName)
+	_ = trend.MarkFlagRequired(queryBeforeFlagName)
+	_ = trend.MarkFlagRequired(queryAfterFlagName)
+	queryCommand.AddCommand(trend)
+	root.AddCommand(queryCommand)
 
 	entities := &cobra.Command{Use: string(CommandEntities)}
 	entities.AddCommand(leaf(string(ActionList), CommandEntities, ActionList, cobra.NoArgs))
@@ -275,4 +317,30 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	root.AddCommand(review)
 
 	return root
+}
+
+type singleStringFlag struct {
+	value string
+	set   bool
+}
+
+func newSingleStringFlag(defaultValue string) *singleStringFlag {
+	return &singleStringFlag{value: defaultValue}
+}
+
+func (flag *singleStringFlag) Set(value string) error {
+	if flag.set {
+		return fmt.Errorf("flag may be provided only once")
+	}
+	flag.value = value
+	flag.set = true
+	return nil
+}
+
+func (flag *singleStringFlag) String() string {
+	return flag.value
+}
+
+func (*singleStringFlag) Type() string {
+	return "string"
 }

@@ -59,6 +59,12 @@ func targetForInvocation(invocation cli.Invocation) (validationTarget, error) {
 	}
 
 	target := validationTarget{Command: config.Command(invocation.Command)}
+	if invocation.Command == cli.CommandQuery {
+		if invocation.Action != cli.ActionTrend || invocation.Query == nil || len(invocation.Arguments) != 0 {
+			return validationTarget{}, fmt.Errorf("query invocation is invalid")
+		}
+		return target, nil
+	}
 	if invocation.Command != cli.CommandAuth {
 		return target, nil
 	}
@@ -83,7 +89,7 @@ func targetForConfigValidation(input cli.ConfigValidationInput) (validationTarge
 	}
 	switch input.Command {
 	case cli.CommandServe, cli.CommandDoctor, cli.CommandSync, cli.CommandEntities,
-		cli.CommandReview, cli.CommandAnalyze, cli.CommandDBMigrate,
+		cli.CommandReview, cli.CommandAnalyze, cli.CommandQuery, cli.CommandDBMigrate,
 		cli.CommandDBStatus, cli.CommandDBReset:
 		return validationTarget{Command: config.Command(input.Command)}, nil
 	default:
