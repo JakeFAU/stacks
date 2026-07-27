@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -65,6 +66,9 @@ var (
 	atlasOwnerCorrectionAt          = time.Date(2026, time.January, 2, 10, 10, 0, 0, time.UTC)
 	atlasStatusRetiredAt            = time.Date(2026, time.January, 2, 10, 20, 0, 0, time.UTC)
 	atlasConcurrentRetiredAt        = time.Date(2026, time.January, 2, 10, 30, 0, 0, time.UTC)
+	atlasTopologyVisibleAt          = time.Date(2026, time.January, 2, 10, 40, 0, 0, time.UTC)
+	atlasTopologyCutoff             = time.Date(2026, time.January, 2, 10, 50, 0, 0, time.UTC)
+	atlasTopologyFutureAt           = time.Date(2026, time.January, 2, 11, 0, 0, 0, time.UTC)
 	atlasValidAt                    = time.Date(2026, time.February, 1, 12, 0, 0, 0, time.UTC)
 )
 
@@ -188,6 +192,68 @@ func TestTemporalQueryPostgresLaterSupersessionDoesNotRewriteEarlierCutoff(t *te
 		TemporalCoverageAuthorityExcluded,
 		fixture.statusObservation.ID(),
 	)
+}
+
+func TestTemporalQueryPostgresRejectsVisibleResolutionBehindFuturePredecessor(
+	t *testing.T,
+) {
+	fixture := newTemporalQueryPostgresFixture(t)
+	fixture.appendResolutionTopologyAcrossCutoff(t)
+
+	_, err := fixture.database.LoadTemporalQuerySnapshot(
+		fixture.ctx,
+		fixture.selection(
+			[]identity.EntityID{atlasCurrentOwnerID},
+			TemporalEntityMatchAll,
+			atlasOwnerPredicate,
+			&atlasTopologyCutoff,
+		),
+		nil,
+	)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf(
+			"LoadTemporalQuerySnapshot() error = %v, want ErrConflict",
+			err,
+		)
+	}
+	if err.Error() !=
+		"load temporal query snapshot: validate canonical authority failed" {
+		t.Fatalf(
+			"LoadTemporalQuerySnapshot() error = %q, want bounded topology conflict",
+			err,
+		)
+	}
+}
+
+func TestTemporalQueryPostgresRejectsVisibleAdmissionBehindFuturePredecessor(
+	t *testing.T,
+) {
+	fixture := newTemporalQueryPostgresFixture(t)
+	fixture.appendAdmissionTopologyAcrossCutoff(t)
+
+	_, err := fixture.database.LoadTemporalQuerySnapshot(
+		fixture.ctx,
+		fixture.selection(
+			[]identity.EntityID{atlasCurrentOwnerID},
+			TemporalEntityMatchAll,
+			atlasOwnerPredicate,
+			&atlasTopologyCutoff,
+		),
+		nil,
+	)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf(
+			"LoadTemporalQuerySnapshot() error = %v, want ErrConflict",
+			err,
+		)
+	}
+	if err.Error() !=
+		"load temporal query snapshot: validate canonical authority failed" {
+		t.Fatalf(
+			"LoadTemporalQuerySnapshot() error = %q, want bounded topology conflict",
+			err,
+		)
+	}
 }
 
 func TestTemporalQueryPostgresEntityMatchAllAndAny(t *testing.T) {
@@ -612,6 +678,8 @@ type temporalQueryPostgresFixture struct {
 
 	ownerMention        identity.MentionRecord
 	collaboratorMention identity.MentionRecord
+	ownerProposal       identity.ResolutionProposal
+	ownerCorrection     identity.ResolutionDecision
 
 	ownerObservation         observation.Observation
 	statusObservation        observation.Observation
@@ -619,6 +687,7 @@ type temporalQueryPostgresFixture struct {
 	lateSourceObservation    observation.Observation
 	concurrentObservation    observation.Observation
 	concurrentAdmission      admission.Decision
+	ownerAdmission           admission.Decision
 
 	selectionValue temporal.TemporalSelection
 }
@@ -854,7 +923,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 		Role:            "collaborator",
 		RecordedAt:      atlasCollaboratorMentionAt,
 	})
-	ownerProposal := mustTemporalProposal(t, identity.ResolutionProposalInput{
+	fixture.ownerProposal = mustTemporalProposal(t, identity.ResolutionProposalInput{
 		ID:          "proposal:project-atlas/alex",
 		MentionID:   fixture.ownerMention.ID(),
 		ReasonCode:  "reviewed_identity",
@@ -872,7 +941,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 		t,
 		identity.ResolutionDecisionInput{
 			ID:         "decision:project-atlas/alex-initial",
-			ProposalID: ownerProposal.ID(),
+			ProposalID: fixture.ownerProposal.ID(),
 			Outcome:    identity.DecisionAccepted,
 			EntityID:   initialOwner.ID(),
 			Authority:  identity.AuthorityReviewer,
@@ -880,11 +949,11 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 			RecordedAt: atlasOwnerInitialDecisionAt,
 		},
 	)
-	ownerCorrection := mustTemporalResolutionDecision(
+	fixture.ownerCorrection = mustTemporalResolutionDecision(
 		t,
 		identity.ResolutionDecisionInput{
 			ID:           "decision:project-atlas/alex-corrected",
-			ProposalID:   ownerProposal.ID(),
+			ProposalID:   fixture.ownerProposal.ID(),
 			Outcome:      identity.DecisionAccepted,
 			EntityID:     currentOwner.ID(),
 			Authority:    identity.AuthorityReviewer,
@@ -945,7 +1014,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 		mustTemporalAdmissionDecision(t, admission.DecisionInput{
 			ID:         "admission:project-atlas/alex-corrected-decision",
 			TargetKind: admission.TargetIdentityDecision,
-			TargetID:   string(ownerCorrection.ID()),
+			TargetID:   string(fixture.ownerCorrection.ID()),
 			Outcome:    admission.Admitted,
 			ReasonCode: "reviewed_identity_correction",
 			Authority:  admission.AuthorityReviewer,
@@ -974,7 +1043,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 				}
 			}
 			for _, proposal := range []identity.ResolutionProposal{
-				ownerProposal,
+				fixture.ownerProposal,
 				collaboratorProposal,
 			} {
 				if _, err := transaction.PutResolutionProposal(
@@ -986,7 +1055,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 			}
 			for _, decision := range []identity.ResolutionDecision{
 				ownerInitialDecision,
-				ownerCorrection,
+				fixture.ownerCorrection,
 				collaboratorDecision,
 			} {
 				if err := transaction.AppendResolutionDecision(
@@ -1143,7 +1212,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 			Status: observation.StatusObserved,
 		},
 	)
-	ownerAdmission := mustTemporalAdmissionDecision(t, admission.DecisionInput{
+	fixture.ownerAdmission = mustTemporalAdmissionDecision(t, admission.DecisionInput{
 		ID:         "admission:project-atlas/owner",
 		TargetKind: admission.TargetObservation,
 		TargetID:   string(fixture.ownerObservation.ID()),
@@ -1225,7 +1294,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 				}
 			}
 			for _, decision := range []admission.Decision{
-				ownerAdmission,
+				fixture.ownerAdmission,
 				statusAdmission,
 				statusRetired,
 				collaborationAdmission,
@@ -1248,6 +1317,109 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 	fixture.selectionValue, err = temporal.At("project-atlas", atlasValidAt)
 	if err != nil {
 		t.Fatalf("temporal.At() error = %v", err)
+	}
+}
+
+func (fixture *temporalQueryPostgresFixture) appendResolutionTopologyAcrossCutoff(
+	t testing.TB,
+) {
+	t.Helper()
+	futurePredecessor := mustTemporalResolutionDecision(
+		t,
+		identity.ResolutionDecisionInput{
+			ID:           "decision:project-atlas/cutoff-future-predecessor",
+			ProposalID:   fixture.ownerProposal.ID(),
+			Outcome:      identity.DecisionAccepted,
+			EntityID:     atlasInitialOwnerID,
+			Authority:    identity.AuthorityReviewer,
+			ReasonCode:   "reviewed_future_correction",
+			RecordedAt:   atlasTopologyFutureAt,
+			SupersedesID: fixture.ownerCorrection.ID(),
+		},
+	)
+	visibleSuccessor := mustTemporalResolutionDecision(
+		t,
+		identity.ResolutionDecisionInput{
+			ID:           "decision:project-atlas/cutoff-visible-successor",
+			ProposalID:   fixture.ownerProposal.ID(),
+			Outcome:      identity.DecisionAccepted,
+			EntityID:     atlasCurrentOwnerID,
+			Authority:    identity.AuthorityReviewer,
+			ReasonCode:   "reviewed_retrograde_correction",
+			RecordedAt:   atlasTopologyVisibleAt,
+			SupersedesID: futurePredecessor.ID(),
+		},
+	)
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *Transaction) error {
+			for _, decision := range []identity.ResolutionDecision{
+				futurePredecessor,
+				visibleSuccessor,
+			} {
+				if err := transaction.AppendResolutionDecision(
+					fixture.ctx,
+					decision,
+					nil,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("append resolution cutoff topology: %v", err)
+	}
+}
+
+func (fixture *temporalQueryPostgresFixture) appendAdmissionTopologyAcrossCutoff(
+	t testing.TB,
+) {
+	t.Helper()
+	futurePredecessor := mustTemporalAdmissionDecision(
+		t,
+		admission.DecisionInput{
+			ID:           "admission:project-atlas/cutoff-future-predecessor",
+			TargetKind:   fixture.ownerAdmission.TargetKind(),
+			TargetID:     fixture.ownerAdmission.TargetID(),
+			Outcome:      admission.Retired,
+			ReasonCode:   "reviewed_future_authority",
+			Authority:    admission.AuthorityReviewer,
+			RecordedAt:   atlasTopologyFutureAt,
+			SupersedesID: fixture.ownerAdmission.ID(),
+		},
+	)
+	visibleSuccessor := mustTemporalAdmissionDecision(
+		t,
+		admission.DecisionInput{
+			ID:           "admission:project-atlas/cutoff-visible-successor",
+			TargetKind:   fixture.ownerAdmission.TargetKind(),
+			TargetID:     fixture.ownerAdmission.TargetID(),
+			Outcome:      admission.Admitted,
+			ReasonCode:   "reviewed_retrograde_authority",
+			Authority:    admission.AuthorityReviewer,
+			RecordedAt:   atlasTopologyVisibleAt,
+			SupersedesID: futurePredecessor.ID(),
+		},
+	)
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *Transaction) error {
+			for _, decision := range []admission.Decision{
+				futurePredecessor,
+				visibleSuccessor,
+			} {
+				if err := transaction.AppendAdmissionDecision(
+					fixture.ctx,
+					decision,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("append admission cutoff topology: %v", err)
 	}
 }
 

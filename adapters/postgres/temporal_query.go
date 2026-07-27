@@ -589,24 +589,27 @@ const temporalCanonicalAuthoritySQL = `
 		WHERE parameters.cutoff IS NULL
 		   OR proposal.recorded_at <= parameters.cutoff
 	),
-	visible_resolution_decisions AS (
-		SELECT decision.*
+	all_resolution_decisions AS (
+		SELECT
+			decision.*,
+			(
+				parameters.cutoff IS NULL
+				OR decision.recorded_at <= parameters.cutoff
+			) AS is_visible
 		FROM stacks_core.resolution_decisions AS decision
 		CROSS JOIN parameters
-		WHERE parameters.cutoff IS NULL
-		   OR decision.recorded_at <= parameters.cutoff
 	),
 	reachable_resolution_decisions AS (
 		SELECT
 			root_resolution.*,
 			root_resolution.id AS chain_root_id
-		FROM visible_resolution_decisions AS root_resolution
+		FROM all_resolution_decisions AS root_resolution
 		WHERE root_resolution.supersedes_id IS NULL
 		UNION
 		SELECT
 			resolution_successor.*,
 			resolution_predecessor.chain_root_id
-		FROM visible_resolution_decisions AS resolution_successor
+		FROM all_resolution_decisions AS resolution_successor
 		JOIN reachable_resolution_decisions AS resolution_predecessor
 		  ON resolution_successor.supersedes_id = resolution_predecessor.id
 	),
@@ -617,7 +620,8 @@ const temporalCanonicalAuthoritySQL = `
 		  ON entity.id = decision.entity_id
 		JOIN requested_entities AS requested
 		  ON requested.id = decision.entity_id
-		WHERE decision.outcome = 'accepted'
+		WHERE decision.is_visible
+		  AND decision.outcome = 'accepted'
 	),
 	requested_resolution_mentions AS (
 		SELECT DISTINCT proposal.mention_id
@@ -626,6 +630,7 @@ const temporalCanonicalAuthoritySQL = `
 		  ON chain.chain_root_id = decision.chain_root_id
 		JOIN visible_resolution_proposals AS proposal
 		  ON proposal.id = decision.proposal_id
+		WHERE decision.is_visible
 	),
 	visible_observations AS (
 		SELECT value.*
@@ -675,6 +680,7 @@ const temporalCanonicalAuthoritySQL = `
 		  ON proposal.id = decision.proposal_id
 		JOIN relevant_mentions AS mention
 		  ON mention.id = proposal.mention_id
+		WHERE decision.is_visible
 	),
 	relevant_resolution_decisions AS (
 		SELECT decision.*
@@ -682,34 +688,27 @@ const temporalCanonicalAuthoritySQL = `
 		JOIN relevant_resolution_chains AS chain
 		  ON chain.chain_root_id = decision.chain_root_id
 	),
-	visible_admission_targets AS (
-		SELECT target.*
-		FROM stacks_core.admission_targets AS target
-		CROSS JOIN parameters
-		WHERE parameters.cutoff IS NULL
-		   OR target.recorded_at <= parameters.cutoff
-	),
-	visible_admission_decisions AS (
-		SELECT decision.*
+	all_admission_decisions AS (
+		SELECT
+			decision.*,
+			(
+				parameters.cutoff IS NULL
+				OR decision.recorded_at <= parameters.cutoff
+			) AS is_visible
 		FROM stacks_core.admission_decisions AS decision
-		JOIN visible_admission_targets AS target
-		  ON target.target_kind = decision.target_kind
-		 AND target.target_id = decision.target_id
 		CROSS JOIN parameters
-		WHERE parameters.cutoff IS NULL
-		   OR decision.recorded_at <= parameters.cutoff
 	),
 	reachable_admission_decisions AS (
 		SELECT
 			root_admission.*,
 			root_admission.id AS chain_root_id
-		FROM visible_admission_decisions AS root_admission
+		FROM all_admission_decisions AS root_admission
 		WHERE root_admission.supersedes_id IS NULL
 		UNION
 		SELECT
 			admission_successor.*,
 			admission_predecessor.chain_root_id
-		FROM visible_admission_decisions AS admission_successor
+		FROM all_admission_decisions AS admission_successor
 		JOIN reachable_admission_decisions AS admission_predecessor
 		  ON admission_successor.supersedes_id = admission_predecessor.id
 	),
@@ -722,6 +721,7 @@ const temporalCanonicalAuthoritySQL = `
 		UNION
 		SELECT 'identity_decision'::text, id::text
 		FROM relevant_resolution_decisions
+		WHERE is_visible
 	),
 	relevant_admission_chains AS (
 		SELECT DISTINCT decision.chain_root_id
@@ -729,6 +729,7 @@ const temporalCanonicalAuthoritySQL = `
 		JOIN relevant_admission_targets AS target
 		  ON target.target_kind = decision.target_kind
 		 AND target.target_id = decision.target_id
+		WHERE decision.is_visible
 	),
 	relevant_admission_decisions AS (
 		SELECT decision.*
@@ -749,7 +750,8 @@ const temporalCanonicalAuthoritySQL = `
 		decision.recorded_at,
 		COALESCE(decision.supersedes_id, ''),
 		decision.digest_version,
-		decision.digest
+		decision.digest,
+		decision.is_visible
 	FROM relevant_resolution_decisions AS decision
 	UNION ALL
 	SELECT
@@ -765,7 +767,8 @@ const temporalCanonicalAuthoritySQL = `
 		decision.recorded_at,
 		COALESCE(decision.supersedes_id, ''),
 		decision.digest_version,
-		decision.digest
+		decision.digest,
+		decision.is_visible
 	FROM relevant_admission_decisions AS decision
 	ORDER BY recorded_at, decision_kind, id`
 
@@ -783,6 +786,7 @@ type temporalRawAuthorityDecision struct {
 	supersedesID  string
 	digestVersion string
 	digest        []byte
+	visible       bool
 }
 
 func readTemporalCanonicalAuthority(
@@ -820,6 +824,7 @@ func readTemporalCanonicalAuthority(
 			&raw.supersedesID,
 			&raw.digestVersion,
 			&raw.digest,
+			&raw.visible,
 		); err != nil {
 			return temporalSnapshotError(ctx, "scan canonical authority", err)
 		}
@@ -833,7 +838,8 @@ func readTemporalCanonicalAuthority(
 		}
 		seen[key] = struct{}{}
 		raw.digest = append([]byte(nil), raw.digest...)
-		if err := validateTemporalRawAuthorityDecision(raw); err != nil {
+		if raw.visible &&
+			validateTemporalRawAuthorityDecision(raw) != nil {
 			return temporalSnapshotError(
 				ctx,
 				"validate canonical authority",
@@ -917,12 +923,14 @@ func validateTemporalRawAuthorityChains(
 		byID[value.kind+"\x00"+value.id] = value
 	}
 	for _, successor := range values {
-		if successor.supersedesID == "" {
+		if !successor.visible || successor.supersedesID == "" {
 			continue
 		}
 		predecessorKey := successor.kind + "\x00" + successor.supersedesID
 		predecessor, exists := byID[predecessorKey]
-		if !exists || successor.recordedAt.Before(predecessor.recordedAt) {
+		if !exists ||
+			!predecessor.visible ||
+			successor.recordedAt.Before(predecessor.recordedAt) {
 			return ErrConflict
 		}
 		switch successor.kind {
@@ -974,24 +982,32 @@ const temporalQualificationSQL = `
 		WHERE parameters.cutoff IS NULL
 		   OR proposal.recorded_at <= parameters.cutoff
 	),
-	visible_resolution_decisions AS (
+	all_resolution_decisions AS (
 		SELECT decision.*
 		FROM stacks_core.resolution_decisions AS decision
+	),
+	reachable_resolution_decisions AS (
+		SELECT
+			root_resolution.*,
+			root_resolution.id AS chain_root_id,
+			0::bigint AS chain_depth
+		FROM all_resolution_decisions AS root_resolution
+		WHERE root_resolution.supersedes_id IS NULL
+		UNION ALL
+		SELECT
+			resolution_successor.*,
+			resolution_predecessor.chain_root_id,
+			resolution_predecessor.chain_depth + 1
+		FROM all_resolution_decisions AS resolution_successor
+		JOIN reachable_resolution_decisions AS resolution_predecessor
+		  ON resolution_successor.supersedes_id = resolution_predecessor.id
+	),
+	visible_resolution_decisions AS (
+		SELECT decision.*
+		FROM reachable_resolution_decisions AS decision
 		CROSS JOIN parameters
 		WHERE parameters.cutoff IS NULL
 		   OR decision.recorded_at <= parameters.cutoff
-	),
-	reachable_resolution_decisions AS (
-		SELECT root_resolution.*
-		FROM visible_resolution_decisions AS root_resolution
-		WHERE root_resolution.supersedes_id IS NULL
-		UNION
-		SELECT resolution_successor.*
-		FROM visible_resolution_decisions AS resolution_successor
-		JOIN reachable_resolution_decisions AS resolution_predecessor
-		  ON resolution_successor.supersedes_id = resolution_predecessor.id
-		 AND resolution_successor.proposal_id = resolution_predecessor.proposal_id
-		 AND resolution_successor.recorded_at >= resolution_predecessor.recorded_at
 	),
 	effective_resolution_decisions AS (
 		SELECT
@@ -1008,9 +1024,9 @@ const temporalQualificationSQL = `
 		WHERE decision.outcome = 'accepted'
 		  AND NOT EXISTS (
 			SELECT 1
-			FROM reachable_resolution_decisions AS resolution_successor
-			WHERE resolution_successor.supersedes_id = decision.id
-			  AND resolution_successor.proposal_id = decision.proposal_id
+			FROM visible_resolution_decisions AS resolution_successor
+			WHERE resolution_successor.chain_root_id = decision.chain_root_id
+			  AND resolution_successor.chain_depth > decision.chain_depth
 		  )
 	),
 	visible_admission_targets AS (
@@ -1020,9 +1036,29 @@ const temporalQualificationSQL = `
 		WHERE parameters.cutoff IS NULL
 		   OR target.recorded_at <= parameters.cutoff
 	),
-	visible_admission_decisions AS (
+	all_admission_decisions AS (
 		SELECT decision.*
 		FROM stacks_core.admission_decisions AS decision
+	),
+	reachable_admission_decisions AS (
+		SELECT
+			root_admission.*,
+			root_admission.id AS chain_root_id,
+			0::bigint AS chain_depth
+		FROM all_admission_decisions AS root_admission
+		WHERE root_admission.supersedes_id IS NULL
+		UNION ALL
+		SELECT
+			admission_successor.*,
+			admission_predecessor.chain_root_id,
+			admission_predecessor.chain_depth + 1
+		FROM all_admission_decisions AS admission_successor
+		JOIN reachable_admission_decisions AS admission_predecessor
+		  ON admission_successor.supersedes_id = admission_predecessor.id
+	),
+	visible_admission_decisions AS (
+		SELECT decision.*
+		FROM reachable_admission_decisions AS decision
 		JOIN visible_admission_targets AS target
 		  ON target.target_kind = decision.target_kind
 		 AND target.target_id = decision.target_id
@@ -1030,28 +1066,14 @@ const temporalQualificationSQL = `
 		WHERE parameters.cutoff IS NULL
 		   OR decision.recorded_at <= parameters.cutoff
 	),
-	reachable_admission_decisions AS (
-		SELECT root_admission.*
-		FROM visible_admission_decisions AS root_admission
-		WHERE root_admission.supersedes_id IS NULL
-		UNION
-		SELECT admission_successor.*
-		FROM visible_admission_decisions AS admission_successor
-		JOIN reachable_admission_decisions AS admission_predecessor
-		  ON admission_successor.supersedes_id = admission_predecessor.id
-		 AND admission_successor.target_kind = admission_predecessor.target_kind
-		 AND admission_successor.target_id = admission_predecessor.target_id
-		 AND admission_successor.recorded_at >= admission_predecessor.recorded_at
-	),
 	effective_admissions AS (
 		SELECT decision.*
-		FROM reachable_admission_decisions AS decision
+		FROM visible_admission_decisions AS decision
 		WHERE NOT EXISTS (
 			SELECT 1
-			FROM reachable_admission_decisions AS admission_successor
-			WHERE admission_successor.supersedes_id = decision.id
-			  AND admission_successor.target_kind = decision.target_kind
-			  AND admission_successor.target_id = decision.target_id
+			FROM visible_admission_decisions AS admission_successor
+			WHERE admission_successor.chain_root_id = decision.chain_root_id
+			  AND admission_successor.chain_depth > decision.chain_depth
 		)
 	),
 	admitted_resolution_edges AS (

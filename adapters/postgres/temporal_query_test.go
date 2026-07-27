@@ -288,6 +288,8 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 	}
 	canonicalAuthoritySQL := pool.transaction.queries[1].sql
 	for _, required := range []string{
+		"all_resolution_decisions AS",
+		"all_admission_decisions AS",
 		"relevant_observations AS",
 		"relevant_resolution_decisions AS",
 		"relevant_admission_decisions AS",
@@ -295,6 +297,7 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 		"admission_successor.supersedes_id = admission_predecessor.id",
 		"decision.digest_version",
 		"decision.digest",
+		"decision.is_visible",
 	} {
 		if !strings.Contains(canonicalAuthoritySQL, required) {
 			t.Fatalf(
@@ -324,26 +327,28 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 		"reachable_resolution_decisions AS",
 		"root_resolution.supersedes_id IS NULL",
 		"resolution_successor.supersedes_id = resolution_predecessor.id",
-		"resolution_successor.proposal_id = resolution_predecessor.proposal_id",
-		"resolution_successor.recorded_at >= resolution_predecessor.recorded_at",
+		"0::bigint AS chain_depth",
+		"resolution_predecessor.chain_depth + 1",
+		"visible_resolution_decisions AS",
 		"effective_resolution_decisions AS",
-		"FROM reachable_resolution_decisions AS resolution_successor",
-		"resolution_successor.proposal_id = decision.proposal_id",
+		"FROM visible_resolution_decisions AS resolution_successor",
+		"resolution_successor.chain_root_id = decision.chain_root_id",
+		"resolution_successor.chain_depth > decision.chain_depth",
 		"visible_admission_targets AS",
 		"target.recorded_at <= parameters.cutoff",
 		"JOIN visible_admission_targets AS target",
 		"target.target_kind = decision.target_kind",
 		"target.target_id = decision.target_id",
+		"all_admission_decisions AS",
 		"reachable_admission_decisions AS",
 		"root_admission.supersedes_id IS NULL",
 		"admission_successor.supersedes_id = admission_predecessor.id",
-		"admission_successor.target_kind = admission_predecessor.target_kind",
-		"admission_successor.target_id = admission_predecessor.target_id",
-		"admission_successor.recorded_at >= admission_predecessor.recorded_at",
+		"admission_predecessor.chain_depth + 1",
+		"visible_admission_decisions AS",
 		"effective_admissions AS",
-		"FROM reachable_admission_decisions AS admission_successor",
-		"admission_successor.target_kind = decision.target_kind",
-		"admission_successor.target_id = decision.target_id",
+		"FROM visible_admission_decisions AS admission_successor",
+		"admission_successor.chain_root_id = decision.chain_root_id",
+		"admission_successor.chain_depth > decision.chain_depth",
 		"mention_admission.target_kind = 'mention'",
 		"decision_admission.target_kind = 'identity_decision'",
 		"observation_admission.target_kind = 'observation'",
@@ -353,6 +358,20 @@ func TestTemporalQuerySnapshotBeginsRepeatableReadOnlyTransaction(t *testing.T) 
 	} {
 		if !strings.Contains(authoritySQL, required) {
 			t.Fatalf("authority SQL does not contain required boundary %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"AND resolution_successor.proposal_id = resolution_predecessor.proposal_id",
+		"AND resolution_successor.recorded_at >= resolution_predecessor.recorded_at",
+		"AND admission_successor.target_kind = admission_predecessor.target_kind",
+		"AND admission_successor.target_id = admission_predecessor.target_id",
+		"AND admission_successor.recorded_at >= admission_predecessor.recorded_at",
+	} {
+		if strings.Contains(authoritySQL, forbidden) {
+			t.Fatalf(
+				"qualification SQL filters raw topology before visibility with %q",
+				forbidden,
+			)
 		}
 	}
 	for _, required := range []string{
@@ -698,6 +717,82 @@ func TestTemporalQuerySnapshotRejectsMalformedCanonicalAuthorityChain(t *testing
 			if len(pool.transaction.queries) != 2 {
 				t.Fatalf(
 					"transaction queries = %d, want authority validation to stop qualification",
+					len(pool.transaction.queries),
+				)
+			}
+			if pool.transaction.commitCalls != 0 ||
+				pool.transaction.rollbackCalls != 1 {
+				t.Fatalf(
+					"commit/rollback calls = %d/%d, want 0/1",
+					pool.transaction.commitCalls,
+					pool.transaction.rollbackCalls,
+				)
+			}
+		})
+	}
+}
+
+func TestTemporalQuerySnapshotRejectsVisibleDecisionBehindFuturePredecessor(
+	t *testing.T,
+) {
+	cutoff := temporalTestRecordedAt.Add(150 * time.Second)
+	tests := []struct {
+		name string
+		rows [][]any
+	}{
+		{
+			name: "resolution",
+			rows: temporalResolutionAuthorityRowsAcrossCutoff(
+				t,
+				cutoff,
+			),
+		},
+		{
+			name: "admission",
+			rows: temporalAdmissionAuthorityRowsAcrossCutoff(
+				t,
+				cutoff,
+			),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selection := temporalTestSelection(t)
+			selection.KnowledgeAsOf = &cutoff
+			pool := newTemporalQueryFakePool(
+				temporalQueryRowsResult([][]any{{
+					string(temporalTestEntityID),
+					true,
+				}}),
+				temporalQueryRowsResult(test.rows),
+				temporalQueryRowsResult(nil),
+				temporalQueryRowsResult(nil),
+				temporalQueryRowsResult(nil),
+			)
+
+			_, err := loadTemporalQuerySnapshot(
+				context.Background(),
+				pool,
+				selection,
+				nil,
+			)
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf(
+					"loadTemporalQuerySnapshot() error = %v, want ErrConflict",
+					err,
+				)
+			}
+			if err.Error() !=
+				"load temporal query snapshot: validate canonical authority failed" {
+				t.Fatalf(
+					"loadTemporalQuerySnapshot() error = %q, want bounded topology conflict",
+					err,
+				)
+			}
+			if len(pool.transaction.queries) != 2 {
+				t.Fatalf(
+					"transaction queries = %d, want topology validation to stop qualification",
 					len(pool.transaction.queries),
 				)
 			}
@@ -1401,6 +1496,13 @@ func temporalResolutionAuthorityRows(t *testing.T) [][]any {
 }
 
 func temporalResolutionAuthorityRow(value identity.ResolutionDecision) []any {
+	return temporalResolutionAuthorityRowWithVisibility(value, true)
+}
+
+func temporalResolutionAuthorityRowWithVisibility(
+	value identity.ResolutionDecision,
+	visible bool,
+) []any {
 	var entityID any
 	if value.EntityID() != "" {
 		entityID = string(value.EntityID())
@@ -1424,6 +1526,67 @@ func temporalResolutionAuthorityRow(value identity.ResolutionDecision) []any {
 		supersedesID,
 		value.DigestVersion(),
 		digest[:],
+		visible,
+	}
+}
+
+func temporalResolutionAuthorityRowsAcrossCutoff(
+	t *testing.T,
+	cutoff time.Time,
+) [][]any {
+	t.Helper()
+	root, err := identity.NewResolutionDecision(identity.ResolutionDecisionInput{
+		ID:         "decision:synthetic/cutoff-root",
+		ProposalID: "proposal:synthetic/temporal",
+		Outcome:    identity.DecisionAccepted,
+		EntityID:   temporalTestEntityID,
+		Authority:  identity.AuthorityReviewer,
+		ReasonCode: "synthetic-root",
+		RecordedAt: cutoff.Add(-90 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("identity.NewResolutionDecision(root) error = %v", err)
+	}
+	futurePredecessor, err := identity.NewResolutionDecision(
+		identity.ResolutionDecisionInput{
+			ID:           "decision:synthetic/cutoff-future-predecessor",
+			ProposalID:   root.ProposalID(),
+			Outcome:      identity.DecisionAccepted,
+			EntityID:     temporalTestSecondEntityID,
+			Authority:    identity.AuthorityReviewer,
+			ReasonCode:   "synthetic-future",
+			RecordedAt:   cutoff.Add(30 * time.Second),
+			SupersedesID: root.ID(),
+		},
+	)
+	if err != nil {
+		t.Fatalf(
+			"identity.NewResolutionDecision(future predecessor) error = %v",
+			err,
+		)
+	}
+	visibleSuccessor, err := identity.NewResolutionDecision(
+		identity.ResolutionDecisionInput{
+			ID:           "decision:synthetic/cutoff-visible-successor",
+			ProposalID:   root.ProposalID(),
+			Outcome:      identity.DecisionAccepted,
+			EntityID:     temporalTestEntityID,
+			Authority:    identity.AuthorityReviewer,
+			ReasonCode:   "synthetic-retrograde",
+			RecordedAt:   cutoff.Add(-30 * time.Second),
+			SupersedesID: futurePredecessor.ID(),
+		},
+	)
+	if err != nil {
+		t.Fatalf(
+			"identity.NewResolutionDecision(visible successor) error = %v",
+			err,
+		)
+	}
+	return [][]any{
+		temporalResolutionAuthorityRowWithVisibility(root, true),
+		temporalResolutionAuthorityRowWithVisibility(futurePredecessor, false),
+		temporalResolutionAuthorityRowWithVisibility(visibleSuccessor, true),
 	}
 }
 
@@ -1487,6 +1650,13 @@ func temporalAdmissionAuthorityRows(t *testing.T) [][]any {
 }
 
 func temporalAdmissionAuthorityRow(value admission.Decision) []any {
+	return temporalAdmissionAuthorityRowWithVisibility(value, true)
+}
+
+func temporalAdmissionAuthorityRowWithVisibility(
+	value admission.Decision,
+	visible bool,
+) []any {
 	var supersedesID any
 	if value.SupersedesID() != "" {
 		supersedesID = value.SupersedesID()
@@ -1506,6 +1676,57 @@ func temporalAdmissionAuthorityRow(value admission.Decision) []any {
 		supersedesID,
 		value.DigestVersion(),
 		digest[:],
+		visible,
+	}
+}
+
+func temporalAdmissionAuthorityRowsAcrossCutoff(
+	t *testing.T,
+	cutoff time.Time,
+) [][]any {
+	t.Helper()
+	root, err := admission.NewDecision(admission.DecisionInput{
+		ID:         "admission:synthetic/cutoff-root",
+		TargetKind: admission.TargetObservation,
+		TargetID:   string(temporalTestObservationID),
+		Outcome:    admission.Admitted,
+		ReasonCode: "synthetic-root",
+		Authority:  admission.AuthorityReviewer,
+		RecordedAt: cutoff.Add(-90 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("admission.NewDecision(root) error = %v", err)
+	}
+	futurePredecessor, err := admission.NewDecision(admission.DecisionInput{
+		ID:           "admission:synthetic/cutoff-future-predecessor",
+		TargetKind:   root.TargetKind(),
+		TargetID:     root.TargetID(),
+		Outcome:      admission.Retired,
+		ReasonCode:   "synthetic-future",
+		Authority:    admission.AuthorityReviewer,
+		RecordedAt:   cutoff.Add(30 * time.Second),
+		SupersedesID: root.ID(),
+	})
+	if err != nil {
+		t.Fatalf("admission.NewDecision(future predecessor) error = %v", err)
+	}
+	visibleSuccessor, err := admission.NewDecision(admission.DecisionInput{
+		ID:           "admission:synthetic/cutoff-visible-successor",
+		TargetKind:   root.TargetKind(),
+		TargetID:     root.TargetID(),
+		Outcome:      admission.Admitted,
+		ReasonCode:   "synthetic-retrograde",
+		Authority:    admission.AuthorityReviewer,
+		RecordedAt:   cutoff.Add(-30 * time.Second),
+		SupersedesID: futurePredecessor.ID(),
+	})
+	if err != nil {
+		t.Fatalf("admission.NewDecision(visible successor) error = %v", err)
+	}
+	return [][]any{
+		temporalAdmissionAuthorityRowWithVisibility(root, true),
+		temporalAdmissionAuthorityRowWithVisibility(futurePredecessor, false),
+		temporalAdmissionAuthorityRowWithVisibility(visibleSuccessor, true),
 	}
 }
 
