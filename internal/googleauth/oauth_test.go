@@ -118,6 +118,43 @@ func TestOAuthCallbackHandlerIgnoresMismatchedStateUntilValidCallback(t *testing
 	}
 }
 
+func TestAuthorizerRejectsIncompleteCallbackHeadersWithinBoundedTime(t *testing.T) {
+	fixture := newAuthorizationFixture(
+		t,
+		[]string{"https://example.test/readonly"},
+		successfulTokenTransport(t),
+	)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	result := make(chan error, 1)
+	go func() { result <- fixture.authorizer.Authorize(ctx) }()
+
+	parsed := parseURL(t, fixture.authorizationURL(t))
+	redirect := parseURL(t, parsed.Query().Get("redirect_uri"))
+	connection, err := net.Dial("tcp", redirect.Host)
+	if err != nil {
+		t.Fatalf("dial OAuth callback: %v", err)
+	}
+	defer connection.Close()
+	if _, err := io.WriteString(
+		connection,
+		"GET "+oauthCallbackPath+" HTTP/1.1\r\nHost: "+redirect.Host+"\r\n",
+	); err != nil {
+		t.Fatalf("write incomplete OAuth callback headers: %v", err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(7 * time.Second)); err != nil {
+		t.Fatalf("set OAuth callback read deadline: %v", err)
+	}
+	if _, err := io.ReadAll(connection); err != nil {
+		t.Fatalf("OAuth callback left incomplete headers open: %v", err)
+	}
+
+	fixture.callback(t, redirect, "synthetic-code", parsed.Query().Get("state"))
+	if err := <-result; err != nil {
+		t.Fatalf("Authorize() error after incomplete callback = %v", err)
+	}
+}
+
 func TestAuthorizerDoesNotReplaceTokenWithoutRefreshToken(t *testing.T) {
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return jsonResponse(request, `{"access_token":"synthetic-access-token","token_type":"Bearer","expires_in":3600}`), nil

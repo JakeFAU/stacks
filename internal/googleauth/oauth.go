@@ -22,9 +22,10 @@ import (
 )
 
 const (
-	oauthCallbackPath            = "/oauth2/callback"
-	oauthStateBytes              = 32
-	oauthCallbackShutdownTimeout = 5 * time.Second
+	oauthCallbackPath              = "/oauth2/callback"
+	oauthStateBytes                = 32
+	oauthCallbackReadHeaderTimeout = 5 * time.Second
+	oauthCallbackShutdownTimeout   = 5 * time.Second
 )
 
 // Authorizer performs Google's installed-application OAuth flow and replaces
@@ -116,7 +117,10 @@ func (authorizer *Authorizer) Authorize(ctx context.Context) error {
 
 	callbackResult := make(chan oauthCallback, 1)
 	serverErrors := make(chan error, 1)
-	server := &http.Server{Handler: oauthCallbackHandler(state, callbackResult)}
+	server := &http.Server{
+		Handler:           oauthCallbackHandler(state, callbackResult),
+		ReadHeaderTimeout: oauthCallbackReadHeaderTimeout,
+	}
 	defer server.Close()
 	go func() {
 		if serveErr := server.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) && !errors.Is(serveErr, net.ErrClosed) {
