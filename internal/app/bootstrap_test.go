@@ -509,6 +509,21 @@ func TestExecuteJoinsCommandAndShutdownErrors(t *testing.T) {
 	}
 }
 
+func TestShutdownExecutionAddsOperationContextWithoutChangingIdentity(t *testing.T) {
+	shutdownError := errors.New("shutdown sentinel")
+
+	err := shutdownExecution(t.Context(), func(context.Context) error {
+		return shutdownError
+	})
+
+	if !errors.Is(err, shutdownError) {
+		t.Fatalf("shutdownExecution() error = %v, want shutdown sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "shut down runtime") {
+		t.Fatalf("shutdownExecution() error = %v, want runtime shutdown context", err)
+	}
+}
+
 func TestExecuteCanceledCommandUsesValuePreservingShutdownContext(t *testing.T) {
 	type contextKey string
 	const key contextKey = "shutdown-value"

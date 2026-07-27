@@ -39,6 +39,20 @@ model:
 	}
 }
 
+func TestLoadWithOptionsEmptyEnvironmentDoesNotSuppressFileValue(t *testing.T) {
+	clearConfigurationEnvironment(t)
+	path := writeConfigFixture(t, ".yaml", "http:\n  host: 192.0.2.11\n")
+	t.Setenv(HTTPHostEnvironmentVariable, "")
+
+	settings, err := LoadWithOptions(LoadOptions{ConfigFile: &path})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+	if settings.HTTPAddress != "192.0.2.11:8080" {
+		t.Fatalf("HTTPAddress = %q, want file host with default port", settings.HTTPAddress)
+	}
+}
+
 func TestLoadQueryUsesDefaultsAndInclusiveEnvironmentBounds(t *testing.T) {
 	clearConfigurationEnvironment(t)
 
