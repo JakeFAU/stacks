@@ -249,7 +249,16 @@ func orderTransitions(values []Transition) {
 	sort.Slice(values, func(left, right int) bool { return compareTransitions(values[left], values[right]) < 0 })
 }
 func compareTransitions(left, right Transition) int {
-	if result := compareChronology(transitionTime(left), transitionRecordedAt(left), transitionObservationID(left), transitionTime(right), transitionRecordedAt(right), transitionObservationID(right)); result != 0 {
+	if result := compareOptionalTime(transitionTime(left), transitionTime(right)); result != 0 {
+		return result
+	}
+	if result := compareTemporalExtent(left.ValidTime, right.ValidTime); result != 0 {
+		return result
+	}
+	if result := compareOptionalTime(transitionRecordedAt(left), transitionRecordedAt(right)); result != 0 {
+		return result
+	}
+	if result := cmp.Compare(transitionObservationID(left), transitionObservationID(right)); result != 0 {
 		return result
 	}
 	if result := temporal.CompareStateKeys(left.Key, right.Key); result != 0 {

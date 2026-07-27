@@ -340,6 +340,15 @@ func TestOrderingIsTotalAcrossEarlierKeyTies(t *testing.T) {
 	if !reflect.DeepEqual(transitionsA, transitionsB) {
 		t.Errorf("orderTransitions() differs after reverse")
 	}
+	shortInterval := mustDuring(t, time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, time.January, 2, 0, 0, 0, 0, time.UTC))
+	longInterval := mustDuring(t, time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, time.January, 3, 0, 0, 0, 0, time.UTC))
+	boundTiesA := []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: shortInterval, After: &firstFact}, {Kind: temporal.ChangeAdded, Key: key, ValidTime: longInterval, After: &firstFact}}
+	boundTiesB := []Transition{{Kind: temporal.ChangeAdded, Key: key, ValidTime: longInterval, After: &firstFact}, {Kind: temporal.ChangeAdded, Key: key, ValidTime: shortInterval, After: &firstFact}}
+	orderTransitions(boundTiesA)
+	orderTransitions(boundTiesB)
+	if !reflect.DeepEqual(boundTiesA, boundTiesB) {
+		t.Errorf("orderTransitions() differs after reverse equal-start intervals")
+	}
 
 	firstLink, secondLink := CausalLink{Cause: mustText(t, "cause"), Effect: mustText(t, "effect"), Contributions: firstFact.Contributions, SupportingCitations: firstFact.SupportingCitations, ContradictingCitations: []Citation{}}, CausalLink{Cause: mustText(t, "cause"), Effect: mustText(t, "effect"), Contributions: secondFact.Contributions, SupportingCitations: secondFact.SupportingCitations, ContradictingCitations: []Citation{}}
 	linksA, linksB := []CausalLink{firstLink, secondLink}, []CausalLink{secondLink, firstLink}
@@ -403,6 +412,15 @@ func mustText(t *testing.T, value string) observation.Term {
 func mustInstant(t *testing.T) observation.TemporalExtent {
 	t.Helper()
 	extent, err := observation.AtTime(time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return extent
+}
+
+func mustDuring(t *testing.T, start, end time.Time) observation.TemporalExtent {
+	t.Helper()
+	extent, err := observation.During(start, end)
 	if err != nil {
 		t.Fatal(err)
 	}
