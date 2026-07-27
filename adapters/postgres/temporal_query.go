@@ -100,6 +100,7 @@ type TemporalCoverageRecord struct {
 	EntityID      identity.EntityID
 	Predicate     observation.Predicate
 	ObservationID observation.ObservationID
+	ValidTime     observation.TemporalExtent
 }
 
 // TemporalQuerySnapshot is one coherent historical authority, observation,
@@ -1281,6 +1282,11 @@ const temporalQualificationSQL = `
 	SELECT
 		projected.id,
 		projected.predicate,
+		projected.temporal_kind,
+		projected.has_start,
+		projected.valid_start,
+		projected.has_end,
+		projected.valid_end,
 		projected.resolved_subject_kind,
 		COALESCE(projected.subject_text, ''),
 		COALESCE(projected.resolved_subject_entity_id, ''),
@@ -1360,10 +1366,16 @@ func readTemporalQualification(
 			subjectGroundingMentionID                            string
 			objectKind, objectText, objectEntityID               string
 			objectGroundingMentionID, classification, coverageID string
+			validTime                                            storedTemporalExtent
 		)
 		if err := rows.Scan(
 			&id,
 			&predicate,
+			&validTime.kind,
+			&validTime.hasStart,
+			&validTime.start,
+			&validTime.hasEnd,
+			&validTime.end,
 			&subjectKind,
 			&subjectText,
 			&subjectEntityID,
@@ -1384,6 +1396,14 @@ func readTemporalQualification(
 		observationID := observation.ObservationID(strings.TrimSpace(id))
 		predicateValue, predicateErr := observation.NewPredicate(predicate)
 		if observationID == "" || predicateErr != nil {
+			return nil, nil, temporalSnapshotError(
+				ctx,
+				"validate observation authority",
+				ErrConflict,
+			)
+		}
+		decodedValidTime, validTimeErr := decodeTemporalExtent(validTime)
+		if validTimeErr != nil {
 			return nil, nil, temporalSnapshotError(
 				ctx,
 				"validate observation authority",
@@ -1451,6 +1471,7 @@ func readTemporalQualification(
 				EntityID:      identity.EntityID(coverageID),
 				Predicate:     predicateValue,
 				ObservationID: observationID,
+				ValidTime:     decodedValidTime,
 			}
 			if !slices.Contains(selection.EntityIDs, record.EntityID) {
 				return nil, nil, temporalSnapshotError(

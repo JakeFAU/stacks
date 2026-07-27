@@ -96,20 +96,24 @@ func TestPostgresRepositoryMapsNormalizedSelectionAndExactSnapshot(t *testing.T)
 				{
 					Reason:        postgres.TemporalCoverageUnresolvedMention,
 					ObservationID: "observation:synthetic/unresolved",
+					ValidTime:     observation.UnknownTime(),
 				},
 				{
 					Reason:        postgres.TemporalCoverageAuthorityExcluded,
 					ObservationID: "observation:synthetic/excluded",
+					ValidTime:     record.Observation.ValidTime(),
 				},
 				{
 					Reason:        postgres.TemporalCoverageEntityFiltered,
 					EntityID:      "entity:synthetic/beta",
 					ObservationID: "observation:synthetic/entity-filtered",
+					ValidTime:     record.Observation.ValidTime(),
 				},
 				{
 					Reason:        postgres.TemporalCoveragePredicateFiltered,
 					Predicate:     "project.synthetic/other",
 					ObservationID: "observation:synthetic/predicate-filtered",
+					ValidTime:     record.Observation.ValidTime(),
 				},
 			},
 		},
@@ -169,20 +173,24 @@ func TestPostgresRepositoryMapsNormalizedSelectionAndExactSnapshot(t *testing.T)
 			{
 				Reason:        CoverageUnresolvedMention,
 				ObservationID: "observation:synthetic/unresolved",
+				ValidTime:     observation.UnknownTime(),
 			},
 			{
 				Reason:        CoverageAuthorityExcluded,
 				ObservationID: "observation:synthetic/excluded",
+				ValidTime:     record.Observation.ValidTime(),
 			},
 			{
 				Reason:        CoverageEntityFiltered,
 				EntityID:      "entity:synthetic/beta",
 				ObservationID: "observation:synthetic/entity-filtered",
+				ValidTime:     record.Observation.ValidTime(),
 			},
 			{
 				Reason:        CoveragePredicateFiltered,
 				Predicate:     "project.synthetic/other",
 				ObservationID: "observation:synthetic/predicate-filtered",
+				ValidTime:     record.Observation.ValidTime(),
 			},
 		},
 	}

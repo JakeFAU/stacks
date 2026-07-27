@@ -330,39 +330,141 @@ func TestProjectAtlasPointContractReconstructsCitedState(t *testing.T) {
 	if !ok {
 		t.Fatal("current Payload.Point() = false")
 	}
-	if got := factPredicates(point.Facts); !slices.Equal(got, []observation.Predicate{
-		"project.delivery_commitment",
-		"project.responsible_party",
-	}) {
-		t.Fatalf("current point facts = %v", got)
+	project := atlasEntityTerm(t, "entity:project-atlas")
+	commitmentKey, err := temporal.NewStateKey(project, "project.delivery_commitment")
+	if err != nil {
+		t.Fatalf("temporal.NewStateKey(commitment) error = %v", err)
 	}
-	if got := unresolvedPredicates(point.Unresolved); !slices.Equal(got, []observation.Predicate{
-		"project.delivery_risk",
-		"project.priority",
-	}) {
-		t.Fatalf("current point unresolved = %v", got)
+	responsibilityKey, err := temporal.NewStateKey(project, "project.responsible_party")
+	if err != nil {
+		t.Fatalf("temporal.NewStateKey(responsibility) error = %v", err)
 	}
-	commitment := point.Facts[0]
-	assertTextTerm(t, commitment.Value, "2032-06-15")
-	if len(commitment.Contributions) != 1 ||
-		commitment.Contributions[0].ObservationID != "observation:atlas/initial-observed" ||
-		!reflect.DeepEqual(commitment.SupportingCitations, []Citation{fixture.initialEvidence.citation(observation.EvidenceSupporting)}) ||
-		!reflect.DeepEqual(commitment.ContradictingCitations, []Citation{fixture.revisionEvidence.citation(observation.EvidenceContradicting)}) {
-		t.Fatalf("current point commitment lost exact provenance: %#v", commitment)
+	riskKey, err := temporal.NewStateKey(project, "project.delivery_risk")
+	if err != nil {
+		t.Fatalf("temporal.NewStateKey(risk) error = %v", err)
 	}
-	if point.Unresolved[0].Reason != temporal.UnresolvedTemporalUncertainty ||
-		point.Unresolved[1].Reason != temporal.UnresolvedConflict ||
-		len(point.Unresolved[1].Candidates) != 2 {
-		t.Fatalf("current point unresolved material = %#v", point.Unresolved)
+	priorityKey, err := temporal.NewStateKey(project, "project.priority")
+	if err != nil {
+		t.Fatalf("temporal.NewStateKey(priority) error = %v", err)
 	}
-	for _, want := range []Gap{
+	derivation := observation.Derivation{
+		Method:  "synthetic-acceptance",
+		Version: "d1-v1",
+		RunID:   "run:project-atlas",
+	}
+	ownerAlpha := Fact{
+		Key:   responsibilityKey,
+		Value: atlasEntityTerm(t, "entity:delivery-unit-alpha"),
+		Contributions: []Contribution{{
+			ObservationID: "observation:atlas/owner-alpha",
+			Status:        observation.StatusObserved,
+			ValidTime: atlasInterval(
+				t,
+				time.Date(2032, time.January, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(2032, time.February, 1, 0, 0, 0, 0, time.UTC),
+			),
+			RecordedAt: time.Date(2032, time.January, 12, 10, 5, 0, 0, time.UTC),
+			Derivation: derivation,
+		}},
+		SupportingCitations: []Citation{
+			fixture.ownerAlphaEvidence.citation(observation.EvidenceSupporting),
+		},
+		ContradictingCitations: []Citation{},
+	}
+	risk := UnresolvedItem{
+		Key:    riskKey,
+		Reason: temporal.UnresolvedTemporalUncertainty,
+		Candidates: []Fact{{
+			Key:   riskKey,
+			Value: atlasTextTerm(t, "watch"),
+			Contributions: []Contribution{{
+				ObservationID: "observation:atlas/risk-unknown",
+				Status:        observation.StatusObserved,
+				ValidTime:     observation.UnknownTime(),
+				RecordedAt:    time.Date(2032, time.January, 18, 10, 5, 0, 0, time.UTC),
+				Derivation:    derivation,
+			}},
+			SupportingCitations: []Citation{
+				fixture.riskUnknownEvidence.citation(observation.EvidenceSupporting),
+			},
+			ContradictingCitations: []Citation{},
+		}},
+	}
+	priorityCritical := Fact{
+		Key:   priorityKey,
+		Value: atlasTextTerm(t, "critical"),
+		Contributions: []Contribution{{
+			ObservationID: "observation:atlas/priority-critical",
+			Status:        observation.StatusObserved,
+			ValidTime:     atlasInstant(t, at),
+			RecordedAt:    time.Date(2032, time.January, 20, 11, 5, 0, 0, time.UTC),
+			Derivation:    derivation,
+		}},
+		SupportingCitations: []Citation{
+			fixture.priorityCriticalEvidence.citation(observation.EvidenceSupporting),
+		},
+		ContradictingCitations: []Citation{},
+	}
+	priorityRoutine := Fact{
+		Key:   priorityKey,
+		Value: atlasTextTerm(t, "routine"),
+		Contributions: []Contribution{{
+			ObservationID: "observation:atlas/priority-routine",
+			Status:        observation.StatusObserved,
+			ValidTime:     atlasInstant(t, at),
+			RecordedAt:    time.Date(2032, time.January, 20, 10, 5, 0, 0, time.UTC),
+			Derivation:    derivation,
+		}},
+		SupportingCitations: []Citation{
+			fixture.priorityRoutineEvidence.citation(observation.EvidenceSupporting),
+		},
+		ContradictingCitations: []Citation{},
+	}
+	priority := UnresolvedItem{
+		Key:        priorityKey,
+		Reason:     temporal.UnresolvedConflict,
+		Candidates: []Fact{priorityCritical, priorityRoutine},
+	}
+	wantCurrentPoint := PointInTimeResult{
+		Selection: selection,
+		Facts: []Fact{
+			{
+				Key:   commitmentKey,
+				Value: atlasTextTerm(t, "2032-06-15"),
+				Contributions: []Contribution{{
+					ObservationID: "observation:atlas/initial-observed",
+					Status:        observation.StatusObserved,
+					ValidTime: atlasInterval(
+						t,
+						time.Date(2032, time.January, 1, 0, 0, 0, 0, time.UTC),
+						time.Date(2032, time.February, 1, 0, 0, 0, 0, time.UTC),
+					),
+					RecordedAt: time.Date(2032, time.April, 2, 10, 0, 0, 0, time.UTC),
+					Derivation: derivation,
+				}},
+				SupportingCitations: []Citation{
+					fixture.initialEvidence.citation(observation.EvidenceSupporting),
+				},
+				ContradictingCitations: []Citation{
+					fixture.revisionEvidence.citation(observation.EvidenceContradicting),
+				},
+			},
+			ownerAlpha,
+		},
+		Unresolved: []UnresolvedItem{risk, priority},
+	}
+	if !reflect.DeepEqual(point, wantCurrentPoint) {
+		t.Fatalf("current point = %#v, want exact %#v", point, wantCurrentPoint)
+	}
+	wantCurrentGaps := []Gap{
 		{Kind: GapUnresolvedMention, EntityID: "entity:project-atlas", Predicate: "project.partner"},
 		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.delivery_commitment", SelectionLabel: "at-boundary"},
+		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.delivery_risk", SelectionLabel: "at-boundary"},
 		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.responsible_party", SelectionLabel: "at-boundary"},
-	} {
-		if !slices.Contains(current.Gaps, want) {
-			t.Fatalf("current point gaps = %#v, missing %#v", current.Gaps, want)
-		}
+		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.scope", SelectionLabel: "at-boundary"},
+	}
+	if !reflect.DeepEqual(current.Gaps, wantCurrentGaps) {
+		t.Fatalf("current point gaps = %#v, want exact %#v", current.Gaps, wantCurrentGaps)
 	}
 
 	historicalRequest := request
@@ -375,18 +477,22 @@ func TestProjectAtlasPointContractReconstructsCitedState(t *testing.T) {
 	if !ok {
 		t.Fatal("historical Payload.Point() = false")
 	}
-	if got := factPredicates(historicalPoint.Facts); !slices.Equal(got, []observation.Predicate{"project.responsible_party"}) {
-		t.Fatalf("historical point facts = %v, want cutoff-visible responsibility only", got)
+	wantHistoricalPoint := PointInTimeResult{
+		Selection:  selection,
+		Facts:      []Fact{ownerAlpha},
+		Unresolved: []UnresolvedItem{risk, priority},
 	}
-	if slices.Contains(factPredicates(historicalPoint.Facts), observation.Predicate("project.delivery_commitment")) {
-		t.Fatal("historical point used a later-recorded observation")
+	if !reflect.DeepEqual(historicalPoint, wantHistoricalPoint) {
+		t.Fatalf("historical point = %#v, want exact %#v", historicalPoint, wantHistoricalPoint)
 	}
-	if !slices.Contains(historical.Gaps, Gap{
-		Kind:      GapAuthorityExcluded,
-		EntityID:  "entity:project-atlas",
-		Predicate: "project.responsible_party",
-	}) {
-		t.Fatalf("historical point gaps = %#v, want cutoff authority gap", historical.Gaps)
+	wantHistoricalGaps := []Gap{{
+		Kind:           GapValidTimeExcluded,
+		EntityID:       "entity:project-atlas",
+		Predicate:      "project.delivery_commitment",
+		SelectionLabel: "at-boundary",
+	}}
+	if !reflect.DeepEqual(historical.Gaps, wantHistoricalGaps) {
+		t.Fatalf("historical point gaps = %#v, want exact %#v", historical.Gaps, wantHistoricalGaps)
 	}
 
 	reordered := cloneReadSnapshot(fixture.currentSnapshot)
@@ -413,17 +519,22 @@ func TestProjectAtlasPointContractReconstructsCitedState(t *testing.T) {
 }
 
 type projectAtlasFixture struct {
-	currentRequest     Request
-	currentSnapshot    ReadSnapshot
-	historicalSnapshot ReadSnapshot
-	historicalScope    temporal.KnowledgeScope
-	cutoff             time.Time
-	initialEvidence    projectAtlasEvidence
-	revisionEvidence   projectAtlasEvidence
-	ownerAlphaEvidence projectAtlasEvidence
-	ownerBetaEvidence  projectAtlasEvidence
-	priorityRoutine    observation.Observation
-	priorityCritical   observation.Observation
+	currentRequest           Request
+	currentSnapshot          ReadSnapshot
+	historicalSnapshot       ReadSnapshot
+	historicalScope          temporal.KnowledgeScope
+	cutoff                   time.Time
+	initialEvidence          projectAtlasEvidence
+	revisionEvidence         projectAtlasEvidence
+	ownerAlphaEvidence       projectAtlasEvidence
+	ownerBetaEvidence        projectAtlasEvidence
+	priorityRoutineEvidence  projectAtlasEvidence
+	priorityCriticalEvidence projectAtlasEvidence
+	riskUnknownEvidence      projectAtlasEvidence
+	riskWindowEvidence       projectAtlasEvidence
+	scopeEvidence            projectAtlasEvidence
+	priorityRoutine          observation.Observation
+	priorityCritical         observation.Observation
 }
 
 type projectAtlasEvidence struct {
@@ -517,31 +628,31 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 		"Synthetic responsibility transfers to delivery unit beta.",
 		time.Date(2032, time.March, 3, 10, 0, 0, 0, time.UTC),
 	)
-	priorityRoutineEvidence := newProjectAtlasEvidence(
+	fixture.priorityRoutineEvidence = newProjectAtlasEvidence(
 		t,
 		"priority-routine",
 		"Synthetic note supports routine priority.",
 		time.Date(2032, time.January, 20, 10, 0, 0, 0, time.UTC),
 	)
-	priorityCriticalEvidence := newProjectAtlasEvidence(
+	fixture.priorityCriticalEvidence = newProjectAtlasEvidence(
 		t,
 		"priority-critical",
 		"Synthetic note independently supports critical priority.",
 		time.Date(2032, time.January, 20, 11, 0, 0, 0, time.UTC),
 	)
-	riskUnknownEvidence := newProjectAtlasEvidence(
+	fixture.riskUnknownEvidence = newProjectAtlasEvidence(
 		t,
 		"risk-unknown",
 		"Synthetic note records delivery risk with unknown valid time.",
 		time.Date(2032, time.January, 18, 10, 0, 0, 0, time.UTC),
 	)
-	riskWindowEvidence := newProjectAtlasEvidence(
+	fixture.riskWindowEvidence = newProjectAtlasEvidence(
 		t,
 		"risk-window",
 		"Synthetic note bounds elevated risk to an uncertainty window.",
 		time.Date(2032, time.March, 16, 10, 0, 0, 0, time.UTC),
 	)
-	scopeEvidence := newProjectAtlasEvidence(
+	fixture.scopeEvidence = newProjectAtlasEvidence(
 		t,
 		"scope",
 		"Synthetic note hypothesizes an expanded scope.",
@@ -647,7 +758,7 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 		recordedAt:      time.Date(2032, time.January, 20, 10, 5, 0, 0, time.UTC),
 		status:          observation.StatusObserved,
 		confidence:      &lowConfidence,
-		citations:       []Citation{priorityRoutineEvidence.citation(observation.EvidenceSupporting)},
+		citations:       []Citation{fixture.priorityRoutineEvidence.citation(observation.EvidenceSupporting)},
 	}).Observation
 	fixture.priorityCritical = atlasReadObservation(t, atlasObservationInput{
 		id:              "observation:atlas/priority-critical",
@@ -660,13 +771,13 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 		recordedAt:      time.Date(2032, time.January, 20, 11, 5, 0, 0, time.UTC),
 		status:          observation.StatusObserved,
 		confidence:      &highConfidence,
-		citations:       []Citation{priorityCriticalEvidence.citation(observation.EvidenceSupporting)},
+		citations:       []Citation{fixture.priorityCriticalEvidence.citation(observation.EvidenceSupporting)},
 	}).Observation
 	priorityRoutine := atlasReadObservationFromCanonical(t, fixture.priorityRoutine, project, atlasTextTerm(t, "routine"), "", []Citation{
-		priorityRoutineEvidence.citation(observation.EvidenceSupporting),
+		fixture.priorityRoutineEvidence.citation(observation.EvidenceSupporting),
 	})
 	priorityCritical := atlasReadObservationFromCanonical(t, fixture.priorityCritical, project, atlasTextTerm(t, "critical"), "", []Citation{
-		priorityCriticalEvidence.citation(observation.EvidenceSupporting),
+		fixture.priorityCriticalEvidence.citation(observation.EvidenceSupporting),
 	})
 	riskUnknown := atlasReadObservation(t, atlasObservationInput{
 		id:              "observation:atlas/risk-unknown",
@@ -679,7 +790,7 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 		recordedAt:      time.Date(2032, time.January, 18, 10, 5, 0, 0, time.UTC),
 		status:          observation.StatusObserved,
 		confidence:      &lowConfidence,
-		citations:       []Citation{riskUnknownEvidence.citation(observation.EvidenceSupporting)},
+		citations:       []Citation{fixture.riskUnknownEvidence.citation(observation.EvidenceSupporting)},
 	})
 	riskWindow := atlasReadObservation(t, atlasObservationInput{
 		id:              "observation:atlas/risk-window",
@@ -696,7 +807,7 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 		recordedAt: time.Date(2032, time.March, 16, 10, 5, 0, 0, time.UTC),
 		status:     observation.StatusObserved,
 		confidence: &highConfidence,
-		citations:  []Citation{riskWindowEvidence.citation(observation.EvidenceSupporting)},
+		citations:  []Citation{fixture.riskWindowEvidence.citation(observation.EvidenceSupporting)},
 	})
 	scopeHypothesis := atlasReadObservation(t, atlasObservationInput{
 		id:              "observation:atlas/scope-hypothesis",
@@ -709,7 +820,7 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 		recordedAt:      time.Date(2032, time.March, 18, 10, 5, 0, 0, time.UTC),
 		status:          observation.StatusHypothesized,
 		confidence:      &highConfidence,
-		citations:       []Citation{scopeEvidence.citation(observation.EvidenceSupporting)},
+		citations:       []Citation{fixture.scopeEvidence.citation(observation.EvidenceSupporting)},
 	})
 
 	fixture.currentSnapshot = ReadSnapshot{
@@ -731,6 +842,7 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 			EntityID:      "entity:project-atlas",
 			Predicate:     "project.partner",
 			ObservationID: "observation:atlas/partner-mention",
+			ValidTime:     observation.UnknownTime(),
 		}},
 	}
 	fixture.historicalSnapshot = ReadSnapshot{
@@ -747,6 +859,7 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 			EntityID:      "entity:project-atlas",
 			Predicate:     "project.responsible_party",
 			ObservationID: "observation:atlas/owner-beta",
+			ValidTime:     revisedInterval,
 		}},
 	}
 	return fixture

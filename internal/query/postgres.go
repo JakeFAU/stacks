@@ -139,6 +139,7 @@ func readSnapshotFromPostgres(
 			EntityID:      record.EntityID,
 			Predicate:     record.Predicate,
 			ObservationID: record.ObservationID,
+			ValidTime:     record.ValidTime,
 		}
 	}
 	return ReadSnapshot{

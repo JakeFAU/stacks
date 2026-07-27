@@ -81,6 +81,7 @@ type Coverage struct {
 	EntityID      identity.EntityID
 	Predicate     observation.Predicate
 	ObservationID observation.ObservationID
+	ValidTime     observation.TemporalExtent
 }
 
 // ReadObservation is one qualified observation together with its resolved

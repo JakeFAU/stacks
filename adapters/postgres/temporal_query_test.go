@@ -436,6 +436,13 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 		temporalTestSecondEntityID,
 	}
 	selection.EntityMatch = TemporalEntityMatchAny
+	coverageValidTime, err := observation.During(
+		time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("observation.During(coverage) error = %v", err)
+	}
 	pool := newTemporalQueryFakePool(
 		temporalQueryRowsResult([][]any{
 			{string(temporalTestEntityID), true},
@@ -444,9 +451,10 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 		temporalQueryRowsResult(nil),
 		temporalQueryRowsResult([][]any{
 			temporalQualificationRow(value, "retained"),
-			temporalExcludedQualificationRow(
+			temporalExcludedQualificationRowWithValidTime(
 				"observation:synthetic/authority-excluded",
 				string(TemporalCoverageAuthorityExcluded),
+				coverageValidTime,
 			),
 			temporalExcludedQualificationRow(
 				"observation:synthetic/admission-target-after-cutoff",
@@ -533,6 +541,13 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 		"observation:synthetic/entity-filtered",
 		"observation:synthetic/predicate-filtered",
 	}
+	wantCoverageValidTimes := []observation.TemporalExtent{
+		coverageValidTime,
+		observation.UnknownTime(),
+		observation.UnknownTime(),
+		observation.UnknownTime(),
+		observation.UnknownTime(),
+	}
 	if len(snapshot.Coverage) != len(wantCoverageReasons) {
 		t.Fatalf("snapshot coverage = %#v, want five closed exclusions", snapshot.Coverage)
 	}
@@ -540,7 +555,8 @@ func TestTemporalQuerySnapshotCommitsAfterAllAuthorityObservationAndEvidenceRead
 		if snapshot.Coverage[index].Reason != reason ||
 			snapshot.Coverage[index].ObservationID != wantCoverageObservationIDs[index] ||
 			snapshot.Coverage[index].EntityID != temporalTestEntityID ||
-			snapshot.Coverage[index].Predicate != temporalTestPredicate {
+			snapshot.Coverage[index].Predicate != temporalTestPredicate ||
+			snapshot.Coverage[index].ValidTime != wantCoverageValidTimes[index] {
 			t.Fatalf(
 				"snapshot coverage %d = %#v, want reason %q",
 				index,
@@ -1062,14 +1078,29 @@ func TestTemporalQuerySnapshotDoesNotApplyValidTimeOrConfidencePolicy(t *testing
 		}
 	}
 	authoritySQL := pool.transaction.queries[2].sql
+	qualificationPolicySQL, projectionSQL, foundProjection := strings.Cut(
+		authoritySQL,
+		"\n\tSELECT\n\t\tprojected.id,",
+	)
+	if !foundProjection {
+		t.Fatal("authority eligibility SQL omitted final projection")
+	}
 	for _, forbidden := range []string{
 		"valid_start",
 		"valid_end",
 		"confidence_value",
 		"epistemic_status",
 	} {
-		if strings.Contains(authoritySQL, forbidden) {
+		if strings.Contains(qualificationPolicySQL, forbidden) {
 			t.Fatalf("authority eligibility SQL contains core policy field %q", forbidden)
+		}
+	}
+	for _, projected := range []string{
+		"projected.valid_start",
+		"projected.valid_end",
+	} {
+		if !strings.Contains(projectionSQL, projected) {
+			t.Fatalf("authority coverage projection omitted %q", projected)
 		}
 	}
 	observationSQL := pool.transaction.queries[3].sql
@@ -1346,9 +1377,12 @@ func temporalQualificationRow(
 ) []any {
 	subjectID, _, _ := value.Statement().Subject.Entity()
 	objectText, _ := value.Statement().Object.Text()
-	return []any{
+	result := []any{
 		string(value.ID()),
 		string(value.Statement().Predicate),
+	}
+	result = append(result, temporalExtentColumns(value.ValidTime())...)
+	return append(result,
 		termKindEntity,
 		nil,
 		subjectID,
@@ -1359,16 +1393,31 @@ func temporalQualificationRow(
 		nil,
 		classification,
 		string(temporalTestEntityID),
-	}
+	)
 }
 
 func temporalExcludedQualificationRow(
 	id string,
 	classification string,
 ) []any {
-	return []any{
+	return temporalExcludedQualificationRowWithValidTime(
+		id,
+		classification,
+		observation.UnknownTime(),
+	)
+}
+
+func temporalExcludedQualificationRowWithValidTime(
+	id string,
+	classification string,
+	validTime observation.TemporalExtent,
+) []any {
+	result := []any{
 		id,
 		string(temporalTestPredicate),
+	}
+	result = append(result, temporalExtentColumns(validTime)...)
+	return append(result,
 		termKindEntity,
 		nil,
 		string(temporalTestEntityID),
@@ -1379,6 +1428,20 @@ func temporalExcludedQualificationRow(
 		nil,
 		classification,
 		string(temporalTestEntityID),
+	)
+}
+
+func temporalExtentColumns(extent observation.TemporalExtent) []any {
+	stored, err := encodeTemporalExtent(extent)
+	if err != nil {
+		panic(err)
+	}
+	return []any{
+		stored.kind,
+		stored.hasStart,
+		stored.start,
+		stored.hasEnd,
+		stored.end,
 	}
 }
 

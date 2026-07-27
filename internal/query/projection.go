@@ -403,6 +403,7 @@ func projectTrendGaps(
 			{selection: before.Selection, facts: before.Facts, unresolved: before.Unresolved},
 			{selection: after.Selection, facts: after.Facts, unresolved: after.Unresolved},
 		},
+		nil,
 	)
 }
 
@@ -412,6 +413,7 @@ func projectPointGaps(
 	candidates []temporal.StateCandidate,
 	summary temporal.PointSummary,
 ) ([]Gap, error) {
+	selection := summary.Selection
 	return projectStateGaps(
 		request,
 		snapshot,
@@ -421,6 +423,7 @@ func projectPointGaps(
 			facts:      summary.Facts,
 			unresolved: summary.Unresolved,
 		}},
+		&selection,
 	)
 }
 
@@ -435,6 +438,7 @@ func projectStateGaps(
 	snapshot ReadSnapshot,
 	candidates []temporal.StateCandidate,
 	summaries []stateGapMaterial,
+	coverageSelection *temporal.TemporalSelection,
 ) ([]Gap, error) {
 	if err := validateCoverageReasons(snapshot.Coverage); err != nil {
 		return nil, err
@@ -442,6 +446,10 @@ func projectStateGaps(
 	gaps := make(map[Gap]struct{})
 	hasMaterial := make(map[identity.EntityID]bool, len(request.EntityIDs))
 	for _, coverage := range snapshot.Coverage {
+		if coverageSelection != nil &&
+			definitelyOutsideSelection(coverage.ValidTime, *coverageSelection) {
+			continue
+		}
 		switch coverage.Reason {
 		case CoverageUnresolvedMention:
 			gaps[Gap{Kind: GapUnresolvedMention, EntityID: coverage.EntityID, Predicate: coverage.Predicate}] = struct{}{}

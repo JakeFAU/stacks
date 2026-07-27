@@ -220,6 +220,127 @@ func TestPointQueryProjectsExactCitationsAndGaps(t *testing.T) {
 	}
 }
 
+func TestPointQueryIgnoresCoverageWhollyOutsidePointAndReportsNoEvidence(t *testing.T) {
+	fixture := newTrendFixture(t)
+	at := time.Date(2024, time.January, 15, 12, 0, 0, 0, time.UTC)
+	selection, err := temporal.At("at", at)
+	if err != nil {
+		t.Fatalf("temporal.At() error = %v", err)
+	}
+	request := Request{
+		Intent:         temporal.IntentPointInTime,
+		EntityIDs:      []identity.EntityID{"entity-a"},
+		EntityMatch:    EntityMatchAll,
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+	}
+	before := fixture.instant(2024, time.January, 14)
+	after := fixture.interval(2024, time.February, 1, time.March, 1)
+	snapshot := fixture.snapshot()
+	snapshot.Coverage = []Coverage{
+		{
+			Reason:        CoverageUnresolvedMention,
+			EntityID:      "entity-a",
+			Predicate:     "work.owner",
+			ObservationID: "coverage-before-point",
+			ValidTime:     before,
+		},
+		{
+			Reason:        CoverageAuthorityExcluded,
+			EntityID:      "entity-a",
+			Predicate:     "work.team",
+			ObservationID: "coverage-after-point",
+			ValidTime:     after,
+		},
+	}
+
+	result, err := (Service{
+		Reader: &recordingTrendReader{snapshot: snapshot},
+		Limits: validLimits(),
+	}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	want := []Gap{{Kind: GapNoEvidence, EntityID: "entity-a"}}
+	if !reflect.DeepEqual(result.Gaps, want) {
+		t.Fatalf("Query() gaps = %#v, want only no-evidence", result.Gaps)
+	}
+}
+
+func TestPointQueryKeepsCoverageThatCanApplyAtPoint(t *testing.T) {
+	fixture := newTrendFixture(t)
+	at := time.Date(2024, time.January, 15, 12, 0, 0, 0, time.UTC)
+	selection, err := temporal.At("at", at)
+	if err != nil {
+		t.Fatalf("temporal.At() error = %v", err)
+	}
+	overlapping := fixture.interval(2024, time.January, 1, time.February, 1)
+	uncertain, err := observation.Within(at.Add(-time.Hour), at.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("observation.Within() error = %v", err)
+	}
+	tests := []struct {
+		name      string
+		reason    CoverageReason
+		validTime observation.TemporalExtent
+		wantKind  GapKind
+	}{
+		{
+			name:      "overlapping interval",
+			reason:    CoverageUnresolvedMention,
+			validTime: overlapping,
+			wantKind:  GapUnresolvedMention,
+		},
+		{
+			name:      "unknown valid time",
+			reason:    CoverageAuthorityExcluded,
+			validTime: observation.UnknownTime(),
+			wantKind:  GapAuthorityExcluded,
+		},
+		{
+			name:      "overlapping uncertainty window",
+			reason:    CoverageUnresolvedMention,
+			validTime: uncertain,
+			wantKind:  GapUnresolvedMention,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := Request{
+				Intent:         temporal.IntentPointInTime,
+				EntityIDs:      []identity.EntityID{"entity-a"},
+				EntityMatch:    EntityMatchAll,
+				Selections:     []temporal.TemporalSelection{selection},
+				KnowledgeScope: temporal.CurrentKnowledge(),
+			}
+			snapshot := fixture.snapshot()
+			snapshot.Coverage = []Coverage{{
+				Reason:        test.reason,
+				EntityID:      "entity-a",
+				Predicate:     "work.owner",
+				ObservationID: "coverage-at-point",
+				ValidTime:     test.validTime,
+			}}
+
+			result, err := (Service{
+				Reader: &recordingTrendReader{snapshot: snapshot},
+				Limits: validLimits(),
+			}).Query(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Query() error = %v", err)
+			}
+			want := []Gap{{
+				Kind:      test.wantKind,
+				EntityID:  "entity-a",
+				Predicate: "work.owner",
+			}}
+			if !reflect.DeepEqual(result.Gaps, want) {
+				t.Fatalf("Query() gaps = %#v, want %#v", result.Gaps, want)
+			}
+		})
+	}
+}
+
 func TestTrendQueryPreservesConflictHypothesisCounterevidenceAndTemporalUncertainty(t *testing.T) {
 	fixture := newTrendFixture(t)
 	observations := []ReadObservation{
