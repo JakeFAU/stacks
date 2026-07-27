@@ -34,7 +34,7 @@ func TestAggregateWindowFiltersValidAndRecordedTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AggregateWindow() error = %v", err)
 	}
-	if len(summary.Facts) != 1 || summary.Facts[0].Key != "status" {
+	if len(summary.Facts) != 1 || summary.Facts[0].Key.Predicate != "status" {
 		t.Errorf("Facts = %v, want only eligible status fact", summary.Facts)
 	}
 }
@@ -201,7 +201,7 @@ func TestAggregateWindowPreservesConflictingProvenance(t *testing.T) {
 	if unresolved.Reason != temporal.UnresolvedConflict {
 		t.Errorf("Reason = %q, want %q", unresolved.Reason, temporal.UnresolvedConflict)
 	}
-	if got := []string{unresolved.Candidates[0].Value, unresolved.Candidates[1].Value}; !slices.Equal(got, []string{"active", "paused"}) {
+	if got := []string{termText(t, unresolved.Candidates[0].Value), termText(t, unresolved.Candidates[1].Value)}; !slices.Equal(got, []string{"active", "paused"}) {
 		t.Errorf("candidate values = %v, want ordered conflicting values", got)
 	}
 }
@@ -241,7 +241,7 @@ func TestAggregateWindowKeepsSubstantiveConflictWhenCounterevidenceOnlyCandidate
 		t.Fatalf("Candidates = %+v, want active and paused", unresolved.Candidates)
 	}
 	active := unresolved.Candidates[0]
-	if active.Value != "active" ||
+	if termText(t, active.Value) != "active" ||
 		!slices.Equal(active.ObservationIDs, []observation.ObservationID{"observation-active", "observation-counter"}) ||
 		!slices.Equal(active.SupportingEvidenceIDs, []evidence.EvidenceID{"evidence-active"}) ||
 		!slices.Equal(active.ContradictingEvidenceIDs, []evidence.EvidenceID{"evidence-counter"}) {
@@ -344,7 +344,7 @@ func TestAggregateWindowDoesNotLetMatchingHypothesisUndermineSupportedState(t *t
 	if err != nil {
 		t.Fatalf("AggregateWindow() error = %v", err)
 	}
-	if len(summary.Facts) != 1 || summary.Facts[0].Value != "active" {
+	if len(summary.Facts) != 1 || termText(t, summary.Facts[0].Value) != "active" {
 		t.Errorf("Facts = %v, want supported active state", summary.Facts)
 	}
 	if !slices.Equal(summary.Facts[0].ObservationIDs, []observation.ObservationID{"observation-1"}) {
@@ -492,8 +492,90 @@ func TestAggregateAndCompareReconstructsRelationshipChange(t *testing.T) {
 		t.Fatalf("len(Changes) = %d, want 1", len(comparison.Changes))
 	}
 	change := comparison.Changes[0]
-	if change.Kind != temporal.ChangeChanged || change.Before.Value != "collaborator" || change.After.Value != "partner" {
+	if change.Kind != temporal.ChangeChanged || termText(t, change.Before.Value) != "collaborator" || termText(t, change.After.Value) != "partner" {
 		t.Errorf("Change = %+v, want collaborator to partner", change)
+	}
+}
+
+func TestAggregateWindowKeepsTypedEntityAndTextTermsDistinct(t *testing.T) {
+	entity := entityTerm(t, "same:/雪", "")
+	text := textTerm(t, "same:/雪")
+	key := stateKeyFor(t, textTerm(t, " subject: /雪 "), "status: / ")
+	validTime := mustDuring(t, time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, time.June, 1, 0, 0, 0, 0, time.UTC))
+	recordedAt := time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC)
+	summary, err := temporal.AggregateWindow(aggregationWindow(t), temporal.CurrentKnowledge(), []temporal.StateCandidate{
+		typedCandidate(t, key, entity, key.Subject, key.Predicate, entity, "entity", validTime, recordedAt),
+		typedCandidate(t, key, text, key.Subject, key.Predicate, text, "text", validTime, recordedAt),
+	})
+	if err != nil {
+		t.Fatalf("AggregateWindow() error = %v", err)
+	}
+	if len(summary.Facts) != 0 || len(summary.Unresolved) != 1 {
+		t.Fatalf("summary = %+v, want unresolved typed conflict", summary)
+	}
+	if subject, ok := summary.Unresolved[0].Key.Subject.Text(); !ok || subject != " subject: /雪 " || summary.Unresolved[0].Key.Predicate != "status: / " {
+		t.Errorf("state key = %+v, want exact whitespace-preserving text and predicate", summary.Unresolved[0].Key)
+	}
+	got := summary.Unresolved[0].Candidates
+	if len(got) != 2 || got[0].Value.Kind() != observation.TermText || got[1].Value.Kind() != observation.TermEntity {
+		t.Errorf("candidate kinds = %v, want text then entity with equal visible bytes", []observation.TermKind{got[0].Value.Kind(), got[1].Value.Kind()})
+	}
+}
+
+func TestAggregateWindowIgnoresGroundingMentionForEntitySemanticIdentity(t *testing.T) {
+	canonicalSubject := entityTerm(t, "entity:/雪", "")
+	value := textTerm(t, "active")
+	predicate, err := observation.NewPredicate("status")
+	if err != nil {
+		t.Fatalf("NewPredicate() error = %v", err)
+	}
+	key, err := temporal.NewStateKey(canonicalSubject, predicate)
+	if err != nil {
+		t.Fatalf("NewStateKey() error = %v", err)
+	}
+	firstMention := mentionTerm(t, "mention:1 /雪")
+	secondMention := mentionTerm(t, "mention:2 /雪")
+	validTime := mustDuring(t, time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, time.June, 1, 0, 0, 0, 0, time.UTC))
+	recordedAt := time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC)
+	summary, err := temporal.AggregateWindow(aggregationWindow(t), temporal.CurrentKnowledge(), []temporal.StateCandidate{
+		typedCandidate(t, key, value, firstMention, predicate, value, "first", validTime, recordedAt, withSubjectGrounding("mention:1 /雪")),
+		typedCandidate(t, key, value, secondMention, predicate, value, "second", validTime, recordedAt, withSubjectGrounding("mention:2 /雪")),
+	})
+	if err != nil {
+		t.Fatalf("AggregateWindow() error = %v", err)
+	}
+	if len(summary.Facts) != 1 || temporal.CompareTerms(summary.Facts[0].Key.Subject, canonicalSubject) != 0 {
+		t.Fatalf("Facts = %+v, want one entity-keyed fact", summary.Facts)
+	}
+	entityID, groundingMentionID, ok := summary.Facts[0].Key.Subject.Entity()
+	if !ok || entityID != "entity:/雪" || groundingMentionID != "" {
+		t.Errorf("fact subject = (%q, %q, %t), want ungrounded canonical entity", entityID, groundingMentionID, ok)
+	}
+	if !slices.Equal(summary.Facts[0].ObservationIDs, []observation.ObservationID{"first", "second"}) {
+		t.Errorf("ObservationIDs = %v, want contributions from both grounded mentions", summary.Facts[0].ObservationIDs)
+	}
+	ungrounded := typedCandidate(t, key, value, firstMention, predicate, value, "ungrounded", validTime, recordedAt)
+	if _, err := temporal.AggregateWindow(aggregationWindow(t), temporal.CurrentKnowledge(), []temporal.StateCandidate{ungrounded}); err == nil {
+		t.Fatal("AggregateWindow() error = nil, want missing grounding mention rejection")
+	}
+}
+
+func TestAggregateWindowRejectsCandidateThatDoesNotMatchObservationStatement(t *testing.T) {
+	key := stateKeyFor(t, textTerm(t, "entity-1"), "status")
+	active := textTerm(t, "active")
+	paused := textTerm(t, "paused")
+	validTime := mustDuring(t, time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, time.June, 1, 0, 0, 0, 0, time.UTC))
+	candidate := typedCandidate(t, key, paused, key.Subject, key.Predicate, active, "mismatch", validTime, time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC))
+	if _, err := temporal.AggregateWindow(aggregationWindow(t), temporal.CurrentKnowledge(), []temporal.StateCandidate{candidate}); err == nil {
+		t.Fatal("AggregateWindow() error = nil, want statement mapping error")
+	}
+}
+
+func TestStateKeyNeverDependsOnStringDelimiterEncoding(t *testing.T) {
+	first := stateKeyFor(t, textTerm(t, "subject:part /雪"), "predicate")
+	second := stateKeyFor(t, textTerm(t, "subject"), "part /雪:predicate")
+	if temporal.CompareStateKeys(first, second) == 0 {
+		t.Fatal("CompareStateKeys() = 0, want distinct typed keys")
 	}
 }
 
@@ -565,7 +647,99 @@ func stateCandidate(
 	if err != nil {
 		t.Fatalf("observation.NewObservation() error = %v", err)
 	}
-	return temporal.StateCandidate{Key: key, Value: value, Observation: valueObservation}
+	return temporal.StateCandidate{
+		Key:         temporal.StateKey{Subject: subject, Predicate: predicate},
+		Value:       object,
+		Observation: valueObservation,
+	}
+}
+
+func textTerm(t *testing.T, value string) observation.Term {
+	t.Helper()
+	term, err := observation.NewTextTerm(value)
+	if err != nil {
+		t.Fatalf("NewTextTerm(%q) error = %v", value, err)
+	}
+	return term
+}
+
+func mentionTerm(t *testing.T, mentionID string) observation.Term {
+	t.Helper()
+	term, err := observation.NewMentionTerm(mentionID)
+	if err != nil {
+		t.Fatalf("NewMentionTerm(%q) error = %v", mentionID, err)
+	}
+	return term
+}
+
+func entityTerm(t *testing.T, entityID, groundingMentionID string) observation.Term {
+	t.Helper()
+	term, err := observation.NewEntityTerm(entityID, groundingMentionID)
+	if err != nil {
+		t.Fatalf("NewEntityTerm(%q, %q) error = %v", entityID, groundingMentionID, err)
+	}
+	return term
+}
+
+func stateKeyFor(t *testing.T, subject observation.Term, predicateValue string) temporal.StateKey {
+	t.Helper()
+	predicate, err := observation.NewPredicate(predicateValue)
+	if err != nil {
+		t.Fatalf("NewPredicate(%q) error = %v", predicateValue, err)
+	}
+	key, err := temporal.NewStateKey(subject, predicate)
+	if err != nil {
+		t.Fatalf("NewStateKey() error = %v", err)
+	}
+	return key
+}
+
+type candidateOption func(*temporal.StateCandidate)
+
+func withSubjectGrounding(mentionID string) candidateOption {
+	return func(candidate *temporal.StateCandidate) {
+		candidate.SubjectGroundingMentionID = mentionID
+	}
+}
+
+func typedCandidate(
+	t *testing.T,
+	key temporal.StateKey,
+	value, subject observation.Term,
+	predicate observation.Predicate,
+	object observation.Term,
+	id observation.ObservationID,
+	validTime observation.TemporalExtent,
+	recordedAt time.Time,
+	options ...candidateOption,
+) temporal.StateCandidate {
+	t.Helper()
+	valueObservation, err := observation.NewObservation(observation.ObservationInput{
+		ID:         id,
+		Statement:  observation.Statement{Subject: subject, Predicate: predicate, Object: object},
+		ValidTime:  validTime,
+		RecordedAt: recordedAt,
+		Evidence:   supporting(evidence.EvidenceID("evidence-" + string(id))),
+		Derivation: observation.Derivation{Method: "synthetic-test", Version: "v1"},
+		Status:     observation.StatusObserved,
+	})
+	if err != nil {
+		t.Fatalf("NewObservation() error = %v", err)
+	}
+	candidate := temporal.StateCandidate{Key: key, Value: value, Observation: valueObservation}
+	for _, option := range options {
+		option(&candidate)
+	}
+	return candidate
+}
+
+func termText(t *testing.T, term observation.Term) string {
+	t.Helper()
+	value, ok := term.Text()
+	if !ok {
+		t.Fatalf("term kind = %d, want text", term.Kind())
+	}
+	return value
 }
 
 func withConfidence(t *testing.T, source observation.Observation, value float64) observation.Observation {

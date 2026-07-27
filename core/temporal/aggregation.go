@@ -11,15 +11,6 @@ import (
 	"github.com/JakeFAU/stacks/core/observation"
 )
 
-// Fact is an aggregated state value with role-separated provenance.
-type Fact struct {
-	Key                      string
-	Value                    string
-	ObservationIDs           []observation.ObservationID
-	SupportingEvidenceIDs    []evidence.EvidenceID
-	ContradictingEvidenceIDs []evidence.EvidenceID
-}
-
 // UnresolvedReason explains why aggregation did not promote a fact to state.
 type UnresolvedReason string
 
@@ -34,7 +25,7 @@ const (
 // UnresolvedFact preserves candidate values and provenance that aggregation
 // could not safely collapse into one state value.
 type UnresolvedFact struct {
-	Key        string
+	Key        StateKey
 	Reason     UnresolvedReason
 	Candidates []Fact
 }
@@ -46,23 +37,15 @@ type WindowSummary struct {
 	Unresolved []UnresolvedFact
 }
 
-// StateCandidate is an entity-resolved projection of an observation. Key and
-// Value are supplied by the retrieval boundary.
-type StateCandidate struct {
-	Key         string
-	Value       string
-	Observation observation.Observation
-}
-
 type candidateIdentity struct {
-	key         string
-	value       string
+	key         stateKeyIdentity
+	value       termIdentity
 	observation observation.Observation
 }
 
 type factAccumulator struct {
-	key           string
-	value         string
+	key           StateKey
+	value         observation.Term
 	observations  map[observation.ObservationID]struct{}
 	supporting    map[evidence.EvidenceID]struct{}
 	contradicting map[evidence.EvidenceID]struct{}
@@ -70,21 +53,18 @@ type factAccumulator struct {
 }
 
 type keyAccumulator struct {
-	supported        map[string]*factAccumulator
-	tentative        map[string]*factAccumulator
-	counterOnly      map[string]*factAccumulator
-	temporalValues   map[string]struct{}
-	hypothesisValues map[string]struct{}
+	key              StateKey
+	supported        map[termIdentity]*factAccumulator
+	tentative        map[termIdentity]*factAccumulator
+	counterOnly      map[termIdentity]*factAccumulator
+	temporalValues   map[termIdentity]struct{}
+	hypothesisValues map[termIdentity]struct{}
 }
 
 // AggregateWindow selects eligible observations and constructs deterministic
 // state for one valid-time window. Confidence is never used as a truth
 // threshold or conflict tie-breaker.
-func AggregateWindow(
-	selection TemporalSelection,
-	scope KnowledgeScope,
-	candidates []StateCandidate,
-) (WindowSummary, error) {
+func AggregateWindow(selection TemporalSelection, scope KnowledgeScope, candidates []StateCandidate) (WindowSummary, error) {
 	if selection.kind != SelectionWindow {
 		return WindowSummary{}, fmt.Errorf("state aggregation requires a window selection")
 	}
@@ -92,20 +72,21 @@ func AggregateWindow(
 		return WindowSummary{}, fmt.Errorf("state aggregation knowledge scope is invalid")
 	}
 
-	groups := make(map[string]*keyAccumulator)
+	groups := make(map[stateKeyIdentity]*keyAccumulator)
 	seenObservations := make(map[observation.ObservationID]candidateIdentity)
 	for _, candidate := range candidates {
-		key := strings.TrimSpace(candidate.Key)
-		value := strings.TrimSpace(candidate.Value)
-		if key == "" || value == "" {
-			return WindowSummary{}, fmt.Errorf("state candidate key and value are required")
+		if err := candidateMatchesObservation(candidate); err != nil {
+			return WindowSummary{}, err
 		}
-
 		observationID := candidate.Observation.ID()
 		if strings.TrimSpace(string(observationID)) == "" {
 			return WindowSummary{}, fmt.Errorf("state candidate observation is invalid")
 		}
-		identity := candidateIdentity{key: key, value: value, observation: candidate.Observation}
+		identity := candidateIdentity{
+			key:         identityForStateKey(candidate.Key),
+			value:       identityForTerm(candidate.Value),
+			observation: candidate.Observation,
+		}
 		if prior, exists := seenObservations[observationID]; exists {
 			if prior.key != identity.key || prior.value != identity.value {
 				return WindowSummary{}, fmt.Errorf("observation %q maps to conflicting state candidates", observationID)
@@ -128,34 +109,36 @@ func AggregateWindow(
 			continue
 		}
 
-		group := groups[key]
+		keyIdentity := identityForStateKey(candidate.Key)
+		group := groups[keyIdentity]
 		if group == nil {
 			group = &keyAccumulator{
-				supported:        make(map[string]*factAccumulator),
-				tentative:        make(map[string]*factAccumulator),
-				counterOnly:      make(map[string]*factAccumulator),
-				temporalValues:   make(map[string]struct{}),
-				hypothesisValues: make(map[string]struct{}),
+				key:              candidate.Key,
+				supported:        make(map[termIdentity]*factAccumulator),
+				tentative:        make(map[termIdentity]*factAccumulator),
+				counterOnly:      make(map[termIdentity]*factAccumulator),
+				temporalValues:   make(map[termIdentity]struct{}),
+				hypothesisValues: make(map[termIdentity]struct{}),
 			}
-			groups[key] = group
+			groups[keyIdentity] = group
 		}
 
+		valueIdentity := identityForTerm(candidate.Value)
 		hasSupporting := observationHasSupportingEvidence(candidate.Observation)
 		switch {
 		case !hasSupporting:
-			mergeCandidate(group.counterOnly, key, value, candidate.Observation)
+			mergeCandidate(group.counterOnly, candidate.Key, candidate.Value, candidate.Observation)
 		case temporallyUncertain || candidate.Observation.Status() == observation.StatusHypothesized:
-			mergeCandidate(group.tentative, key, value, candidate.Observation)
+			mergeCandidate(group.tentative, candidate.Key, candidate.Value, candidate.Observation)
 			if temporallyUncertain {
-				group.temporalValues[value] = struct{}{}
+				group.temporalValues[valueIdentity] = struct{}{}
 			} else {
-				group.hypothesisValues[value] = struct{}{}
+				group.hypothesisValues[valueIdentity] = struct{}{}
 			}
 		default:
-			mergeCandidate(group.supported, key, value, candidate.Observation)
+			mergeCandidate(group.supported, candidate.Key, candidate.Value, candidate.Observation)
 		}
 	}
-
 	return summarizeGroups(selection, groups), nil
 }
 
@@ -215,9 +198,7 @@ func validTimeEligibility(selection TemporalSelection, extent observation.Tempor
 		return !instant.Before(windowStart) && instant.Before(windowEnd), false
 	case observation.TemporalInterval:
 		start, hasStart, end, hasEnd := extent.Bounds()
-		startsBeforeWindowEnds := !hasStart || start.Before(windowEnd)
-		endsAfterWindowStarts := !hasEnd || end.After(windowStart)
-		return startsBeforeWindowEnds && endsAfterWindowStarts, false
+		return (!hasStart || start.Before(windowEnd)) && (!hasEnd || end.After(windowStart)), false
 	case observation.TemporalWindow:
 		start, _, end, _ := extent.Bounds()
 		if !start.Before(windowEnd) || !end.After(windowStart) {
@@ -230,15 +211,16 @@ func validTimeEligibility(selection TemporalSelection, extent observation.Tempor
 }
 
 func mergeCandidate(
-	target map[string]*factAccumulator,
-	key string,
-	value string,
+	target map[termIdentity]*factAccumulator,
+	key StateKey,
+	value observation.Term,
 	valueObservation observation.Observation,
 ) {
-	accumulator := target[value]
+	identity := identityForTerm(value)
+	accumulator := target[identity]
 	if accumulator == nil {
 		accumulator = newFactAccumulator(key, value)
-		target[value] = accumulator
+		target[identity] = accumulator
 	}
 	accumulator.observations[valueObservation.ID()] = struct{}{}
 	accumulator.extents = append(accumulator.extents, valueObservation.ValidTime())
@@ -252,7 +234,7 @@ func mergeCandidate(
 	}
 }
 
-func newFactAccumulator(key, value string) *factAccumulator {
+func newFactAccumulator(key StateKey, value observation.Term) *factAccumulator {
 	return &factAccumulator{
 		key:           key,
 		value:         value,
@@ -262,42 +244,39 @@ func newFactAccumulator(key, value string) *factAccumulator {
 	}
 }
 
-func summarizeGroups(selection TemporalSelection, groups map[string]*keyAccumulator) WindowSummary {
-	keys := make([]string, 0, len(groups))
-	for key := range groups {
-		keys = append(keys, key)
+func summarizeGroups(selection TemporalSelection, groups map[stateKeyIdentity]*keyAccumulator) WindowSummary {
+	orderedGroups := make([]*keyAccumulator, 0, len(groups))
+	for _, group := range groups {
+		orderedGroups = append(orderedGroups, group)
 	}
-	sort.Strings(keys)
-
+	sort.Slice(orderedGroups, func(left, right int) bool {
+		return CompareStateKeys(orderedGroups[left].key, orderedGroups[right].key) < 0
+	})
 	summary := WindowSummary{Selection: selection}
-	for _, key := range keys {
-		group := groups[key]
+	for _, group := range orderedGroups {
 		supportedValues := sortedAccumulatorValues(group.supported)
 		tentativeValues := sortedAccumulatorValues(group.tentative)
 		counterOnlyValues := sortedAccumulatorValues(group.counterOnly)
-
 		if len(counterOnlyValues) == 0 &&
 			len(supportedValues) == 1 &&
 			noAlternativeValues(supportedValues[0], tentativeValues) {
 			summary.Facts = append(summary.Facts, accumulatorFact(group.supported[supportedValues[0]]))
 			continue
 		}
-
 		allCandidates := mergeAccumulators(group.supported, group.tentative, group.counterOnly)
 		if len(allCandidates) == 0 {
 			continue
 		}
-		reason := unresolvedReason(group, supportedValues, tentativeValues, counterOnlyValues)
 		summary.Unresolved = append(summary.Unresolved, UnresolvedFact{
-			Key:        key,
-			Reason:     reason,
+			Key:        group.key,
+			Reason:     unresolvedReason(group, supportedValues, tentativeValues, counterOnlyValues),
 			Candidates: orderedAccumulatorFacts(allCandidates),
 		})
 	}
 	return summary
 }
 
-func noAlternativeValues(supported string, tentative []string) bool {
+func noAlternativeValues(supported termIdentity, tentative []termIdentity) bool {
 	for _, value := range tentative {
 		if value != supported {
 			return false
@@ -306,22 +285,15 @@ func noAlternativeValues(supported string, tentative []string) bool {
 	return true
 }
 
-func unresolvedReason(
-	group *keyAccumulator,
-	supported []string,
-	tentative []string,
-	counterOnly []string,
-) UnresolvedReason {
-	values := make(map[string]struct{}, len(supported)+len(tentative))
+func unresolvedReason(group *keyAccumulator, supported, tentative, counterOnly []termIdentity) UnresolvedReason {
+	values := make(map[termIdentity]struct{}, len(supported)+len(tentative))
+	supportedSet := make(map[termIdentity]struct{}, len(supported))
 	for _, value := range supported {
 		values[value] = struct{}{}
+		supportedSet[value] = struct{}{}
 	}
 	for _, value := range tentative {
 		values[value] = struct{}{}
-	}
-	supportedSet := make(map[string]struct{}, len(supported))
-	for _, value := range supported {
-		supportedSet[value] = struct{}{}
 	}
 	if hasAlternative(group.temporalValues, supportedSet) {
 		return UnresolvedTemporalUncertainty
@@ -341,7 +313,7 @@ func unresolvedReason(
 	return UnresolvedHypothesis
 }
 
-func hasAlternative(tentative, supported map[string]struct{}) bool {
+func hasAlternative(tentative, supported map[termIdentity]struct{}) bool {
 	if len(tentative) == 0 {
 		return false
 	}
@@ -356,7 +328,7 @@ func hasAlternative(tentative, supported map[string]struct{}) bool {
 	return false
 }
 
-func supportedValuesOverlap(values map[string]*factAccumulator) bool {
+func supportedValuesOverlap(values map[termIdentity]*factAccumulator) bool {
 	orderedValues := sortedAccumulatorValues(values)
 	for left := 0; left < len(orderedValues); left++ {
 		for right := left + 1; right < len(orderedValues); right++ {
@@ -383,7 +355,6 @@ func temporalExtentsOverlap(left, right observation.TemporalExtent) bool {
 	case rightIsInstant:
 		return intervalContains(left, rightInstant)
 	}
-
 	leftStart, leftHasStart, leftEnd, leftHasEnd := left.Bounds()
 	rightStart, rightHasStart, rightEnd, rightHasEnd := right.Bounds()
 	leftStartsBeforeRightEnds := !leftHasStart || !rightHasEnd || leftStart.Before(rightEnd)
@@ -396,23 +367,25 @@ func intervalContains(extent observation.TemporalExtent, instant time.Time) bool
 	return (!hasStart || !instant.Before(start)) && (!hasEnd || instant.Before(end))
 }
 
-func sortedAccumulatorValues(values map[string]*factAccumulator) []string {
-	ordered := make([]string, 0, len(values))
+func sortedAccumulatorValues(values map[termIdentity]*factAccumulator) []termIdentity {
+	ordered := make([]termIdentity, 0, len(values))
 	for value := range values {
 		ordered = append(ordered, value)
 	}
-	sort.Strings(ordered)
+	sort.Slice(ordered, func(left, right int) bool {
+		return CompareTerms(values[ordered[left]].value, values[ordered[right]].value) < 0
+	})
 	return ordered
 }
 
-func mergeAccumulators(groups ...map[string]*factAccumulator) map[string]*factAccumulator {
-	merged := make(map[string]*factAccumulator)
+func mergeAccumulators(groups ...map[termIdentity]*factAccumulator) map[termIdentity]*factAccumulator {
+	merged := make(map[termIdentity]*factAccumulator)
 	for _, group := range groups {
-		for value, source := range group {
-			target := merged[value]
+		for identity, source := range group {
+			target := merged[identity]
 			if target == nil {
 				target = newFactAccumulator(source.key, source.value)
-				merged[value] = target
+				merged[identity] = target
 			}
 			for observationID := range source.observations {
 				target.observations[observationID] = struct{}{}
@@ -428,7 +401,7 @@ func mergeAccumulators(groups ...map[string]*factAccumulator) map[string]*factAc
 	return merged
 }
 
-func orderedAccumulatorFacts(values map[string]*factAccumulator) []Fact {
+func orderedAccumulatorFacts(values map[termIdentity]*factAccumulator) []Fact {
 	orderedValues := sortedAccumulatorValues(values)
 	facts := make([]Fact, 0, len(orderedValues))
 	for _, value := range orderedValues {
