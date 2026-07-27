@@ -109,12 +109,53 @@ func TestProjectAtlasTrendContractPreservesCitedTemporalEvidence(t *testing.T) {
 
 	beforeOwner := currentTrend.Before.Facts[1]
 	afterOwner := currentTrend.After.Facts[1]
-	assertEntityTerm(t, beforeOwner.Value, "entity:delivery-unit-alpha")
-	assertEntityTerm(t, afterOwner.Value, "entity:delivery-unit-beta")
-	if got := afterOwner.Contributions; len(got) != 1 ||
-		got[0].ObservationID != "observation:atlas/owner-beta" ||
-		got[0].ObjectGroundingMentionID != "mention:delivery-unit-beta" {
-		t.Fatalf("after responsibility contribution = %#v", got)
+	ownerKey, err := temporal.NewStateKey(
+		atlasEntityTerm(t, "entity:project-atlas"),
+		"project.responsible_party",
+	)
+	if err != nil {
+		t.Fatalf("temporal.NewStateKey(responsibility) error = %v", err)
+	}
+	wantBeforeOwner := Fact{
+		Key:   ownerKey,
+		Value: atlasEntityTerm(t, "entity:delivery-unit-alpha"),
+		Contributions: []Contribution{{
+			ObservationID: "observation:atlas/owner-alpha",
+			Status:        observation.StatusObserved,
+			ValidTime: atlasInterval(
+				t,
+				time.Date(2032, time.January, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(2032, time.February, 1, 0, 0, 0, 0, time.UTC),
+			),
+			RecordedAt: time.Date(2032, time.January, 12, 10, 5, 0, 0, time.UTC),
+			Derivation: observation.Derivation{
+				Method:  "synthetic-acceptance",
+				Version: "d1-v1",
+				RunID:   "run:project-atlas",
+			},
+		}},
+		SupportingCitations:    []Citation{fixture.ownerAlphaEvidence.citation(observation.EvidenceSupporting)},
+		ContradictingCitations: []Citation{},
+	}
+	wantAfterOwner := Fact{
+		Key:   ownerKey,
+		Value: atlasEntityTerm(t, "entity:delivery-unit-beta"),
+		Contributions: []Contribution{{
+			ObservationID:            "observation:atlas/owner-beta",
+			Status:                   observation.StatusObserved,
+			ValidTime:                atlasSince(t, time.Date(2032, time.March, 1, 0, 0, 0, 0, time.UTC)),
+			RecordedAt:               time.Date(2032, time.March, 3, 10, 5, 0, 0, time.UTC),
+			Derivation:               observation.Derivation{Method: "synthetic-acceptance", Version: "d1-v1", RunID: "run:project-atlas"},
+			ObjectGroundingMentionID: "mention:delivery-unit-beta",
+		}},
+		SupportingCitations:    []Citation{fixture.ownerBetaEvidence.citation(observation.EvidenceSupporting)},
+		ContradictingCitations: []Citation{},
+	}
+	if !reflect.DeepEqual(beforeOwner, wantBeforeOwner) {
+		t.Fatalf("before responsibility fact = %#v, want independent %#v", beforeOwner, wantBeforeOwner)
+	}
+	if !reflect.DeepEqual(afterOwner, wantAfterOwner) {
+		t.Fatalf("after responsibility fact = %#v, want independent %#v", afterOwner, wantAfterOwner)
 	}
 
 	if got := changePredicates(currentTrend.Changes); !slices.Equal(got, []observation.Predicate{
@@ -130,8 +171,8 @@ func TestProjectAtlasTrendContractPreservesCitedTemporalEvidence(t *testing.T) {
 	}
 	if !reflect.DeepEqual(*currentTrend.Changes[0].Before, beforeCommitment) ||
 		!reflect.DeepEqual(*currentTrend.Changes[0].After, afterCommitment) ||
-		!reflect.DeepEqual(*currentTrend.Changes[1].Before, beforeOwner) ||
-		!reflect.DeepEqual(*currentTrend.Changes[1].After, afterOwner) {
+		!reflect.DeepEqual(*currentTrend.Changes[1].Before, wantBeforeOwner) ||
+		!reflect.DeepEqual(*currentTrend.Changes[1].After, wantAfterOwner) {
 		t.Fatal("current changes did not retain the exact cited before/after facts")
 	}
 
@@ -166,16 +207,15 @@ func TestProjectAtlasTrendContractPreservesCitedTemporalEvidence(t *testing.T) {
 	}
 
 	wantCurrentGaps := []Gap{
-		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.delivery_commitment", SelectionLabel: "after-change"},
-		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.delivery_commitment", SelectionLabel: "before-change"},
-		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.delivery_risk", SelectionLabel: "before-change"},
 		{Kind: GapUnresolvedMention, EntityID: "entity:project-atlas", Predicate: "project.partner"},
+		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.delivery_commitment", SelectionLabel: "after-change"},
 		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.priority", SelectionLabel: "after-change"},
 		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.responsible_party", SelectionLabel: "after-change"},
+		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.delivery_commitment", SelectionLabel: "before-change"},
+		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.delivery_risk", SelectionLabel: "before-change"},
 		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.responsible_party", SelectionLabel: "before-change"},
 		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.scope", SelectionLabel: "before-change"},
 	}
-	orderGaps(wantCurrentGaps)
 	if !reflect.DeepEqual(current.Gaps, wantCurrentGaps) {
 		t.Fatalf("current gaps = %#v, want %#v", current.Gaps, wantCurrentGaps)
 	}
@@ -270,6 +310,8 @@ type projectAtlasFixture struct {
 	cutoff             time.Time
 	initialEvidence    projectAtlasEvidence
 	revisionEvidence   projectAtlasEvidence
+	ownerAlphaEvidence projectAtlasEvidence
+	ownerBetaEvidence  projectAtlasEvidence
 	priorityRoutine    observation.Observation
 	priorityCritical   observation.Observation
 }
@@ -353,13 +395,13 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 		"Later synthetic planning note records the changed delivery commitment for 2032-07-01.",
 		time.Date(2032, time.March, 2, 10, 0, 0, 0, time.UTC),
 	)
-	ownerAlphaEvidence := newProjectAtlasEvidence(
+	fixture.ownerAlphaEvidence = newProjectAtlasEvidence(
 		t,
 		"owner-alpha",
 		"Synthetic responsibility is assigned to delivery unit alpha.",
 		time.Date(2032, time.January, 12, 10, 0, 0, 0, time.UTC),
 	)
-	ownerBetaEvidence := newProjectAtlasEvidence(
+	fixture.ownerBetaEvidence = newProjectAtlasEvidence(
 		t,
 		"owner-beta",
 		"Synthetic responsibility transfers to delivery unit beta.",
@@ -468,7 +510,7 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 		recordedAt:      time.Date(2032, time.January, 12, 10, 5, 0, 0, time.UTC),
 		status:          observation.StatusObserved,
 		confidence:      &lowConfidence,
-		citations:       []Citation{ownerAlphaEvidence.citation(observation.EvidenceSupporting)},
+		citations:       []Citation{fixture.ownerAlphaEvidence.citation(observation.EvidenceSupporting)},
 	})
 	ownerBetaObservation := atlasReadObservation(t, atlasObservationInput{
 		id:                       "observation:atlas/owner-beta",
@@ -482,7 +524,7 @@ func newProjectAtlasFixture(t *testing.T) projectAtlasFixture {
 		recordedAt:               time.Date(2032, time.March, 3, 10, 5, 0, 0, time.UTC),
 		status:                   observation.StatusObserved,
 		confidence:               &lowConfidence,
-		citations:                []Citation{ownerBetaEvidence.citation(observation.EvidenceSupporting)},
+		citations:                []Citation{fixture.ownerBetaEvidence.citation(observation.EvidenceSupporting)},
 	})
 	fixture.priorityRoutine = atlasReadObservation(t, atlasObservationInput{
 		id:              "observation:atlas/priority-routine",
@@ -850,13 +892,5 @@ func assertTextTerm(t *testing.T, term observation.Term, want string) {
 	got, ok := term.Text()
 	if !ok || got != want {
 		t.Fatalf("term.Text() = (%q, %v), want (%q, true)", got, ok, want)
-	}
-}
-
-func assertEntityTerm(t *testing.T, term observation.Term, want string) {
-	t.Helper()
-	got, groundingMentionID, ok := term.Entity()
-	if !ok || got != want || groundingMentionID != "" {
-		t.Fatalf("term.Entity() = (%q, %q, %v), want (%q, empty, true)", got, groundingMentionID, ok, want)
 	}
 }
