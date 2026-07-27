@@ -61,6 +61,13 @@ type keyAccumulator struct {
 	hypothesisValues map[termIdentity]struct{}
 }
 
+type stateMaterial struct {
+	facts      []Fact
+	unresolved []UnresolvedFact
+}
+
+type validTimeSelector func(observation.TemporalExtent) (eligible, uncertain bool)
+
 // AggregateWindow selects eligible observations and constructs deterministic
 // state for one valid-time window. Confidence is never used as a truth
 // threshold or conflict tie-breaker.
@@ -72,15 +79,30 @@ func AggregateWindow(selection TemporalSelection, scope KnowledgeScope, candidat
 		return WindowSummary{}, fmt.Errorf("state aggregation knowledge scope is invalid")
 	}
 
+	groups, err := aggregateCandidates(scope, candidates, func(extent observation.TemporalExtent) (bool, bool) {
+		return validTimeEligibility(selection, extent)
+	})
+	if err != nil {
+		return WindowSummary{}, err
+	}
+	material := summarizeGroups(groups)
+	return WindowSummary{Selection: selection, Facts: material.facts, Unresolved: material.unresolved}, nil
+}
+
+func aggregateCandidates(
+	scope KnowledgeScope,
+	candidates []StateCandidate,
+	selectValidTime validTimeSelector,
+) (map[stateKeyIdentity]*keyAccumulator, error) {
 	groups := make(map[stateKeyIdentity]*keyAccumulator)
 	seenObservations := make(map[observation.ObservationID]candidateIdentity)
 	for _, candidate := range candidates {
 		if err := candidateMatchesObservation(candidate); err != nil {
-			return WindowSummary{}, err
+			return nil, err
 		}
 		observationID := candidate.Observation.ID()
 		if strings.TrimSpace(string(observationID)) == "" {
-			return WindowSummary{}, fmt.Errorf("state candidate observation is invalid")
+			return nil, fmt.Errorf("state candidate observation is invalid")
 		}
 		identity := candidateIdentity{
 			key:         identityForStateKey(candidate.Key),
@@ -89,10 +111,10 @@ func AggregateWindow(selection TemporalSelection, scope KnowledgeScope, candidat
 		}
 		if prior, exists := seenObservations[observationID]; exists {
 			if prior.key != identity.key || prior.value != identity.value {
-				return WindowSummary{}, fmt.Errorf("observation %q maps to conflicting state candidates", observationID)
+				return nil, fmt.Errorf("observation maps to conflicting state candidates")
 			}
 			if !observationsEqual(prior.observation, identity.observation) {
-				return WindowSummary{}, fmt.Errorf("observation %q maps to conflicting canonical payloads", observationID)
+				return nil, fmt.Errorf("observation maps to conflicting canonical payloads")
 			}
 			continue
 		}
@@ -101,7 +123,7 @@ func AggregateWindow(selection TemporalSelection, scope KnowledgeScope, candidat
 		if !recordedTimeEligible(scope, candidate.Observation) {
 			continue
 		}
-		eligible, temporallyUncertain := validTimeEligibility(selection, candidate.Observation.ValidTime())
+		eligible, temporallyUncertain := selectValidTime(candidate.Observation.ValidTime())
 		if !eligible && !temporallyUncertain {
 			continue
 		}
@@ -139,7 +161,7 @@ func AggregateWindow(selection TemporalSelection, scope KnowledgeScope, candidat
 			mergeCandidate(group.supported, candidate.Key, candidate.Value, candidate.Observation)
 		}
 	}
-	return summarizeGroups(selection, groups), nil
+	return groups, nil
 }
 
 func observationsEqual(left, right observation.Observation) bool {
@@ -244,7 +266,7 @@ func newFactAccumulator(key StateKey, value observation.Term) *factAccumulator {
 	}
 }
 
-func summarizeGroups(selection TemporalSelection, groups map[stateKeyIdentity]*keyAccumulator) WindowSummary {
+func summarizeGroups(groups map[stateKeyIdentity]*keyAccumulator) stateMaterial {
 	orderedGroups := make([]*keyAccumulator, 0, len(groups))
 	for _, group := range groups {
 		orderedGroups = append(orderedGroups, group)
@@ -252,7 +274,7 @@ func summarizeGroups(selection TemporalSelection, groups map[stateKeyIdentity]*k
 	sort.Slice(orderedGroups, func(left, right int) bool {
 		return CompareStateKeys(orderedGroups[left].key, orderedGroups[right].key) < 0
 	})
-	summary := WindowSummary{Selection: selection}
+	summary := stateMaterial{}
 	for _, group := range orderedGroups {
 		supportedValues := sortedAccumulatorValues(group.supported)
 		tentativeValues := sortedAccumulatorValues(group.tentative)
@@ -260,14 +282,14 @@ func summarizeGroups(selection TemporalSelection, groups map[stateKeyIdentity]*k
 		if len(counterOnlyValues) == 0 &&
 			len(supportedValues) == 1 &&
 			noAlternativeValues(supportedValues[0], tentativeValues) {
-			summary.Facts = append(summary.Facts, accumulatorFact(group.supported[supportedValues[0]]))
+			summary.facts = append(summary.facts, accumulatorFact(group.supported[supportedValues[0]]))
 			continue
 		}
 		allCandidates := mergeAccumulators(group.supported, group.tentative, group.counterOnly)
 		if len(allCandidates) == 0 {
 			continue
 		}
-		summary.Unresolved = append(summary.Unresolved, UnresolvedFact{
+		summary.unresolved = append(summary.unresolved, UnresolvedFact{
 			Key:        group.key,
 			Reason:     unresolvedReason(group, supportedValues, tentativeValues, counterOnlyValues),
 			Candidates: orderedAccumulatorFacts(allCandidates),

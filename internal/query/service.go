@@ -20,7 +20,7 @@ const (
 var errQueryTelemetry = errors.New("temporal query failed")
 
 // Service executes provider-neutral temporal queries over one coherent reader
-// snapshot. D1 supports trend comparison; later intents extend this boundary.
+// snapshot.
 type Service struct {
 	Reader Reader
 	Limits Limits
@@ -40,7 +40,8 @@ func (service Service) Query(ctx context.Context, request Request) (result Resul
 	if err != nil {
 		return Result{}, boundedQueryError{operation: "validate temporal query", cause: err}
 	}
-	if normalized.Intent != temporal.IntentTrendComparison {
+	if normalized.Intent != temporal.IntentPointInTime &&
+		normalized.Intent != temporal.IntentTrendComparison {
 		return Result{}, errors.New("execute temporal query: intent is not implemented")
 	}
 
@@ -67,34 +68,40 @@ func (service Service) Query(ctx context.Context, request Request) (result Resul
 	if err != nil {
 		return Result{}, boundedQueryError{operation: "read temporal snapshot", cause: err}
 	}
-	candidates, index, err := indexTrendSnapshot(normalized, snapshot)
+	candidates, index, err := indexSnapshot(normalized, snapshot)
 	if err != nil {
 		return Result{}, err
 	}
 
-	beforeSummary, err := temporal.AggregateWindow(normalized.Selections[0], normalized.KnowledgeScope, candidates)
-	if err != nil {
-		return Result{}, boundedQueryError{operation: "aggregate before trend window", cause: err}
-	}
-	afterSummary, err := temporal.AggregateWindow(normalized.Selections[1], normalized.KnowledgeScope, candidates)
-	if err != nil {
-		return Result{}, boundedQueryError{operation: "aggregate after trend window", cause: err}
-	}
-	comparison, err := temporal.CompareWindowSummaries(beforeSummary, afterSummary)
-	if err != nil {
-		return Result{}, boundedQueryError{operation: "compare trend windows", cause: err}
-	}
-	trend, err := projectTrend(comparison, index)
-	if err != nil {
-		return Result{}, err
-	}
-	payload, err := NewTrendPayload(trend)
-	if err != nil {
-		return Result{}, boundedQueryError{operation: "construct trend result", cause: err}
-	}
-	gaps, err := projectTrendGaps(normalized, snapshot, candidates, beforeSummary, afterSummary)
-	if err != nil {
-		return Result{}, err
+	var payload IntentPayload
+	var gaps []Gap
+	switch normalized.Intent {
+	case temporal.IntentPointInTime:
+		summary, reconstructErr := temporal.ReconstructState(
+			normalized.Selections[0],
+			normalized.KnowledgeScope,
+			candidates,
+		)
+		if reconstructErr != nil {
+			return Result{}, boundedQueryError{operation: "reconstruct temporal state", cause: reconstructErr}
+		}
+		point, projectErr := projectPoint(summary, index)
+		if projectErr != nil {
+			return Result{}, projectErr
+		}
+		payload, err = NewPointPayload(point)
+		if err != nil {
+			return Result{}, boundedQueryError{operation: "construct point result", cause: err}
+		}
+		gaps, err = projectPointGaps(normalized, snapshot, candidates, summary)
+		if err != nil {
+			return Result{}, err
+		}
+	case temporal.IntentTrendComparison:
+		payload, gaps, err = executeTrend(normalized, snapshot, candidates, index)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 
 	result, err = NormalizeResult(Result{
@@ -112,6 +119,39 @@ func (service Service) Query(ctx context.Context, request Request) (result Resul
 		return Result{}, boundedQueryError{operation: "validate temporal query result", cause: err}
 	}
 	return result, nil
+}
+
+func executeTrend(
+	request Request,
+	snapshot ReadSnapshot,
+	candidates []temporal.StateCandidate,
+	index projectionIndex,
+) (IntentPayload, []Gap, error) {
+	beforeSummary, err := temporal.AggregateWindow(request.Selections[0], request.KnowledgeScope, candidates)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{operation: "aggregate before trend window", cause: err}
+	}
+	afterSummary, err := temporal.AggregateWindow(request.Selections[1], request.KnowledgeScope, candidates)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{operation: "aggregate after trend window", cause: err}
+	}
+	comparison, err := temporal.CompareWindowSummaries(beforeSummary, afterSummary)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{operation: "compare trend windows", cause: err}
+	}
+	trend, err := projectTrend(comparison, index)
+	if err != nil {
+		return IntentPayload{}, nil, err
+	}
+	payload, err := NewTrendPayload(trend)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{operation: "construct trend result", cause: err}
+	}
+	gaps, err := projectTrendGaps(request, snapshot, candidates, beforeSummary, afterSummary)
+	if err != nil {
+		return IntentPayload{}, nil, err
+	}
+	return payload, gaps, nil
 }
 
 type boundedQueryError struct {

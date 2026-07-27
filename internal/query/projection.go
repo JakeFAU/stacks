@@ -4,6 +4,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/identity"
@@ -21,7 +22,7 @@ type projectionIndex struct {
 	citations     map[citationKey]Citation
 }
 
-func indexTrendSnapshot(request Request, snapshot ReadSnapshot) ([]temporal.StateCandidate, projectionIndex, error) {
+func indexSnapshot(request Request, snapshot ReadSnapshot) ([]temporal.StateCandidate, projectionIndex, error) {
 	if err := validateSnapshotAuthority(request, snapshot.Entities); err != nil {
 		return nil, projectionIndex{}, err
 	}
@@ -276,17 +277,50 @@ func projectTrend(comparison temporal.Comparison, index projectionIndex) (TrendR
 	}, nil
 }
 
+func projectPoint(summary temporal.PointSummary, index projectionIndex) (PointInTimeResult, error) {
+	projected, err := projectStateMaterial(summary.Facts, summary.Unresolved, index)
+	if err != nil {
+		return PointInTimeResult{}, err
+	}
+	return PointInTimeResult{
+		Selection:  summary.Selection,
+		Facts:      projected.facts,
+		Unresolved: projected.unresolved,
+	}, nil
+}
+
 func projectWindow(
 	selection temporal.TemporalSelection,
 	facts []temporal.Fact,
 	unresolved []temporal.UnresolvedFact,
 	index projectionIndex,
 ) (WindowResult, error) {
+	projected, err := projectStateMaterial(facts, unresolved, index)
+	if err != nil {
+		return WindowResult{}, err
+	}
+	return WindowResult{
+		Selection:  selection,
+		Facts:      projected.facts,
+		Unresolved: projected.unresolved,
+	}, nil
+}
+
+type projectedStateMaterial struct {
+	facts      []Fact
+	unresolved []UnresolvedItem
+}
+
+func projectStateMaterial(
+	facts []temporal.Fact,
+	unresolved []temporal.UnresolvedFact,
+	index projectionIndex,
+) (projectedStateMaterial, error) {
 	projectedFacts := make([]Fact, len(facts))
 	for position, fact := range facts {
 		projected, err := projectFact(fact, index)
 		if err != nil {
-			return WindowResult{}, err
+			return projectedStateMaterial{}, err
 		}
 		projectedFacts[position] = projected
 	}
@@ -296,13 +330,13 @@ func projectWindow(
 		for candidatePosition, candidate := range item.Candidates {
 			projected, err := projectFact(candidate, index)
 			if err != nil {
-				return WindowResult{}, err
+				return projectedStateMaterial{}, err
 			}
 			candidates[candidatePosition] = projected
 		}
 		projectedUnresolved[position] = UnresolvedItem{Key: item.Key, Reason: item.Reason, Candidates: candidates}
 	}
-	return WindowResult{Selection: selection, Facts: projectedFacts, Unresolved: projectedUnresolved}, nil
+	return projectedStateMaterial{facts: projectedFacts, unresolved: projectedUnresolved}, nil
 }
 
 func projectFactPointer(value *temporal.Fact, index projectionIndex) (*Fact, error) {
@@ -361,6 +395,47 @@ func projectTrendGaps(
 	before temporal.WindowSummary,
 	after temporal.WindowSummary,
 ) ([]Gap, error) {
+	return projectStateGaps(
+		request,
+		snapshot,
+		candidates,
+		[]stateGapMaterial{
+			{selection: before.Selection, facts: before.Facts, unresolved: before.Unresolved},
+			{selection: after.Selection, facts: after.Facts, unresolved: after.Unresolved},
+		},
+	)
+}
+
+func projectPointGaps(
+	request Request,
+	snapshot ReadSnapshot,
+	candidates []temporal.StateCandidate,
+	summary temporal.PointSummary,
+) ([]Gap, error) {
+	return projectStateGaps(
+		request,
+		snapshot,
+		candidates,
+		[]stateGapMaterial{{
+			selection:  summary.Selection,
+			facts:      summary.Facts,
+			unresolved: summary.Unresolved,
+		}},
+	)
+}
+
+type stateGapMaterial struct {
+	selection  temporal.TemporalSelection
+	facts      []temporal.Fact
+	unresolved []temporal.UnresolvedFact
+}
+
+func projectStateGaps(
+	request Request,
+	snapshot ReadSnapshot,
+	candidates []temporal.StateCandidate,
+	summaries []stateGapMaterial,
+) ([]Gap, error) {
 	if err := validateCoverageReasons(snapshot.Coverage); err != nil {
 		return nil, err
 	}
@@ -375,10 +450,10 @@ func projectTrendGaps(
 		case CoverageEntityFiltered, CoveragePredicateFiltered:
 		}
 	}
-	addValidTimeGaps(gaps, request, candidates, before)
-	addValidTimeGaps(gaps, request, candidates, after)
-	addWindowSummaryMaterial(hasMaterial, before)
-	addWindowSummaryMaterial(hasMaterial, after)
+	for _, summary := range summaries {
+		addValidTimeGaps(gaps, request, candidates, summary.selection)
+		addStateSummaryMaterial(hasMaterial, summary)
+	}
 	for gap := range gaps {
 		if gap.EntityID != "" {
 			hasMaterial[gap.EntityID] = true
@@ -398,33 +473,38 @@ func projectTrendGaps(
 	return result, nil
 }
 
-func addValidTimeGaps(gaps map[Gap]struct{}, request Request, candidates []temporal.StateCandidate, summary temporal.WindowSummary) {
+func addValidTimeGaps(
+	gaps map[Gap]struct{},
+	request Request,
+	candidates []temporal.StateCandidate,
+	selection temporal.TemporalSelection,
+) {
 	for _, candidate := range candidates {
 		if candidate.Observation.Status() == observation.StatusRejected {
 			continue
 		}
-		if !definitelyOutsideSelection(candidate.Observation.ValidTime(), summary.Selection) {
+		if !definitelyOutsideSelection(candidate.Observation.ValidTime(), selection) {
 			continue
 		}
 		entityIDs := candidateEntityIDs(candidate)
 		added := false
 		for _, entityID := range entityIDs {
 			if slices.Contains(request.EntityIDs, entityID) {
-				gaps[Gap{Kind: GapValidTimeExcluded, EntityID: entityID, Predicate: candidate.Key.Predicate, SelectionLabel: summary.Selection.Label()}] = struct{}{}
+				gaps[Gap{Kind: GapValidTimeExcluded, EntityID: entityID, Predicate: candidate.Key.Predicate, SelectionLabel: selection.Label()}] = struct{}{}
 				added = true
 			}
 		}
 		if !added {
-			gaps[Gap{Kind: GapValidTimeExcluded, Predicate: candidate.Key.Predicate, SelectionLabel: summary.Selection.Label()}] = struct{}{}
+			gaps[Gap{Kind: GapValidTimeExcluded, Predicate: candidate.Key.Predicate, SelectionLabel: selection.Label()}] = struct{}{}
 		}
 	}
 }
 
-func addWindowSummaryMaterial(hasMaterial map[identity.EntityID]bool, summary temporal.WindowSummary) {
-	for _, fact := range summary.Facts {
+func addStateSummaryMaterial(hasMaterial map[identity.EntityID]bool, summary stateGapMaterial) {
+	for _, fact := range summary.facts {
 		addStateMaterialEntityIDs(hasMaterial, fact.Key, fact.Value)
 	}
-	for _, item := range summary.Unresolved {
+	for _, item := range summary.unresolved {
 		for _, candidate := range item.Candidates {
 			addStateMaterialEntityIDs(hasMaterial, candidate.Key, candidate.Value)
 		}
@@ -442,6 +522,17 @@ func addStateMaterialEntityIDs(
 }
 
 func definitelyOutsideSelection(extent observation.TemporalExtent, selection temporal.TemporalSelection) bool {
+	if point, ok := selection.Point(); ok {
+		switch extent.Kind() {
+		case observation.TemporalInstant:
+			instant, _ := extent.Instant()
+			return !instant.Equal(point)
+		case observation.TemporalInterval, observation.TemporalWindow:
+			return !pointInsideExtent(extent, point)
+		default:
+			return false
+		}
+	}
 	windowStart, windowEnd, ok := selection.Window()
 	if !ok {
 		return false
@@ -456,6 +547,11 @@ func definitelyOutsideSelection(extent observation.TemporalExtent, selection tem
 	default:
 		return false
 	}
+}
+
+func pointInsideExtent(extent observation.TemporalExtent, point time.Time) bool {
+	start, hasStart, end, hasEnd := extent.Bounds()
+	return (!hasStart || !point.Before(start)) && (!hasEnd || point.Before(end))
 }
 
 func candidateEntityIDs(candidate temporal.StateCandidate) []identity.EntityID {

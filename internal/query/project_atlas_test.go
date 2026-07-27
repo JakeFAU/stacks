@@ -302,6 +302,116 @@ func TestProjectAtlasTrendContractPreservesCitedTemporalEvidence(t *testing.T) {
 	}
 }
 
+func TestProjectAtlasPointContractReconstructsCitedState(t *testing.T) {
+	fixture := newProjectAtlasFixture(t)
+	at := time.Date(2032, time.January, 20, 12, 0, 0, 0, time.UTC)
+	selection, err := temporal.At("at-boundary", at)
+	if err != nil {
+		t.Fatalf("temporal.At() error = %v", err)
+	}
+	request := fixture.currentRequest
+	request.Intent = temporal.IntentPointInTime
+	request.Selections = []temporal.TemporalSelection{selection}
+	reader := &projectAtlasReader{
+		current:    fixture.currentSnapshot,
+		historical: fixture.historicalSnapshot,
+		cutoff:     fixture.cutoff,
+	}
+	service := Service{Reader: reader, Limits: Limits{MaxEntities: 4, MaxPredicates: 8, MaxChronology: 20}}
+
+	current, err := service.Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("current Query() error = %v", err)
+	}
+	if err := ValidateResult(current); err != nil {
+		t.Fatalf("ValidateResult(current) error = %v", err)
+	}
+	point, ok := current.Payload.Point()
+	if !ok {
+		t.Fatal("current Payload.Point() = false")
+	}
+	if got := factPredicates(point.Facts); !slices.Equal(got, []observation.Predicate{
+		"project.delivery_commitment",
+		"project.responsible_party",
+	}) {
+		t.Fatalf("current point facts = %v", got)
+	}
+	if got := unresolvedPredicates(point.Unresolved); !slices.Equal(got, []observation.Predicate{
+		"project.delivery_risk",
+		"project.priority",
+	}) {
+		t.Fatalf("current point unresolved = %v", got)
+	}
+	commitment := point.Facts[0]
+	assertTextTerm(t, commitment.Value, "2032-06-15")
+	if len(commitment.Contributions) != 1 ||
+		commitment.Contributions[0].ObservationID != "observation:atlas/initial-observed" ||
+		!reflect.DeepEqual(commitment.SupportingCitations, []Citation{fixture.initialEvidence.citation(observation.EvidenceSupporting)}) ||
+		!reflect.DeepEqual(commitment.ContradictingCitations, []Citation{fixture.revisionEvidence.citation(observation.EvidenceContradicting)}) {
+		t.Fatalf("current point commitment lost exact provenance: %#v", commitment)
+	}
+	if point.Unresolved[0].Reason != temporal.UnresolvedTemporalUncertainty ||
+		point.Unresolved[1].Reason != temporal.UnresolvedConflict ||
+		len(point.Unresolved[1].Candidates) != 2 {
+		t.Fatalf("current point unresolved material = %#v", point.Unresolved)
+	}
+	for _, want := range []Gap{
+		{Kind: GapUnresolvedMention, EntityID: "entity:project-atlas", Predicate: "project.partner"},
+		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.delivery_commitment", SelectionLabel: "at-boundary"},
+		{Kind: GapValidTimeExcluded, EntityID: "entity:project-atlas", Predicate: "project.responsible_party", SelectionLabel: "at-boundary"},
+	} {
+		if !slices.Contains(current.Gaps, want) {
+			t.Fatalf("current point gaps = %#v, missing %#v", current.Gaps, want)
+		}
+	}
+
+	historicalRequest := request
+	historicalRequest.KnowledgeScope = fixture.historicalScope
+	historical, err := service.Query(context.Background(), historicalRequest)
+	if err != nil {
+		t.Fatalf("historical Query() error = %v", err)
+	}
+	historicalPoint, ok := historical.Payload.Point()
+	if !ok {
+		t.Fatal("historical Payload.Point() = false")
+	}
+	if got := factPredicates(historicalPoint.Facts); !slices.Equal(got, []observation.Predicate{"project.responsible_party"}) {
+		t.Fatalf("historical point facts = %v, want cutoff-visible responsibility only", got)
+	}
+	if slices.Contains(factPredicates(historicalPoint.Facts), observation.Predicate("project.delivery_commitment")) {
+		t.Fatal("historical point used a later-recorded observation")
+	}
+	if !slices.Contains(historical.Gaps, Gap{
+		Kind:      GapAuthorityExcluded,
+		EntityID:  "entity:project-atlas",
+		Predicate: "project.responsible_party",
+	}) {
+		t.Fatalf("historical point gaps = %#v, want cutoff authority gap", historical.Gaps)
+	}
+
+	reordered := cloneReadSnapshot(fixture.currentSnapshot)
+	slices.Reverse(reordered.Entities)
+	slices.Reverse(reordered.Observations)
+	slices.Reverse(reordered.Coverage)
+	for index := range reordered.Observations {
+		slices.Reverse(reordered.Observations[index].Evidence)
+	}
+	reorderedResult, err := (Service{
+		Reader: &projectAtlasReader{
+			current:    reordered,
+			historical: fixture.historicalSnapshot,
+			cutoff:     fixture.cutoff,
+		},
+		Limits: service.Limits,
+	}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("reordered Query() error = %v", err)
+	}
+	if !reflect.DeepEqual(current, reorderedResult) {
+		t.Fatalf("reordered point result differs:\ncurrent   %#v\nreordered %#v", current, reorderedResult)
+	}
+}
+
 type projectAtlasFixture struct {
 	currentRequest     Request
 	currentSnapshot    ReadSnapshot

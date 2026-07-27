@@ -128,6 +128,98 @@ func TestTrendQueryProjectsExactContributionsAndRoleSeparatedCitations(t *testin
 	}
 }
 
+func TestPointQueryProjectsExactCitationsAndGaps(t *testing.T) {
+	fixture := newTrendFixture(t)
+	at := time.Date(2024, time.January, 15, 12, 0, 0, 0, time.UTC)
+	selection, err := temporal.At("at", at)
+	if err != nil {
+		t.Fatalf("temporal.At() error = %v", err)
+	}
+	request := Request{
+		Intent:         temporal.IntentPointInTime,
+		EntityIDs:      []identity.EntityID{" entity-a "},
+		EntityMatch:    EntityMatchAll,
+		Predicates:     []observation.Predicate{" work.location "},
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+	}
+	supporting := fixture.citation("evidence-point-support", observation.EvidenceSupporting)
+	contradicting := fixture.citation("evidence-point-counter", observation.EvidenceContradicting)
+	active := fixture.readObservation(
+		"observation-point",
+		fixture.entity("entity-a"),
+		fixture.text("remote"),
+		fixture.interval(2024, time.January, 1, time.February, 1),
+		observation.StatusObserved,
+		nil,
+		supporting,
+		contradicting,
+	)
+	outside := fixture.readObservation(
+		"observation-outside-point",
+		fixture.entity("entity-a"),
+		fixture.text("office"),
+		fixture.instant(2024, time.March, 15),
+		observation.StatusObserved,
+		nil,
+		fixture.citation("evidence-point-outside", observation.EvidenceSupporting),
+	)
+	snapshot := fixture.snapshot(outside, active)
+	snapshot.Coverage = []Coverage{{
+		Reason:        CoverageUnresolvedMention,
+		EntityID:      "entity-a",
+		Predicate:     "work.owner",
+		ObservationID: "coverage-point-unresolved",
+	}}
+	reader := &recordingTrendReader{snapshot: snapshot}
+
+	result, err := (Service{Reader: reader, Limits: validLimits()}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("Reader.Read() calls = %d, want 1", reader.calls)
+	}
+	if !reflect.DeepEqual(reader.selection, ReadSelection{
+		EntityIDs:      []identity.EntityID{"entity-a"},
+		EntityMatch:    EntityMatchAll,
+		Predicates:     []observation.Predicate{"work.location"},
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+	}) {
+		t.Fatalf("Reader.Read() selection = %#v, want normalized point selection", reader.selection)
+	}
+	point, ok := result.Payload.Point()
+	if !ok {
+		t.Fatal("Payload.Point() = false")
+	}
+	if point.Selection != selection || len(point.Facts) != 1 || len(point.Unresolved) != 0 {
+		t.Fatalf("point payload = %#v, want one resolved fact", point)
+	}
+	fact := point.Facts[0]
+	if got := fact.Contributions; len(got) != 1 ||
+		got[0].ObservationID != "observation-point" ||
+		got[0].Status != observation.StatusObserved ||
+		got[0].ValidTime != active.Observation.ValidTime() {
+		t.Fatalf("point contributions = %#v, want exact source observation", got)
+	}
+	if !reflect.DeepEqual(fact.SupportingCitations, []Citation{supporting}) ||
+		!reflect.DeepEqual(fact.ContradictingCitations, []Citation{contradicting}) {
+		t.Fatalf("point citations = support %#v counter %#v", fact.SupportingCitations, fact.ContradictingCitations)
+	}
+	wantGaps := []Gap{
+		{Kind: GapValidTimeExcluded, EntityID: "entity-a", Predicate: "work.location", SelectionLabel: "at"},
+		{Kind: GapUnresolvedMention, EntityID: "entity-a", Predicate: "work.owner"},
+	}
+	orderGaps(wantGaps)
+	if !reflect.DeepEqual(result.Gaps, wantGaps) {
+		t.Fatalf("point gaps = %#v, want %#v", result.Gaps, wantGaps)
+	}
+	if err := ValidateResult(result); err != nil {
+		t.Fatalf("ValidateResult() error = %v", err)
+	}
+}
+
 func TestTrendQueryPreservesConflictHypothesisCounterevidenceAndTemporalUncertainty(t *testing.T) {
 	fixture := newTrendFixture(t)
 	observations := []ReadObservation{
