@@ -225,6 +225,57 @@ func TestTemporalQueryPostgresRejectsVisibleResolutionBehindFuturePredecessor(
 	}
 }
 
+func TestTemporalQueryPostgresPostCutoffResolutionStaysOutOfHistoricalAuthority(
+	t *testing.T,
+) {
+	fixture := newTemporalQueryPostgresFixture(t)
+	fixture.appendPostCutoffResolutionWithVisibleAdmission(t)
+
+	historical := fixture.loadSnapshot(
+		t,
+		[]identity.EntityID{atlasCurrentOwnerID},
+		TemporalEntityMatchAll,
+		atlasOwnerPredicate,
+		&atlasTopologyCutoff,
+	)
+	current := fixture.loadSnapshot(
+		t,
+		[]identity.EntityID{atlasObserverID},
+		TemporalEntityMatchAll,
+		atlasOwnerPredicate,
+		nil,
+	)
+
+	if len(historical.Observations) != 1 ||
+		len(current.Observations) != 1 {
+		t.Fatalf(
+			"owner observations historical/current = %d/%d, want 1/1",
+			len(historical.Observations),
+			len(current.Observations),
+		)
+	}
+	assertTemporalResolvedEntity(
+		t,
+		historical.Observations[0].Subject,
+		atlasCurrentOwnerID,
+	)
+	assertTemporalResolvedEntity(
+		t,
+		current.Observations[0].Subject,
+		atlasObserverID,
+	)
+	assertNoTemporalCoverageForObservation(
+		t,
+		historical.Coverage,
+		fixture.ownerObservation.ID(),
+	)
+	assertNoTemporalCoverageForObservation(
+		t,
+		current.Coverage,
+		fixture.ownerObservation.ID(),
+	)
+}
+
 func TestTemporalQueryPostgresRejectsVisibleAdmissionBehindFuturePredecessor(
 	t *testing.T,
 ) {
@@ -1369,6 +1420,55 @@ func (fixture *temporalQueryPostgresFixture) appendResolutionTopologyAcrossCutof
 		},
 	); err != nil {
 		t.Fatalf("append resolution cutoff topology: %v", err)
+	}
+}
+
+func (fixture *temporalQueryPostgresFixture) appendPostCutoffResolutionWithVisibleAdmission(
+	t testing.TB,
+) {
+	t.Helper()
+	futureResolution := mustTemporalResolutionDecision(
+		t,
+		identity.ResolutionDecisionInput{
+			ID:           "decision:project-atlas/post-cutoff-owner",
+			ProposalID:   fixture.ownerProposal.ID(),
+			Outcome:      identity.DecisionAccepted,
+			EntityID:     atlasObserverID,
+			Authority:    identity.AuthorityReviewer,
+			ReasonCode:   "reviewed_post_cutoff_owner",
+			RecordedAt:   atlasTopologyFutureAt,
+			SupersedesID: fixture.ownerCorrection.ID(),
+		},
+	)
+	visibleAdmission := mustTemporalAdmissionDecision(
+		t,
+		admission.DecisionInput{
+			ID:         "admission:project-atlas/post-cutoff-owner",
+			TargetKind: admission.TargetIdentityDecision,
+			TargetID:   string(futureResolution.ID()),
+			Outcome:    admission.Admitted,
+			ReasonCode: "reviewed_post_cutoff_owner",
+			Authority:  admission.AuthorityReviewer,
+			RecordedAt: atlasTopologyVisibleAt,
+		},
+	)
+	if err := fixture.database.InTransaction(
+		fixture.ctx,
+		func(transaction *Transaction) error {
+			if err := transaction.AppendResolutionDecision(
+				fixture.ctx,
+				futureResolution,
+				nil,
+			); err != nil {
+				return err
+			}
+			return transaction.AppendAdmissionDecision(
+				fixture.ctx,
+				visibleAdmission,
+			)
+		},
+	); err != nil {
+		t.Fatalf("append post-cutoff resolution authority: %v", err)
 	}
 }
 

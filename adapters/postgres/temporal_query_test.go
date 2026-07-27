@@ -1085,6 +1085,78 @@ func TestTemporalQuerySnapshotDoesNotApplyValidTimeOrConfidencePolicy(t *testing
 	}
 }
 
+func TestTemporalQuerySnapshotSourcesEffectiveResolutionFromVisibleRows(
+	t *testing.T,
+) {
+	evidenceRows, sectionRows := temporalCanonicalEvidenceRows(
+		t,
+		temporalTestObservationID,
+	)
+	value := temporalTestObservationWithEvidenceID(
+		t,
+		observation.StatusObserved,
+		nil,
+		evidence.EvidenceID(evidenceRows[0][14].(string)),
+	)
+	pool := newTemporalQueryFakePool(
+		temporalQueryRowsResult([][]any{{
+			string(temporalTestEntityID),
+			true,
+		}}),
+		temporalQueryRowsResult(nil),
+		temporalQueryRowsResult([][]any{temporalQualificationRow(
+			value,
+			temporalCoverageRetained,
+		)}),
+		temporalQueryRowsResult([][]any{temporalObservationRow(t, value)}),
+		temporalQueryRowsResult(evidenceRows),
+		temporalQueryRowsResult(sectionRows),
+	)
+	cutoff := temporalTestRecordedAt.Add(time.Hour)
+	selection := temporalTestSelection(t)
+	selection.KnowledgeAsOf = &cutoff
+
+	snapshot, err := loadTemporalQuerySnapshot(
+		context.Background(),
+		pool,
+		selection,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("loadTemporalQuerySnapshot() error = %v", err)
+	}
+	if len(snapshot.Observations) != 1 ||
+		snapshot.Observations[0].Observation.ID() != value.ID() {
+		t.Fatalf(
+			"snapshot observations = %#v, want retained visible resolution row",
+			snapshot.Observations,
+		)
+	}
+	authoritySQL := pool.transaction.queries[2].sql
+	start := strings.Index(authoritySQL, "effective_resolution_decisions AS")
+	end := strings.Index(authoritySQL, "visible_admission_targets AS")
+	if start < 0 || end <= start {
+		t.Fatal("authority SQL does not expose the effective resolution boundary")
+	}
+	effectiveResolutionSQL := authoritySQL[start:end]
+	if !strings.Contains(
+		effectiveResolutionSQL,
+		"FROM visible_resolution_decisions AS decision",
+	) {
+		t.Fatal(
+			"effective resolution candidates are not sourced from cutoff-visible rows",
+		)
+	}
+	if strings.Contains(
+		effectiveResolutionSQL,
+		"FROM reachable_resolution_decisions AS decision",
+	) {
+		t.Fatal(
+			"effective resolution candidates source raw reachable rows across the cutoff",
+		)
+	}
+}
+
 func TestTemporalQuerySnapshotFinishesBoundedObservationOnSuccessAndFailure(t *testing.T) {
 	selection := temporalTestSelection(t)
 	selection.EntityIDs = []identity.EntityID{

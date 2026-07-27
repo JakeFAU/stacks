@@ -1014,7 +1014,7 @@ const temporalQualificationSQL = `
 			decision.id,
 			proposal.mention_id,
 			decision.entity_id
-		FROM reachable_resolution_decisions AS decision
+		FROM visible_resolution_decisions AS decision
 		JOIN visible_resolution_proposals AS proposal
 		  ON proposal.id = decision.proposal_id
 		JOIN visible_mentions AS mention
