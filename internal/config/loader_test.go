@@ -194,6 +194,38 @@ func TestLoadWithOptionsUsesIndependentBindingMetadata(t *testing.T) {
 	}
 }
 
+func TestLoadDoesNotBindRetiredAnalysisEnvironmentInputs(t *testing.T) {
+	clearConfigurationEnvironment(t)
+	baseline, err := Load()
+	if err != nil {
+		t.Fatalf("baseline Load() error = %v", err)
+	}
+
+	retired := []string{
+		"STACKS_" + "ANALYSIS_PROMPT_VERSION",
+		"STACKS_" + "EMPLOYEE_ENTITY_ID",
+		"STACKS_" + "MANAGER_ENTITY_ID",
+	}
+	for _, binding := range configurationEnvironmentBindings() {
+		for _, name := range retired {
+			if binding.name == name {
+				t.Fatalf("configuration binding retains retired environment name %q", name)
+			}
+		}
+	}
+	for _, name := range retired {
+		t.Setenv(name, "synthetic-retired-value")
+	}
+
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load() read retired environment input: %v", err)
+	}
+	if !reflect.DeepEqual(got, baseline) {
+		t.Fatal("retired analysis environment inputs changed loaded settings")
+	}
+}
+
 func TestLoadWithOptionsUsesDefaultsForEmptyDefaultedFileStrings(t *testing.T) {
 	clearConfigurationEnvironment(t)
 	path := writeConfigFixture(t, ".yaml", `
@@ -208,8 +240,6 @@ database:
   application_role: ""
 extraction:
   prompt_version: ""
-analysis:
-  prompt_version: ""
 `)
 
 	settings, err := LoadWithOptions(LoadOptions{ConfigFile: &path})
@@ -219,8 +249,7 @@ analysis:
 	if settings.HTTPAddress != "127.0.0.1:8080" || settings.LogLevel != defaultLogLevel ||
 		settings.Telemetry.Endpoint != defaultOTelEndpoint || settings.Telemetry.ServiceName != defaultOTelServiceName ||
 		settings.Database.ApplicationRole != defaultDatabaseAppRole ||
-		settings.Application.ExtractionPromptVersion != defaultExtractionPromptVersion ||
-		settings.Application.ManagerConfidence.PromptVersion != defaultAnalysisPromptVersion {
+		settings.Application.ExtractionPromptVersion != defaultExtractionPromptVersion {
 		t.Fatal("empty defaulted file strings did not select their named defaults")
 	}
 }
@@ -309,14 +338,10 @@ func TestLoadWithOptionsKeepsCredentialsEnvironmentOnly(t *testing.T) {
 	const migrationDatabaseSecret = "postgres://synthetic-admin-secret@localhost/stacks"
 	const providerSecret = "synthetic-provider-secret"
 	const anthropicSecret = "synthetic-anthropic-secret"
-	const employeeID = "synthetic-employee"
-	const managerID = "synthetic-manager"
 	t.Setenv(DatabaseURLEnvironmentVariable, databaseSecret)
 	t.Setenv(MigrationDatabaseURLEnvironmentVariable, migrationDatabaseSecret)
 	t.Setenv(OpenAIAPIKeyEnvironmentVariable, providerSecret)
 	t.Setenv(AnthropicAPIKeyEnvironmentVariable, anthropicSecret)
-	t.Setenv(EmployeeEntityIDEnvironmentVariable, employeeID)
-	t.Setenv(ManagerEntityIDEnvironmentVariable, managerID)
 	path := writeConfigFixture(t, ".json", `{"model":{"provider":"openai"}}`)
 
 	settings, err := LoadWithOptions(LoadOptions{ConfigFile: &path})
@@ -324,8 +349,7 @@ func TestLoadWithOptionsKeepsCredentialsEnvironmentOnly(t *testing.T) {
 		t.Fatalf("LoadWithOptions() error = %v", err)
 	}
 	if settings.Database.URL != databaseSecret || settings.Database.MigrationURL != migrationDatabaseSecret ||
-		settings.Application.Model.OpenAIAPIKey != providerSecret || settings.Application.Model.AnthropicAPIKey != anthropicSecret ||
-		settings.Application.ManagerConfidence.EmployeeEntityID != employeeID || settings.Application.ManagerConfidence.ManagerEntityID != managerID {
+		settings.Application.Model.OpenAIAPIKey != providerSecret || settings.Application.Model.AnthropicAPIKey != anthropicSecret {
 		t.Fatal("environment-only credentials were not retained in memory")
 	}
 }
@@ -394,12 +418,12 @@ func clearConfigurationEnvironment(t *testing.T) {
 		IngestionLeaseDurationEnvironmentVariable,
 		IngestionAttemptTimeoutEnvironmentVariable,
 		ExtractionPromptVersionEnvironmentVariable,
-		AnalysisPromptVersionEnvironmentVariable,
 		QueryMaxEntitiesEnvironmentVariable,
 		QueryMaxPredicatesEnvironmentVariable,
 		QueryMaxChronologyEnvironmentVariable,
-		EmployeeEntityIDEnvironmentVariable,
-		ManagerEntityIDEnvironmentVariable,
+		"STACKS_" + "ANALYSIS_PROMPT_VERSION",
+		"STACKS_" + "EMPLOYEE_ENTITY_ID",
+		"STACKS_" + "MANAGER_ENTITY_ID",
 	} {
 		t.Setenv(name, "")
 	}

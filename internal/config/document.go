@@ -100,9 +100,6 @@ var configurationSchema = configObjectSchema(map[string]configSchemaNode{
 	"extraction": configObjectSchema(map[string]configSchemaNode{
 		"prompt_version": configLeafSchema(configSchemaString),
 	}),
-	"analysis": configObjectSchema(map[string]configSchemaNode{
-		"prompt_version": configLeafSchema(configSchemaString),
-	}),
 	"query": configObjectSchema(map[string]configSchemaNode{
 		"max_entities":   configLeafSchema(configSchemaInteger),
 		"max_predicates": configLeafSchema(configSchemaInteger),

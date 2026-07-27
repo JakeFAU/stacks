@@ -40,6 +40,31 @@ func TestRunnerDefaultsToServeAndSupportsExplicitServe(t *testing.T) {
 	}
 }
 
+func TestRunnerRejectsRetiredAnalyzeBeforeExecution(t *testing.T) {
+	calls := 0
+	err := (Runner{Execute: func(context.Context, Invocation) error {
+		calls++
+		return nil
+	}}).Run(t.Context(), []string{"analyze"})
+	if err == nil {
+		t.Fatal("Run(analyze) error = nil, want retired command rejection")
+	}
+	if calls != 0 {
+		t.Fatalf("Execute calls = %d, want 0", calls)
+	}
+}
+
+func TestRunnerHelpOmitsRetiredAnalyze(t *testing.T) {
+	var output strings.Builder
+	err := (Runner{Output: &output}).Run(t.Context(), []string{"--help"})
+	if err != nil {
+		t.Fatalf("Run(--help) error = %v", err)
+	}
+	if strings.Contains(output.String(), "analyze") {
+		t.Fatalf("root help retains retired analyze command:\n%s", output.String())
+	}
+}
+
 func TestRunnerCarriesExplicitConfigBeforeAndAfterCommand(t *testing.T) {
 	for _, args := range [][]string{
 		{"--config", "/synthetic/stacks.yaml", "sync"},
@@ -111,7 +136,6 @@ func TestRunnerParsesConfigValidationTargets(t *testing.T) {
 		{[]string{"config", "validate", "sync"}, CommandSync, ""},
 		{[]string{"config", "validate", "entities"}, CommandEntities, ""},
 		{[]string{"config", "validate", "review"}, CommandReview, ""},
-		{[]string{"config", "validate", "analyze"}, CommandAnalyze, ""},
 		{[]string{"config", "validate", "query"}, CommandQuery, ""},
 		{[]string{"config", "validate", "db-migrate"}, CommandDBMigrate, ""},
 		{[]string{"config", "validate", "db-status"}, CommandDBStatus, ""},

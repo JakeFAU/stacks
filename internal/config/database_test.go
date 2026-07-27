@@ -121,7 +121,6 @@ func TestApplicationDatabaseCommandsRequireCanonicalDatabaseURL(t *testing.T) {
 		CommandSync,
 		CommandEntities,
 		CommandReview,
-		CommandAnalyze,
 	} {
 		command := command
 		t.Run(string(command), func(t *testing.T) {

@@ -150,14 +150,12 @@ ingestion:
   attempt_timeout: 4m
 extraction:
   prompt_version: v1
-analysis:
-  prompt_version: v1
 `,
 		},
 		{
 			name:   "JSON",
 			format: "json",
-			body:   `{"http":{"host":"127.0.0.1","port":8080,"read_header_timeout_seconds":5},"log":{"level":"info"},"telemetry":{"enabled":true,"endpoint":"collector:4317","insecure":false,"metric_export_interval":"10s","service_name":"stacks","trace_sample_ratio":0.5},"database":{"scopes":["core","directory"],"application_role":"stacks_app"},"google":{"folder_id":"synthetic-folder","oauth_client_file":"/synthetic/client.json","oauth_token_file":"/synthetic/token.json","transcript_titles":["Transcripts"],"notes_titles":["Notes"]},"directory":{"enabled":false,"oauth_client_file":"/synthetic/directory-client.json","oauth_token_file":"/synthetic/directory-token.json","email_domains":["example.test"],"freshness":"24h","retry_after":"15m","max_attempts":3},"model":{"data_mode":"remote","provider":"openai","id":"synthetic-model","max_output_tokens":256,"max_attempts":2,"aws_profile":"synthetic","aws_region":"us-east-1"},"ingestion":{"lease_duration":"5m","attempt_timeout":"4m"},"extraction":{"prompt_version":"v1"},"analysis":{"prompt_version":"v1"}}`,
+			body:   `{"http":{"host":"127.0.0.1","port":8080,"read_header_timeout_seconds":5},"log":{"level":"info"},"telemetry":{"enabled":true,"endpoint":"collector:4317","insecure":false,"metric_export_interval":"10s","service_name":"stacks","trace_sample_ratio":0.5},"database":{"scopes":["core","directory"],"application_role":"stacks_app"},"google":{"folder_id":"synthetic-folder","oauth_client_file":"/synthetic/client.json","oauth_token_file":"/synthetic/token.json","transcript_titles":["Transcripts"],"notes_titles":["Notes"]},"directory":{"enabled":false,"oauth_client_file":"/synthetic/directory-client.json","oauth_token_file":"/synthetic/directory-token.json","email_domains":["example.test"],"freshness":"24h","retry_after":"15m","max_attempts":3},"model":{"data_mode":"remote","provider":"openai","id":"synthetic-model","max_output_tokens":256,"max_attempts":2,"aws_profile":"synthetic","aws_region":"us-east-1"},"ingestion":{"lease_duration":"5m","attempt_timeout":"4m"},"extraction":{"prompt_version":"v1"}}`,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -180,6 +178,28 @@ func TestValidateConfigDocumentAcceptsQueryLimitsInYAMLAndJSON(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			if err := validateConfigDocument(testCase.format, []byte(testCase.body)); err != nil {
 				t.Fatalf("validateConfigDocument() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigDocumentRejectsRetiredAnalysisSection(t *testing.T) {
+	retiredPromptVersion := "analyze-" + "v1"
+	for _, testCase := range []struct {
+		name   string
+		format string
+		body   string
+	}{
+		{name: "YAML", format: "yaml", body: "analysis:\n  prompt_version: " + retiredPromptVersion + "\n"},
+		{name: "JSON", format: "json", body: `{"analysis":{"prompt_version":"` + retiredPromptVersion + `"}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateConfigDocument(testCase.format, []byte(testCase.body))
+			if err == nil || !strings.Contains(err.Error(), "analysis") {
+				t.Fatalf("validateConfigDocument() error = %v, want strict retired analysis key rejection", err)
+			}
+			if strings.Contains(err.Error(), retiredPromptVersion) {
+				t.Fatalf("validateConfigDocument() error exposed retired value: %v", err)
 			}
 		})
 	}

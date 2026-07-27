@@ -18,17 +18,12 @@ var (
 
 const (
 	ExtractionPromptVersion = "extract-v2"
-	AnalysisPromptVersion   = "analyze-v1"
 
 	ExtractionSchemaName = "meeting_extraction_v2"
-	AnalysisSchemaName   = "pair_analysis"
 )
 
 //go:embed prompts/extract-v2.txt
 var extractionPrompt string
-
-//go:embed prompts/analyze-v1.txt
-var analysisPrompt string
 
 // Model is the provider-neutral structured generation boundary.
 type Model interface {
@@ -90,11 +85,6 @@ func PromptContract(version string) (Contract, error) {
 			Version: version, SystemPrompt: extractionPrompt,
 			SchemaName: ExtractionSchemaName, JSONSchema: ExtractionJSONSchema(),
 		}, nil
-	case AnalysisPromptVersion:
-		return Contract{
-			Version: version, SystemPrompt: analysisPrompt,
-			SchemaName: AnalysisSchemaName, JSONSchema: AnalysisJSONSchema(),
-		}, nil
 	default:
 		return Contract{}, fmt.Errorf("prompt version is not supported")
 	}
@@ -103,11 +93,6 @@ func PromptContract(version string) (Contract, error) {
 // ExtractionJSONSchema returns an isolated copy of the extraction schema.
 func ExtractionJSONSchema() []byte {
 	return append([]byte(nil), extractionJSONSchema...)
-}
-
-// AnalysisJSONSchema returns an isolated copy of the analysis schema.
-func AnalysisJSONSchema() []byte {
-	return append([]byte(nil), analysisJSONSchema...)
 }
 
 var extractionJSONSchema = []byte(`{
@@ -185,19 +170,5 @@ var extractionJSONSchema = []byte(`{
         }
       }
     }
-  }
-}`)
-
-var analysisJSONSchema = []byte(`{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["conclusion", "rationale", "supporting_signal_ids", "contradicting_signal_ids", "gaps"],
-  "properties": {
-    "conclusion": {"type": "string", "enum": ["insufficient evidence", "no material directional change detected", "mixed or conflicting signals", "possible declining-confidence signal"]},
-    "rationale": {"type": "string", "minLength": 1},
-    "supporting_signal_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"}},
-    "contradicting_signal_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "^\\S(?:.*\\S)?$"}},
-    "gaps": {"type": "array", "items": {"type": "string"}}
   }
 }`)

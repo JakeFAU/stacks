@@ -127,7 +127,7 @@ func (settings DatabaseSettings) validate(command Command, directoryEnabled bool
 		)
 	}
 	switch command {
-	case CommandDoctor, CommandSync, CommandEntities, CommandReview, CommandAnalyze, CommandQuery, CommandDBStatus:
+	case CommandDoctor, CommandSync, CommandEntities, CommandReview, CommandQuery, CommandDBStatus:
 		return validateExactRequired(command, DatabaseURLEnvironmentVariable, settings.URL)
 	case CommandDBMigrate, CommandDBReset:
 		if command == CommandDBReset {

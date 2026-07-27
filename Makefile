@@ -9,12 +9,7 @@ case "$$STACKS_MAKE_ENV_FILE" in \
 esac;
 endef
 
-.PHONY: analyze auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up query-trend review run staticcheck sync test test-env-file test-integration test-integration-contract test-race
-
-analyze:
-	@$(resolve_env_file_path) \
-	test -f "$$env_file_path" || { printf 'copy .env.example to %s and configure the application\n' "$$STACKS_MAKE_ENV_FILE" >&2; exit 1; }; \
-	set -a; . "$$env_file_path"; set +a; go run ./cmd/stacks analyze
+.PHONY: auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up query-trend review run staticcheck sync test test-env-file test-integration test-integration-contract test-race
 
 auth-google:
 	@$(resolve_env_file_path) \
@@ -128,7 +123,7 @@ test-integration:
 		test -n "$$STACKS_TEST_MIGRATION_DATABASE_URL" || (echo "STACKS_TEST_MIGRATION_DATABASE_URL is required" >&2; exit 1); \
 		(cd adapters/postgres && GOWORK=off go run ./cmd/validate-test-database) && \
 		(cd adapters/postgres && GOWORK=off go test ./... -count=1) && \
-		go test ./internal/ingest ./internal/directory ./internal/analysis ./internal/app ./internal/doctor ./internal/query -count=1
+		go test ./internal/ingest ./internal/directory ./internal/app ./internal/doctor ./internal/query -count=1
 
 staticcheck:
 	@sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' modules.txt | while IFS= read -r module; do \

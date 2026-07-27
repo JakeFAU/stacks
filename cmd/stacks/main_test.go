@@ -267,30 +267,8 @@ func TestRestrictedSyncChecksDisclosureBeforeExternalConstruction(t *testing.T) 
 	}
 }
 
-func TestRestrictedAnalyzeChecksDisclosureBeforeExternalConstruction(t *testing.T) {
-	settings := validCommandApplicationSettings(config.CommandAnalyze, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
-	calls := []string{}
-	runtime := boundaryOrderRuntime(&calls, doctor.InvocationLoggingDisabled)
-
-	commands, err := commandProviderWithRuntime(
-		context.Background(), commandSettings(settings), io.Discard, io.Discard,
-		tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime,
-	)
-	if err != nil {
-		t.Fatalf("commandProviderWithRuntime() error = %v", err)
-	}
-	err = commands[string(config.CommandAnalyze)].Run(context.Background(), cli.Invocation{Command: cli.CommandAnalyze})
-	if !errors.Is(err, errStopAfterModelConstruction) {
-		t.Fatalf("analyze error = %v, want sentinel model-construction stop", err)
-	}
-	want := []string{"logging", "postgres", "model", "close"}
-	if strings.Join(calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("calls = %v, want %v", calls, want)
-	}
-}
-
 func TestFailedRestrictedGateConstructsNoSourceStorageOrModel(t *testing.T) {
-	for _, command := range []config.Command{config.CommandSync, config.CommandAnalyze} {
+	for _, command := range []config.Command{config.CommandSync} {
 		t.Run(string(command), func(t *testing.T) {
 			settings := validCommandApplicationSettings(command, modelpolicy.ProviderBedrock, modelpolicy.DataModeRestricted)
 			if command == config.CommandSync {
@@ -396,7 +374,7 @@ func TestFailedRestrictedReviewGateConstructsNoDirectoryOrStorage(t *testing.T) 
 }
 
 func TestRestrictedDirectProvidersRejectBeforeExternalConstruction(t *testing.T) {
-	for _, command := range []config.Command{config.CommandSync, config.CommandAnalyze} {
+	for _, command := range []config.Command{config.CommandSync} {
 		for _, provider := range []modelpolicy.Provider{modelpolicy.ProviderOpenAI, modelpolicy.ProviderAnthropic} {
 			t.Run(string(command)+"/"+string(provider), func(t *testing.T) {
 				settings := validCommandApplicationSettings(command, provider, modelpolicy.DataModeRestricted)
@@ -1133,7 +1111,7 @@ func TestPaddedDirectProviderSettingsRejectBeforeAnyBoundary(t *testing.T) {
 		},
 	}
 
-	for _, command := range []config.Command{config.CommandSync, config.CommandAnalyze} {
+	for _, command := range []config.Command{config.CommandSync} {
 		for _, testCase := range tests {
 			t.Run(string(command)+"/"+testCase.name, func(t *testing.T) {
 				settings := validCommandApplicationSettings(command, testCase.provider, modelpolicy.DataModePersonal)
@@ -1407,11 +1385,7 @@ func validCommandApplicationSettings(command config.Command, provider modelpolic
 			AWSRegion: "us-east-1", OpenAIAPIKey: "synthetic-openai-key", AnthropicAPIKey: "synthetic-anthropic-key",
 		},
 		IngestionLeaseDuration: 5 * time.Minute, IngestionAttemptTimeout: 4 * time.Minute,
-		ExtractionPromptVersion: extract.ExtractionPromptVersion, ManagerConfidence: config.ManagerConfidenceSettings{PromptVersion: extract.AnalysisPromptVersion},
-	}
-	if command == config.CommandAnalyze {
-		settings.ManagerConfidence.EmployeeEntityID = "employee-id"
-		settings.ManagerConfidence.ManagerEntityID = "manager-id"
+		ExtractionPromptVersion: extract.ExtractionPromptVersion,
 	}
 	return settings
 }
@@ -1478,7 +1452,7 @@ func TestValidateAWSConfigurationCredentialsAcceptsRetrievedSigningKeys(t *testi
 	}
 }
 
-func TestCommandProviderRegistersDoctorSyncAnalyzeAndQueryWithoutConstructingLiveDependencies(t *testing.T) {
+func TestCommandProviderRegistersDoctorSyncAndQueryWithoutConstructingLiveDependencies(t *testing.T) {
 	recorder, err := observability.NewDecisionRecorder(noop.NewMeterProvider().Meter("synthetic"))
 	if err != nil {
 		t.Fatalf("create decision recorder: %v", err)
@@ -1499,9 +1473,6 @@ func TestCommandProviderRegistersDoctorSyncAnalyzeAndQueryWithoutConstructingLiv
 	}
 	if commands[string(config.CommandDoctor)] == nil {
 		t.Fatal("doctor command is not registered")
-	}
-	if commands[string(config.CommandAnalyze)] == nil {
-		t.Fatal("analyze command is not registered")
 	}
 	if commands[string(config.CommandQuery)] == nil {
 		t.Fatal("query command is not registered")
@@ -1528,12 +1499,6 @@ func TestCommandServicesReceiveSelectedInvocationPolicy(t *testing.T) {
 				ingestion := newIngestionService(settings, nil, nil, nil, nil, nil, nil, nil)
 				if ingestion.Provider != test.provider || ingestion.DataMode != test.dataMode || ingestion.Region != test.region {
 					t.Fatalf("ingestion invocation = %q/%q/%q, want %q/%q/%q", ingestion.Provider, ingestion.DataMode, ingestion.Region, test.provider, test.dataMode, test.region)
-				}
-			})
-			t.Run("analyze", func(t *testing.T) {
-				pairAnalysis := newAnalysisService(settings, nil, nil, nil, nil, nil)
-				if pairAnalysis.Provider != test.provider || pairAnalysis.DataMode != test.dataMode || pairAnalysis.Region != test.region {
-					t.Fatalf("analysis invocation = %q/%q/%q, want %q/%q/%q", pairAnalysis.Provider, pairAnalysis.DataMode, pairAnalysis.Region, test.provider, test.dataMode, test.region)
 				}
 			})
 		})

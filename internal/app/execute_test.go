@@ -145,7 +145,6 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 		IngestionLeaseDuration:  5 * time.Minute,
 		IngestionAttemptTimeout: 4 * time.Minute,
 		ExtractionPromptVersion: "extract-v2",
-		ManagerConfidence:       config.ManagerConfidenceSettings{PromptVersion: "analyze-v1"},
 	}}
 	providerCalls := 0
 	syncCalls := 0
@@ -204,41 +203,6 @@ func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
 	}
 	if providerCalls != 1 || doctorCalls != 1 {
 		t.Fatalf("provider/doctor calls = %d/%d, want 1/1", providerCalls, doctorCalls)
-	}
-}
-
-func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
-	settings := config.Settings{Database: config.DatabaseSettings{URL: "postgres://synthetic"}, Application: config.ApplicationSettings{
-		Model: config.ModelSettings{
-			DataMode: "personal", Provider: "bedrock", ModelID: "synthetic-model",
-			MaxOutputTokens: 256, MaxAttempts: 1, AWSProfile: "synthetic-profile", AWSRegion: "us-east-1",
-		},
-		ExtractionPromptVersion: "extract-v2",
-		ManagerConfidence: config.ManagerConfidenceSettings{
-			PromptVersion: "analyze-v1", EmployeeEntityID: "employee-id", ManagerEntityID: "manager-id",
-		},
-	}}
-	providerCalls := 0
-	analyzeCalls := 0
-	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
-		providerCalls++
-		return map[string]cli.Command{"analyze": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
-			analyzeCalls++
-			if invocation.Command != cli.CommandAnalyze || invocation.Action != "" || len(invocation.Arguments) != 0 {
-				return fmt.Errorf("analyze received unexpected invocation")
-			}
-			return nil
-		})}, nil
-	})
-
-	err := executeWithSettings(context.Background(), []string{"analyze"}, settings,
-		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
-		provider, io.Discard, io.Discard)
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-	if providerCalls != 1 || analyzeCalls != 1 {
-		t.Fatalf("provider/analyze calls = %d/%d, want 1/1", providerCalls, analyzeCalls)
 	}
 }
 
@@ -349,24 +313,10 @@ func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *
 		name      string
 		arguments []string
 		settings  config.ApplicationSettings
-	}{
-		{
-			name: "sync legacy extraction", arguments: []string{"sync"},
-			settings: validSyncSettingsForExecute("extract-v1", "analyze-v1"),
-		},
-		{
-			name: "analyze legacy extraction", arguments: []string{"analyze"},
-			settings: validAnalyzeSettingsForExecute("extract-v1", "analyze-v1"),
-		},
-		{
-			name: "sync legacy analysis", arguments: []string{"sync"},
-			settings: validSyncSettingsForExecute("extract-v2", "analyze-v0"),
-		},
-		{
-			name: "analyze legacy analysis", arguments: []string{"analyze"},
-			settings: validAnalyzeSettingsForExecute("extract-v2", "analyze-v0"),
-		},
-	}
+	}{{
+		name: "sync legacy extraction", arguments: []string{"sync"},
+		settings: validSyncSettingsForExecute("extract-v1"),
+	}}
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -392,7 +342,7 @@ func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *
 	}
 }
 
-func validSyncSettingsForExecute(extractionVersion, analysisVersion string) config.ApplicationSettings {
+func validSyncSettingsForExecute(extractionVersion string) config.ApplicationSettings {
 	return config.ApplicationSettings{
 		GoogleFolderID:        "synthetic-folder",
 		GoogleOAuthClientFile: "/synthetic/client.json", GoogleOAuthTokenFile: "/synthetic/token.json",
@@ -403,15 +353,7 @@ func validSyncSettingsForExecute(extractionVersion, analysisVersion string) conf
 		},
 		IngestionLeaseDuration: 5 * time.Minute, IngestionAttemptTimeout: 4 * time.Minute,
 		ExtractionPromptVersion: extractionVersion,
-		ManagerConfidence:       config.ManagerConfidenceSettings{PromptVersion: analysisVersion},
 	}
-}
-
-func validAnalyzeSettingsForExecute(extractionVersion, analysisVersion string) config.ApplicationSettings {
-	settings := validSyncSettingsForExecute(extractionVersion, analysisVersion)
-	settings.ManagerConfidence.EmployeeEntityID = "employee-id"
-	settings.ManagerConfidence.ManagerEntityID = "manager-id"
-	return settings
 }
 
 func executeWithSettings(

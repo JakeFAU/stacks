@@ -13,7 +13,6 @@ import (
 const (
 	defaultModelMaxAttempts           = 5
 	defaultExtractionPromptVersion    = extract.ExtractionPromptVersion
-	defaultAnalysisPromptVersion      = extract.AnalysisPromptVersion
 	defaultIngestionLeaseDuration     = 5 * time.Minute
 	defaultIngestionAttemptTimeout    = 4 * time.Minute
 	maximumIngestionLeaseDuration     = time.Hour
@@ -56,9 +55,6 @@ const (
 	IngestionLeaseDurationEnvironmentVariable     = "STACKS_INGEST_LEASE_DURATION"
 	IngestionAttemptTimeoutEnvironmentVariable    = "STACKS_INGEST_ATTEMPT_TIMEOUT"
 	ExtractionPromptVersionEnvironmentVariable    = "STACKS_EXTRACTION_PROMPT_VERSION"
-	AnalysisPromptVersionEnvironmentVariable      = "STACKS_ANALYSIS_PROMPT_VERSION"
-	EmployeeEntityIDEnvironmentVariable           = "STACKS_EMPLOYEE_ENTITY_ID"
-	ManagerEntityIDEnvironmentVariable            = "STACKS_MANAGER_ENTITY_ID"
 	GoogleDirectoryEnabledEnvironmentVariable     = "STACKS_GOOGLE_DIRECTORY_ENABLED"
 	GoogleDirectoryClientFileEnvironmentVariable  = "STACKS_GOOGLE_DIRECTORY_OAUTH_CLIENT_FILE"
 	GoogleDirectoryTokenFileEnvironmentVariable   = "STACKS_GOOGLE_DIRECTORY_OAUTH_TOKEN_FILE"
@@ -93,7 +89,6 @@ const (
 	CommandSync      Command = "sync"
 	CommandEntities  Command = "entities"
 	CommandReview    Command = "review"
-	CommandAnalyze   Command = "analyze"
 	CommandQuery     Command = "query"
 	CommandDBMigrate Command = "db-migrate"
 	CommandDBStatus  Command = "db-status"
@@ -135,14 +130,6 @@ const (
 	GoogleAuthDirectory GoogleAuthTarget = "google-directory"
 )
 
-// ManagerConfidenceSettings groups the temporary manager-confidence query
-// configuration without making that use case a database scope.
-type ManagerConfidenceSettings struct {
-	PromptVersion    string
-	EmployeeEntityID string
-	ManagerEntityID  string
-}
-
 // ApplicationSettings holds command-specific application settings. Values are
 // loaded without command validation so serving health traffic remains possible
 // before the application is fully configured.
@@ -158,7 +145,6 @@ type ApplicationSettings struct {
 	IngestionLeaseDuration  time.Duration
 	IngestionAttemptTimeout time.Duration
 	ExtractionPromptVersion string
-	ManagerConfidence       ManagerConfidenceSettings
 }
 
 // Validate verifies only the settings required by command. Serve intentionally
@@ -177,14 +163,6 @@ func (settings ApplicationSettings) Validate(command Command) error {
 		return nil
 	case CommandReview:
 		return settings.validateGoogleDirectory(command)
-	case CommandAnalyze:
-		if err := settings.validateRequired(command,
-			EmployeeEntityIDEnvironmentVariable,
-			ManagerEntityIDEnvironmentVariable,
-		); err != nil {
-			return err
-		}
-		return settings.validateModelSettings(command)
 	default:
 		return nil
 	}
@@ -323,17 +301,12 @@ func (settings ApplicationSettings) validateModelSettings(command Command) error
 	}
 	if err := settings.validateRequired(command,
 		ExtractionPromptVersionEnvironmentVariable,
-		AnalysisPromptVersionEnvironmentVariable,
 	); err != nil {
 		return err
 	}
 	if settings.ExtractionPromptVersion != extract.ExtractionPromptVersion {
 		return fmt.Errorf("%s must be %q; update it and run stacks sync to create current derivations",
 			ExtractionPromptVersionEnvironmentVariable, extract.ExtractionPromptVersion)
-	}
-	if settings.ManagerConfidence.PromptVersion != extract.AnalysisPromptVersion {
-		return fmt.Errorf("%s must be %q; update it and run stacks sync before analysis",
-			AnalysisPromptVersionEnvironmentVariable, extract.AnalysisPromptVersion)
 	}
 	return nil
 }
@@ -427,12 +400,6 @@ func (settings ApplicationSettings) valueForEnvironment(name string) string {
 		return settings.Model.ModelID
 	case ExtractionPromptVersionEnvironmentVariable:
 		return settings.ExtractionPromptVersion
-	case AnalysisPromptVersionEnvironmentVariable:
-		return settings.ManagerConfidence.PromptVersion
-	case EmployeeEntityIDEnvironmentVariable:
-		return settings.ManagerConfidence.EmployeeEntityID
-	case ManagerEntityIDEnvironmentVariable:
-		return settings.ManagerConfidence.ManagerEntityID
 	default:
 		return ""
 	}

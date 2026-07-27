@@ -48,7 +48,7 @@ func configValidationTarget(input ConfigValidationInput) (string, error) {
 	}
 	switch input.Command {
 	case CommandServe, CommandDoctor, CommandSync, CommandEntities, CommandReview,
-		CommandAnalyze, CommandQuery, CommandDBMigrate, CommandDBStatus, CommandDBReset:
+		CommandQuery, CommandDBMigrate, CommandDBStatus, CommandDBReset:
 		return string(input.Command), nil
 	default:
 		return "", fmt.Errorf("configuration validation target is invalid")

@@ -25,7 +25,6 @@ import (
 	"github.com/JakeFAU/stacks/adapters/postgres/directorymigrations"
 	"github.com/JakeFAU/stacks/adapters/postgres/migration"
 
-	"stacks/internal/analysis"
 	"stacks/internal/app"
 	"stacks/internal/cli"
 	"stacks/internal/config"
@@ -190,7 +189,6 @@ type canonicalRepositories struct {
 	directory directory.Repository
 	entities  cli.EntityStore
 	review    cli.CanonicalReviewRepository
-	analysis  analysis.Repository
 	close     func()
 }
 
@@ -261,7 +259,6 @@ func defaultCommandRuntime() commandRuntime {
 				directory: directoryRepository,
 				entities:  reviewRepository,
 				review:    reviewRepository,
-				analysis:  analysis.PostgresRepository{Database: database},
 				close:     database.Close,
 			}, nil
 		},
@@ -540,40 +537,6 @@ func commandProviderWithRuntime(
 				Service: &cli.ReviewService{Store: store}, Output: stdout,
 			}).Run(ctx, invocation)
 		}),
-		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
-			if err := settings.Validate(config.CommandAnalyze); err != nil {
-				return err
-			}
-			if err := requireRestrictedDisclosure(ctx, settings.Application.Model, runtime); err != nil {
-				return err
-			}
-			if runtime.openCanonicalRepositories == nil || runtime.newModel == nil {
-				return errors.New("analyze command dependencies are not configured")
-			}
-			repositories, err := runtime.openCanonicalRepositories(
-				ctx,
-				settings.Database.URL,
-				false,
-			)
-			if err != nil {
-				return err
-			}
-			if repositories.close != nil {
-				defer repositories.close()
-			}
-			model, err := runtime.newModel(ctx, settings.Application.Model, invocations, tracer)
-			if err != nil {
-				return err
-			}
-			service := newAnalysisService(
-				settings.Application, repositories.analysis, model,
-				tracer, decisions, time.Now,
-			)
-			return (cli.AnalyzeCommand{
-				Service: service, EmployeeID: settings.Application.ManagerConfidence.EmployeeEntityID,
-				ManagerID: settings.Application.ManagerConfidence.ManagerEntityID, Output: stdout,
-			}).Run(ctx, invocation)
-		}),
 		string(config.CommandQuery): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			if err := settings.Validate(config.CommandQuery); err != nil {
 				return err
@@ -813,23 +776,6 @@ func waitForDirectoryRetry(ctx context.Context, delay time.Duration) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
-	}
-}
-
-func newAnalysisService(
-	settings config.ApplicationSettings,
-	repository analysis.Repository,
-	model extract.Model,
-	tracer trace.Tracer,
-	decisions analysis.DecisionRecorder,
-	now func() time.Time,
-) *analysis.Service {
-	return &analysis.Service{
-		Repository: repository, Model: model, PromptVersion: settings.ManagerConfidence.PromptVersion,
-		Provider: settings.Model.Provider, DataMode: settings.Model.DataMode,
-		Region: modelInvocation(settings.Model).Region, ModelID: strings.TrimSpace(settings.Model.ModelID),
-		MaxTokens: settings.Model.MaxOutputTokens, Tracer: tracer,
-		Decisions: decisions, Now: now,
 	}
 }
 

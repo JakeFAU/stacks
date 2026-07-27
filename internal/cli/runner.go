@@ -43,7 +43,6 @@ const (
 	CommandSync      CommandName = "sync"
 	CommandEntities  CommandName = "entities"
 	CommandReview    CommandName = "review"
-	CommandAnalyze   CommandName = "analyze"
 	CommandQuery     CommandName = "query"
 	CommandDBMigrate CommandName = "db-migrate"
 	CommandDBStatus  CommandName = "db-status"
@@ -172,7 +171,6 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	root.AddCommand(serve)
 	root.AddCommand(leaf(string(CommandDoctor), CommandDoctor, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandSync), CommandSync, "", cobra.NoArgs))
-	root.AddCommand(leaf(string(CommandAnalyze), CommandAnalyze, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandDBMigrate), CommandDBMigrate, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandDBStatus), CommandDBStatus, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandDBReset)+" <confirmation>", CommandDBReset, "", cobra.ExactArgs(1)))
@@ -210,7 +208,6 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 		CommandSync,
 		CommandEntities,
 		CommandReview,
-		CommandAnalyze,
 		CommandQuery,
 		CommandDBMigrate,
 		CommandDBStatus,

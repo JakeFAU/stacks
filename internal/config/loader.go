@@ -50,7 +50,6 @@ const (
 	configKeyIngestionLeaseDuration    = "ingestion.lease_duration"
 	configKeyIngestionAttemptTimeout   = "ingestion.attempt_timeout"
 	configKeyExtractionPromptVersion   = "extraction.prompt_version"
-	configKeyAnalysisPromptVersion     = "analysis.prompt_version"
 	configKeyQueryMaxEntities          = "query.max_entities"
 	configKeyQueryMaxPredicates        = "query.max_predicates"
 	configKeyQueryMaxChronology        = "query.max_chronology"
@@ -97,7 +96,6 @@ func configurationEnvironmentBindings() []environmentBinding {
 		{configKeyIngestionLeaseDuration, IngestionLeaseDurationEnvironmentVariable},
 		{configKeyIngestionAttemptTimeout, IngestionAttemptTimeoutEnvironmentVariable},
 		{configKeyExtractionPromptVersion, ExtractionPromptVersionEnvironmentVariable},
-		{configKeyAnalysisPromptVersion, AnalysisPromptVersionEnvironmentVariable},
 		{configKeyQueryMaxEntities, QueryMaxEntitiesEnvironmentVariable},
 		{configKeyQueryMaxPredicates, QueryMaxPredicatesEnvironmentVariable},
 		{configKeyQueryMaxChronology, QueryMaxChronologyEnvironmentVariable},
@@ -156,7 +154,6 @@ func setDefaults(values *viper.Viper) {
 	values.SetDefault(configKeyIngestionLeaseDuration, defaultIngestionLeaseDuration)
 	values.SetDefault(configKeyIngestionAttemptTimeout, defaultIngestionAttemptTimeout)
 	values.SetDefault(configKeyExtractionPromptVersion, defaultExtractionPromptVersion)
-	values.SetDefault(configKeyAnalysisPromptVersion, defaultAnalysisPromptVersion)
 	values.SetDefault(configKeyQueryMaxEntities, defaultQueryMaxEntities)
 	values.SetDefault(configKeyQueryMaxPredicates, defaultQueryMaxPredicates)
 	values.SetDefault(configKeyQueryMaxChronology, defaultQueryMaxChronology)
@@ -324,10 +321,6 @@ func settingsFrom(values *viper.Viper) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	analysisPromptVersion, err := defaultedStringValue(values, configKeyAnalysisPromptVersion, AnalysisPromptVersionEnvironmentVariable, defaultAnalysisPromptVersion)
-	if err != nil {
-		return Settings{}, err
-	}
 	queryMaxEntities, err := boundedIntegerValue(values, configKeyQueryMaxEntities, QueryMaxEntitiesEnvironmentVariable, maximumQueryEntities)
 	if err != nil {
 		return Settings{}, err
@@ -371,9 +364,6 @@ func settingsFrom(values *viper.Viper) (Settings, error) {
 			LegacyModelEnvironment: configuredUnsupportedModelEnvironment(),
 			IngestionLeaseDuration: ingestionLeaseDuration, IngestionAttemptTimeout: ingestionAttemptTimeout,
 			ExtractionPromptVersion: extractionPromptVersion,
-			ManagerConfidence: ManagerConfidenceSettings{
-				PromptVersion: analysisPromptVersion, EmployeeEntityID: os.Getenv(EmployeeEntityIDEnvironmentVariable), ManagerEntityID: os.Getenv(ManagerEntityIDEnvironmentVariable),
-			},
 		},
 	}, nil
 }

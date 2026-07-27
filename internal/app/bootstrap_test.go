@@ -29,7 +29,7 @@ func TestExecuteLoadsValidatesThenBootstrapsSelectedCommand(t *testing.T) {
 	calls := []string{}
 	settings := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	loader := SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) {
 		calls = append(calls, "load")
@@ -115,6 +115,30 @@ func TestExecuteSyntaxAndHelpDoNotLoadOrBootstrap(t *testing.T) {
 				t.Fatalf("loader/bootstrap calls = %d/%d, want 0/0", loaderCalls, len(bootstrapCalls))
 			}
 		})
+	}
+}
+
+func TestExecuteRejectsRetiredAnalyzeBeforeLoadOrBootstrap(t *testing.T) {
+	loaderCalls := 0
+	bootstrapCalls := []string{}
+	loader := SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) {
+		loaderCalls++
+		return config.Settings{}, nil
+	})
+
+	err := Execute(
+		t.Context(),
+		[]string{"analyze"},
+		loader,
+		recordingBootstrap{calls: &bootstrapCalls},
+		io.Discard,
+		io.Discard,
+	)
+	if err == nil {
+		t.Fatal("Execute(analyze) error = nil, want retired command rejection")
+	}
+	if loaderCalls != 0 || len(bootstrapCalls) != 0 {
+		t.Fatalf("loader/bootstrap calls = %d/%d, want 0/0", loaderCalls, len(bootstrapCalls))
 	}
 }
 
@@ -276,7 +300,6 @@ func TestExecuteOfflineTargetsUseSettingsValidation(t *testing.T) {
 		{"sync"},
 		{"entities"},
 		{"review"},
-		{"analyze"},
 		{"db-migrate"},
 		{"db-status"},
 		{"db-reset"},
@@ -445,7 +468,7 @@ func TestExecuteCommandFailureStillShutsDown(t *testing.T) {
 
 	settings := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	err := Execute(t.Context(), []string{"sync"}, settingsLoader(settings), bootstrap, io.Discard, io.Discard)
 	if !errors.Is(err, commandError) {
@@ -478,7 +501,7 @@ func TestExecuteJoinsCommandAndShutdownErrors(t *testing.T) {
 
 	settings := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	err := Execute(t.Context(), []string{"sync"}, settingsLoader(settings), bootstrap, io.Discard, io.Discard)
 	if !errors.Is(err, commandError) || !errors.Is(err, shutdownError) {
@@ -531,7 +554,7 @@ func TestExecuteCanceledCommandUsesValuePreservingShutdownContext(t *testing.T) 
 func TestExecuteRejectsMissingShutdownBeforeApplicationWork(t *testing.T) {
 	validSync := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	tests := []struct {
 		name         string
@@ -597,7 +620,7 @@ func TestExecuteRejectsMissingShutdownBeforeApplicationWork(t *testing.T) {
 func TestExecuteReportsMissingRequiredDependencies(t *testing.T) {
 	validSync := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	tests := []struct {
 		name      string

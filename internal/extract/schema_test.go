@@ -2,15 +2,50 @@ package extract
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
 
+func TestExtractV2SchemaAndPromptRemainByteStable(t *testing.T) {
+	contract, err := PromptContract(ExtractionPromptVersion)
+	if err != nil {
+		t.Fatalf("PromptContract(%q) error = %v", ExtractionPromptVersion, err)
+	}
+	const (
+		wantPromptDigest = "88e19f093fb72f5b948caafd8bdc57d52e95273c5e84e465445157d05c84aedc"
+		wantSchemaDigest = "26d5a016ac6d529b51685da2927d5fe1368fbd0dd270f05ed14a9707a427b6ea"
+	)
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(contract.SystemPrompt))); got != wantPromptDigest {
+		t.Fatalf("extract-v2 prompt SHA-256 = %s, want %s", got, wantPromptDigest)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(contract.JSONSchema)); got != wantSchemaDigest {
+		t.Fatalf("extract-v2 schema SHA-256 = %s, want %s", got, wantSchemaDigest)
+	}
+}
+
+func TestPromptContractSupportsExtractionOnly(t *testing.T) {
+	contract, err := PromptContract(ExtractionPromptVersion)
+	if err != nil {
+		t.Fatalf("PromptContract(%q) error = %v", ExtractionPromptVersion, err)
+	}
+	if contract.Version != ExtractionPromptVersion ||
+		contract.SchemaName != ExtractionSchemaName ||
+		contract.SystemPrompt == "" ||
+		len(contract.JSONSchema) == 0 {
+		t.Fatalf("PromptContract(%q) = %+v, want complete extraction contract", ExtractionPromptVersion, contract)
+	}
+	retiredPromptVersion := "analyze-" + "v1"
+	if _, err := PromptContract(retiredPromptVersion); err == nil {
+		t.Fatalf("PromptContract(%q) error = nil, want retired prompt rejection", retiredPromptVersion)
+	}
+}
+
 func TestSchemasCloseEveryObjectAndRequireCoreFields(t *testing.T) {
 	for name, schema := range map[string][]byte{
 		"extraction": ExtractionJSONSchema(),
-		"analysis":   AnalysisJSONSchema(),
 	} {
 		t.Run(name, func(t *testing.T) {
 			var document any
@@ -28,7 +63,6 @@ func TestSchemasRejectWhitespacePaddedModelLocalIdentifiers(t *testing.T) {
 		count  int
 	}{
 		"extraction": {schema: ExtractionJSONSchema(), count: 14},
-		"analysis":   {schema: AnalysisJSONSchema(), count: 2},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var document any
@@ -48,7 +82,6 @@ func TestPromptVersionsAreEmbeddedAndExplicit(t *testing.T) {
 		want    string
 	}{
 		{version: ExtractionPromptVersion, want: "UTF-8 byte offsets"},
-		{version: AnalysisPromptVersion, want: "private mental state"},
 	} {
 		prompt, err := Prompt(test.version)
 		if err != nil {
@@ -82,32 +115,24 @@ func TestExtractionContractAdvancesPastSupersededIdentityAssociationSemantics(t 
 	}
 }
 
-func TestPromptContractReturnsIsolatedReviewedPairings(t *testing.T) {
-	tests := []struct {
-		version    string
-		schemaName string
-	}{
-		{version: ExtractionPromptVersion, schemaName: ExtractionSchemaName},
-		{version: AnalysisPromptVersion, schemaName: AnalysisSchemaName},
+func TestPromptContractReturnsIsolatedReviewedPairing(t *testing.T) {
+	first, err := PromptContract(ExtractionPromptVersion)
+	if err != nil {
+		t.Fatalf("PromptContract(%q) error = %v", ExtractionPromptVersion, err)
 	}
-	for _, test := range tests {
-		first, err := PromptContract(test.version)
-		if err != nil {
-			t.Fatalf("PromptContract(%q) error = %v", test.version, err)
-		}
-		if first.Version != test.version || first.SystemPrompt == "" || first.SchemaName != test.schemaName || len(first.JSONSchema) == 0 {
-			t.Fatalf("PromptContract(%q) = %+v", test.version, first)
-		}
-		first.SystemPrompt = "mutated"
-		first.JSONSchema[0] = 'x'
+	if first.Version != ExtractionPromptVersion || first.SystemPrompt == "" ||
+		first.SchemaName != ExtractionSchemaName || len(first.JSONSchema) == 0 {
+		t.Fatalf("PromptContract(%q) = %+v", ExtractionPromptVersion, first)
+	}
+	first.SystemPrompt = "mutated"
+	first.JSONSchema[0] = 'x'
 
-		second, err := PromptContract(test.version)
-		if err != nil {
-			t.Fatalf("second PromptContract(%q) error = %v", test.version, err)
-		}
-		if second.SystemPrompt == "mutated" || second.JSONSchema[0] == 'x' {
-			t.Fatalf("PromptContract(%q) returned mutable shared state", test.version)
-		}
+	second, err := PromptContract(ExtractionPromptVersion)
+	if err != nil {
+		t.Fatalf("second PromptContract(%q) error = %v", ExtractionPromptVersion, err)
+	}
+	if second.SystemPrompt == "mutated" || second.JSONSchema[0] == 'x' {
+		t.Fatalf("PromptContract(%q) returned mutable shared state", ExtractionPromptVersion)
 	}
 	if _, err := PromptContract("unknown-v1"); err == nil {
 		t.Fatal("PromptContract(unknown) error = nil")

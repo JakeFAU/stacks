@@ -16,9 +16,10 @@ case "$dry_run" in
 esac
 
 case "$dry_run" in
-	*"go test "*"./internal/analysis"*) ;;
-	*)
-		echo "test-integration does not execute ./internal/analysis" >&2
+	*"go test "*"./internal/analysis"*)
+		echo "test-integration still executes retired ./internal/analysis" >&2
 		exit 1
+		;;
+	*)
 		;;
 esac

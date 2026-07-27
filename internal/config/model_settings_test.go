@@ -70,7 +70,7 @@ func TestApplicationSettingsValidateKeepsNonModelCommandsLazy(t *testing.T) {
 }
 
 func TestApplicationSettingsValidateModelCommandsRequireExplicitModelSelection(t *testing.T) {
-	for _, command := range []Command{CommandDoctor, CommandSync, CommandAnalyze} {
+	for _, command := range []Command{CommandDoctor, CommandSync} {
 		t.Run(string(command), func(t *testing.T) {
 			settings := validModelCommandSettings()
 			settings.Model = ModelSettings{}
@@ -196,7 +196,7 @@ func TestApplicationSettingsValidateRejectsPaddedDirectProviderSettingsWithoutVa
 		},
 	}
 
-	for _, command := range []Command{CommandSync, CommandAnalyze} {
+	for _, command := range []Command{CommandSync} {
 		for _, testCase := range tests {
 			t.Run(string(command)+"/"+testCase.name, func(t *testing.T) {
 				settings := validModelCommandSettings()

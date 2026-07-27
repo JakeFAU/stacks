@@ -197,31 +197,6 @@ func TestGenerateRejectsUnknownOrMutatedPromptContract(t *testing.T) {
 	}
 }
 
-func TestGenerateUsesReviewedAnalysisContract(t *testing.T) {
-	contract, err := extract.PromptContract(extract.AnalysisPromptVersion)
-	if err != nil {
-		t.Fatalf("PromptContract() error = %v", err)
-	}
-	api := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{successfulOutput(`{}`)}}
-	client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
-
-	response, err := client.Generate(context.Background(), extract.Request{
-		PromptVersion: contract.Version,
-		SystemPrompt:  contract.SystemPrompt,
-		Input:         testPrivateInput,
-		SchemaName:    contract.SchemaName,
-		JSONSchema:    contract.JSONSchema,
-	})
-	if err != nil {
-		t.Fatalf("Generate() error = %v", err)
-	}
-	input := api.inputs[0]
-	format := input.OutputConfig.TextFormat.Structure.(*types.OutputFormatStructureMemberJsonSchema)
-	if response.PromptVersion != extract.AnalysisPromptVersion || aws.ToString(format.Value.Name) != extract.AnalysisSchemaName || aws.ToString(format.Value.Schema) != string(extract.AnalysisJSONSchema()) {
-		t.Fatalf("analysis contract was not preserved")
-	}
-}
-
 func TestGenerateRetriesThrottlingWithinConfiguredBound(t *testing.T) {
 	throttled := &smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateInput}
 	api := &fakeConverseAPI{errors: []error{throttled, throttled, throttled, throttled}}

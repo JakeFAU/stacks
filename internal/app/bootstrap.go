@@ -89,7 +89,7 @@ func targetForConfigValidation(input cli.ConfigValidationInput) (validationTarge
 	}
 	switch input.Command {
 	case cli.CommandServe, cli.CommandDoctor, cli.CommandSync, cli.CommandEntities,
-		cli.CommandReview, cli.CommandAnalyze, cli.CommandQuery, cli.CommandDBMigrate,
+		cli.CommandReview, cli.CommandQuery, cli.CommandDBMigrate,
 		cli.CommandDBStatus, cli.CommandDBReset:
 		return validationTarget{Command: config.Command(input.Command)}, nil
 	default:
