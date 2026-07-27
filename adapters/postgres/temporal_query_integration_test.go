@@ -31,6 +31,15 @@ const (
 	atlasStatusPredicate        observation.Predicate = "project.atlas/status"
 	atlasCollaborationPredicate observation.Predicate = "project.atlas/collaborates"
 	atlasConcurrentPredicate    observation.Predicate = "project.atlas/concurrent"
+
+	atlasSupportingSectionText    = "Alex leads Project Atlas with Blair."
+	atlasSupportingQuote          = "leads Project Atlas"
+	atlasSupportingStartOffset    = 5
+	atlasSupportingEndOffset      = 24
+	atlasContradictingSectionText = "A reviewer recorded counterevidence about Atlas ownership."
+	atlasContradictingQuote       = "counterevidence about Atlas"
+	atlasContradictingStartOffset = 20
+	atlasContradictingEndOffset   = 47
 )
 
 var (
@@ -200,6 +209,13 @@ func TestTemporalQueryPostgresEntityMatchAllAndAny(t *testing.T) {
 		atlasCollaborationPredicate,
 		nil,
 	)
+	anyWithOnlyUnrelatedPerson := fixture.loadSnapshot(
+		t,
+		[]identity.EntityID{atlasObserverID},
+		TemporalEntityMatchAny,
+		atlasCollaborationPredicate,
+		nil,
+	)
 
 	if len(allReviewedPeople.Observations) != 1 ||
 		allReviewedPeople.Observations[0].Observation.ID() !=
@@ -231,6 +247,17 @@ func TestTemporalQueryPostgresEntityMatchAllAndAny(t *testing.T) {
 			fixture.collaborationObservation.ID(),
 		)
 	}
+	if len(anyWithOnlyUnrelatedPerson.Observations) != 0 {
+		t.Fatalf(
+			"any with only unrelated person observations = %#v, want none",
+			anyWithOnlyUnrelatedPerson.Observations,
+		)
+	}
+	assertNoTemporalCoverageForObservation(
+		t,
+		anyWithOnlyUnrelatedPerson.Coverage,
+		fixture.collaborationObservation.ID(),
+	)
 }
 
 func TestTemporalQueryPostgresRoundTripsExactCitationsAndCanonicalTerms(t *testing.T) {
@@ -283,37 +310,75 @@ func TestTemporalQueryPostgresRoundTripsExactCitationsAndCanonicalTerms(t *testi
 		)
 	}
 
-	expectedRoles := map[evidence.EvidenceID]observation.EvidenceRole{
-		fixture.supportingSpan.ID():    observation.EvidenceSupporting,
-		fixture.contradictingSpan.ID(): observation.EvidenceContradicting,
+	expectedCitations := map[evidence.EvidenceID]TemporalEvidenceRecord{
+		fixture.supportingSpan.ID(): {
+			EvidenceID:        fixture.supportingSpan.ID(),
+			Role:              observation.EvidenceSupporting,
+			SourceDocumentID:  fixture.documentRef.Ref.SourceDocumentID,
+			DocumentVersionID: fixture.documentRef.Ref.VersionID,
+			SectionID:         "section:project-atlas/decision-log",
+			SectionTitle:      "Project Atlas decision log",
+			SectionPath:       []string{"Project Atlas", "Decision log"},
+			SectionOrder:      0,
+			SectionRole:       "decision-log",
+			StartOffset:       atlasSupportingStartOffset,
+			EndOffset:         atlasSupportingEndOffset,
+			Locator:           "synthetic://project-atlas/authority-history",
+			Text:              atlasSupportingQuote,
+		},
+		fixture.contradictingSpan.ID(): {
+			EvidenceID:        fixture.contradictingSpan.ID(),
+			Role:              observation.EvidenceContradicting,
+			SourceDocumentID:  fixture.documentRef.Ref.SourceDocumentID,
+			DocumentVersionID: fixture.documentRef.Ref.VersionID,
+			SectionID:         "section:project-atlas/review-note",
+			SectionTitle:      "Project Atlas review note",
+			SectionPath:       []string{"Project Atlas", "Review note"},
+			SectionOrder:      1,
+			SectionRole:       "review-note",
+			StartOffset:       atlasContradictingStartOffset,
+			EndOffset:         atlasContradictingEndOffset,
+			Locator:           "synthetic://project-atlas/authority-history",
+			Text:              atlasContradictingQuote,
+		},
 	}
-	if len(got.Evidence) != len(expectedRoles) {
+	if len(got.Evidence) != len(expectedCitations) {
 		t.Fatalf(
 			"citation count = %d, want %d",
 			len(got.Evidence),
-			len(expectedRoles),
+			len(expectedCitations),
 		)
 	}
+	seenCitations := make(map[evidence.EvidenceID]int, len(expectedCitations))
 	for _, citation := range got.Evidence {
-		wantRole, exists := expectedRoles[citation.EvidenceID]
+		want, exists := expectedCitations[citation.EvidenceID]
 		if !exists {
 			t.Fatalf("unexpected citation evidence ID %q", citation.EvidenceID)
 		}
-		span := fixture.spanByID(t, citation.EvidenceID)
-		section := fixture.sectionByID(t, span.SectionID())
-		if citation.Role != wantRole ||
-			citation.SourceDocumentID != fixture.documentRef.Ref.SourceDocumentID ||
-			citation.DocumentVersionID != fixture.documentRef.Ref.VersionID ||
-			citation.SectionID != section.ID() ||
-			citation.SectionTitle != section.Title() ||
-			!reflect.DeepEqual(citation.SectionPath, section.Path()) ||
-			citation.SectionOrder != section.Order() ||
-			citation.SectionRole != section.Role() ||
-			citation.StartOffset != span.StartOffset() ||
-			citation.EndOffset != span.EndOffset() ||
-			citation.Locator != fixture.document.Locator() ||
-			citation.Text != span.Text() {
-			t.Fatalf("citation %q did not round-trip exactly: %#v", citation.EvidenceID, citation)
+		seenCitations[citation.EvidenceID]++
+		if seenCitations[citation.EvidenceID] != 1 {
+			t.Fatalf(
+				"citation evidence ID %q occurred %d times, want exactly once",
+				citation.EvidenceID,
+				seenCitations[citation.EvidenceID],
+			)
+		}
+		if !reflect.DeepEqual(citation, want) {
+			t.Fatalf(
+				"citation %q did not round-trip exactly:\ngot  %#v\nwant %#v",
+				citation.EvidenceID,
+				citation,
+				want,
+			)
+		}
+	}
+	for evidenceID := range expectedCitations {
+		if seenCitations[evidenceID] != 1 {
+			t.Fatalf(
+				"citation evidence ID %q occurred %d times, want exactly once",
+				evidenceID,
+				seenCitations[evidenceID],
+			)
 		}
 	}
 }
@@ -538,7 +603,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 			Path:  []string{"Project Atlas", "Decision log"},
 			Order: 0,
 			Role:  "decision-log",
-			Text:  "Alex leads Project Atlas with Blair.",
+			Text:  atlasSupportingSectionText,
 		}),
 		mustTemporalSection(t, evidence.SectionInput{
 			ID:    "section:project-atlas/review-note",
@@ -546,7 +611,7 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 			Path:  []string{"Project Atlas", "Review note"},
 			Order: 1,
 			Role:  "review-note",
-			Text:  "A reviewer recorded counterevidence about Atlas ownership.",
+			Text:  atlasContradictingSectionText,
 		}),
 	}
 	fixture.document = mustTemporalDocument(t, evidence.DocumentVersionInput{
@@ -572,12 +637,18 @@ func (fixture *temporalQueryPostgresFixture) seed(t testing.TB) {
 		t,
 		fixture.document,
 		fixture.sections[0],
+		atlasSupportingStartOffset,
+		atlasSupportingEndOffset,
+		atlasSupportingQuote,
 		atlasDocumentRecordedAt.Add(time.Minute),
 	)
 	fixture.contradictingSpan = mustTemporalSpan(
 		t,
 		fixture.document,
 		fixture.sections[1],
+		atlasContradictingStartOffset,
+		atlasContradictingEndOffset,
+		atlasContradictingQuote,
 		atlasDocumentRecordedAt.Add(2*time.Minute),
 	)
 	if err := fixture.database.InTransaction(
@@ -1035,37 +1106,6 @@ func (fixture temporalQueryPostgresFixture) loadSnapshot(
 	return snapshot
 }
 
-func (fixture temporalQueryPostgresFixture) spanByID(
-	t testing.TB,
-	id evidence.EvidenceID,
-) evidence.EvidenceSpan {
-	t.Helper()
-	for _, span := range []evidence.EvidenceSpan{
-		fixture.supportingSpan,
-		fixture.contradictingSpan,
-	} {
-		if span.ID() == id {
-			return span
-		}
-	}
-	t.Fatalf("unknown fixture evidence ID %q", id)
-	return evidence.EvidenceSpan{}
-}
-
-func (fixture temporalQueryPostgresFixture) sectionByID(
-	t testing.TB,
-	id string,
-) evidence.Section {
-	t.Helper()
-	for _, section := range fixture.sections {
-		if section.ID() == id {
-			return section
-		}
-	}
-	t.Fatalf("unknown fixture section ID %q", id)
-	return evidence.Section{}
-}
-
 type temporalMutationRecord struct {
 	count       int64
 	fingerprint string
@@ -1283,15 +1323,18 @@ func mustTemporalSpan(
 	t testing.TB,
 	document evidence.DocumentVersion,
 	section evidence.Section,
+	startOffset int,
+	endOffset int,
+	quote string,
 	recordedAt time.Time,
 ) evidence.EvidenceSpan {
 	t.Helper()
 	value, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
 		Document:    document,
 		SectionID:   section.ID(),
-		StartOffset: 0,
-		EndOffset:   len(section.Text()),
-		Quote:       section.Text(),
+		StartOffset: startOffset,
+		EndOffset:   endOffset,
+		Quote:       quote,
 		RecordedAt:  recordedAt,
 	})
 	if err != nil {
