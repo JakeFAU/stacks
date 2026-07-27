@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -220,72 +221,42 @@ func TestQueryJSONEncodesExactRemainingIntentUnions(t *testing.T) {
 	}
 }
 
-func TestQueryJSONPreservesTransitionAndCausalAssociations(t *testing.T) {
-	results := populatedRemainingIntentResults(t)
-	trajectoryJSON, err := renderQueryJSON(results["trajectory"])
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{
-		`"valid_time":{"kind":"instant","at":"2026-01-16T13:09:10.654321Z"}`,
-		`"kind":"added"`, `"after":`, `"kind":"removed"`, `"before":`,
-		`"unresolved":[`, `"observation_id":"observation-unresolved"`,
-	} {
-		if !bytes.Contains(trajectoryJSON, []byte(want)) {
-			t.Fatalf("trajectory JSON missing %s: %s", want, trajectoryJSON)
-		}
-	}
-	var envelope map[string]json.RawMessage
-	mustUnmarshalJSON(t, trajectoryJSON, &envelope)
-	var union map[string]json.RawMessage
-	mustUnmarshalJSON(t, envelope["result"], &union)
-	var trajectory map[string]json.RawMessage
-	mustUnmarshalJSON(t, union["trajectory"], &trajectory)
-	var transitions []map[string]json.RawMessage
-	mustUnmarshalJSON(t, trajectory["transitions"], &transitions)
-	assertJSONKeys(t, transitions[0], "after", "key", "kind", "unresolved", "valid_time")
-	assertJSONKeys(t, transitions[1], "before", "key", "kind", "unresolved", "valid_time")
-	if _, exists := transitions[0]["before"]; exists {
-		t.Fatalf("added transition contains before: %s", transitions[0]["before"])
-	}
-	if _, exists := transitions[1]["after"]; exists {
-		t.Fatalf("removed transition contains after: %s", transitions[1]["after"])
-	}
-
-	causalJSON, err := renderQueryJSON(results["causal"])
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{
-		`"cause":{"kind":"text","text":"decision"}`,
-		`"effect":{"kind":"text","text":"delivery"}`,
-		`"observation_id":"observation-causal"`,
-		`"supporting_citations":[`, `"contradicting_citations":[`,
-		`"evidence_id":"evidence-causal-counter"`,
-	} {
-		if !bytes.Contains(causalJSON, []byte(want)) {
-			t.Fatalf("causal JSON missing %s: %s", want, causalJSON)
-		}
+func TestQueryJSONPreservesExactRemainingIntentAssociations(t *testing.T) {
+	for name, result := range populatedRemainingIntentResults(t) {
+		t.Run(name, func(t *testing.T) {
+			rendered, err := renderQueryJSON(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoder := json.NewDecoder(bytes.NewReader(rendered))
+			decoder.DisallowUnknownFields()
+			var got remainingIntentJSONEnvelope
+			if err := decoder.Decode(&got); err != nil {
+				t.Fatalf("strict JSON decode error = %v", err)
+			}
+			var extra json.RawMessage
+			if err := decoder.Decode(&extra); err != io.EOF {
+				t.Fatalf("strict JSON trailing decode error = %v, want EOF", err)
+			}
+			want := expectedRemainingIntentJSON(name)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s JSON associations mismatch\n got: %#v\nwant: %#v", name, got, want)
+			}
+		})
 	}
 }
 
-func TestQueryTextAndJSONExposeSameRemainingIntentAssociations(t *testing.T) {
+func TestQueryTextUsesExactRemainingIntentOracles(t *testing.T) {
 	for name, result := range populatedRemainingIntentResults(t) {
 		t.Run(name, func(t *testing.T) {
 			text, err := renderQueryText(result)
 			if err != nil {
 				t.Fatal(err)
 			}
-			jsonBytes, err := renderQueryJSON(result)
-			if err != nil {
-				t.Fatal(err)
+			want := expectedRemainingIntentText(name)
+			if string(text) != want {
+				t.Fatalf("%s text mismatch\n--- got ---\n%s--- want ---\n%s", name, text, want)
 			}
-			for _, identifier := range remainingIntentIdentifiers(name) {
-				if !bytes.Contains(text, []byte(identifier)) || !bytes.Contains(jsonBytes, []byte(identifier)) {
-					t.Fatalf("%s association %q missing: text=%s JSON=%s", name, identifier, text, jsonBytes)
-				}
-			}
-			assertRemainingIntentTextAssociations(t, name, string(text))
 		})
 	}
 }
@@ -319,6 +290,7 @@ func populatedRemainingIntentResults(t *testing.T) map[string]query.Result {
 	window := mustQueryWindow(t, "between", testInstant(2026, time.January, 1), testInstant(2026, time.February, 1))
 	key := mustQueryKey(t, mustQueryEntity(t, "entity-a"), "project.atlas/owner")
 	unresolvedKey := mustQueryKey(t, mustQueryEntity(t, "entity-a"), "project.atlas/risk")
+	topOnlyKey := mustQueryKey(t, mustQueryEntity(t, "entity-a"), "project.atlas/scope")
 	before := testFact(t, key, mustQueryText(t, "alex"),
 		testContribution(t, "observation-before", observation.StatusObserved,
 			mustQuerySince(t, testInstant(2026, time.January, 1)),
@@ -339,6 +311,15 @@ func populatedRemainingIntentResults(t *testing.T) map[string]query.Result {
 	)
 	unresolved := query.UnresolvedItem{
 		Key: unresolvedKey, Reason: temporal.UnresolvedHypothesis, Candidates: []query.Fact{unresolvedFact},
+	}
+	topOnlyFact := testFact(t, topOnlyKey, mustQueryText(t, "expanded"),
+		testContribution(t, "observation-top-only", observation.StatusHypothesized,
+			mustQueryInstant(t, testInstant(2026, time.January, 18)),
+			observation.Derivation{Method: "review", Version: "v2"}, "", ""),
+		testCitation("evidence-top-only", observation.EvidenceSupporting, true),
+	)
+	topOnly := query.UnresolvedItem{
+		Key: topOnlyKey, Reason: temporal.UnresolvedHypothesis, Candidates: []query.Fact{topOnlyFact},
 	}
 
 	pointPayload, err := query.NewPointPayload(query.PointInTimeResult{
@@ -368,7 +349,7 @@ func populatedRemainingIntentResults(t *testing.T) map[string]query.Result {
 				Before:    queryFactPointer(after), Unresolved: []query.UnresolvedItem{},
 			},
 		},
-		Unresolved: []query.UnresolvedItem{unresolved},
+		Unresolved: []query.UnresolvedItem{topOnly},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -419,63 +400,349 @@ func mustQueryPoint(t *testing.T, label string, at time.Time) temporal.TemporalS
 	return value
 }
 
-func remainingIntentIdentifiers(name string) []string {
+type remainingIntentJSONEnvelope struct {
+	SchemaVersion string                   `json:"schema_version"`
+	Intent        string                   `json:"intent"`
+	Request       queryRequestJSON         `json:"request"`
+	Result        remainingIntentJSONUnion `json:"result"`
+	Gaps          []queryGapJSON           `json:"gaps"`
+}
+
+type remainingIntentJSONUnion struct {
+	Point      *queryPointJSON      `json:"point,omitempty"`
+	Trajectory *queryTrajectoryJSON `json:"trajectory,omitempty"`
+	Causal     *queryCausalJSON     `json:"causal,omitempty"`
+}
+
+func expectedRemainingIntentJSON(name string) remainingIntentJSONEnvelope {
+	pointSelection := querySelectionJSON{
+		Kind: "point", Label: "point", At: "2026-01-16T13:09:10.654321Z",
+	}
+	windowSelection := querySelectionJSON{
+		Kind: "window", Label: "between",
+		Start: "2026-01-01T13:09:10.654321Z",
+		End:   "2026-02-01T13:09:10.654321Z",
+	}
+	ownerKey := queryStateKeyJSON{
+		Subject:   queryTermJSONDTO{Kind: "entity", EntityID: "entity-a"},
+		Predicate: "project.atlas/owner",
+	}
+	riskKey := queryStateKeyJSON{
+		Subject:   queryTermJSONDTO{Kind: "entity", EntityID: "entity-a"},
+		Predicate: "project.atlas/risk",
+	}
+	scopeKey := queryStateKeyJSON{
+		Subject:   queryTermJSONDTO{Kind: "entity", EntityID: "entity-a"},
+		Predicate: "project.atlas/scope",
+	}
+	beforeFact := remainingIntentJSONFact(
+		ownerKey,
+		"alex",
+		"observation-before",
+		"observed",
+		queryExtentJSON{Kind: "interval", Start: "2026-01-01T13:09:10.654321Z"},
+		"synthetic",
+		"v1",
+		"evidence-before",
+		"supporting",
+		false,
+	)
+	afterFact := remainingIntentJSONFact(
+		ownerKey,
+		"blair",
+		"observation-after",
+		"observed",
+		queryExtentJSON{Kind: "instant", At: "2026-01-16T13:09:10.654321Z"},
+		"synthetic",
+		"v1",
+		"evidence-after",
+		"supporting",
+		false,
+	)
+	transitionUnresolvedFact := remainingIntentJSONFact(
+		riskKey,
+		"casey",
+		"observation-unresolved",
+		"hypothesized",
+		queryExtentJSON{Kind: "unknown"},
+		"synthetic",
+		"v1",
+		"evidence-unresolved",
+		"contradicting",
+		false,
+	)
+	topOnlyFact := remainingIntentJSONFact(
+		scopeKey,
+		"expanded",
+		"observation-top-only",
+		"hypothesized",
+		queryExtentJSON{Kind: "instant", At: "2026-01-18T13:09:10.654321Z"},
+		"review",
+		"v2",
+		"evidence-top-only",
+		"supporting",
+		true,
+	)
+	transitionUnresolved := queryUnresolvedJSON{
+		Key: riskKey, Reason: "hypothesized",
+		Candidates: []queryFactJSON{transitionUnresolvedFact},
+	}
+	topOnlyUnresolved := queryUnresolvedJSON{
+		Key: scopeKey, Reason: "hypothesized",
+		Candidates: []queryFactJSON{topOnlyFact},
+	}
+	envelope := remainingIntentJSONEnvelope{
+		SchemaVersion: temporalQuerySchemaVersion,
+		Request: queryRequestJSON{
+			EntityIDs: []string{"entity-a"}, EntityMatch: "all",
+			KnowledgeScope: queryKnowledgeJSON{Kind: "current"},
+		},
+		Gaps: []queryGapJSON{},
+	}
 	switch name {
 	case "point":
-		return []string{"observation-before", "evidence-before", "observation-unresolved", "evidence-unresolved"}
+		envelope.Intent = "point-in-time"
+		envelope.Request.Predicates = []string{"project.atlas/owner"}
+		envelope.Request.Selections = []querySelectionJSON{pointSelection}
+		envelope.Result.Point = &queryPointJSON{
+			Selection:  pointSelection,
+			Facts:      []queryFactJSON{beforeFact},
+			Unresolved: []queryUnresolvedJSON{transitionUnresolved},
+		}
 	case "trajectory":
-		return []string{"observation-after", "evidence-after", "observation-unresolved", "evidence-unresolved"}
+		envelope.Intent = "trajectory"
+		envelope.Request.Predicates = []string{"project.atlas/owner"}
+		envelope.Request.Selections = []querySelectionJSON{windowSelection}
+		envelope.Request.Limit = 4
+		envelope.Result.Trajectory = &queryTrajectoryJSON{
+			Selection: windowSelection,
+			Transitions: []queryTransitionJSON{
+				{
+					Kind: "added", Key: ownerKey,
+					ValidTime:  queryExtentJSON{Kind: "instant", At: "2026-01-16T13:09:10.654321Z"},
+					After:      &afterFact,
+					Unresolved: []queryUnresolvedJSON{transitionUnresolved},
+				},
+				{
+					Kind: "removed", Key: ownerKey,
+					ValidTime:  queryExtentJSON{Kind: "instant", At: "2026-01-20T13:09:10.654321Z"},
+					Before:     &afterFact,
+					Unresolved: []queryUnresolvedJSON{},
+				},
+			},
+			Unresolved: []queryUnresolvedJSON{topOnlyUnresolved},
+		}
 	case "causal":
-		return []string{"observation-causal", "evidence-causal-support", "evidence-causal-counter"}
-	default:
-		return nil
+		envelope.Intent = "causal-chain"
+		envelope.Request.Predicates = []string{"stacks.causal.v1/causes"}
+		envelope.Request.Selections = []querySelectionJSON{windowSelection}
+		envelope.Request.Limit = 4
+		envelope.Result.Causal = &queryCausalJSON{
+			Selection: windowSelection,
+			Links: []queryCausalLinkJSON{{
+				Cause:  queryTermJSONDTO{Kind: "text", Text: "decision"},
+				Effect: queryTermJSONDTO{Kind: "text", Text: "delivery"},
+				Contributions: []queryContributionJSON{remainingIntentJSONContribution(
+					"observation-causal",
+					"observed",
+					queryExtentJSON{Kind: "instant", At: "2026-01-16T13:09:10.654321Z"},
+					"synthetic",
+					"v1",
+				)},
+				SupportingCitations: []queryCitationJSON{
+					remainingIntentJSONCitation("evidence-causal-support", "supporting", false),
+				},
+				ContradictingCitations: []queryCitationJSON{
+					remainingIntentJSONCitation("evidence-causal-counter", "contradicting", false),
+				},
+			}},
+		}
+		envelope.Gaps = []queryGapJSON{{Kind: "authority-excluded"}}
+	}
+	return envelope
+}
+
+func remainingIntentJSONFact(
+	key queryStateKeyJSON,
+	value string,
+	observationID string,
+	status string,
+	validTime queryExtentJSON,
+	method string,
+	version string,
+	evidenceID string,
+	role string,
+	populatedOptional bool,
+) queryFactJSON {
+	fact := queryFactJSON{
+		Key: key, Value: queryTermJSONDTO{Kind: "text", Text: value},
+		Contributions: []queryContributionJSON{
+			remainingIntentJSONContribution(
+				observationID,
+				status,
+				validTime,
+				method,
+				version,
+			),
+		},
+		SupportingCitations:    []queryCitationJSON{},
+		ContradictingCitations: []queryCitationJSON{},
+	}
+	citation := remainingIntentJSONCitation(evidenceID, role, populatedOptional)
+	if role == "supporting" {
+		fact.SupportingCitations = []queryCitationJSON{citation}
+	} else {
+		fact.ContradictingCitations = []queryCitationJSON{citation}
+	}
+	return fact
+}
+
+func remainingIntentJSONContribution(
+	observationID string,
+	status string,
+	validTime queryExtentJSON,
+	method string,
+	version string,
+) queryContributionJSON {
+	return queryContributionJSON{
+		ObservationID: observationID,
+		Status:        status,
+		ValidTime:     validTime,
+		RecordedAt:    "2026-06-01T09:06:07.123456Z",
+		Derivation:    queryDerivationJSON{Method: method, Version: version},
 	}
 }
 
-func assertRemainingIntentTextAssociations(t *testing.T, name, rendered string) {
-	t.Helper()
+func remainingIntentJSONCitation(
+	evidenceID string,
+	role string,
+	populatedOptional bool,
+) queryCitationJSON {
+	citation := queryCitationJSON{
+		EvidenceID:        evidenceID,
+		Role:              role,
+		SourceDocumentID:  "document-" + evidenceID,
+		DocumentVersionID: "version-" + evidenceID,
+		SectionID:         "section-" + evidenceID,
+		SectionTitle:      "Synthetic section",
+		SectionPath:       []string{},
+		SectionOrder:      2,
+		SectionRole:       "body",
+		StartOffset:       3,
+		EndOffset:         11,
+	}
+	if populatedOptional {
+		citation.SectionPath = []string{"Parent", "Child"}
+		citation.Locator = "synthetic://document/" + evidenceID
+		citation.Text = "exact synthetic bytes"
+	}
+	return citation
+}
+
+func expectedRemainingIntentText(name string) string {
 	switch name {
 	case "point":
-		facts, unresolved, ok := strings.Cut(rendered, "unresolved:\n")
-		if !ok ||
-			!strings.Contains(facts, "observation_id=observation-before") ||
-			!strings.Contains(facts, "evidence_id=evidence-before role=supporting") ||
-			strings.Contains(facts, "observation-unresolved") ||
-			!strings.Contains(unresolved, "observation_id=observation-unresolved") ||
-			!strings.Contains(unresolved, "evidence_id=evidence-unresolved role=contradicting") {
-			t.Fatalf("point text associations are incorrect:\n%s", rendered)
-		}
+		return `intent: point-in-time
+entities: entity-a
+entity match: all
+predicates: project.atlas/owner
+point point: 2026-01-16T13:09:10.654321Z
+knowledge scope: current
+limit: 0
+facts:
+  - key: subject=entity:entity-a predicate=project.atlas/owner value=text:"alex"
+    contributions:
+      - observation_id=observation-before status=observed valid_time=interval:[2026-01-01T13:09:10.654321Z,) recorded_at=2026-06-01T09:06:07.123456Z derivation_method=synthetic derivation_version=v1
+    supporting citations:
+      - evidence_id=evidence-before role=supporting source_document_id=document-evidence-before document_version_id=version-evidence-before section_id=section-evidence-before section_title="Synthetic section" section_path=[] section_order=2 section_role=body offsets=3:11
+    contradicting citations:
+      (none)
+unresolved:
+  - key: subject=entity:entity-a predicate=project.atlas/risk reason=hypothesized
+    candidates:
+      - key: subject=entity:entity-a predicate=project.atlas/risk value=text:"casey"
+        contributions:
+          - observation_id=observation-unresolved status=hypothesized valid_time=unknown recorded_at=2026-06-01T09:06:07.123456Z derivation_method=synthetic derivation_version=v1
+        supporting citations:
+          (none)
+        contradicting citations:
+          - evidence_id=evidence-unresolved role=contradicting source_document_id=document-evidence-unresolved document_version_id=version-evidence-unresolved section_id=section-evidence-unresolved section_title="Synthetic section" section_path=[] section_order=2 section_role=body offsets=3:11
+gaps:
+  (none)
+`
 	case "trajectory":
-		addedStart := strings.Index(rendered, "  - kind=added ")
-		removedStart := strings.Index(rendered, "  - kind=removed ")
-		topUnresolved := strings.LastIndex(rendered, "\nunresolved:\n")
-		if addedStart < 0 || removedStart <= addedStart || topUnresolved <= removedStart {
-			t.Fatalf("trajectory sections are missing:\n%s", rendered)
-		}
-		added := rendered[addedStart:removedStart]
-		removed := rendered[removedStart:topUnresolved]
-		unresolved := rendered[topUnresolved:]
-		if strings.Contains(added, "\n    before:\n") ||
-			!strings.Contains(added, "\n    after:\n") ||
-			!strings.Contains(added, "observation_id=observation-after") ||
-			!strings.Contains(added, "evidence_id=evidence-after role=supporting") ||
-			!strings.Contains(added, "observation_id=observation-unresolved") ||
-			strings.Contains(removed, "\n    after:\n") ||
-			!strings.Contains(removed, "\n    before:\n") ||
-			!strings.Contains(unresolved, "observation_id=observation-unresolved") ||
-			!strings.Contains(unresolved, "evidence_id=evidence-unresolved role=contradicting") {
-			t.Fatalf("trajectory text associations are incorrect:\n%s", rendered)
-		}
+		return `intent: trajectory
+entities: entity-a
+entity match: all
+predicates: project.atlas/owner
+between window: [2026-01-01T13:09:10.654321Z, 2026-02-01T13:09:10.654321Z)
+knowledge scope: current
+limit: 4
+transitions:
+  - kind=added key: subject=entity:entity-a predicate=project.atlas/owner valid_time=instant:2026-01-16T13:09:10.654321Z
+    after:
+      - key: subject=entity:entity-a predicate=project.atlas/owner value=text:"blair"
+        contributions:
+          - observation_id=observation-after status=observed valid_time=instant:2026-01-16T13:09:10.654321Z recorded_at=2026-06-01T09:06:07.123456Z derivation_method=synthetic derivation_version=v1
+        supporting citations:
+          - evidence_id=evidence-after role=supporting source_document_id=document-evidence-after document_version_id=version-evidence-after section_id=section-evidence-after section_title="Synthetic section" section_path=[] section_order=2 section_role=body offsets=3:11
+        contradicting citations:
+          (none)
+    unresolved:
+      - key: subject=entity:entity-a predicate=project.atlas/risk reason=hypothesized
+        candidates:
+          - key: subject=entity:entity-a predicate=project.atlas/risk value=text:"casey"
+            contributions:
+              - observation_id=observation-unresolved status=hypothesized valid_time=unknown recorded_at=2026-06-01T09:06:07.123456Z derivation_method=synthetic derivation_version=v1
+            supporting citations:
+              (none)
+            contradicting citations:
+              - evidence_id=evidence-unresolved role=contradicting source_document_id=document-evidence-unresolved document_version_id=version-evidence-unresolved section_id=section-evidence-unresolved section_title="Synthetic section" section_path=[] section_order=2 section_role=body offsets=3:11
+  - kind=removed key: subject=entity:entity-a predicate=project.atlas/owner valid_time=instant:2026-01-20T13:09:10.654321Z
+    before:
+      - key: subject=entity:entity-a predicate=project.atlas/owner value=text:"blair"
+        contributions:
+          - observation_id=observation-after status=observed valid_time=instant:2026-01-16T13:09:10.654321Z recorded_at=2026-06-01T09:06:07.123456Z derivation_method=synthetic derivation_version=v1
+        supporting citations:
+          - evidence_id=evidence-after role=supporting source_document_id=document-evidence-after document_version_id=version-evidence-after section_id=section-evidence-after section_title="Synthetic section" section_path=[] section_order=2 section_role=body offsets=3:11
+        contradicting citations:
+          (none)
+    unresolved:
+      (none)
+unresolved:
+  - key: subject=entity:entity-a predicate=project.atlas/scope reason=hypothesized
+    candidates:
+      - key: subject=entity:entity-a predicate=project.atlas/scope value=text:"expanded"
+        contributions:
+          - observation_id=observation-top-only status=hypothesized valid_time=instant:2026-01-18T13:09:10.654321Z recorded_at=2026-06-01T09:06:07.123456Z derivation_method=review derivation_version=v2
+        supporting citations:
+          - evidence_id=evidence-top-only role=supporting source_document_id=document-evidence-top-only document_version_id=version-evidence-top-only section_id=section-evidence-top-only section_title="Synthetic section" section_path=["Parent" "Child"] section_order=2 section_role=body offsets=3:11 locator="synthetic://document/evidence-top-only" text="exact synthetic bytes"
+        contradicting citations:
+          (none)
+gaps:
+  (none)
+`
 	case "causal":
-		if strings.Count(rendered, "  - cause=") != 1 ||
-			!strings.Contains(rendered, "cause=text:\"decision\" effect=text:\"delivery\"") ||
-			!strings.Contains(rendered, "observation_id=observation-causal") ||
-			!strings.Contains(rendered, "evidence_id=evidence-causal-support role=supporting") ||
-			!strings.Contains(rendered, "evidence_id=evidence-causal-counter role=contradicting") {
-			t.Fatalf("causal text associations are incorrect:\n%s", rendered)
-		}
+		return `intent: causal-chain
+entities: entity-a
+entity match: all
+predicates: stacks.causal.v1/causes
+between window: [2026-01-01T13:09:10.654321Z, 2026-02-01T13:09:10.654321Z)
+knowledge scope: current
+limit: 4
+links:
+  - cause=text:"decision" effect=text:"delivery"
+    contributions:
+      - observation_id=observation-causal status=observed valid_time=instant:2026-01-16T13:09:10.654321Z recorded_at=2026-06-01T09:06:07.123456Z derivation_method=synthetic derivation_version=v1
+    supporting citations:
+      - evidence_id=evidence-causal-support role=supporting source_document_id=document-evidence-causal-support document_version_id=version-evidence-causal-support section_id=section-evidence-causal-support section_title="Synthetic section" section_path=[] section_order=2 section_role=body offsets=3:11
+    contradicting citations:
+      - evidence_id=evidence-causal-counter role=contradicting source_document_id=document-evidence-causal-counter document_version_id=version-evidence-causal-counter section_id=section-evidence-causal-counter section_title="Synthetic section" section_path=[] section_order=2 section_role=body offsets=3:11
+gaps:
+  - kind=authority-excluded
+`
 	default:
-		t.Fatalf("unknown result name %q", name)
+		return ""
 	}
 }
 

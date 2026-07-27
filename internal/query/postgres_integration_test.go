@@ -80,19 +80,71 @@ func TestPostgresRepositoryExecutesAllTemporalIntentsOverSyntheticAtlas(t *testi
 
 	before := queryPoint(fixture.boundary.Add(-time.Second), temporal.CurrentKnowledge())
 	beforePoint, ok := before.Payload.Point()
-	if !ok || len(beforePoint.Facts) != 1 || len(beforePoint.Unresolved) != 0 {
-		t.Fatalf("before point = %#v, want one resolved fact", beforePoint)
+	wantInitial := allIntentFact(
+		t,
+		fixture,
+		fixture.responsibilityPredicate,
+		"Alex",
+		"observation:project-atlas/responsibility-initial",
+		mustAllIntentDuring(t, fixture.windowStart, fixture.boundary),
+		time.Date(2026, time.January, 2, 9, 10, 0, 0, time.UTC),
+		false,
+	)
+	if !ok || !reflect.DeepEqual(beforePoint.Facts, []Fact{wantInitial}) ||
+		len(beforePoint.Unresolved) != 0 {
+		t.Fatalf("before point = %#v, want exact cited initial responsibility", beforePoint)
 	}
+	assertAllIntentGaps(t, before.Gaps, []Gap{{
+		Kind: GapValidTimeExcluded, EntityID: fixture.ownerID,
+		Predicate: fixture.responsibilityPredicate, SelectionLabel: "point",
+	}})
+
+	wantTransfer := allIntentFact(
+		t,
+		fixture,
+		fixture.responsibilityPredicate,
+		"Blair",
+		"observation:project-atlas/responsibility-transfer",
+		mustAllIntentDuring(t, fixture.boundary, fixture.windowEnd),
+		time.Date(2026, time.January, 30, 9, 0, 0, 0, time.UTC),
+		false,
+	)
+	wantConflict := allIntentFact(
+		t,
+		fixture,
+		fixture.responsibilityPredicate,
+		"Casey",
+		"observation:project-atlas/responsibility-conflict",
+		mustAllIntentDuring(t, fixture.boundary, fixture.conflictEnd),
+		time.Date(2026, time.January, 30, 9, 1, 0, 0, time.UTC),
+		true,
+	)
 	at := queryPoint(fixture.boundary, temporal.CurrentKnowledge())
 	atPoint, ok := at.Payload.Point()
-	if !ok || len(atPoint.Facts) != 0 || len(atPoint.Unresolved) != 1 {
-		t.Fatalf("boundary point = %#v, want cited conflict", atPoint)
+	wantConflictItem := UnresolvedItem{
+		Key:        wantTransfer.Key,
+		Reason:     temporal.UnresolvedConflict,
+		Candidates: []Fact{wantTransfer, wantConflict},
 	}
+	if !ok || len(atPoint.Facts) != 0 ||
+		!reflect.DeepEqual(atPoint.Unresolved, []UnresolvedItem{wantConflictItem}) {
+		t.Fatalf("boundary point = %#v, want exact cited conflict %#v", atPoint, wantConflictItem)
+	}
+	assertAllIntentGaps(t, at.Gaps, []Gap{{
+		Kind: GapValidTimeExcluded, EntityID: fixture.ownerID,
+		Predicate: fixture.responsibilityPredicate, SelectionLabel: "point",
+	}})
+
 	after := queryPoint(fixture.conflictEnd, temporal.CurrentKnowledge())
 	afterPoint, ok := after.Payload.Point()
-	if !ok || len(afterPoint.Facts) != 1 || len(afterPoint.Unresolved) != 0 {
-		t.Fatalf("after point = %#v, want transferred responsibility", afterPoint)
+	if !ok || !reflect.DeepEqual(afterPoint.Facts, []Fact{wantTransfer}) ||
+		len(afterPoint.Unresolved) != 0 {
+		t.Fatalf("after point = %#v, want exact cited transferred responsibility", afterPoint)
 	}
+	assertAllIntentGaps(t, after.Gaps, []Gap{{
+		Kind: GapValidTimeExcluded, EntityID: fixture.ownerID,
+		Predicate: fixture.responsibilityPredicate, SelectionLabel: "point",
+	}})
 
 	historicalScope, err := temporal.KnownAsOf(fixture.historicalCutoff)
 	if err != nil {
@@ -100,12 +152,61 @@ func TestPostgresRepositoryExecutesAllTemporalIntentsOverSyntheticAtlas(t *testi
 	}
 	historical := queryPoint(fixture.conflictEnd, historicalScope)
 	historicalPoint, ok := historical.Payload.Point()
-	if !ok || len(historicalPoint.Facts) != 0 {
+	if !ok || len(historicalPoint.Facts) != 0 || len(historicalPoint.Unresolved) != 0 {
 		t.Fatalf("historical point = %#v, want later authority hidden", historicalPoint)
 	}
+	assertAllIntentGaps(t, historical.Gaps, []Gap{{
+		Kind: GapValidTimeExcluded, EntityID: fixture.ownerID,
+		Predicate: fixture.responsibilityPredicate, SelectionLabel: "point",
+	}})
 	if !reflect.DeepEqual(after.Selections, historical.Selections) {
 		t.Fatal("valid-time selections differ across recorded-time scope")
 	}
+
+	authorityCurrent := queryPointForPredicate(
+		t,
+		service,
+		fixture.ownerID,
+		fixture.authorityPredicate,
+		fixture.conflictEnd,
+		temporal.CurrentKnowledge(),
+	)
+	authorityHistorical := queryPointForPredicate(
+		t,
+		service,
+		fixture.ownerID,
+		fixture.authorityPredicate,
+		fixture.conflictEnd,
+		historicalScope,
+	)
+	currentAuthorityPoint, ok := authorityCurrent.Payload.Point()
+	if !ok || len(currentAuthorityPoint.Facts) != 0 {
+		t.Fatalf("current authority point = %#v, want retired observation hidden", currentAuthorityPoint)
+	}
+	historicalAuthorityPoint, ok := authorityHistorical.Payload.Point()
+	wantHistoricalAuthority := allIntentFact(
+		t,
+		fixture,
+		fixture.authorityPredicate,
+		"visible historically",
+		"observation:project-atlas/authority-scope",
+		mustAllIntentDuring(t, fixture.windowStart, fixture.windowEnd),
+		time.Date(2026, time.January, 2, 9, 15, 0, 0, time.UTC),
+		false,
+	)
+	if !ok ||
+		!reflect.DeepEqual(historicalAuthorityPoint.Facts, []Fact{wantHistoricalAuthority}) ||
+		len(historicalAuthorityPoint.Unresolved) != 0 {
+		t.Fatalf("historical authority point = %#v, want exact cutoff-effective admitted fact", historicalAuthorityPoint)
+	}
+	if !reflect.DeepEqual(authorityCurrent.Selections, authorityHistorical.Selections) {
+		t.Fatal("authority comparison changed valid-time selection")
+	}
+	assertAllIntentGaps(t, authorityCurrent.Gaps, []Gap{{
+		Kind: GapAuthorityExcluded, EntityID: fixture.ownerID,
+		Predicate: fixture.authorityPredicate,
+	}})
+	assertAllIntentGaps(t, authorityHistorical.Gaps, []Gap{})
 
 	window, err := temporal.Between("between", fixture.windowStart, fixture.windowEnd)
 	if err != nil {
@@ -123,9 +224,69 @@ func TestPostgresRepositoryExecutesAllTemporalIntentsOverSyntheticAtlas(t *testi
 		t.Fatalf("trajectory Query() error = %v", err)
 	}
 	trajectoryPayload, ok := trajectory.Payload.Trajectory()
-	if !ok || len(trajectoryPayload.Transitions) < 2 || len(trajectoryPayload.Unresolved) < 2 {
-		t.Fatalf("trajectory = %#v, want transfer, conflict, and uncertainty", trajectoryPayload)
+	wantUncertainty := allIntentFact(
+		t,
+		fixture,
+		fixture.uncertaintyPredicate,
+		"uncertain",
+		"observation:project-atlas/uncertainty",
+		observation.UnknownTime(),
+		time.Date(2026, time.January, 2, 9, 11, 0, 0, time.UTC),
+		false,
+	)
+	wantTransitions := []Transition{
+		{
+			Kind: temporal.ChangeAdded, Key: wantInitial.Key,
+			ValidTime: mustAllIntentAt(t, fixture.windowStart),
+			After:     factPointer(wantInitial), Unresolved: []UnresolvedItem{},
+		},
+		{
+			Kind: temporal.ChangeRemoved, Key: wantInitial.Key,
+			ValidTime:  mustAllIntentAt(t, fixture.boundary),
+			Before:     factPointer(wantInitial),
+			Unresolved: []UnresolvedItem{wantConflictItem},
+		},
+		{
+			Kind: temporal.ChangeAdded, Key: wantInitial.Key,
+			ValidTime:  mustAllIntentAt(t, fixture.conflictEnd),
+			After:      factPointer(wantTransfer),
+			Unresolved: []UnresolvedItem{wantConflictItem},
+		},
 	}
+	wantTrajectoryUnresolved := []UnresolvedItem{
+		{
+			Key: wantInitial.Key, Reason: temporal.UnresolvedConflict,
+			Candidates: []Fact{wantInitial, wantTransfer, wantConflict},
+		},
+		{
+			Key: wantUncertainty.Key, Reason: temporal.UnresolvedTemporalUncertainty,
+			Candidates: []Fact{wantUncertainty},
+		},
+	}
+	if !ok || trajectoryPayload.Selection != window {
+		t.Fatalf("trajectory selection = %#v, want %#v", trajectoryPayload.Selection, window)
+	}
+	if len(trajectoryPayload.Transitions) != len(wantTransitions) {
+		t.Fatalf("trajectory transition count = %d, want %d", len(trajectoryPayload.Transitions), len(wantTransitions))
+	}
+	for index, wantTransition := range wantTransitions {
+		if !reflect.DeepEqual(trajectoryPayload.Transitions[index], wantTransition) {
+			t.Fatalf(
+				"trajectory transition[%d] = %#v, want exact %#v",
+				index,
+				trajectoryPayload.Transitions[index],
+				wantTransition,
+			)
+		}
+	}
+	if !reflect.DeepEqual(trajectoryPayload.Unresolved, wantTrajectoryUnresolved) {
+		t.Fatalf(
+			"trajectory unresolved = %#v, want exact %#v",
+			trajectoryPayload.Unresolved,
+			wantTrajectoryUnresolved,
+		)
+	}
+	assertAllIntentGaps(t, trajectory.Gaps, []Gap{})
 
 	causal, err := service.Query(t.Context(), Request{
 		Intent: temporal.IntentCausalChain, EntityIDs: []identity.EntityID{fixture.ownerID},
@@ -137,10 +298,35 @@ func TestPostgresRepositoryExecutesAllTemporalIntentsOverSyntheticAtlas(t *testi
 		t.Fatalf("causal Query() error = %v", err)
 	}
 	causalPayload, ok := causal.Payload.Causal()
-	if !ok || len(causalPayload.Links) != 2 ||
-		len(causalPayload.Links[0].ContradictingCitations)+len(causalPayload.Links[1].ContradictingCitations) != 1 {
-		t.Fatalf("causal = %#v, want two cited links with counterevidence", causalPayload)
+	ownerTerm := mustAllIntentEntityTerm(t, fixture.ownerID)
+	handoffTerm := mustAllIntentTextTerm(t, "handoff")
+	wantCausalLinks := []CausalLink{
+		{
+			Cause: ownerTerm, Effect: handoffTerm,
+			Contributions: []Contribution{allIntentContribution(
+				"observation:project-atlas/cause-one",
+				mustAllIntentAt(t, fixture.windowStart.Add(5*24*time.Hour)),
+				time.Date(2026, time.January, 2, 9, 12, 0, 0, time.UTC),
+			)},
+			SupportingCitations:    []Citation{fixture.supportCitation},
+			ContradictingCitations: []Citation{fixture.counterCitation},
+		},
+		{
+			Cause: handoffTerm, Effect: ownerTerm,
+			Contributions: []Contribution{allIntentContribution(
+				"observation:project-atlas/cause-two",
+				mustAllIntentAt(t, fixture.windowStart.Add(10*24*time.Hour)),
+				time.Date(2026, time.January, 2, 9, 13, 0, 0, time.UTC),
+			)},
+			SupportingCitations:    []Citation{fixture.supportCitation},
+			ContradictingCitations: []Citation{},
+		},
 	}
+	if !ok || causalPayload.Selection != window ||
+		!reflect.DeepEqual(causalPayload.Links, wantCausalLinks) {
+		t.Fatalf("causal = %#v, want exact ordered links %#v", causalPayload, wantCausalLinks)
+	}
+	assertAllIntentGaps(t, causal.Gaps, []Gap{})
 
 	chronologyOnly, err := service.Query(t.Context(), Request{
 		Intent: temporal.IntentCausalChain, EntityIDs: []identity.EntityID{fixture.chronologyOnlyID},
@@ -152,13 +338,13 @@ func TestPostgresRepositoryExecutesAllTemporalIntentsOverSyntheticAtlas(t *testi
 		t.Fatalf("chronology-only causal Query() error = %v", err)
 	}
 	chronologyPayload, ok := chronologyOnly.Payload.Causal()
-	if !ok || len(chronologyPayload.Links) != 0 ||
-		len(chronologyOnly.Gaps) != 1 ||
-		chronologyOnly.Gaps[0].Kind != GapNoCausalEvidence ||
-		chronologyOnly.Gaps[0].Predicate != CausalPredicate ||
-		chronologyOnly.Gaps[0].SelectionLabel != "between" {
+	if !ok || chronologyPayload.Selection != window ||
+		!reflect.DeepEqual(chronologyPayload.Links, []CausalLink{}) {
 		t.Fatalf("chronology-only causal result = %#v", chronologyOnly)
 	}
+	assertAllIntentGaps(t, chronologyOnly.Gaps, []Gap{{
+		Kind: GapNoCausalEvidence, Predicate: CausalPredicate, SelectionLabel: "between",
+	}})
 
 	for _, test := range []struct {
 		name    string
@@ -195,17 +381,150 @@ func TestPostgresRepositoryExecutesAllTemporalIntentsOverSyntheticAtlas(t *testi
 	}
 }
 
+func queryPointForPredicate(
+	t *testing.T,
+	service Service,
+	entityID identity.EntityID,
+	predicate observation.Predicate,
+	at time.Time,
+	scope temporal.KnowledgeScope,
+) Result {
+	t.Helper()
+	selection, err := temporal.At("point", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Query(t.Context(), Request{
+		Intent: temporal.IntentPointInTime, EntityIDs: []identity.EntityID{entityID},
+		EntityMatch: EntityMatchAll, Predicates: []observation.Predicate{predicate},
+		Selections: []temporal.TemporalSelection{selection}, KnowledgeScope: scope,
+	})
+	if err != nil {
+		t.Fatalf("point Query() error = %v", err)
+	}
+	return result
+}
+
+func allIntentFact(
+	t *testing.T,
+	fixture allIntentPostgresFixture,
+	predicate observation.Predicate,
+	value string,
+	observationID observation.ObservationID,
+	validTime observation.TemporalExtent,
+	recordedAt time.Time,
+	counter bool,
+) Fact {
+	t.Helper()
+	subject, err := observation.NewEntityTerm(string(fixture.ownerID), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := temporal.NewStateKey(subject, predicate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := observation.NewTextTerm(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contradicting := []Citation{}
+	if counter {
+		contradicting = []Citation{fixture.counterCitation}
+	}
+	return Fact{
+		Key: key, Value: object,
+		Contributions: []Contribution{{
+			ObservationID: observationID,
+			Status:        observation.StatusObserved,
+			ValidTime:     validTime,
+			RecordedAt:    recordedAt,
+			Derivation: observation.Derivation{
+				Method: "synthetic", Version: "all-intents-v1",
+			},
+		}},
+		SupportingCitations:    []Citation{fixture.supportCitation},
+		ContradictingCitations: contradicting,
+	}
+}
+
+func mustAllIntentDuring(t *testing.T, start, end time.Time) observation.TemporalExtent {
+	t.Helper()
+	value, err := observation.During(start, end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func mustAllIntentAt(t *testing.T, at time.Time) observation.TemporalExtent {
+	t.Helper()
+	value, err := observation.AtTime(at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func mustAllIntentTextTerm(t *testing.T, value string) observation.Term {
+	t.Helper()
+	term, err := observation.NewTextTerm(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return term
+}
+
+func mustAllIntentEntityTerm(t *testing.T, entityID identity.EntityID) observation.Term {
+	t.Helper()
+	term, err := observation.NewEntityTerm(string(entityID), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return term
+}
+
+func allIntentContribution(
+	observationID observation.ObservationID,
+	validTime observation.TemporalExtent,
+	recordedAt time.Time,
+) Contribution {
+	return Contribution{
+		ObservationID: observationID,
+		Status:        observation.StatusObserved,
+		ValidTime:     validTime,
+		RecordedAt:    recordedAt,
+		Derivation: observation.Derivation{
+			Method: "synthetic", Version: "all-intents-v1",
+		},
+	}
+}
+
+func factPointer(value Fact) *Fact {
+	return &value
+}
+
+func assertAllIntentGaps(t *testing.T, got, want []Gap) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("gaps = %#v, want exact %#v", got, want)
+	}
+}
+
 type allIntentPostgresFixture struct {
 	database                *postgres.Database
 	ownerID                 identity.EntityID
 	chronologyOnlyID        identity.EntityID
 	responsibilityPredicate observation.Predicate
 	uncertaintyPredicate    observation.Predicate
+	authorityPredicate      observation.Predicate
 	windowStart             time.Time
 	boundary                time.Time
 	conflictEnd             time.Time
 	windowEnd               time.Time
 	historicalCutoff        time.Time
+	supportCitation         Citation
+	counterCitation         Citation
 }
 
 func newAllIntentPostgresFixture(t *testing.T) allIntentPostgresFixture {
@@ -236,6 +555,7 @@ func newAllIntentPostgresFixture(t *testing.T) allIntentPostgresFixture {
 		ownerID:  "entity:project-atlas/owner", chronologyOnlyID: "entity:project-atlas/chronology-only",
 		responsibilityPredicate: "project.atlas/responsibility",
 		uncertaintyPredicate:    "project.atlas/uncertainty",
+		authorityPredicate:      "project.atlas/authority-scope",
 		windowStart:             time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
 		boundary:                time.Date(2026, time.January, 15, 0, 0, 0, 0, time.UTC),
 		conflictEnd:             time.Date(2026, time.January, 20, 0, 0, 0, 0, time.UTC),
@@ -246,7 +566,7 @@ func newAllIntentPostgresFixture(t *testing.T) allIntentPostgresFixture {
 	return fixture
 }
 
-func (fixture allIntentPostgresFixture) seed(t *testing.T) {
+func (fixture *allIntentPostgresFixture) seed(t *testing.T) {
 	t.Helper()
 	recordedBase := time.Date(2026, time.January, 2, 9, 0, 0, 0, time.UTC)
 	supportText := "Project Atlas synthetic support records responsibility and causality."
@@ -296,6 +616,36 @@ func (fixture allIntentPostgresFixture) seed(t *testing.T) {
 	}
 	supportSpan := newSpan(supportSection, supportText, "synthetic support", recordedBase.Add(time.Minute))
 	counterSpan := newSpan(counterSection, counterText, "synthetic counterevidence", recordedBase.Add(2*time.Minute))
+	fixture.supportCitation = Citation{
+		EvidenceID:        supportSpan.ID(),
+		Role:              observation.EvidenceSupporting,
+		SourceDocumentID:  documentRef.Ref.SourceDocumentID,
+		DocumentVersionID: documentRef.Ref.VersionID,
+		SectionID:         supportSection.ID(),
+		SectionTitle:      supportSection.Title(),
+		SectionPath:       supportSection.Path(),
+		SectionOrder:      supportSection.Order(),
+		SectionRole:       supportSection.Role(),
+		StartOffset:       supportSpan.StartOffset(),
+		EndOffset:         supportSpan.EndOffset(),
+		Locator:           document.Locator(),
+		Text:              supportSpan.Text(),
+	}
+	fixture.counterCitation = Citation{
+		EvidenceID:        counterSpan.ID(),
+		Role:              observation.EvidenceContradicting,
+		SourceDocumentID:  documentRef.Ref.SourceDocumentID,
+		DocumentVersionID: documentRef.Ref.VersionID,
+		SectionID:         counterSection.ID(),
+		SectionTitle:      counterSection.Title(),
+		SectionPath:       counterSection.Path(),
+		SectionOrder:      counterSection.Order(),
+		SectionRole:       counterSection.Role(),
+		StartOffset:       counterSpan.StartOffset(),
+		EndOffset:         counterSpan.EndOffset(),
+		Locator:           document.Locator(),
+		Text:              counterSpan.Text(),
+	}
 
 	newEntity := func(id identity.EntityID, name string) identity.Entity {
 		t.Helper()
@@ -386,6 +736,10 @@ func (fixture allIntentPostgresFixture) seed(t *testing.T) {
 		newObservation("observation:project-atlas/uncertainty", ownerTerm,
 			fixture.uncertaintyPredicate, textTerm("uncertain"), observation.UnknownTime(),
 			recordedBase.Add(11*time.Minute), false, observation.StatusObserved),
+		newObservation("observation:project-atlas/authority-scope", ownerTerm,
+			fixture.authorityPredicate, textTerm("visible historically"),
+			during(fixture.windowStart, fixture.windowEnd),
+			recordedBase.Add(15*time.Minute), false, observation.StatusObserved),
 		newObservation("observation:project-atlas/cause-one", ownerTerm,
 			CausalPredicate, textTerm("handoff"), at(fixture.windowStart.Add(5*24*time.Hour)),
 			recordedBase.Add(12*time.Minute), true, observation.StatusObserved),
@@ -409,6 +763,20 @@ func (fixture allIntentPostgresFixture) seed(t *testing.T) {
 			t.Fatal(err)
 		}
 		admissions[index] = decision
+	}
+	authoritySuccessor, err := admission.NewDecision(admission.DecisionInput{
+		ID:         "admission:observation:project-atlas/authority-scope#retired",
+		TargetKind: admission.TargetObservation,
+		TargetID:   "observation:project-atlas/authority-scope",
+		Outcome:    admission.Retired,
+		ReasonCode: "synthetic_successor",
+		Authority:  admission.AuthorityReviewer,
+		RecordedAt: lateRecorded.Add(10 * time.Minute),
+		SupersedesID: "admission:" +
+			"observation:project-atlas/authority-scope",
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	if err := fixture.database.InTransaction(t.Context(), func(transaction *postgres.Transaction) error {
@@ -436,6 +804,9 @@ func (fixture allIntentPostgresFixture) seed(t *testing.T) {
 			if err := transaction.AppendAdmissionDecision(t.Context(), decision); err != nil {
 				return err
 			}
+		}
+		if err := transaction.AppendAdmissionDecision(t.Context(), authoritySuccessor); err != nil {
+			return err
 		}
 		return nil
 	}); err != nil {
