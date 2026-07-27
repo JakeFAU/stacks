@@ -3,7 +3,9 @@
 Stacks builds provenance-backed temporal knowledge from personal source
 documents. The current application reads tabbed Gemini meeting Docs from one
 Google Drive folder and can analyze one explicitly configured employee-manager
-pair for changes in observable interaction patterns.
+pair for changes in observable interaction patterns. It can also compare two
+valid-time windows over canonical observations and return deterministic cited
+facts, unresolved material, changes, and evidence gaps.
 
 The analysis does not claim access to a manager's private beliefs or mental
 state. It reports dated, transcript-backed signals such as delegation,
@@ -39,10 +41,11 @@ evidence uses its own independently configured directory scope.
   access
 - for optional directory enrichment, a separate Google installed-application
   OAuth client with read-only Workspace directory access
-- one explicitly selected model provider: an OpenAI API key, an Anthropic API
-  key, or AWS credentials available through the default credential chain or an
-  optional shared profile
-- an explicit compatible model ID; Bedrock also requires an explicit AWS region
+- for provider-backed `doctor`, `sync`, and `analyze`, one explicitly selected
+  model provider: an OpenAI API key, an Anthropic API key, or AWS credentials
+  available through the default credential chain or an optional shared profile
+- for those provider-backed commands, an explicit compatible model ID; Bedrock
+  also requires an explicit AWS region
 
 ## Command-line interface
 
@@ -57,7 +60,7 @@ stacks
 ├── serve
 ├── config
 │   └── validate
-│       ├── serve | doctor | sync | entities | review | analyze
+│       ├── serve | doctor | sync | entities | review | analyze | query
 │       ├── db-migrate | db-status | db-reset
 │       └── auth
 │           ├── google
@@ -79,6 +82,8 @@ stacks
 │   ├── create <proposal-id> --name <name> [--email <email>]
 │   └── correct <effective-decision-id> <entity-id>
 ├── analyze
+├── query
+│   └── trend --entity <id> --before <start>/<end> --after <start>/<end>
 ├── db-migrate
 ├── db-status
 └── db-reset <confirmation>
@@ -86,6 +91,81 @@ stacks
 
 `analyze` runs the currently configured cited temporal analysis for the
 accepted employee-manager pair; it does not select or install a provider.
+
+### Cited temporal trend queries
+
+`query trend` is the only executable general temporal-query intent in this
+phase. It reads canonical PostgreSQL observations through the least-privileged
+application database URL. It does not construct Drive, Workspace Directory,
+disclosure, model, or model-provider clients.
+
+The exact syntax is:
+
+```text
+stacks query trend \
+  --entity <canonical-entity-id> [--entity <canonical-entity-id> ...] \
+  [--entity-match all|any] \
+  [--predicate <exact-observation-predicate> ...] \
+  --before <RFC3339-start>/<RFC3339-end> \
+  --after <RFC3339-start>/<RFC3339-end> \
+  [--known-as-of <RFC3339-recorded-time-cutoff>] \
+  [--output text|json]
+```
+
+Both windows are half-open: `[start, end)`. `before` must end no later than
+`after` starts. Entity IDs and predicates must be unique. `--entity-match`
+defaults to `all`; omit `--predicate` to consider every qualifying predicate;
+and `--output` defaults to `text`. The equivalent Make target loads the ignored
+`ENV_FILE` and forwards only caller-supplied arguments:
+
+```sh
+make query-trend ARGS="--entity <canonical-entity-id> --before <RFC3339-start>/<RFC3339-end> --after <RFC3339-start>/<RFC3339-end>"
+```
+
+Text and JSON render the same deterministically ordered result. JSON uses the
+normative `stacks.temporal-query.v1` envelope. Each window separates resolved
+facts from unresolved candidates, the comparison reports added, removed, and
+changed state, and every fact preserves observation contributions plus
+role-separated supporting and contradicting citations. An empty result or gap
+never asserts that a fact is false.
+
+Successful results can report these evidence gaps:
+
+- `no-evidence`: no qualifying material was available for a requested entity;
+- `valid-time-excluded`: relevant material existed but did not overlap the
+  named half-open window;
+- `unresolved-mention`: relevant material could not cross identity authority;
+- `authority-excluded`: material was excluded by the selected recorded-time
+  authority or admission state.
+
+An unknown canonical entity is an error rather than a gap. Unresolved facts
+remain visible with their cited candidates and uncertainty reason; confidence
+alone never chooses a winner.
+
+Without `--known-as-of`, `knowledge scope: current` uses the current
+recorded-time authority and canonical knowledge. With `--known-as-of`, the
+query reconstructs only what Stacks had recorded by that inclusive cutoff.
+Recorded-time scope and the two valid-time windows are independent filters.
+
+Query configuration defaults to 16 entities, 32 predicates, and a chronology
+ceiling of 1000. `STACKS_QUERY_MAX_ENTITIES` accepts 1–64,
+`STACKS_QUERY_MAX_PREDICATES` accepts 1–256, and
+`STACKS_QUERY_MAX_CHRONOLOGY` accepts 1–10000. The chronology ceiling is
+validated and wired now but trend does not consume it; it bounds later
+trajectory/causal expansion.
+
+Query output is explicit private operator output. Citations can disclose source
+document/version identifiers, section titles and paths, locators, exact quote
+text, offsets, derivation identifiers, model metadata, and grounding mention
+identifiers. Keep output local and do not copy it into logs, commits, tickets,
+or shared reports. Query telemetry contains only bounded intent, cutoff,
+count-bucket, and outcome fields.
+
+Local query acceptance is provider-free: help, configuration validation,
+deterministic tests, and PostgreSQL integration require no Google, Directory,
+Bedrock, Anthropic, OpenAI, disclosure, or model construction. Point-in-time,
+trajectory, and explicit-causal CLI execution are not implemented in this
+phase; those command forms remain invalid until D4.
 
 ## Configure the local environment
 
@@ -187,6 +267,9 @@ file schema with synthetic values:
 | `ingestion.attempt_timeout` | duration string | `STACKS_INGEST_ATTEMPT_TIMEOUT` |
 | `extraction.prompt_version` | string | `STACKS_EXTRACTION_PROMPT_VERSION` |
 | `analysis.prompt_version` | string | `STACKS_ANALYSIS_PROMPT_VERSION` |
+| `query.max_entities` | integer | `STACKS_QUERY_MAX_ENTITIES` |
+| `query.max_predicates` | integer | `STACKS_QUERY_MAX_PREDICATES` |
+| `query.max_chronology` | integer | `STACKS_QUERY_MAX_CHRONOLOGY` |
 
 OAuth client and token paths are file-eligible, but the credential files and
 their contents are not. Keep real configuration files uncommitted, store OAuth
@@ -233,8 +316,8 @@ stacks --config /absolute/path/stacks.yaml config validate auth google-directory
 ```
 
 The first form validates an application target. Other application targets are
-`doctor`, `sync`, `entities`, `review`, `analyze`, `db-migrate`, `db-status`,
-and `db-reset`. Successful validation confirms syntax and settings only. Use
+`doctor`, `sync`, `entities`, `review`, `analyze`, `query`, `db-migrate`,
+`db-status`, and `db-reset`. Successful validation confirms syntax and settings only. Use
 `doctor` for read-only live dependency readiness and the separately approved
 acceptance workflows below for network access, provider quota, corpus behavior,
 and model quality.
@@ -288,6 +371,9 @@ and model quality.
 | `STACKS_INGEST_ATTEMPT_TIMEOUT` | `4m` | Per-document attempt deadline; must leave at least `5s` before the extraction lease expires |
 | `STACKS_EXTRACTION_PROMPT_VERSION` | `extract-v2` | Versioned extraction prompt; v2 keeps model-proposed email non-authoritative |
 | `STACKS_ANALYSIS_PROMPT_VERSION` | `analyze-v1` | Versioned pair-analysis prompt |
+| `STACKS_QUERY_MAX_ENTITIES` | `16` | Maximum unique entity IDs per temporal query, from `1` to `64` |
+| `STACKS_QUERY_MAX_PREDICATES` | `32` | Maximum unique predicates per temporal query, from `1` to `256` |
+| `STACKS_QUERY_MAX_CHRONOLOGY` | `1000` | Maximum later chronology expansion, from `1` to `10000`; trend does not consume it |
 | `STACKS_EMPLOYEE_ENTITY_ID` | no default | Accepted employee entity used by `analyze` |
 | `STACKS_MANAGER_ENTITY_ID` | no default | Accepted manager entity used by `analyze` |
 
@@ -523,6 +609,8 @@ make review ARGS="create <proposal-id> --name <name> [--email <email>]"
 make review ARGS="correct <effective-decision-id> <entity-id>"
 
 make analyze
+
+make query-trend ARGS="--entity <canonical-entity-id> --before <RFC3339-start>/<RFC3339-end> --after <RFC3339-start>/<RFC3339-end>"
 ```
 
 `stacks doctor` is read-only. It checks PostgreSQL connectivity and the complete

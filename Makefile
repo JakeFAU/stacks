@@ -9,7 +9,7 @@ case "$$STACKS_MAKE_ENV_FILE" in \
 esac;
 endef
 
-.PHONY: analyze auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up review run staticcheck sync test test-env-file test-integration test-race
+.PHONY: analyze auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up query-trend review run staticcheck sync test test-env-file test-integration test-race
 
 analyze:
 	@$(resolve_env_file_path) \
@@ -84,6 +84,11 @@ obs-down:
 
 obs-up:
 	docker compose -f compose.observability.yaml up --detach
+
+query-trend:
+	@$(resolve_env_file_path) \
+	test -f "$$env_file_path" || { printf 'copy .env.example to %s and configure the query database\n' "$$STACKS_MAKE_ENV_FILE" >&2; exit 1; }; \
+	set -a; . "$$env_file_path"; set +a; go run ./cmd/stacks query trend $(ARGS)
 
 review:
 	@$(resolve_env_file_path) \

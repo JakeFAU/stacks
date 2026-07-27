@@ -1478,7 +1478,7 @@ func TestValidateAWSConfigurationCredentialsAcceptsRetrievedSigningKeys(t *testi
 	}
 }
 
-func TestCommandProviderRegistersDoctorSyncAndAnalyzeWithoutConstructingLiveDependencies(t *testing.T) {
+func TestCommandProviderRegistersDoctorSyncAnalyzeAndQueryWithoutConstructingLiveDependencies(t *testing.T) {
 	recorder, err := observability.NewDecisionRecorder(noop.NewMeterProvider().Meter("synthetic"))
 	if err != nil {
 		t.Fatalf("create decision recorder: %v", err)
@@ -1502,6 +1502,9 @@ func TestCommandProviderRegistersDoctorSyncAndAnalyzeWithoutConstructingLiveDepe
 	}
 	if commands[string(config.CommandAnalyze)] == nil {
 		t.Fatal("analyze command is not registered")
+	}
+	if commands[string(config.CommandQuery)] == nil {
+		t.Fatal("query command is not registered")
 	}
 }
 

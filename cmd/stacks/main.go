@@ -39,6 +39,7 @@ import (
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
+	"stacks/internal/query"
 	"stacks/internal/source"
 	"stacks/internal/source/drive"
 )
@@ -158,10 +159,20 @@ type doctorDatabase interface {
 	Close()
 }
 
+type queryDatabase interface {
+	LoadTemporalQuerySnapshot(
+		context.Context,
+		postgres.TemporalQuerySelection,
+		postgres.TemporalSnapshotObserver,
+	) (postgres.TemporalQuerySnapshot, error)
+	Close()
+}
+
 type commandRuntime struct {
 	newDriveAuthorizer        func(string, string, io.Writer) cli.GoogleAuthorizer
 	newDirectoryAuthorizer    func(string, string, io.Writer) cli.GoogleAuthorizer
 	openDoctorDatabase        func(context.Context, string) (doctorDatabase, error)
+	openQueryDatabase         func(context.Context, string) (queryDatabase, error)
 	newDoctorGoogle           func(config.ApplicationSettings) doctor.Google
 	newDoctorDirectory        func(config.GoogleDirectorySettings) doctor.DirectoryProbe
 	newDoctorProviderProbe    func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
@@ -196,6 +207,9 @@ func defaultCommandRuntime() commandRuntime {
 			return googledirectory.NewAuthorizer(clientFile, tokenFile, output)
 		},
 		openDoctorDatabase: func(ctx context.Context, databaseURL string) (doctorDatabase, error) {
+			return postgres.Open(ctx, databaseURL)
+		},
+		openQueryDatabase: func(ctx context.Context, databaseURL string) (queryDatabase, error) {
 			return postgres.Open(ctx, databaseURL)
 		},
 		newDoctorGoogle: func(settings config.ApplicationSettings) doctor.Google {
@@ -558,6 +572,37 @@ func commandProviderWithRuntime(
 			return (cli.AnalyzeCommand{
 				Service: service, EmployeeID: settings.Application.ManagerConfidence.EmployeeEntityID,
 				ManagerID: settings.Application.ManagerConfidence.ManagerEntityID, Output: stdout,
+			}).Run(ctx, invocation)
+		}),
+		string(config.CommandQuery): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
+			if err := settings.Validate(config.CommandQuery); err != nil {
+				return err
+			}
+			if runtime.openQueryDatabase == nil {
+				return errors.New("query command dependencies are not configured")
+			}
+			database, err := runtime.openQueryDatabase(ctx, settings.Database.URL)
+			if err != nil {
+				return err
+			}
+			defer database.Close()
+			service := query.Service{
+				Reader: query.PostgresRepository{
+					Database: database,
+					SnapshotObserver: query.PostgresSnapshotObserver{
+						Tracer: tracer,
+					},
+				},
+				Limits: query.Limits{
+					MaxEntities:   settings.Query.MaxEntities,
+					MaxPredicates: settings.Query.MaxPredicates,
+					MaxChronology: settings.Query.MaxChronology,
+				},
+				Tracer: tracer,
+			}
+			return (cli.QueryCommand{
+				Service: service,
+				Output:  stdout,
 			}).Run(ctx, invocation)
 		}),
 	}, nil
