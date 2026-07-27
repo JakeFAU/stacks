@@ -289,6 +289,37 @@ func projectPoint(summary temporal.PointSummary, index projectionIndex) (PointIn
 	}, nil
 }
 
+func projectTrajectory(
+	selection temporal.TemporalSelection,
+	values []temporal.Transition,
+	index projectionIndex,
+) (TrajectoryResult, error) {
+	transitions := make([]Transition, len(values))
+	for position, value := range values {
+		before, err := projectFactPointer(value.Before, index)
+		if err != nil {
+			return TrajectoryResult{}, err
+		}
+		after, err := projectFactPointer(value.After, index)
+		if err != nil {
+			return TrajectoryResult{}, err
+		}
+		projected, err := projectStateMaterial(nil, value.Unresolved, index)
+		if err != nil {
+			return TrajectoryResult{}, err
+		}
+		transitions[position] = Transition{
+			Kind:       value.Kind,
+			Key:        value.Key,
+			ValidTime:  value.ValidTime,
+			Before:     before,
+			After:      after,
+			Unresolved: projected.unresolved,
+		}
+	}
+	return TrajectoryResult{Selection: selection, Transitions: transitions}, nil
+}
+
 func projectWindow(
 	selection temporal.TemporalSelection,
 	facts []temporal.Fact,
@@ -412,6 +443,26 @@ func projectPointGaps(
 	snapshot ReadSnapshot,
 	candidates []temporal.StateCandidate,
 	summary temporal.PointSummary,
+) ([]Gap, error) {
+	selection := summary.Selection
+	return projectStateGaps(
+		request,
+		snapshot,
+		candidates,
+		[]stateGapMaterial{{
+			selection:  summary.Selection,
+			facts:      summary.Facts,
+			unresolved: summary.Unresolved,
+		}},
+		&selection,
+	)
+}
+
+func projectTrajectoryGaps(
+	request Request,
+	snapshot ReadSnapshot,
+	candidates []temporal.StateCandidate,
+	summary temporal.WindowSummary,
 ) ([]Gap, error) {
 	selection := summary.Selection
 	return projectStateGaps(

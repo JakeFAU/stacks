@@ -41,7 +41,8 @@ func (service Service) Query(ctx context.Context, request Request) (result Resul
 		return Result{}, boundedQueryError{operation: "validate temporal query", cause: err}
 	}
 	if normalized.Intent != temporal.IntentPointInTime &&
-		normalized.Intent != temporal.IntentTrendComparison {
+		normalized.Intent != temporal.IntentTrendComparison &&
+		normalized.Intent != temporal.IntentTrajectory {
 		return Result{}, errors.New("execute temporal query: intent is not implemented")
 	}
 
@@ -102,6 +103,11 @@ func (service Service) Query(ctx context.Context, request Request) (result Resul
 		if err != nil {
 			return Result{}, err
 		}
+	case temporal.IntentTrajectory:
+		payload, gaps, err = executeTrajectory(normalized, snapshot, candidates, index)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 
 	result, err = NormalizeResult(Result{
@@ -119,6 +125,58 @@ func (service Service) Query(ctx context.Context, request Request) (result Resul
 		return Result{}, boundedQueryError{operation: "validate temporal query result", cause: err}
 	}
 	return result, nil
+}
+
+func executeTrajectory(
+	request Request,
+	snapshot ReadSnapshot,
+	candidates []temporal.StateCandidate,
+	index projectionIndex,
+) (IntentPayload, []Gap, error) {
+	transitions, err := temporal.BuildTrajectory(
+		request.Selections[0],
+		request.KnowledgeScope,
+		candidates,
+	)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{
+			operation: "build temporal trajectory",
+			cause:     err,
+		}
+	}
+	if len(transitions) > request.Limit {
+		return IntentPayload{}, nil, boundedQueryError{
+			operation: "bound temporal trajectory",
+			cause:     ErrLimitExceeded,
+		}
+	}
+	trajectory, err := projectTrajectory(request.Selections[0], transitions, index)
+	if err != nil {
+		return IntentPayload{}, nil, err
+	}
+	payload, err := NewTrajectoryPayload(trajectory)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{
+			operation: "construct trajectory result",
+			cause:     err,
+		}
+	}
+	summary, err := temporal.AggregateWindow(
+		request.Selections[0],
+		request.KnowledgeScope,
+		candidates,
+	)
+	if err != nil {
+		return IntentPayload{}, nil, boundedQueryError{
+			operation: "aggregate trajectory window",
+			cause:     err,
+		}
+	}
+	gaps, err := projectTrajectoryGaps(request, snapshot, candidates, summary)
+	if err != nil {
+		return IntentPayload{}, nil, err
+	}
+	return payload, gaps, nil
 }
 
 func executeTrend(
@@ -172,6 +230,8 @@ func queryOutcome(err error) string {
 		return "deadline-exceeded"
 	case errors.Is(err, ErrEntityNotFound):
 		return "entity-not-found"
+	case errors.Is(err, ErrLimitExceeded):
+		return "limit-exceeded"
 	default:
 		return "failed"
 	}

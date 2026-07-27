@@ -518,6 +518,127 @@ func TestProjectAtlasPointContractReconstructsCitedState(t *testing.T) {
 	}
 }
 
+func TestProjectAtlasTrajectoryContractPreservesCitedTransitions(t *testing.T) {
+	fixture := newProjectAtlasFixture(t)
+	selection, err := temporal.Between(
+		"atlas-trajectory",
+		time.Date(2032, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2032, time.April, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	request := fixture.currentRequest
+	request.Intent = temporal.IntentTrajectory
+	request.Selections = []temporal.TemporalSelection{selection}
+	request.Limit = 12
+	reader := &projectAtlasReader{
+		current:    fixture.currentSnapshot,
+		historical: fixture.historicalSnapshot,
+		cutoff:     fixture.cutoff,
+	}
+	service := Service{
+		Reader: reader,
+		Limits: Limits{MaxEntities: 4, MaxPredicates: 8, MaxChronology: 20},
+	}
+
+	result, err := service.Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if err := ValidateResult(result); err != nil {
+		t.Fatalf("ValidateResult() error = %v", err)
+	}
+	trajectory, ok := result.Payload.Trajectory()
+	if !ok {
+		t.Fatal("Payload.Trajectory() = false")
+	}
+	if trajectory.Selection != selection || len(trajectory.Transitions) != 6 {
+		t.Fatalf("trajectory = %#v, want six bounded responsibility/commitment transitions", trajectory)
+	}
+	gotKinds := make([]temporal.ChangeKind, len(trajectory.Transitions))
+	gotPredicates := make([]observation.Predicate, len(trajectory.Transitions))
+	for index, transition := range trajectory.Transitions {
+		gotKinds[index] = transition.Kind
+		gotPredicates[index] = transition.Key.Predicate
+	}
+	if !slices.Equal(gotKinds, []temporal.ChangeKind{
+		temporal.ChangeAdded,
+		temporal.ChangeAdded,
+		temporal.ChangeRemoved,
+		temporal.ChangeRemoved,
+		temporal.ChangeAdded,
+		temporal.ChangeAdded,
+	}) {
+		t.Fatalf("trajectory kinds = %v", gotKinds)
+	}
+	if !slices.Equal(gotPredicates, []observation.Predicate{
+		"project.responsible_party",
+		"project.delivery_commitment",
+		"project.responsible_party",
+		"project.delivery_commitment",
+		"project.delivery_commitment",
+		"project.responsible_party",
+	}) {
+		t.Fatalf("trajectory predicate order = %v", gotPredicates)
+	}
+	firstOwner := trajectory.Transitions[0].After
+	firstCommitment := trajectory.Transitions[1].After
+	revisedCommitment := trajectory.Transitions[4].After
+	revisedOwner := trajectory.Transitions[5].After
+	if firstOwner == nil || firstCommitment == nil ||
+		revisedCommitment == nil || revisedOwner == nil {
+		t.Fatalf("trajectory facts = %#v, want complete added facts", trajectory.Transitions)
+	}
+	if !reflect.DeepEqual(firstOwner.SupportingCitations, []Citation{
+		fixture.ownerAlphaEvidence.citation(observation.EvidenceSupporting),
+	}) || !reflect.DeepEqual(revisedOwner.SupportingCitations, []Citation{
+		fixture.ownerBetaEvidence.citation(observation.EvidenceSupporting),
+	}) {
+		t.Fatalf("responsibility transitions lost exact citations: %#v", trajectory.Transitions)
+	}
+	if !reflect.DeepEqual(firstCommitment.SupportingCitations, []Citation{
+		fixture.initialEvidence.citation(observation.EvidenceSupporting),
+	}) || !reflect.DeepEqual(firstCommitment.ContradictingCitations, []Citation{
+		fixture.revisionEvidence.citation(observation.EvidenceContradicting),
+	}) || !reflect.DeepEqual(revisedCommitment.SupportingCitations, []Citation{
+		fixture.revisionEvidence.citation(observation.EvidenceSupporting),
+	}) || !reflect.DeepEqual(revisedCommitment.ContradictingCitations, []Citation{
+		fixture.initialEvidence.citation(observation.EvidenceContradicting),
+	}) {
+		t.Fatalf("commitment transitions lost exact evidence roles: %#v", trajectory.Transitions)
+	}
+	if !reflect.DeepEqual(result.Gaps, []Gap{{
+		Kind:      GapUnresolvedMention,
+		EntityID:  "entity:project-atlas",
+		Predicate: "project.partner",
+	}}) {
+		t.Fatalf("trajectory gaps = %#v, want exact unresolved mention coverage", result.Gaps)
+	}
+
+	reordered := cloneReadSnapshot(fixture.currentSnapshot)
+	slices.Reverse(reordered.Entities)
+	slices.Reverse(reordered.Observations)
+	slices.Reverse(reordered.Coverage)
+	for index := range reordered.Observations {
+		slices.Reverse(reordered.Observations[index].Evidence)
+	}
+	reorderedResult, err := (Service{
+		Reader: &projectAtlasReader{
+			current:    reordered,
+			historical: fixture.historicalSnapshot,
+			cutoff:     fixture.cutoff,
+		},
+		Limits: service.Limits,
+	}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("reordered Query() error = %v", err)
+	}
+	if !reflect.DeepEqual(result, reorderedResult) {
+		t.Fatalf("reordered trajectory result differs:\nresult    %#v\nreordered %#v", result, reorderedResult)
+	}
+}
+
 type projectAtlasFixture struct {
 	currentRequest           Request
 	currentSnapshot          ReadSnapshot

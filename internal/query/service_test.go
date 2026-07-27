@@ -341,6 +341,232 @@ func TestPointQueryKeepsCoverageThatCanApplyAtPoint(t *testing.T) {
 	}
 }
 
+func TestTrajectoryQueryProjectsCompleteCitedTransitionsAndGaps(t *testing.T) {
+	fixture := newTrendFixture(t)
+	start := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+	boundary := time.Date(2024, time.February, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC)
+	selection, err := temporal.Between("trajectory", start, end)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	request := Request{
+		Intent:         temporal.IntentTrajectory,
+		EntityIDs:      []identity.EntityID{" entity-a "},
+		EntityMatch:    EntityMatchAll,
+		Predicates:     []observation.Predicate{" work.location "},
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          4,
+	}
+	beforeSupport := fixture.citation("trajectory-before-support", observation.EvidenceSupporting)
+	beforeCounter := fixture.citation("trajectory-before-counter", observation.EvidenceContradicting)
+	afterSupport := fixture.citation("trajectory-after-support", observation.EvidenceSupporting)
+	before := fixture.readObservation(
+		"trajectory-before",
+		fixture.entity("entity-a"),
+		fixture.text("remote"),
+		fixture.interval(2024, time.January, 1, time.February, 1),
+		observation.StatusObserved,
+		nil,
+		beforeSupport,
+		beforeCounter,
+	)
+	after := fixture.readObservation(
+		"trajectory-after",
+		fixture.entity("entity-a"),
+		fixture.text("office"),
+		fixture.interval(2024, time.February, 1, time.March, 1),
+		observation.StatusObserved,
+		nil,
+		afterSupport,
+	)
+	snapshot := fixture.snapshot(after, before)
+	snapshot.Coverage = []Coverage{{
+		Reason:        CoverageUnresolvedMention,
+		EntityID:      "entity-a",
+		Predicate:     "work.owner",
+		ObservationID: "trajectory-coverage",
+		ValidTime:     fixture.interval(2024, time.January, 15, time.February, 15),
+	}}
+	reader := &recordingTrendReader{snapshot: snapshot}
+
+	result, err := (Service{
+		Reader: reader,
+		Limits: Limits{MaxEntities: 2, MaxPredicates: 2, MaxChronology: 4},
+	}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("Reader.Read() calls = %d, want 1", reader.calls)
+	}
+	trajectory, ok := result.Payload.Trajectory()
+	if !ok {
+		t.Fatal("Payload.Trajectory() = false")
+	}
+	if trajectory.Selection != selection || len(trajectory.Transitions) != 2 {
+		t.Fatalf("trajectory = %#v, want add then changed", trajectory)
+	}
+	added := trajectory.Transitions[0]
+	changed := trajectory.Transitions[1]
+	if added.Kind != temporal.ChangeAdded || added.Before != nil || added.After == nil ||
+		changed.Kind != temporal.ChangeChanged || changed.Before == nil || changed.After == nil {
+		t.Fatalf("transitions = %#v, want added then changed cited state", trajectory.Transitions)
+	}
+	changedAt, ok := changed.ValidTime.Instant()
+	if !ok || !changedAt.Equal(boundary) {
+		t.Fatalf("changed valid time = %#v, want exact boundary %s", changed.ValidTime, boundary)
+	}
+	if !reflect.DeepEqual(added.After.SupportingCitations, []Citation{beforeSupport}) ||
+		!reflect.DeepEqual(added.After.ContradictingCitations, []Citation{beforeCounter}) ||
+		!reflect.DeepEqual(changed.After.SupportingCitations, []Citation{afterSupport}) {
+		t.Fatalf("trajectory citations lost role separation: %#v", trajectory.Transitions)
+	}
+	if got := []observation.ObservationID{
+		added.After.Contributions[0].ObservationID,
+		changed.Before.Contributions[0].ObservationID,
+		changed.After.Contributions[0].ObservationID,
+	}; !slices.Equal(got, []observation.ObservationID{
+		"trajectory-before",
+		"trajectory-before",
+		"trajectory-after",
+	}) {
+		t.Fatalf("trajectory contributions = %v, want exact observation provenance", got)
+	}
+	wantGaps := []Gap{{
+		Kind:      GapUnresolvedMention,
+		EntityID:  "entity-a",
+		Predicate: "work.owner",
+	}}
+	if !reflect.DeepEqual(result.Gaps, wantGaps) {
+		t.Fatalf("trajectory gaps = %#v, want %#v", result.Gaps, wantGaps)
+	}
+	if err := ValidateResult(result); err != nil {
+		t.Fatalf("ValidateResult() error = %v", err)
+	}
+}
+
+func TestTrajectoryQueryReturnsLimitExceededWithoutPartialResult(t *testing.T) {
+	fixture := newTrendFixture(t)
+	selection, err := temporal.Between(
+		"trajectory",
+		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, time.April, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	request := Request{
+		Intent:         temporal.IntentTrajectory,
+		EntityIDs:      []identity.EntityID{"entity-a"},
+		EntityMatch:    EntityMatchAll,
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          2,
+	}
+	reader := &recordingTrendReader{snapshot: fixture.snapshot(
+		fixture.readObservation(
+			"trajectory-limit-before",
+			fixture.entity("entity-a"),
+			fixture.text("remote"),
+			fixture.interval(2024, time.January, 1, time.February, 1),
+			observation.StatusObserved,
+			nil,
+			fixture.citation("trajectory-limit-before", observation.EvidenceSupporting),
+		),
+		fixture.readObservation(
+			"trajectory-limit-after",
+			fixture.entity("entity-a"),
+			fixture.text("office"),
+			fixture.interval(2024, time.February, 1, time.March, 1),
+			observation.StatusObserved,
+			nil,
+			fixture.citation("trajectory-limit-after", observation.EvidenceSupporting),
+		),
+	)}
+
+	result, err := (Service{Reader: reader, Limits: validLimits()}).Query(context.Background(), request)
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Query() error = %v, want ErrLimitExceeded", err)
+	}
+	if !reflect.DeepEqual(result, Result{}) {
+		t.Fatalf("Query() result = %#v, want no partial result", result)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("Reader.Read() calls = %d, want complete one-read computation", reader.calls)
+	}
+}
+
+func TestTrajectoryQueryProjectsUnresolvedConflictWithExactCitations(t *testing.T) {
+	fixture := newTrendFixture(t)
+	selection, err := temporal.Between(
+		"trajectory-conflict",
+		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, time.May, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("temporal.Between() error = %v", err)
+	}
+	request := Request{
+		Intent:         temporal.IntentTrajectory,
+		EntityIDs:      []identity.EntityID{"entity-a"},
+		EntityMatch:    EntityMatchAll,
+		Selections:     []temporal.TemporalSelection{selection},
+		KnowledgeScope: temporal.CurrentKnowledge(),
+		Limit:          5,
+	}
+	activeCitation := fixture.citation("trajectory-active", observation.EvidenceSupporting)
+	pausedCitation := fixture.citation("trajectory-paused", observation.EvidenceSupporting)
+	reader := &recordingTrendReader{snapshot: fixture.snapshot(
+		fixture.readObservation(
+			"trajectory-active",
+			fixture.entity("entity-a"),
+			fixture.text("active"),
+			fixture.interval(2024, time.January, 1, time.March, 1),
+			observation.StatusObserved,
+			nil,
+			activeCitation,
+		),
+		fixture.readObservation(
+			"trajectory-paused",
+			fixture.entity("entity-a"),
+			fixture.text("paused"),
+			fixture.interval(2024, time.February, 1, time.April, 1),
+			observation.StatusObserved,
+			nil,
+			pausedCitation,
+		),
+	)}
+
+	result, err := (Service{
+		Reader: reader,
+		Limits: Limits{MaxEntities: 2, MaxPredicates: 2, MaxChronology: 5},
+	}).Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	trajectory, ok := result.Payload.Trajectory()
+	if !ok || len(trajectory.Transitions) != 4 {
+		t.Fatalf("trajectory = %#v, want four conflict-preserving transitions", trajectory)
+	}
+	conflict := trajectory.Transitions[1]
+	if conflict.Kind != temporal.ChangeRemoved || len(conflict.Unresolved) != 1 ||
+		conflict.Unresolved[0].Reason != temporal.UnresolvedConflict ||
+		len(conflict.Unresolved[0].Candidates) != 2 {
+		t.Fatalf("conflict transition = %#v, want unresolved overlap", conflict)
+	}
+	if !reflect.DeepEqual(
+		conflict.Unresolved[0].Candidates[0].SupportingCitations,
+		[]Citation{activeCitation},
+	) || !reflect.DeepEqual(
+		conflict.Unresolved[0].Candidates[1].SupportingCitations,
+		[]Citation{pausedCitation},
+	) {
+		t.Fatalf("conflict citations = %#v, want exact candidate citations", conflict.Unresolved)
+	}
+}
+
 func TestTrendQueryPreservesConflictHypothesisCounterevidenceAndTemporalUncertainty(t *testing.T) {
 	fixture := newTrendFixture(t)
 	observations := []ReadObservation{

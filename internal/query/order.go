@@ -335,28 +335,24 @@ func transitionTime(value Transition) time.Time {
 	return time.Time{}
 }
 func transitionRecordedAt(value Transition) time.Time {
-	return earliestFactRecordedAt(value.Before, value.After)
+	return contributionRecordedAt(transitionContributions(value))
 }
 func transitionObservationID(value Transition) observation.ObservationID {
-	return earliestFactObservationID(value.Before, value.After)
+	return contributionObservationID(transitionContributions(value))
 }
-func earliestFactRecordedAt(values ...*Fact) time.Time {
+func transitionContributions(value Transition) []Contribution {
 	var all []Contribution
-	for _, value := range values {
-		if value != nil {
-			all = append(all, value.Contributions...)
+	for _, fact := range []*Fact{value.Before, value.After} {
+		if fact != nil {
+			all = append(all, fact.Contributions...)
 		}
 	}
-	return contributionRecordedAt(all)
-}
-func earliestFactObservationID(values ...*Fact) observation.ObservationID {
-	var all []Contribution
-	for _, value := range values {
-		if value != nil {
-			all = append(all, value.Contributions...)
+	for _, item := range value.Unresolved {
+		for _, candidate := range item.Candidates {
+			all = append(all, candidate.Contributions...)
 		}
 	}
-	return contributionObservationID(all)
+	return all
 }
 func contributionValidStart(values []Contribution) time.Time {
 	var result time.Time
