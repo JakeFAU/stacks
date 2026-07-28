@@ -557,7 +557,10 @@ func commandProviderWithRuntime(
 			}
 			database, err := runtime.openQueryDatabase(ctx, settings.Database.URL)
 			if err != nil {
-				return err
+				if cancellationErr := canonicalContextError(ctx, err); cancellationErr != nil {
+					return cancellationErr
+				}
+				return errors.New("open query database failed")
 			}
 			defer database.Close()
 			service := query.Service{

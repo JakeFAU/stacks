@@ -78,6 +78,67 @@ func TestQueryTrendOpensOneCanonicalDatabaseAndClosesItOnce(t *testing.T) {
 	}
 }
 
+func TestQueryDatabaseOpenErrorIsBoundedAndPreservesContextIdentity(t *testing.T) {
+	const privateDatabaseURL = "postgres://private-user:private-password@private-host/private-database"
+	tests := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{
+			name: "provider detail",
+			err:  errors.New(privateDatabaseURL),
+		},
+		{
+			name: "cancellation",
+			err:  fmt.Errorf("%s: %w", privateDatabaseURL, context.Canceled),
+			want: context.Canceled,
+		},
+		{
+			name: "deadline",
+			err:  fmt.Errorf("%s: %w", privateDatabaseURL, context.DeadlineExceeded),
+			want: context.DeadlineExceeded,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := commandRuntime{
+				openQueryDatabase: func(context.Context, string) (queryDatabase, error) {
+					return nil, test.err
+				},
+			}
+			commands, err := commandProviderWithRuntime(
+				context.Background(),
+				validQueryCommandSettings(),
+				io.Discard,
+				io.Discard,
+				tracenoop.NewTracerProvider().Tracer("synthetic"),
+				nil,
+				nil,
+				runtime,
+			)
+			if err != nil {
+				t.Fatalf("commandProviderWithRuntime() error = %v", err)
+			}
+
+			err = commands[string(config.CommandQuery)].Run(
+				context.Background(),
+				validQueryTrendInvocation(t),
+			)
+			if err == nil {
+				t.Fatal("query database-open error = nil")
+			}
+			if strings.Contains(err.Error(), privateDatabaseURL) {
+				t.Fatalf("query database-open error exposed private connection detail: %v", err)
+			}
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Fatalf("query database-open error = %v, want errors.Is(_, %v)", err, test.want)
+			}
+		})
+	}
+}
+
 func TestQueryTrendConstructsNoSourceDirectoryModelOrProvider(t *testing.T) {
 	database := &recordingQueryDatabase{
 		snapshot: postgres.TemporalQuerySnapshot{
