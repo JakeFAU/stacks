@@ -38,6 +38,12 @@ type DocumentVersionRecord struct {
 	Revisions []evidence.SourceRevisionObservation
 }
 
+type documentVersionRecordLoader func(
+	context.Context,
+	documentReader,
+	string,
+) (DocumentVersionRecord, error)
+
 // PutDocumentVersionResult reports whether this call created the immutable
 // content row. Revision provenance may still be appended when content existed.
 type PutDocumentVersionResult struct {
@@ -836,6 +842,15 @@ func loadEvidenceSpan(
 	reader documentReader,
 	id evidence.EvidenceID,
 ) (evidence.EvidenceSpan, error) {
+	return loadEvidenceSpanWithDocumentCache(ctx, reader, id, nil)
+}
+
+func loadEvidenceSpanWithDocumentCache(
+	ctx context.Context,
+	reader documentReader,
+	id evidence.EvidenceID,
+	documentVersions map[string]DocumentVersionRecord,
+) (evidence.EvidenceSpan, error) {
 	var (
 		versionID, sectionID, storedDigestVersion, quote string
 		storedDigest                                     []byte
@@ -871,7 +886,13 @@ func loadEvidenceSpan(
 	if err != nil {
 		return evidence.EvidenceSpan{}, err
 	}
-	document, err := loadDocumentVersionRecord(ctx, reader, versionID)
+	document, err := loadDocumentVersionRecordCached(
+		ctx,
+		reader,
+		versionID,
+		documentVersions,
+		loadDocumentVersionRecord,
+	)
 	if err != nil {
 		return evidence.EvidenceSpan{}, err
 	}
@@ -892,6 +913,26 @@ func loadEvidenceSpan(
 		return evidence.EvidenceSpan{}, fmt.Errorf("stored evidence span: %w", ErrConflict)
 	}
 	return span, nil
+}
+
+func loadDocumentVersionRecordCached(
+	ctx context.Context,
+	reader documentReader,
+	versionID string,
+	documentVersions map[string]DocumentVersionRecord,
+	load documentVersionRecordLoader,
+) (DocumentVersionRecord, error) {
+	if document, exists := documentVersions[versionID]; exists {
+		return document, nil
+	}
+	document, err := load(ctx, reader, versionID)
+	if err != nil {
+		return DocumentVersionRecord{}, err
+	}
+	if documentVersions != nil {
+		documentVersions[versionID] = document
+	}
+	return document, nil
 }
 
 func validateDocumentVersion(version evidence.DocumentVersion) error {
