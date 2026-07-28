@@ -195,6 +195,9 @@ func listAdmittedRelationshipObservations(
 	rows.Close()
 
 	records := make([]ObservationRecord, 0, len(observationIDs))
+	// Document versions are immutable, so one validated record can serve every
+	// evidence span that cites it during this relationship read.
+	documentVersions := make(map[string]DocumentVersionRecord)
 	for _, id := range observationIDs {
 		value, err := loadObservationValue(ctx, reader, id)
 		if err != nil {
@@ -242,6 +245,7 @@ func listAdmittedRelationshipObservations(
 			ctx,
 			reader,
 			value,
+			documentVersions,
 		)
 		if err != nil {
 			return nil, wrapObservationError(
@@ -369,11 +373,17 @@ func loadObservationEvidenceRecords(
 	ctx context.Context,
 	reader documentReader,
 	value observation.Observation,
+	documentVersions map[string]DocumentVersionRecord,
 ) ([]ObservationEvidenceRecord, error) {
 	links := value.EvidenceLinks()
 	records := make([]ObservationEvidenceRecord, 0, len(links))
 	for _, link := range links {
-		span, err := loadEvidenceSpan(ctx, reader, link.EvidenceID)
+		span, err := loadEvidenceSpanWithDocumentCache(
+			ctx,
+			reader,
+			link.EvidenceID,
+			documentVersions,
+		)
 		if err != nil {
 			return nil, err
 		}

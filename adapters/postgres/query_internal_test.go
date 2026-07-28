@@ -41,6 +41,59 @@ func TestLoadCurrentAcceptedIdentityAuthoritiesUsesOneQuery(t *testing.T) {
 	}
 }
 
+func TestLoadDocumentVersionRecordCachedLoadsVersionOnce(t *testing.T) {
+	want := DocumentVersionRecord{
+		Ref: DocumentVersionRef{
+			SourceDocumentID: "source-1",
+			VersionID:        "version-1",
+		},
+	}
+	loadCount := 0
+	load := func(
+		_ context.Context,
+		_ documentReader,
+		versionID string,
+	) (DocumentVersionRecord, error) {
+		if versionID != want.Ref.VersionID {
+			return DocumentVersionRecord{}, fmt.Errorf(
+				"version ID = %q, want %q",
+				versionID,
+				want.Ref.VersionID,
+			)
+		}
+		loadCount++
+		return want, nil
+	}
+	cache := make(map[string]DocumentVersionRecord)
+
+	first, err := loadDocumentVersionRecordCached(
+		context.Background(),
+		nil,
+		want.Ref.VersionID,
+		cache,
+		load,
+	)
+	if err != nil {
+		t.Fatalf("first loadDocumentVersionRecordCached() error = %v", err)
+	}
+	second, err := loadDocumentVersionRecordCached(
+		context.Background(),
+		nil,
+		want.Ref.VersionID,
+		cache,
+		load,
+	)
+	if err != nil {
+		t.Fatalf("second loadDocumentVersionRecordCached() error = %v", err)
+	}
+	if first.Ref != want.Ref || second.Ref != want.Ref {
+		t.Fatalf("records = (%#v, %#v), want %#v", first.Ref, second.Ref, want.Ref)
+	}
+	if loadCount != 1 {
+		t.Fatalf("document version load count = %d, want 1", loadCount)
+	}
+}
+
 type authorityReader struct {
 	queryCount      int
 	arguments       []any
