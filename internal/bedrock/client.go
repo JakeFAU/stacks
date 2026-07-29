@@ -249,7 +249,7 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 			if retryToken != nil {
 				_ = retryToken(err)
 			}
-			client.record(ctx, started, request.promptVersion, OutcomeCanceled, structuredUsage{}, 0, attempt-1)
+			client.record(ctx, started, request.promptVersion, outcomeForError(err), structuredUsage{}, 0, attempt-1)
 			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, err)
 		}
 
@@ -280,9 +280,9 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 			return response, nil
 		}
 
-		if ctx.Err() != nil {
-			client.record(ctx, started, request.promptVersion, OutcomeCanceled, structuredUsage{}, 0, attempt)
-			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctx.Err())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			client.record(ctx, started, request.promptVersion, outcomeForError(ctxErr), structuredUsage{}, 0, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctxErr)
 		}
 		if attempt == client.retryer.MaxAttempts() || !client.isRetryable(request, invokeErr) {
 			outcome := outcomeForError(invokeErr)
@@ -305,7 +305,7 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 		if err := wait(ctx, delay); err != nil {
 			_ = retryToken(err)
 			retryToken = nil
-			client.record(ctx, started, request.promptVersion, OutcomeCanceled, structuredUsage{}, 0, attempt)
+			client.record(ctx, started, request.promptVersion, outcomeForError(err), structuredUsage{}, 0, attempt)
 			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, err)
 		}
 	}

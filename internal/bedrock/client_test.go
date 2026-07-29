@@ -352,19 +352,77 @@ func TestClientPlanTreatsProviderContextErrorsAsTerminal(t *testing.T) {
 	}
 }
 
-func TestClientPlanRejectsExpiredDeadlineBeforeProviderInvocation(t *testing.T) {
-	deadline := time.Now().Add(-time.Second)
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
-	defer cancel()
-	api := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{successfulOutput(`{}`)}}
-	client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
-
-	_, err := client.Plan(ctx, validPlanRequest())
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Plan() error = %v, want deadline exceeded", err)
+func TestClientPlanRecordsCallerContextOutcomeAtEachLifecycleBoundary(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
 	}
-	if len(api.inputs) != 0 {
-		t.Fatalf("Converse calls = %d, want 0", len(api.inputs))
+	boundaries := map[string]struct {
+		wantCalls    int
+		wantAttempts int
+		configure    func(*controlledContext, *fakeConverseAPI, *plannerPolicyRetryer)
+	}{
+		"before invocation": {
+			wantCalls: 0, wantAttempts: 0,
+			configure: func(ctx *controlledContext, _ *fakeConverseAPI, _ *plannerPolicyRetryer) {
+				ctx.fail()
+			},
+		},
+		"after provider attempt": {
+			wantCalls: 1, wantAttempts: 1,
+			configure: func(ctx *controlledContext, api *fakeConverseAPI, _ *plannerPolicyRetryer) {
+				api.call = func() error {
+					ctx.fail()
+					return nil
+				}
+			},
+		},
+		"during retry wait": {
+			wantCalls: 1, wantAttempts: 1,
+			configure: func(ctx *controlledContext, _ *fakeConverseAPI, retryer *plannerPolicyRetryer) {
+				retryer.retryDelayHook = ctx.fail
+			},
+		},
+	}
+	for contextName, contextCase := range contextCases {
+		for boundaryName, boundary := range boundaries {
+			t.Run(contextName+"/"+boundaryName, func(t *testing.T) {
+				ctx := newControlledContext(contextCase.err)
+				api := &fakeConverseAPI{
+					errors: []error{&smithy.GenericAPIError{Code: serviceUnavailableErrorCode, Message: testPrivateOutput}},
+				}
+				retryer := &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}}
+				recorder := &recordingInvocationRecorder{}
+				client, err := newClient(api, Options{
+					DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+				}, retryer)
+				if err != nil {
+					t.Fatalf("newClient() error = %v", err)
+				}
+				boundary.configure(ctx, api, retryer)
+
+				_, err = client.Plan(ctx, validPlanRequest())
+				if !errors.Is(err, contextCase.err) {
+					t.Fatalf("Plan() error = %v, want %v", err, contextCase.err)
+				}
+				if len(api.inputs) != boundary.wantCalls {
+					t.Fatalf("Converse calls = %d, want %d", len(api.inputs), boundary.wantCalls)
+				}
+				if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+					recorder.observations[0].Attempts != boundary.wantAttempts {
+					t.Fatalf("telemetry = %+v, want outcome=%s attempts=%d",
+						recorder.observations, contextCase.outcome, boundary.wantAttempts)
+				}
+				telemetry := fmt.Sprintf("%+v", recorder.observations)
+				if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+					strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+					t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+				}
+			})
+		}
 	}
 }
 
@@ -911,6 +969,7 @@ type plannerPolicyRetryer struct {
 	zeroRetryer
 	retryTokenErr   error
 	retryDelayErr   error
+	retryDelayHook  func()
 	retryableCalls  int
 	retryTokenCalls int
 	retryDelayCalls int
@@ -934,6 +993,9 @@ func (retryer *plannerPolicyRetryer) GetRetryToken(context.Context, error) (func
 
 func (retryer *plannerPolicyRetryer) RetryDelay(attempt int, err error) (time.Duration, error) {
 	retryer.retryDelayCalls++
+	if retryer.retryDelayHook != nil {
+		retryer.retryDelayHook()
+	}
 	if retryer.retryDelayErr != nil {
 		return 0, retryer.retryDelayErr
 	}
@@ -941,6 +1003,33 @@ func (retryer *plannerPolicyRetryer) RetryDelay(attempt int, err error) (time.Du
 }
 
 var _ aws.RetryerV2 = (*plannerPolicyRetryer)(nil)
+
+type controlledContext struct {
+	context.Context
+	done chan struct{}
+	err  error
+}
+
+func newControlledContext(err error) *controlledContext {
+	return &controlledContext{Context: context.Background(), done: make(chan struct{}), err: err}
+}
+
+func (ctx *controlledContext) Done() <-chan struct{} {
+	return ctx.done
+}
+
+func (ctx *controlledContext) Err() error {
+	select {
+	case <-ctx.done:
+		return ctx.err
+	default:
+		return nil
+	}
+}
+
+func (ctx *controlledContext) fail() {
+	close(ctx.done)
+}
 
 type syntheticTimeoutError struct{}
 
