@@ -19,6 +19,19 @@ import (
 	"stacks/internal/query"
 )
 
+const executableTrajectoryProposal = `{
+  "status": "executable",
+  "reason": "none",
+  "intent": "trajectory",
+  "entity_match": "all",
+  "predicates": [],
+  "selections": [
+    {"kind": "window", "label": "between", "at": "", "start": "2026-06-01T00:00:00Z", "end": "2026-07-01T00:00:00Z"}
+  ],
+  "knowledge_scope": {"kind": "current", "as_of": ""},
+  "chronology_limit": 2
+}`
+
 type modelFunc func(context.Context, ModelRequest) (ModelResponse, error)
 
 func (fn modelFunc) Plan(ctx context.Context, request ModelRequest) (ModelResponse, error) {
@@ -201,21 +214,85 @@ func TestServiceAskRejectsInvalidModelResponsesBeforeExecution(t *testing.T) {
 }
 
 func TestServiceAskRejectsResultRequestMismatchWithoutExecution(t *testing.T) {
-	expected, err := composeRequest([]byte(executablePointProposal), []identity.EntityID{"entity-atlas-001"}, plannerLimits())
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name   string
+		output string
+		mutate func(*query.Request)
+	}{
+		{
+			name: "entity IDs", output: executablePointProposal,
+			mutate: func(request *query.Request) { request.EntityIDs = []identity.EntityID{"entity-other-001"} },
+		},
+		{
+			name: "entity match", output: executablePointProposal,
+			mutate: func(request *query.Request) { request.EntityMatch = query.EntityMatchAny },
+		},
+		{
+			name: "predicates", output: executablePointProposal,
+			mutate: func(request *query.Request) { request.Predicates = []observation.Predicate{"changed_to"} },
+		},
+		{
+			name: "selections", output: executablePointProposal,
+			mutate: func(request *query.Request) {
+				selection, err := temporal.At("point", time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC))
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Selections = []temporal.TemporalSelection{selection}
+			},
+		},
+		{
+			name: "knowledge scope", output: executablePointProposal,
+			mutate: func(request *query.Request) {
+				scope, err := temporal.KnownAsOf(time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC))
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.KnowledgeScope = scope
+			},
+		},
+		{
+			name: "limit", output: executableTrajectoryProposal,
+			mutate: func(request *query.Request) { request.Limit = 3 },
+		},
 	}
-	mismatched := expected
-	mismatched.EntityIDs = []identity.EntityID{"entity-other-001"}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := composeRequest([]byte(test.output), []identity.EntityID{"entity-atlas-001"}, plannerLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			mismatched := request
+			test.mutate(&mismatched)
+			service := validService(modelFunc(func(context.Context, ModelRequest) (ModelResponse, error) {
+				return syntheticModelResponse([]byte(test.output)), nil
+			}), executorFunc(func(context.Context, query.Request) (query.Result, error) {
+				return syntheticResult(t, mismatched), nil
+			}))
+
+			execution, err := service.Ask(context.Background(), serviceInput())
+			if err == nil || err.Error() != "query planner result does not match the normalized request" {
+				t.Fatalf("Ask() error = %v, want bounded result parity error", err)
+			}
+			if !reflect.DeepEqual(execution, Execution{}) {
+				t.Fatalf("execution = %#v, want no execution", execution)
+			}
+		})
+	}
+}
+
+func TestServiceAskRejectsExecutorMutationOfNormalizedRequest(t *testing.T) {
 	service := validService(modelFunc(func(context.Context, ModelRequest) (ModelResponse, error) {
 		return syntheticModelResponse([]byte(executablePointProposal)), nil
-	}), executorFunc(func(context.Context, query.Request) (query.Result, error) {
-		return syntheticPointResult(t, mismatched), nil
+	}), executorFunc(func(_ context.Context, request query.Request) (query.Result, error) {
+		request.EntityIDs[0] = "entity-mutated-by-executor"
+		request.Predicates[0] = "changed_to"
+		return syntheticPointResult(t, request), nil
 	}))
 
 	execution, err := service.Ask(context.Background(), serviceInput())
 	if err == nil || err.Error() != "query planner result does not match the normalized request" {
-		t.Fatalf("Ask() error = %v, want bounded result parity error", err)
+		t.Fatalf("Ask() error = %v, want immutable-request parity error", err)
 	}
 	if !reflect.DeepEqual(execution, Execution{}) {
 		t.Fatalf("execution = %#v, want no execution", execution)
@@ -472,6 +549,27 @@ func serviceInput() Input {
 func syntheticPointResult(t *testing.T, request query.Request) query.Result {
 	t.Helper()
 	payload, err := query.NewPointPayload(query.PointInTimeResult{Selection: request.Selections[0], Facts: []query.Fact{}, Unresolved: []query.UnresolvedItem{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return query.Result{
+		Intent: request.Intent, EntityIDs: append([]identity.EntityID(nil), request.EntityIDs...), EntityMatch: request.EntityMatch,
+		Predicates: append([]observation.Predicate(nil), request.Predicates...), Selections: append([]temporal.TemporalSelection(nil), request.Selections...),
+		KnowledgeScope: request.KnowledgeScope, Limit: request.Limit, Payload: payload, Gaps: []query.Gap{},
+	}
+}
+
+func syntheticResult(t *testing.T, request query.Request) query.Result {
+	t.Helper()
+	if request.Intent == temporal.IntentPointInTime {
+		return syntheticPointResult(t, request)
+	}
+	if request.Intent != temporal.IntentTrajectory {
+		t.Fatalf("unsupported synthetic result intent %q", request.Intent)
+	}
+	payload, err := query.NewTrajectoryPayload(query.TrajectoryResult{
+		Selection: request.Selections[0], Transitions: []query.Transition{}, Unresolved: []query.UnresolvedItem{},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

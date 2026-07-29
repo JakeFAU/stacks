@@ -97,11 +97,15 @@ func (service Service) Ask(ctx context.Context, input Input) (execution Executio
 	if !validModelResponse(response) {
 		return Execution{}, errors.New("query planner response is invalid")
 	}
-	normalizedRequest, err := composeRequest(response.Output, normalizedInput.EntityIDs, service.Limits)
+	authoritativeRequest, err := composeRequest(response.Output, normalizedInput.EntityIDs, service.Limits)
 	if err != nil {
 		return Execution{}, err
 	}
-	result, err := service.Executor.Query(ctx, normalizedRequest)
+	executorRequest, err := query.NormalizeRequest(authoritativeRequest, service.Limits)
+	if err != nil {
+		return Execution{}, errors.New("query planner request is invalid")
+	}
+	result, err := service.Executor.Query(ctx, executorRequest)
 	if canonical := canonicalContextError(ctx, err); canonical != nil {
 		return Execution{}, canonical
 	}
@@ -112,14 +116,10 @@ func (service Service) Ask(ctx context.Context, input Input) (execution Executio
 	if err != nil {
 		return Execution{}, errors.New("query planner result is invalid")
 	}
-	if !resultMatchesRequest(normalizedResult, normalizedRequest) {
+	if !resultMatchesRequest(normalizedResult, authoritativeRequest) {
 		return Execution{}, errors.New("query planner result does not match the normalized request")
 	}
 
-	requestCopy, err := query.NormalizeRequest(normalizedRequest, service.Limits)
-	if err != nil {
-		return Execution{}, errors.New("query planner request is invalid")
-	}
 	resultCopy, err := query.NormalizeResult(normalizedResult)
 	if err != nil {
 		return Execution{}, errors.New("query planner result is invalid")
@@ -127,7 +127,7 @@ func (service Service) Ask(ctx context.Context, input Input) (execution Executio
 	return Execution{
 		SchemaVersion: OutputSchemaVersion,
 		ReferenceTime: normalizedInput.ReferenceTime,
-		Request:       requestCopy,
+		Request:       authoritativeRequest,
 		Planner: PlannerMetadata{
 			Provider: response.Provider, ModelID: response.ModelID,
 			PromptVersion: response.PromptVersion, SchemaName: response.SchemaName,
