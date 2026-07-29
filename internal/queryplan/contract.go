@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/JakeFAU/stacks/core/identity"
-	"github.com/JakeFAU/stacks/core/timepoint"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/query"
 )
@@ -115,12 +114,4 @@ func PromptContract(version string) (Contract, error) {
 		SchemaName:   SchemaName,
 		JSONSchema:   append([]byte(nil), queryPlanSchema...),
 	}, nil
-}
-
-func normalizeInput(input Input) Input {
-	return Input{
-		Question:      input.Question,
-		EntityIDs:     append([]identity.EntityID(nil), input.EntityIDs...),
-		ReferenceTime: timepoint.Normalize(input.ReferenceTime),
-	}
 }

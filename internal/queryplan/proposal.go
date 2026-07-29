@@ -111,7 +111,7 @@ func composeRequest(output json.RawMessage, entityIDs []identity.EntityID, limit
 }
 
 func decodeProposal(output json.RawMessage) (proposal, error) {
-	if err := rejectDuplicateObjectKeys(output); err != nil {
+	if err := validateProposalJSON(output); err != nil {
 		return proposal{}, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(output))
@@ -147,9 +147,20 @@ func decodeProposal(output json.RawMessage) (proposal, error) {
 	}, nil
 }
 
-func rejectDuplicateObjectKeys(input []byte) error {
+type proposalJSONContext uint8
+
+const (
+	proposalJSONRoot proposalJSONContext = iota + 1
+	proposalJSONSelection
+	proposalJSONKnowledge
+	proposalJSONSelections
+	proposalJSONPredicates
+	proposalJSONScalar
+)
+
+func validateProposalJSON(input []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(input))
-	if err := consumeJSONValue(decoder); err != nil {
+	if err := consumeProposalJSONValue(decoder, proposalJSONRoot); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); err != io.EOF {
@@ -158,7 +169,7 @@ func rejectDuplicateObjectKeys(input []byte) error {
 	return nil
 }
 
-func consumeJSONValue(decoder *json.Decoder) error {
+func consumeProposalJSONValue(decoder *json.Decoder, context proposalJSONContext) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -169,6 +180,9 @@ func consumeJSONValue(decoder *json.Decoder) error {
 	}
 	switch delimiter {
 	case '{':
+		if context != proposalJSONRoot && context != proposalJSONSelection && context != proposalJSONKnowledge {
+			return errors.New("proposal object is invalid")
+		}
 		seen := make(map[string]struct{})
 		for decoder.More() {
 			keyToken, err := decoder.Token()
@@ -183,14 +197,27 @@ func consumeJSONValue(decoder *json.Decoder) error {
 				return errors.New("duplicate object key")
 			}
 			seen[key] = struct{}{}
-			if err := consumeJSONValue(decoder); err != nil {
+			childContext, ok := proposalJSONFieldContext(context, key)
+			if !ok {
+				return errors.New("proposal object key is invalid")
+			}
+			if err := consumeProposalJSONValue(decoder, childContext); err != nil {
 				return err
 			}
 		}
 		return consumeDelimiter(decoder, '}')
 	case '[':
+		var childContext proposalJSONContext
+		switch context {
+		case proposalJSONSelections:
+			childContext = proposalJSONSelection
+		case proposalJSONPredicates:
+			childContext = proposalJSONScalar
+		default:
+			return errors.New("proposal array is invalid")
+		}
 		for decoder.More() {
-			if err := consumeJSONValue(decoder); err != nil {
+			if err := consumeProposalJSONValue(decoder, childContext); err != nil {
 				return err
 			}
 		}
@@ -198,6 +225,33 @@ func consumeJSONValue(decoder *json.Decoder) error {
 	default:
 		return errors.New("JSON delimiter is invalid")
 	}
+}
+
+func proposalJSONFieldContext(context proposalJSONContext, key string) (proposalJSONContext, bool) {
+	switch context {
+	case proposalJSONRoot:
+		switch key {
+		case "status", "reason", "intent", "entity_match", "chronology_limit":
+			return proposalJSONScalar, true
+		case "predicates":
+			return proposalJSONPredicates, true
+		case "selections":
+			return proposalJSONSelections, true
+		case "knowledge_scope":
+			return proposalJSONKnowledge, true
+		}
+	case proposalJSONSelection:
+		switch key {
+		case "kind", "label", "at", "start", "end":
+			return proposalJSONScalar, true
+		}
+	case proposalJSONKnowledge:
+		switch key {
+		case "kind", "as_of":
+			return proposalJSONScalar, true
+		}
+	}
+	return 0, false
 }
 
 func consumeDelimiter(decoder *json.Decoder, want json.Delim) error {

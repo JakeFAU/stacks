@@ -80,6 +80,41 @@ func TestServiceAskRejectsInvalidInputBeforeRecorderModelAndExecutor(t *testing.
 	}
 }
 
+func TestServiceAskRejectsUnserializableReferenceTimeBeforeRecorderModelAndExecutor(t *testing.T) {
+	for _, referenceTime := range []time.Time{
+		time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(-1, time.January, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		calls := []string{}
+		service := Service{
+			Model: modelFunc(func(context.Context, ModelRequest) (ModelResponse, error) {
+				calls = append(calls, "model")
+				return ModelResponse{}, nil
+			}),
+			Executor: executorFunc(func(context.Context, query.Request) (query.Result, error) {
+				calls = append(calls, "executor")
+				return query.Result{}, nil
+			}),
+			Limits:           plannerLimits(),
+			PlannerTimeout:   time.Second,
+			MaxQuestionBytes: 1024,
+			QuestionRecorder: recorderFunc(func(context.Context, int64) { calls = append(calls, "record-question-bytes") }),
+		}
+
+		_, err := service.Ask(context.Background(), Input{
+			Question:      "What changed?",
+			EntityIDs:     []identity.EntityID{"entity-atlas-001"},
+			ReferenceTime: referenceTime,
+		})
+		if err == nil {
+			t.Fatal("Ask() error = nil")
+		}
+		if len(calls) != 0 {
+			t.Fatalf("calls = %v, want no recorder, model, or executor calls", calls)
+		}
+	}
+}
+
 func TestServiceAskRecordsQuestionBytesBeforePlanningAndExecutesNormalizedRequest(t *testing.T) {
 	calls := []string{}
 	input := Input{

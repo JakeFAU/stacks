@@ -34,6 +34,10 @@ func NormalizeInput(input Input, limits query.Limits, maxQuestionBytes int) (Inp
 	if input.ReferenceTime.IsZero() {
 		return Input{}, errors.New("query planner reference time is required")
 	}
+	referenceTime := timepoint.Normalize(input.ReferenceTime)
+	if _, err := serializeReferenceTime(referenceTime); err != nil {
+		return Input{}, errors.New("query planner reference time is invalid")
+	}
 	entityIDs, err := normalizeEntityIDs(input.EntityIDs, limits.MaxEntities)
 	if err != nil {
 		return Input{}, err
@@ -46,7 +50,7 @@ func NormalizeInput(input Input, limits query.Limits, maxQuestionBytes int) (Inp
 	return Input{
 		Question:      input.Question,
 		EntityIDs:     entityIDs,
-		ReferenceTime: timepoint.Normalize(input.ReferenceTime),
+		ReferenceTime: referenceTime,
 	}, nil
 }
 
@@ -93,9 +97,13 @@ func modelRequestFor(input Input, limits query.Limits) (ModelRequest, error) {
 	if err != nil {
 		return ModelRequest{}, errors.New("query planner contract is invalid")
 	}
+	referenceTime, err := serializeReferenceTime(input.ReferenceTime)
+	if err != nil {
+		return ModelRequest{}, errors.New("query planner reference time is invalid")
+	}
 	payload, err := json.Marshal(privateModelInput{
 		Question:                 input.Question,
-		ReferenceTime:            timepoint.Normalize(input.ReferenceTime).Format(time.RFC3339Nano),
+		ReferenceTime:            referenceTime,
 		EntityCount:              len(input.EntityIDs),
 		EntityIDsAttachedLocally: true,
 		Limits: privateModelLimits{
@@ -114,4 +122,14 @@ func modelRequestFor(input Input, limits query.Limits) (ModelRequest, error) {
 		SchemaName:    contract.SchemaName,
 		JSONSchema:    append([]byte(nil), contract.JSONSchema...),
 	}, nil
+}
+
+func serializeReferenceTime(value time.Time) (string, error) {
+	normalized := timepoint.Normalize(value)
+	serialized := normalized.Format(time.RFC3339Nano)
+	parsed, err := time.Parse(time.RFC3339Nano, serialized)
+	if err != nil || !parsed.Equal(normalized) {
+		return "", errors.New("reference time is invalid")
+	}
+	return serialized, nil
 }

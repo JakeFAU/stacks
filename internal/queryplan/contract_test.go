@@ -5,9 +5,6 @@ import (
 	"encoding/json"
 	"math"
 	"testing"
-	"time"
-
-	"github.com/JakeFAU/stacks/core/identity"
 )
 
 func TestPlannerContractConstants(t *testing.T) {
@@ -69,23 +66,5 @@ func TestUsageValidRejectsOverflowedTokenSum(t *testing.T) {
 	usage := Usage{InputTokens: math.MaxInt64, OutputTokens: 1, TotalTokens: math.MaxInt64}
 	if usage.valid() {
 		t.Fatalf("Usage%+v.valid() = true", usage)
-	}
-}
-
-func TestNormalizeInputCopiesEntityIDsAndReferenceTime(t *testing.T) {
-	input := Input{
-		Question:      "What changed?",
-		EntityIDs:     []identity.EntityID{"entity-a"},
-		ReferenceTime: time.Date(2026, time.July, 29, 12, 0, 0, 123456789, time.FixedZone("offset", -4*60*60)),
-	}
-	normalized := normalizeInput(input)
-	input.EntityIDs[0] = "mutated"
-
-	if normalized.EntityIDs[0] != "entity-a" {
-		t.Fatalf("normalizeInput() entity IDs = %v", normalized.EntityIDs)
-	}
-	wantReferenceTime := time.Date(2026, time.July, 29, 16, 0, 0, 123456000, time.UTC)
-	if !normalized.ReferenceTime.Equal(wantReferenceTime) || normalized.ReferenceTime.Location() != time.UTC {
-		t.Fatalf("normalizeInput() reference time = %s, want %s UTC", normalized.ReferenceTime, wantReferenceTime)
 	}
 }

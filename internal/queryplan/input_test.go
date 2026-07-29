@@ -134,6 +134,33 @@ func TestNormalizeInputCanonicalizesPrivateValues(t *testing.T) {
 	}
 }
 
+func TestNormalizeInputRejectsReferenceTimesOutsideRFC3339Range(t *testing.T) {
+	tests := []struct {
+		name          string
+		referenceTime time.Time
+	}{
+		{"future year", time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)},
+		{"negative year", time.Date(-1, time.January, 1, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NormalizeInput(Input{
+				Question:      "private-question-marker",
+				EntityIDs:     []identity.EntityID{"entity-atlas-001"},
+				ReferenceTime: test.referenceTime,
+			}, query.Limits{MaxEntities: 4, MaxPredicates: 8, MaxChronology: 20}, 1024)
+			if err == nil {
+				t.Fatal("NormalizeInput() error = nil")
+			}
+			for _, marker := range []string{"private-question-marker", "entity-atlas-001", "10000", "-0001"} {
+				if strings.Contains(err.Error(), marker) {
+					t.Fatalf("NormalizeInput() error = %q, contains private marker %q", err, marker)
+				}
+			}
+		})
+	}
+}
+
 func TestModelRequestForOmitsCanonicalIDsAndIsDeterministic(t *testing.T) {
 	input := normalizedSyntheticInput(t)
 	limits := query.Limits{MaxEntities: 4, MaxPredicates: 8, MaxChronology: 20}
