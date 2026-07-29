@@ -313,7 +313,8 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 }
 
 func (client *Client) isRetryable(request structuredRequest, err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) && !request.retryProviderDeadline {
+	if !request.retryProviderDeadline &&
+		(errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 		return false
 	}
 	return client.retryer.IsErrorRetryable(err)

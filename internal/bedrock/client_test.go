@@ -861,6 +861,13 @@ type plannerPolicyRetryer struct {
 	retryDelayCalls int
 }
 
+func (retryer *plannerPolicyRetryer) IsErrorRetryable(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	return retryer.zeroRetryer.IsErrorRetryable(err)
+}
+
 func (retryer *plannerPolicyRetryer) GetRetryToken(context.Context, error) (func(error) error, error) {
 	retryer.retryTokenCalls++
 	if retryer.retryTokenErr != nil {
