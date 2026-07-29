@@ -175,12 +175,13 @@ func (client *Client) Plan(ctx context.Context, request queryplan.ModelRequest) 
 }
 
 type structuredRequest struct {
-	promptVersion string
-	systemPrompt  string
-	input         string
-	schemaName    string
-	jsonSchema    []byte
-	validate      func(structuredRequest) error
+	promptVersion         string
+	systemPrompt          string
+	input                 string
+	schemaName            string
+	jsonSchema            []byte
+	validate              func(structuredRequest) error
+	retryProviderDeadline bool
 }
 
 type structuredUsage struct {
@@ -204,6 +205,7 @@ func extractionStructuredRequest(request extract.Request) structuredRequest {
 	return structuredRequest{
 		promptVersion: request.PromptVersion, systemPrompt: request.SystemPrompt, input: request.Input,
 		schemaName: request.SchemaName, jsonSchema: append([]byte(nil), request.JSONSchema...),
+		retryProviderDeadline: true,
 		validate: func(snapshot structuredRequest) error {
 			contract, err := extract.PromptContract(snapshot.promptVersion)
 			if err != nil || snapshot.systemPrompt != contract.SystemPrompt || snapshot.schemaName != contract.SchemaName ||
@@ -282,7 +284,7 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 			client.record(ctx, started, request.promptVersion, OutcomeCanceled, structuredUsage{}, 0, attempt)
 			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctx.Err())
 		}
-		if attempt == client.retryer.MaxAttempts() || !client.retryer.IsErrorRetryable(invokeErr) {
+		if attempt == client.retryer.MaxAttempts() || !client.isRetryable(request, invokeErr) {
 			outcome := outcomeForError(invokeErr)
 			client.record(ctx, started, request.promptVersion, outcome, structuredUsage{}, 0, attempt)
 			return structuredResponse{}, boundedInvocationError(invokeErr, outcome)
@@ -308,6 +310,13 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 		}
 	}
 	return structuredResponse{}, fmt.Errorf("%w: retry policy", ErrInvocation)
+}
+
+func (client *Client) isRetryable(request structuredRequest, err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) && !request.retryProviderDeadline {
+		return false
+	}
+	return client.retryer.IsErrorRetryable(err)
 }
 
 func boundedMetadata(output *bedrockruntime.ConverseOutput) (structuredUsage, time.Duration) {

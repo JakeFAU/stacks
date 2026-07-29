@@ -265,6 +265,39 @@ func TestClientPlanCancellationPreventsFurtherAttempts(t *testing.T) {
 	}
 }
 
+func TestClientPlanTreatsRawProviderContextErrorsAsTerminal(t *testing.T) {
+	tests := map[string]error{
+		"deadline exceeded": context.DeadlineExceeded,
+		"canceled":          context.Canceled,
+	}
+	for name, providerErr := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeConverseAPI{
+				errors:  []error{providerErr, nil},
+				outputs: []*bedrockruntime.ConverseOutput{nil, successfulOutput(`{}`)},
+			}
+			retryer := &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(context.Background(), validPlanRequest())
+			if !errors.Is(err, ErrInvocation) {
+				t.Fatalf("Plan() error = %v, want terminal invocation error", err)
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			}
+			if retryer.retryTokenCalls != 0 || retryer.retryDelayCalls != 0 {
+				t.Fatalf("retry policy calls = token:%d delay:%d, want 0/0", retryer.retryTokenCalls, retryer.retryDelayCalls)
+			}
+		})
+	}
+}
+
 func TestClientPlanRejectsExpiredDeadlineBeforeProviderInvocation(t *testing.T) {
 	deadline := time.Now().Add(-time.Second)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
@@ -822,11 +855,14 @@ func (retryer *noDelayRetryer) RetryDelay(int, error) (time.Duration, error) {
 
 type plannerPolicyRetryer struct {
 	zeroRetryer
-	retryTokenErr error
-	retryDelayErr error
+	retryTokenErr   error
+	retryDelayErr   error
+	retryTokenCalls int
+	retryDelayCalls int
 }
 
 func (retryer *plannerPolicyRetryer) GetRetryToken(context.Context, error) (func(error) error, error) {
+	retryer.retryTokenCalls++
 	if retryer.retryTokenErr != nil {
 		return nil, retryer.retryTokenErr
 	}
@@ -834,6 +870,7 @@ func (retryer *plannerPolicyRetryer) GetRetryToken(context.Context, error) (func
 }
 
 func (retryer *plannerPolicyRetryer) RetryDelay(attempt int, err error) (time.Duration, error) {
+	retryer.retryDelayCalls++
 	if retryer.retryDelayErr != nil {
 		return 0, retryer.retryDelayErr
 	}
