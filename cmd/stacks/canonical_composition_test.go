@@ -139,6 +139,38 @@ func TestQueryDatabaseOpenErrorIsBoundedAndPreservesContextIdentity(t *testing.T
 	}
 }
 
+func TestQueryDatabaseOpenErrorPrefersCallerCancellationOverProviderDeadline(t *testing.T) {
+	const privateProviderDetail = "private provider deadline detail"
+	runtime := commandRuntime{
+		openQueryDatabase: func(context.Context, string) (queryDatabase, error) {
+			return nil, fmt.Errorf("%s: %w", privateProviderDetail, context.DeadlineExceeded)
+		},
+	}
+	commands, err := commandProviderWithRuntime(
+		context.Background(),
+		validQueryCommandSettings(),
+		io.Discard,
+		io.Discard,
+		tracenoop.NewTracerProvider().Tracer("synthetic"),
+		nil,
+		nil,
+		runtime,
+	)
+	if err != nil {
+		t.Fatalf("commandProviderWithRuntime() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = commands[string(config.CommandQuery)].Run(ctx, validQueryTrendInvocation(t))
+	if err != context.Canceled {
+		t.Fatalf("query database-open error = %v, want canonical context.Canceled", err)
+	}
+	if strings.Contains(err.Error(), privateProviderDetail) {
+		t.Fatalf("query database-open error exposed private provider detail: %v", err)
+	}
+}
+
 func TestQueryTrendConstructsNoSourceDirectoryModelOrProvider(t *testing.T) {
 	database := &recordingQueryDatabase{
 		snapshot: postgres.TemporalQuerySnapshot{
