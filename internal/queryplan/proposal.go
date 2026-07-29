@@ -111,6 +111,9 @@ func composeRequest(output json.RawMessage, entityIDs []identity.EntityID, limit
 }
 
 func decodeProposal(output json.RawMessage) (proposal, error) {
+	if err := rejectDuplicateObjectKeys(output); err != nil {
+		return proposal{}, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	decoder.DisallowUnknownFields()
 	var wire proposalWire
@@ -142,6 +145,70 @@ func decodeProposal(output json.RawMessage) (proposal, error) {
 		KnowledgeScope:  knowledge{Kind: *wire.KnowledgeScope.Kind, AsOf: *wire.KnowledgeScope.AsOf},
 		ChronologyLimit: *wire.ChronologyLimit,
 	}, nil
+}
+
+func rejectDuplicateObjectKeys(input []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	if err := consumeJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return errors.New("multiple JSON values")
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("object key is invalid")
+			}
+			if _, exists := seen[key]; exists {
+				return errors.New("duplicate object key")
+			}
+			seen[key] = struct{}{}
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		return consumeDelimiter(decoder, '}')
+	case '[':
+		for decoder.More() {
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		return consumeDelimiter(decoder, ']')
+	default:
+		return errors.New("JSON delimiter is invalid")
+	}
+}
+
+func consumeDelimiter(decoder *json.Decoder, want json.Delim) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != want {
+		return errors.New("JSON delimiter is invalid")
+	}
+	return nil
 }
 
 func validCannotPlan(value proposal) bool {

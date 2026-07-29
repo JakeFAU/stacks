@@ -70,6 +70,8 @@ func TestComposeRequestRejectsInvalidWireShapes(t *testing.T) {
 		{"second json value", executablePointProposal + ` {}`},
 		{"unknown top level field", strings.Replace(executablePointProposal, `"chronology_limit": 0`, `"chronology_limit": 0, "entity_ids": ["private-invented-id"]`, 1)},
 		{"unknown nested field", strings.Replace(executablePointProposal, `"start": "", "end": ""`, `"start": "", "end": "", "extra": "value"`, 1)},
+		{"duplicate top level field", strings.Replace(executablePointProposal, `"status": "executable",`, `"status": "executable", "status": "executable",`, 1)},
+		{"duplicate nested field", strings.Replace(executablePointProposal, `"at": "2026-06-01T12:00:00-04:00",`, `"at": "2026-06-01T12:00:00-04:00", "at": "2026-06-01T12:00:00-04:00",`, 1)},
 		{"invalid enum", strings.Replace(executablePointProposal, `"status": "executable"`, `"status": "unknown"`, 1)},
 		{"missing required field", strings.Replace(executablePointProposal, `  "reason": "none",`, ``, 1)},
 		{"null required field", strings.Replace(executablePointProposal, `"entity_match": "all"`, `"entity_match": null`, 1)},
@@ -165,9 +167,9 @@ func TestComposeRequestAttachesCanonicalIDsAndPreservesTemporalScopes(t *testing
   "status":"executable", "reason":"none", "intent":"trend-comparison", "entity_match":"any",
   "predicates":["assigned_to"],
   "selections":[
-    {"kind":"window","label":"before","at":"","start":"2026-01-01T00:00:00-04:00","end":"2026-02-01T00:00:00-04:00"},
-    {"kind":"window","label":"after","at":"","start":"2026-03-01T00:00:00-04:00","end":"2026-04-01T00:00:00-04:00"}
-  ], "knowledge_scope":{"kind":"as-of","as_of":"2026-07-01T00:00:00-04:00"}, "chronology_limit":0
+    {"kind":"window","label":"before","at":"","start":"2026-01-01T00:00:00.123456789-04:00","end":"2026-02-01T00:00:00.987654321-04:00"},
+    {"kind":"window","label":"after","at":"","start":"2026-03-01T00:00:00.222222999-04:00","end":"2026-04-01T00:00:00.333333999-04:00"}
+  ], "knowledge_scope":{"kind":"as-of","as_of":"2026-07-01T00:00:00.246813579-04:00"}, "chronology_limit":0
 }`
 	entityIDs := []identity.EntityID{"entity-atlas-002", "entity-atlas-001"}
 	request, err := composeRequest([]byte(output), entityIDs, plannerLimits())
@@ -188,14 +190,24 @@ func TestComposeRequestAttachesCanonicalIDsAndPreservesTemporalScopes(t *testing
 		t.Fatalf("composeRequest() knowledge scope = %#v", request.KnowledgeScope)
 	}
 	asOf, ok := request.KnowledgeScope.AsOf()
-	wantAsOf := time.Date(2026, time.July, 1, 4, 0, 0, 0, time.UTC)
+	wantAsOf := time.Date(2026, time.July, 1, 4, 0, 0, 246813000, time.UTC)
 	if !ok || !asOf.Equal(wantAsOf) || asOf.Location() != time.UTC {
 		t.Fatalf("composeRequest() as-of = %s, %t", asOf, ok)
 	}
-	for _, selection := range request.Selections {
+	wantWindows := [][2]time.Time{
+		{
+			time.Date(2026, time.January, 1, 4, 0, 0, 123456000, time.UTC),
+			time.Date(2026, time.February, 1, 4, 0, 0, 987654000, time.UTC),
+		},
+		{
+			time.Date(2026, time.March, 1, 4, 0, 0, 222222000, time.UTC),
+			time.Date(2026, time.April, 1, 4, 0, 0, 333333000, time.UTC),
+		},
+	}
+	for index, selection := range request.Selections {
 		start, end, ok := selection.Window()
-		if !ok || start.Location() != time.UTC || end.Location() != time.UTC {
-			t.Fatalf("composeRequest() window = %s, %s, %t", start, end, ok)
+		if !ok || !start.Equal(wantWindows[index][0]) || !end.Equal(wantWindows[index][1]) || start.Location() != time.UTC || end.Location() != time.UTC {
+			t.Fatalf("composeRequest() window = %s, %s, %t; want %s, %s", start, end, ok, wantWindows[index][0], wantWindows[index][1])
 		}
 	}
 }
