@@ -3,6 +3,7 @@ package queryplan
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
@@ -61,6 +62,13 @@ func TestUsageValidRejectsNegativeAndIncompleteTotals(t *testing.T) {
 	}
 	if !(Usage{InputTokens: 2, OutputTokens: 3, TotalTokens: 5}).valid() {
 		t.Fatal("Usage.valid() = false for complete nonnegative usage")
+	}
+}
+
+func TestUsageValidRejectsOverflowedTokenSum(t *testing.T) {
+	usage := Usage{InputTokens: math.MaxInt64, OutputTokens: 1, TotalTokens: math.MaxInt64}
+	if usage.valid() {
+		t.Fatalf("Usage%+v.valid() = true", usage)
 	}
 }
 
