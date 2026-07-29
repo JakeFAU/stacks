@@ -27,15 +27,183 @@ import (
 	"stacks/internal/extract"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
+	"stacks/internal/queryplan"
 )
 
 const (
-	testAPIKey        = "synthetic-openai-key"
-	testModelID       = "synthetic-openai-model"
-	testPrivateInput  = "PRIVATE REQUEST INPUT"
-	testPrivateOutput = "PRIVATE RESPONSE OUTPUT"
-	testPrivateError  = "PRIVATE PROVIDER ERROR BODY"
+	testAPIKey          = "synthetic-openai-key"
+	testModelID         = "synthetic-openai-model"
+	testPrivateInput    = "PRIVATE REQUEST INPUT"
+	testPrivateOutput   = "PRIVATE RESPONSE OUTPUT"
+	testPrivateError    = "PRIVATE PROVIDER ERROR BODY"
+	testPrivateQuestion = "PRIVATE TEMPORAL QUESTION"
 )
+
+func TestClientPlanSendsOnlyStrictStatelessStructuredResponseRequest(t *testing.T) {
+	api := &fakeResponsesAPI{outputs: []*responses.Response{successfulResponse(t, `{"status":"executable"}`)}}
+	client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
+	request := validPlannerRequest()
+
+	response, err := client.Plan(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	if response.Provider != modelpolicy.ProviderOpenAI || response.ModelID != testModelID ||
+		response.PromptVersion != request.PromptVersion || response.SchemaName != request.SchemaName ||
+		response.Usage != (queryplan.Usage{InputTokens: 11, OutputTokens: 7, TotalTokens: 18}) ||
+		response.Attempts != 1 || response.WallLatency < 0 || response.ProviderLatency != 0 {
+		t.Fatalf("Plan() response = %+v", response)
+	}
+	if len(api.params) != 1 || api.optionCounts[0] != 0 {
+		t.Fatalf("Responses calls/options = %d/%d, want 1/0", len(api.params), api.optionCounts[0])
+	}
+	params := api.params[0]
+	if !params.Background.Valid() || params.Background.Value || !params.Instructions.Valid() ||
+		params.Instructions.Value != request.SystemPrompt || !params.Input.OfString.Valid() ||
+		params.Input.OfString.Value != request.Input || len(params.Input.OfInputItemList) != 0 ||
+		!params.MaxOutputTokens.Valid() || params.MaxOutputTokens.Value != client.maxOutputTokens ||
+		params.Model != responses.ResponsesModel(client.modelID) ||
+		params.Reasoning.Effort != shared.ReasoningEffortNone || !params.Store.Valid() || params.Store.Value {
+		t.Fatalf("planner request fields = %#v", params)
+	}
+	format := params.Text.Format.OfJSONSchema
+	if format == nil || format.Name != queryplan.SchemaName || !format.Strict.Valid() || !format.Strict.Value {
+		t.Fatalf("Text.Format = %#v, want strict planner JSON Schema", params.Text.Format)
+	}
+	assertExactPlannerRequestJSON(t, params, request)
+}
+
+func TestClientPlanRejectsUnknownOrMutatedRequestBeforeProvider(t *testing.T) {
+	tests := map[string]func(*queryplan.ModelRequest){
+		"unknown version":     func(request *queryplan.ModelRequest) { request.PromptVersion = "unknown-v1" },
+		"mutated prompt":      func(request *queryplan.ModelRequest) { request.SystemPrompt = "mutated" },
+		"mutated schema name": func(request *queryplan.ModelRequest) { request.SchemaName = "mutated_schema" },
+		"mutated schema":      func(request *queryplan.ModelRequest) { request.JSONSchema = []byte(`{}`) },
+		"empty input":         func(request *queryplan.ModelRequest) { request.Input = "" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeResponsesAPI{}
+			client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
+			request := validPlannerRequest()
+			mutate(&request)
+
+			_, err := client.Plan(context.Background(), request)
+			if !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("Plan() error = %v, want invalid request", err)
+			}
+			if len(api.params) != 0 {
+				t.Fatalf("Responses calls = %d, want 0", len(api.params))
+			}
+			assertPlannerErrorIsBounded(t, err, request)
+		})
+	}
+}
+
+func TestClientPlanRetriesSameRequestOnlyForRetryableFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "throttled", err: syntheticAPIError(t, http.StatusTooManyRequests)},
+		{name: "internal", err: syntheticAPIError(t, http.StatusInternalServerError)},
+		{name: "transport timeout", err: &url.Error{Op: "Post", URL: "https://api.openai.com/v1/responses", Err: &net.OpError{Op: "dial", Net: "tcp", Err: syntheticTimeoutError{}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeResponsesAPI{
+				errors:  []error{test.err, nil},
+				outputs: []*responses.Response{nil, successfulResponse(t, `{}`)},
+			}
+			client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
+			response, err := client.Plan(context.Background(), validPlannerRequest())
+			if err != nil {
+				t.Fatalf("Plan() error = %v", err)
+			}
+			if len(api.params) != 2 || response.Attempts != 2 {
+				t.Fatalf("Plan() calls/attempts = %d/%d, want 2/2", len(api.params), response.Attempts)
+			}
+			if !reflect.DeepEqual(api.params[0], api.params[1]) {
+				t.Fatalf("retry params differ: %#v != %#v", api.params[0], api.params[1])
+			}
+		})
+	}
+}
+
+func TestClientPlanDoesNotRetryTerminalFailuresOrLeakPrivateData(t *testing.T) {
+	tests := map[string]struct {
+		makeAPI func(t *testing.T) *fakeResponsesAPI
+		want    error
+	}{
+		"unauthorized": {makeAPI: func(t *testing.T) *fakeResponsesAPI {
+			return &fakeResponsesAPI{errors: []error{syntheticAPIError(t, http.StatusUnauthorized)}}
+		}, want: extract.ErrAuthentication},
+		"forbidden": {makeAPI: func(t *testing.T) *fakeResponsesAPI {
+			return &fakeResponsesAPI{errors: []error{syntheticAPIError(t, http.StatusForbidden)}}
+		}, want: extract.ErrAuthorization},
+		"refusal": {makeAPI: func(t *testing.T) *fakeResponsesAPI {
+			return &fakeResponsesAPI{outputs: []*responses.Response{decodedResponse(t, responseJSON(testModelID, "completed", `[{"type":"message","status":"completed","content":[{"type":"refusal","refusal":"`+testPrivateOutput+`"}]}]`, validUsageJSON))}}
+		}, want: ErrInvalidOutput},
+		"incomplete": {makeAPI: func(t *testing.T) *fakeResponsesAPI {
+			return &fakeResponsesAPI{outputs: []*responses.Response{decodedResponse(t, responseJSON(testModelID, "incomplete", `[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{}"}]}]`, validUsageJSON))}}
+		}, want: ErrInvalidOutput},
+		"invalid JSON": {makeAPI: func(t *testing.T) *fakeResponsesAPI {
+			return &fakeResponsesAPI{outputs: []*responses.Response{successfulResponse(t, "not-json")}}
+		}, want: ErrInvalidOutput},
+		"model mismatch": {makeAPI: func(t *testing.T) *fakeResponsesAPI {
+			return &fakeResponsesAPI{outputs: []*responses.Response{decodedResponse(t, responseJSON("different-model", "completed", `[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{}"}]}]`, validUsageJSON))}}
+		}, want: ErrInvalidOutput},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := test.makeAPI(t)
+			client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
+			request := validPlannerRequest()
+			_, err := client.Plan(context.Background(), request)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Plan() error = %v, want %v", err, test.want)
+			}
+			if len(api.params) != 1 {
+				t.Fatalf("Responses calls = %d, want 1", len(api.params))
+			}
+			assertPlannerErrorIsBounded(t, err, request)
+		})
+	}
+}
+
+func TestClientPlanHonorsCallerCancellationAndDeadlineBeforeRetry(t *testing.T) {
+	t.Run("cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		api := &fakeResponsesAPI{call: cancel, errors: []error{syntheticAPIError(t, http.StatusServiceUnavailable)}}
+		waitCalled := false
+		client, err := newClient(api, validOptions(), func(context.Context, time.Duration) error {
+			waitCalled = true
+			return errors.New("retry wait must not run after caller cancellation")
+		})
+		if err != nil {
+			t.Fatalf("newClient() error = %v", err)
+		}
+		_, err = client.Plan(ctx, validPlannerRequest())
+		if !errors.Is(err, context.Canceled) || len(api.params) != 1 || waitCalled {
+			t.Fatalf("Plan() error/calls/wait = %v/%d/%t", err, len(api.params), waitCalled)
+		}
+	})
+
+	t.Run("deadline", func(t *testing.T) {
+		api := &fakeResponsesAPI{errors: []error{syntheticAPIError(t, http.StatusServiceUnavailable)}}
+		options := validOptions()
+		client, err := newClient(api, options, waitForRetry)
+		if err != nil {
+			t.Fatalf("newClient() error = %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		_, err = client.Plan(ctx, validPlannerRequest())
+		if !errors.Is(err, context.DeadlineExceeded) || len(api.params) != 1 {
+			t.Fatalf("Plan() error/calls = %v/%d", err, len(api.params))
+		}
+	})
+}
 
 func TestNewRequiresExplicitValidatedConfiguration(t *testing.T) {
 	tests := []struct {
@@ -577,6 +745,64 @@ func validRequest() extract.Request {
 		Input:         testPrivateInput,
 		SchemaName:    contract.SchemaName,
 		JSONSchema:    contract.JSONSchema,
+	}
+}
+
+func validPlannerRequest() queryplan.ModelRequest {
+	contract, err := queryplan.PromptContract(queryplan.PromptVersion)
+	if err != nil {
+		panic(err)
+	}
+	return queryplan.ModelRequest{
+		PromptVersion: contract.Version,
+		SystemPrompt:  contract.SystemPrompt,
+		Input:         testPrivateQuestion,
+		SchemaName:    contract.SchemaName,
+		JSONSchema:    contract.JSONSchema,
+	}
+}
+
+func assertExactPlannerRequestJSON(t *testing.T, params responses.ResponseNewParams, request queryplan.ModelRequest) {
+	t.Helper()
+	var schema map[string]any
+	if err := json.Unmarshal(request.JSONSchema, &schema); err != nil {
+		t.Fatalf("decode expected planner schema: %v", err)
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal planner request: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("decode marshaled planner request: %v", err)
+	}
+	want := map[string]any{
+		"background":        false,
+		"instructions":      request.SystemPrompt,
+		"input":             request.Input,
+		"max_output_tokens": float64(321),
+		"model":             testModelID,
+		"reasoning":         map[string]any{"effort": "none"},
+		"store":             false,
+		"text": map[string]any{"format": map[string]any{
+			"name": request.SchemaName, "schema": schema, "strict": true, "type": "json_schema",
+		}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("complete planner SDK request = %#v, want %#v", got, want)
+	}
+}
+
+func assertPlannerErrorIsBounded(t *testing.T, err error, request queryplan.ModelRequest) {
+	t.Helper()
+	contract, contractErr := queryplan.PromptContract(queryplan.PromptVersion)
+	if contractErr != nil {
+		t.Fatalf("load planner contract: %v", contractErr)
+	}
+	for _, marker := range []string{testPrivateQuestion, string(request.JSONSchema), string(contract.JSONSchema), testPrivateError, testAPIKey, "resp_synthetic"} {
+		if strings.Contains(err.Error(), marker) {
+			t.Fatalf("Plan() error leaks private/provider data %q: %v", marker, err)
+		}
 	}
 }
 
