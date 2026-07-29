@@ -18,7 +18,10 @@ import (
 
 func TestPostgresProbeUsesOneCallerOwnedQueryBoundary(t *testing.T) {
 	database := &recordingPostgresDatabase{}
-	probe := NewPostgresProbeWithScopes(database, []migration.Scope{"core"})
+	probe := NewPostgresProbeWithScopes(
+		database,
+		[]migration.Scope{"core", "directory"},
+	)
 
 	if err := probe.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping() error = %v", err)
@@ -34,10 +37,12 @@ func TestPostgresProbeUsesOneCallerOwnedQueryBoundary(t *testing.T) {
 			database.inspections,
 		)
 	}
-	if len(database.manifests) != 2 || len(database.configured) != 1 ||
-		database.configured[0] != "core" || len(statuses) != 2 {
+	if len(database.manifests) != 2 || len(database.configured) != 2 ||
+		database.configured[0] != "core" ||
+		database.configured[1] != "directory" ||
+		len(statuses) != 2 {
 		t.Fatalf(
-			"migration inspection = manifests:%d configured:%v statuses:%d, want 2/[core]/2",
+			"migration inspection = manifests:%d configured:%v statuses:%d, want 2/[core directory]/2",
 			len(database.manifests),
 			database.configured,
 			len(statuses),

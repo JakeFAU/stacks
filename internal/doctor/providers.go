@@ -77,11 +77,6 @@ type PostgresProbe struct {
 	manifestErr error
 }
 
-// NewPostgresProbe constructs a read-only core-scope probe.
-func NewPostgresProbe(database postgresQueryBoundary) *PostgresProbe {
-	return NewPostgresProbeWithScopes(database, []migration.Scope{"core"})
-}
-
 // NewPostgresProbeWithScopes constructs a read-only status probe over the
 // caller-owned database and an explicit configured-scope selection.
 func NewPostgresProbeWithScopes(
