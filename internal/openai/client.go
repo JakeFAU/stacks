@@ -181,7 +181,7 @@ type structuredRequest struct {
 	input         string
 	schemaName    string
 	jsonSchema    []byte
-	validate      func() error
+	validate      func(structuredRequest) error
 }
 
 type structuredUsage struct {
@@ -208,10 +208,10 @@ func extractionStructuredRequest(request extract.Request) structuredRequest {
 		input:         request.Input,
 		schemaName:    request.SchemaName,
 		jsonSchema:    append([]byte(nil), request.JSONSchema...),
-		validate: func() error {
-			contract, err := extract.PromptContract(request.PromptVersion)
-			if err != nil || request.SystemPrompt != contract.SystemPrompt || request.SchemaName != contract.SchemaName ||
-				!bytes.Equal(request.JSONSchema, contract.JSONSchema) || request.Input == "" {
+		validate: func(snapshot structuredRequest) error {
+			contract, err := extract.PromptContract(snapshot.promptVersion)
+			if err != nil || snapshot.systemPrompt != contract.SystemPrompt || snapshot.schemaName != contract.SchemaName ||
+				!bytes.Equal(snapshot.jsonSchema, contract.JSONSchema) || snapshot.input == "" {
 				return ErrInvalidRequest
 			}
 			return nil
@@ -226,10 +226,10 @@ func plannerStructuredRequest(request queryplan.ModelRequest) structuredRequest 
 		input:         request.Input,
 		schemaName:    request.SchemaName,
 		jsonSchema:    append([]byte(nil), request.JSONSchema...),
-		validate: func() error {
-			contract, err := queryplan.PromptContract(request.PromptVersion)
-			if err != nil || request.SystemPrompt != contract.SystemPrompt || request.SchemaName != contract.SchemaName ||
-				!bytes.Equal(request.JSONSchema, contract.JSONSchema) || request.Input == "" {
+		validate: func(snapshot structuredRequest) error {
+			contract, err := queryplan.PromptContract(snapshot.promptVersion)
+			if err != nil || snapshot.systemPrompt != contract.SystemPrompt || snapshot.schemaName != contract.SchemaName ||
+				!bytes.Equal(snapshot.jsonSchema, contract.JSONSchema) || snapshot.input == "" {
 				return ErrInvalidRequest
 			}
 			return nil
@@ -292,7 +292,7 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 }
 
 func (client *Client) responseParams(request structuredRequest) (responses.ResponseNewParams, error) {
-	if request.validate == nil || request.validate() != nil {
+	if request.validate == nil || request.validate(request) != nil {
 		return responses.ResponseNewParams{}, ErrInvalidRequest
 	}
 	var schema map[string]any

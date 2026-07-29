@@ -190,17 +190,84 @@ func TestClientPlanHonorsCallerCancellationAndDeadlineBeforeRetry(t *testing.T) 
 	})
 
 	t.Run("deadline", func(t *testing.T) {
-		api := &fakeResponsesAPI{errors: []error{syntheticAPIError(t, http.StatusServiceUnavailable)}}
+		apiEntered := make(chan struct{})
+		ctx := newControlledDeadlineContext()
+		api := &fakeResponsesAPI{
+			errors: []error{syntheticAPIError(t, http.StatusServiceUnavailable)},
+			callWithContext: func(apiContext context.Context) {
+				close(apiEntered)
+				<-apiContext.Done()
+			},
+		}
 		options := validOptions()
-		client, err := newClient(api, options, waitForRetry)
+		waitCalled := false
+		client, err := newClient(api, options, func(context.Context, time.Duration) error {
+			waitCalled = true
+			return errors.New("retry wait must not run after caller deadline")
+		})
 		if err != nil {
 			t.Fatalf("newClient() error = %v", err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-		defer cancel()
-		_, err = client.Plan(ctx, validPlannerRequest())
-		if !errors.Is(err, context.DeadlineExceeded) || len(api.params) != 1 {
-			t.Fatalf("Plan() error/calls = %v/%d", err, len(api.params))
+		result := make(chan error, 1)
+		go func() {
+			_, resultErr := client.Plan(ctx, validPlannerRequest())
+			result <- resultErr
+		}()
+		<-apiEntered
+		ctx.expire()
+		err = <-result
+		if !errors.Is(err, context.DeadlineExceeded) || len(api.params) != 1 || waitCalled {
+			t.Fatalf("Plan() error/calls/wait = %v/%d/%t", err, len(api.params), waitCalled)
+		}
+	})
+}
+
+func TestPlannerStructuredRequestUsesOneImmutableSchemaSnapshot(t *testing.T) {
+	t.Run("caller mutation", func(t *testing.T) {
+		request := validPlannerRequest()
+		originalSchema := append([]byte(nil), request.JSONSchema...)
+		structured := plannerStructuredRequest(request)
+		request.JSONSchema[0] = 'x'
+
+		params, err := newTestClient(t, &fakeResponsesAPI{}, &recordingInvocationRecorder{}, 1).responseParams(structured)
+		if err != nil {
+			t.Fatalf("responseParams() error = %v", err)
+		}
+		assertResponseParamsSchema(t, params, originalSchema)
+	})
+
+	t.Run("private mutation", func(t *testing.T) {
+		structured := plannerStructuredRequest(validPlannerRequest())
+		structured.jsonSchema = []byte(`{}`)
+
+		_, err := newTestClient(t, &fakeResponsesAPI{}, &recordingInvocationRecorder{}, 1).responseParams(structured)
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("responseParams() error = %v, want invalid request", err)
+		}
+	})
+}
+
+func TestExtractionStructuredRequestUsesOneImmutableSchemaSnapshot(t *testing.T) {
+	t.Run("caller mutation", func(t *testing.T) {
+		request := validRequest()
+		originalSchema := append([]byte(nil), request.JSONSchema...)
+		structured := extractionStructuredRequest(request)
+		request.JSONSchema[0] = 'x'
+
+		params, err := newTestClient(t, &fakeResponsesAPI{}, &recordingInvocationRecorder{}, 1).responseParams(structured)
+		if err != nil {
+			t.Fatalf("responseParams() error = %v", err)
+		}
+		assertResponseParamsSchema(t, params, originalSchema)
+	})
+
+	t.Run("private mutation", func(t *testing.T) {
+		structured := extractionStructuredRequest(validRequest())
+		structured.jsonSchema = []byte(`{}`)
+
+		_, err := newTestClient(t, &fakeResponsesAPI{}, &recordingInvocationRecorder{}, 1).responseParams(structured)
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("responseParams() error = %v, want invalid request", err)
 		}
 	})
 }
@@ -793,6 +860,17 @@ func assertExactPlannerRequestJSON(t *testing.T, params responses.ResponseNewPar
 	}
 }
 
+func assertResponseParamsSchema(t *testing.T, params responses.ResponseNewParams, wantBytes []byte) {
+	t.Helper()
+	var want map[string]any
+	if err := json.Unmarshal(wantBytes, &want); err != nil {
+		t.Fatalf("decode expected schema: %v", err)
+	}
+	if got := params.Text.Format.OfJSONSchema; got == nil || !reflect.DeepEqual(got.Schema, want) {
+		t.Fatalf("submitted schema = %#v, want %#v", got, want)
+	}
+}
+
 func assertPlannerErrorIsBounded(t *testing.T, err error, request queryplan.ModelRequest) {
 	t.Helper()
 	contract, contractErr := queryplan.PromptContract(queryplan.PromptVersion)
@@ -820,17 +898,21 @@ func optionsWith(mutate func(*Options)) Options {
 }
 
 type fakeResponsesAPI struct {
-	params       []responses.ResponseNewParams
-	optionCounts []int
-	outputs      []*responses.Response
-	errors       []error
-	call         func()
+	params          []responses.ResponseNewParams
+	optionCounts    []int
+	outputs         []*responses.Response
+	errors          []error
+	call            func()
+	callWithContext func(context.Context)
 }
 
-func (fake *fakeResponsesAPI) New(_ context.Context, params responses.ResponseNewParams, options ...option.RequestOption) (*responses.Response, error) {
+func (fake *fakeResponsesAPI) New(ctx context.Context, params responses.ResponseNewParams, options ...option.RequestOption) (*responses.Response, error) {
 	fake.params = append(fake.params, params)
 	fake.optionCounts = append(fake.optionCounts, len(options))
 	index := len(fake.params) - 1
+	if fake.callWithContext != nil {
+		fake.callWithContext(ctx)
+	}
 	if fake.call != nil {
 		fake.call()
 	}
@@ -842,6 +924,31 @@ func (fake *fakeResponsesAPI) New(_ context.Context, params responses.ResponseNe
 	}
 	return successfulResponseFromFake(), nil
 }
+
+type controlledDeadlineContext struct {
+	done chan struct{}
+}
+
+func newControlledDeadlineContext() *controlledDeadlineContext {
+	return &controlledDeadlineContext{done: make(chan struct{})}
+}
+
+func (ctx *controlledDeadlineContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (ctx *controlledDeadlineContext) Done() <-chan struct{} { return ctx.done }
+
+func (ctx *controlledDeadlineContext) Err() error {
+	select {
+	case <-ctx.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (ctx *controlledDeadlineContext) Value(any) any { return nil }
+
+func (ctx *controlledDeadlineContext) expire() { close(ctx.done) }
 
 func successfulResponseFromFake() *responses.Response {
 	var response responses.Response
