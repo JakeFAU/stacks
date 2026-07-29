@@ -36,6 +36,7 @@ const (
 	testPrivateOutput   = "PRIVATE RESPONSE OUTPUT"
 	testPrivateError    = "PRIVATE PROVIDER ERROR BODY"
 	testPrivateQuestion = "PRIVATE TEMPORAL QUESTION"
+	testPrivateWrapper  = "PRIVATE PROVIDER WRAPPER"
 )
 
 func TestClientPlanSendsOnlyStatelessStructuredMessageRequest(t *testing.T) {
@@ -121,6 +122,69 @@ func TestClientPlanRetriesSameRequestOnlyForRetryableFailures(t *testing.T) {
 			if !reflect.DeepEqual(api.params[0], api.params[1]) {
 				t.Fatalf("retry params differ: %#v != %#v", api.params[0], api.params[1])
 			}
+		})
+	}
+}
+
+func TestClientPlanTreatsContextBearingProviderErrorsAsTerminal(t *testing.T) {
+	retryableTransport := &url.Error{
+		Op: "Post", URL: "https://api.anthropic.com/v1/messages",
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: syntheticTimeoutError{}},
+	}
+	tests := []struct {
+		name        string
+		providerErr error
+		want        error
+		wantOutcome string
+	}{
+		{name: "raw deadline", providerErr: context.DeadlineExceeded, want: context.DeadlineExceeded, wantOutcome: OutcomeTimeout},
+		{name: "raw cancellation", providerErr: context.Canceled, want: context.Canceled, wantOutcome: OutcomeCanceled},
+		{
+			name:        "deadline joined with throttling",
+			providerErr: errors.Join(context.DeadlineExceeded, syntheticAPIError(t, http.StatusTooManyRequests)),
+			want:        context.DeadlineExceeded, wantOutcome: OutcomeTimeout,
+		},
+		{
+			name:        "wrapped deadline joined with transport timeout",
+			providerErr: fmt.Errorf("%s: %w", testPrivateWrapper, errors.Join(context.DeadlineExceeded, retryableTransport)),
+			want:        context.DeadlineExceeded, wantOutcome: OutcomeTimeout,
+		},
+		{
+			name:        "cancellation joined with unavailable",
+			providerErr: errors.Join(context.Canceled, syntheticAPIError(t, http.StatusServiceUnavailable)),
+			want:        context.Canceled, wantOutcome: OutcomeCanceled,
+		},
+		{
+			name:        "wrapped cancellation joined with transport timeout",
+			providerErr: fmt.Errorf("%s: %w", testPrivateWrapper, errors.Join(context.Canceled, retryableTransport)),
+			want:        context.Canceled, wantOutcome: OutcomeCanceled,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeMessagesAPI{errors: []error{test.providerErr}}
+			recorder := &recordingInvocationRecorder{}
+			options := validOptions()
+			options.Recorder = recorder
+			waitCalls := 0
+			client, err := newClient(api, options, func(context.Context, time.Duration) error {
+				waitCalls++
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			request := validPlannerRequest()
+			_, err = client.Plan(context.Background(), request)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Plan() error = %v, want %v", err, test.want)
+			}
+			if len(api.params) != 1 || waitCalls != 0 {
+				t.Fatalf("Plan() calls/waits = %d/%d, want 1/0", len(api.params), waitCalls)
+			}
+			assertOneObservation(t, recorder, test.wantOutcome, 1)
+			assertPlannerDataIsBounded(t, err, recorder, request)
 		})
 	}
 }
@@ -846,7 +910,7 @@ func assertPlannerDataIsBounded(t *testing.T, err error, recorder *recordingInvo
 	if marshalErr != nil {
 		t.Fatalf("marshal observations: %v", marshalErr)
 	}
-	for _, marker := range []string{testPrivateQuestion, string(request.JSONSchema), string(contract.JSONSchema), testPrivateError, testAPIKey, "msg_synthetic"} {
+	for _, marker := range []string{testPrivateQuestion, string(request.JSONSchema), string(contract.JSONSchema), testPrivateError, testPrivateWrapper, testAPIKey, "msg_synthetic"} {
 		if strings.Contains(err.Error(), marker) || strings.Contains(string(encoded), marker) {
 			t.Fatalf("Plan() error or telemetry leaks private/provider data %q", marker)
 		}
