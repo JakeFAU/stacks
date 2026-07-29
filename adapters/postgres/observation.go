@@ -12,6 +12,7 @@ import (
 	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/JakeFAU/stacks/core/timepoint"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -146,22 +147,17 @@ func (transaction *Transaction) PutObservation(
 	).Scan(&insertedID)
 	switch {
 	case insertErr == nil:
-		for _, link := range value.EvidenceLinks() {
-			if _, err := transaction.transaction.Exec(ctx, `
-				INSERT INTO stacks_core.observation_evidence (
-					observation_id, evidence_id, role
-				)
-				VALUES ($1, $2, $3)`,
-				value.ID(),
-				link.EvidenceID,
-				link.Role,
-			); err != nil {
-				return false, wrapObservationError(
-					ctx,
-					"insert observation evidence",
-					conflictError(err),
-				)
-			}
+		if err := insertObservationEvidence(
+			ctx,
+			transaction.transaction,
+			value.ID(),
+			value.EvidenceLinks(),
+		); err != nil {
+			return false, wrapObservationError(
+				ctx,
+				"insert observation evidence",
+				conflictError(err),
+			)
 		}
 		return true, nil
 	case errors.Is(insertErr, pgx.ErrNoRows):
@@ -191,6 +187,35 @@ func (transaction *Transaction) PutObservation(
 			conflictError(insertErr),
 		)
 	}
+}
+
+type observationEvidenceExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func insertObservationEvidence(
+	ctx context.Context,
+	executor observationEvidenceExecutor,
+	observationID observation.ObservationID,
+	links []observation.EvidenceLink,
+) error {
+	evidenceIDs := make([]string, len(links))
+	roles := make([]string, len(links))
+	for index, link := range links {
+		evidenceIDs[index] = string(link.EvidenceID)
+		roles[index] = string(link.Role)
+	}
+	_, err := executor.Exec(ctx, `
+		INSERT INTO stacks_core.observation_evidence (
+			observation_id, evidence_id, role
+		)
+		SELECT $1, evidence_id, role
+		FROM unnest($2::text[], $3::text[]) AS link(evidence_id, role)`,
+		observationID,
+		evidenceIDs,
+		roles,
+	)
+	return err
 }
 
 // LoadObservation reconstructs and digest-verifies one complete canonical
