@@ -74,6 +74,13 @@ func TestNormalizeRequestRejectsInvalidIntentSelectionsBeforeReaderAccess(t *tes
 	}
 }
 
+func TestValidateLimitsMatchesNormalizeRequestPolicy(t *testing.T) {
+	limits := Limits{MaxEntities: 0, MaxPredicates: 1, MaxChronology: 1}
+	if err := ValidateLimits(limits); err == nil || err.Error() != "query limits must be positive" {
+		t.Fatalf("ValidateLimits() error = %v", err)
+	}
+}
+
 func TestNormalizeRequestRejectsBlankDuplicateOrOverLimitEntitiesAndPredicates(t *testing.T) {
 	point := mustPoint(t, "at", 2026, time.January, 1)
 	tests := []struct {
