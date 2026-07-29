@@ -287,7 +287,7 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 		if attempt == client.retryer.MaxAttempts() || !client.isRetryable(request, invokeErr) {
 			outcome := outcomeForError(invokeErr)
 			client.record(ctx, started, request.promptVersion, outcome, structuredUsage{}, 0, attempt)
-			return structuredResponse{}, boundedInvocationError(invokeErr, outcome)
+			return structuredResponse{}, boundedStructuredInvocationError(request, invokeErr, outcome)
 		}
 
 		retryToken, tokenErr = client.retryer.GetRetryToken(ctx, invokeErr)
@@ -310,6 +310,18 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 		}
 	}
 	return structuredResponse{}, fmt.Errorf("%w: retry policy", ErrInvocation)
+}
+
+func boundedStructuredInvocationError(request structuredRequest, err error, outcome string) error {
+	if !request.retryProviderDeadline {
+		if errors.Is(err, context.Canceled) {
+			return fmt.Errorf("%w: %w", ErrInvocation, context.Canceled)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("%w: %w", ErrInvocation, context.DeadlineExceeded)
+		}
+	}
+	return boundedInvocationError(err, outcome)
 }
 
 func (client *Client) isRetryable(request structuredRequest, err error) bool {

@@ -268,12 +268,44 @@ func TestClientPlanCancellationPreventsFurtherAttempts(t *testing.T) {
 func TestClientPlanTreatsProviderContextErrorsAsTerminal(t *testing.T) {
 	tests := map[string]struct {
 		providerErr error
+		want        error
 		outcome     string
 	}{
-		"raw deadline exceeded":     {providerErr: context.DeadlineExceeded, outcome: OutcomeTimeout},
-		"wrapped deadline exceeded": {providerErr: fmt.Errorf("%s: %w", testPrivateOutput, context.DeadlineExceeded), outcome: OutcomeTimeout},
-		"raw canceled":              {providerErr: context.Canceled, outcome: OutcomeCanceled},
-		"wrapped canceled":          {providerErr: fmt.Errorf("%s: %w", testPrivateOutput, context.Canceled), outcome: OutcomeCanceled},
+		"raw deadline exceeded": {
+			providerErr: context.DeadlineExceeded, want: context.DeadlineExceeded, outcome: OutcomeTimeout,
+		},
+		"wrapped deadline exceeded": {
+			providerErr: fmt.Errorf("%s: %w", testPrivateOutput, context.DeadlineExceeded),
+			want:        context.DeadlineExceeded, outcome: OutcomeTimeout,
+		},
+		"deadline joined with retryable API failure": {
+			providerErr: errors.Join(context.DeadlineExceeded, &smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}),
+			want:        context.DeadlineExceeded, outcome: OutcomeTimeout,
+		},
+		"deadline joined with retryable transport failure": {
+			providerErr: fmt.Errorf("%s: %w", testPrivateOutput, errors.Join(context.DeadlineExceeded, syntheticTimeoutError{})),
+			want:        context.DeadlineExceeded, outcome: OutcomeTimeout,
+		},
+		"raw canceled": {
+			providerErr: context.Canceled, want: context.Canceled, outcome: OutcomeCanceled,
+		},
+		"wrapped canceled": {
+			providerErr: fmt.Errorf("%s: %w", testPrivateOutput, context.Canceled),
+			want:        context.Canceled, outcome: OutcomeCanceled,
+		},
+		"canceled joined with retryable API failure": {
+			providerErr: errors.Join(context.Canceled, &smithy.GenericAPIError{Code: serviceUnavailableErrorCode, Message: testPrivateOutput}),
+			want:        context.Canceled, outcome: OutcomeCanceled,
+		},
+		"canceled joined with retryable transport failure": {
+			providerErr: fmt.Errorf("%s: %w", testPrivateOutput, errors.Join(context.Canceled, syntheticTimeoutError{})),
+			want:        context.Canceled, outcome: OutcomeCanceled,
+		},
+		"canceled takes precedence over deadline": {
+			providerErr: errors.Join(context.DeadlineExceeded, context.Canceled,
+				&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}),
+			want: context.Canceled, outcome: OutcomeCanceled,
+		},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -293,6 +325,12 @@ func TestClientPlanTreatsProviderContextErrorsAsTerminal(t *testing.T) {
 			_, err = client.Plan(context.Background(), validPlanRequest())
 			if !errors.Is(err, ErrInvocation) {
 				t.Fatalf("Plan() error = %v, want terminal invocation error", err)
+			}
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Plan() error = %v, want sentinel %v", err, test.want)
+			}
+			if test.want == context.Canceled && errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Plan() error = %v, want cancellation to take precedence over deadline", err)
 			}
 			if len(api.inputs) != 1 {
 				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
