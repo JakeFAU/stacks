@@ -265,20 +265,26 @@ func TestClientPlanCancellationPreventsFurtherAttempts(t *testing.T) {
 	}
 }
 
-func TestClientPlanTreatsRawProviderContextErrorsAsTerminal(t *testing.T) {
-	tests := map[string]error{
-		"deadline exceeded": context.DeadlineExceeded,
-		"canceled":          context.Canceled,
+func TestClientPlanTreatsProviderContextErrorsAsTerminal(t *testing.T) {
+	tests := map[string]struct {
+		providerErr error
+		outcome     string
+	}{
+		"raw deadline exceeded":     {providerErr: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"wrapped deadline exceeded": {providerErr: fmt.Errorf("%s: %w", testPrivateOutput, context.DeadlineExceeded), outcome: OutcomeTimeout},
+		"raw canceled":              {providerErr: context.Canceled, outcome: OutcomeCanceled},
+		"wrapped canceled":          {providerErr: fmt.Errorf("%s: %w", testPrivateOutput, context.Canceled), outcome: OutcomeCanceled},
 	}
-	for name, providerErr := range tests {
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			api := &fakeConverseAPI{
-				errors:  []error{providerErr, nil},
+				errors:  []error{test.providerErr, nil},
 				outputs: []*bedrockruntime.ConverseOutput{nil, successfulOutput(`{}`)},
 			}
 			retryer := &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}}
+			recorder := &recordingInvocationRecorder{}
 			client, err := newClient(api, Options{
-				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2,
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
 			}, retryer)
 			if err != nil {
 				t.Fatalf("newClient() error = %v", err)
@@ -291,8 +297,18 @@ func TestClientPlanTreatsRawProviderContextErrorsAsTerminal(t *testing.T) {
 			if len(api.inputs) != 1 {
 				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
 			}
-			if retryer.retryTokenCalls != 0 || retryer.retryDelayCalls != 0 {
-				t.Fatalf("retry policy calls = token:%d delay:%d, want 0/0", retryer.retryTokenCalls, retryer.retryDelayCalls)
+			if retryer.retryableCalls != 0 || retryer.retryTokenCalls != 0 || retryer.retryDelayCalls != 0 {
+				t.Fatalf("retry policy calls = decision:%d token:%d delay:%d, want 0/0/0",
+					retryer.retryableCalls, retryer.retryTokenCalls, retryer.retryDelayCalls)
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Attempts != 1 ||
+				recorder.observations[0].Outcome != test.outcome {
+				t.Fatalf("telemetry = %+v, want one %s observation at attempt 1", recorder.observations, test.outcome)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
 			}
 		})
 	}
@@ -857,11 +873,13 @@ type plannerPolicyRetryer struct {
 	zeroRetryer
 	retryTokenErr   error
 	retryDelayErr   error
+	retryableCalls  int
 	retryTokenCalls int
 	retryDelayCalls int
 }
 
 func (retryer *plannerPolicyRetryer) IsErrorRetryable(err error) bool {
+	retryer.retryableCalls++
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
 	}
