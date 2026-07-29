@@ -182,6 +182,7 @@ type structuredRequest struct {
 	schemaName    string
 	jsonSchema    []byte
 	validate      func(structuredRequest) error
+	retryable     func(error) bool
 }
 
 type structuredUsage struct {
@@ -208,6 +209,7 @@ func extractionStructuredRequest(request extract.Request) structuredRequest {
 		input:         request.Input,
 		schemaName:    request.SchemaName,
 		jsonSchema:    append([]byte(nil), request.JSONSchema...),
+		retryable:     isRetryable,
 		validate: func(snapshot structuredRequest) error {
 			contract, err := extract.PromptContract(snapshot.promptVersion)
 			if err != nil || snapshot.systemPrompt != contract.SystemPrompt || snapshot.schemaName != contract.SchemaName ||
@@ -226,6 +228,7 @@ func plannerStructuredRequest(request queryplan.ModelRequest) structuredRequest 
 		input:         request.Input,
 		schemaName:    request.SchemaName,
 		jsonSchema:    append([]byte(nil), request.JSONSchema...),
+		retryable:     isPlannerRetryable,
 		validate: func(snapshot structuredRequest) error {
 			contract, err := queryplan.PromptContract(snapshot.promptVersion)
 			if err != nil || snapshot.systemPrompt != contract.SystemPrompt || snapshot.schemaName != contract.SchemaName ||
@@ -278,7 +281,7 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 		}
 
 		outcome := outcomeForError(invokeErr)
-		if attempt == client.maxAttempts || !isRetryable(invokeErr) {
+		if attempt == client.maxAttempts || !request.retryable(invokeErr) {
 			client.record(ctx, started, request.promptVersion, outcome, structuredUsage{}, attempt)
 			return structuredResponse{}, boundedInvocationError(invokeErr, outcome)
 		}
@@ -292,7 +295,7 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 }
 
 func (client *Client) responseParams(request structuredRequest) (responses.ResponseNewParams, error) {
-	if request.validate == nil || request.validate(request) != nil {
+	if request.validate == nil || request.retryable == nil || request.validate(request) != nil {
 		return responses.ResponseNewParams{}, ErrInvalidRequest
 	}
 	var schema map[string]any
@@ -381,6 +384,13 @@ func isRetryable(err error) bool {
 			apiErr.StatusCode >= http.StatusInternalServerError && apiErr.StatusCode < httpStatusUpperBound
 	}
 	return isRetryableTransport(err)
+}
+
+func isPlannerRetryable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return isRetryable(err)
 }
 
 func isRetryableTransport(err error) bool {

@@ -37,6 +37,7 @@ const (
 	testPrivateOutput   = "PRIVATE RESPONSE OUTPUT"
 	testPrivateError    = "PRIVATE PROVIDER ERROR BODY"
 	testPrivateQuestion = "PRIVATE TEMPORAL QUESTION"
+	testPrivateWrapper  = "PRIVATE PROVIDER WRAPPER"
 )
 
 func TestClientPlanSendsOnlyStrictStatelessStructuredResponseRequest(t *testing.T) {
@@ -126,6 +127,69 @@ func TestClientPlanRetriesSameRequestOnlyForRetryableFailures(t *testing.T) {
 			if !reflect.DeepEqual(api.params[0], api.params[1]) {
 				t.Fatalf("retry params differ: %#v != %#v", api.params[0], api.params[1])
 			}
+		})
+	}
+}
+
+func TestClientPlanTreatsContextBearingProviderErrorsAsTerminal(t *testing.T) {
+	retryableTransport := &url.Error{
+		Op: "Post", URL: "https://api.openai.com/v1/responses",
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: syntheticTimeoutError{}},
+	}
+	tests := []struct {
+		name        string
+		providerErr error
+		want        error
+		wantOutcome string
+	}{
+		{name: "raw deadline", providerErr: context.DeadlineExceeded, want: context.DeadlineExceeded, wantOutcome: OutcomeTimeout},
+		{name: "raw cancellation", providerErr: context.Canceled, want: context.Canceled, wantOutcome: OutcomeCanceled},
+		{
+			name:        "deadline joined with throttling",
+			providerErr: errors.Join(context.DeadlineExceeded, syntheticAPIError(t, http.StatusTooManyRequests)),
+			want:        context.DeadlineExceeded, wantOutcome: OutcomeTimeout,
+		},
+		{
+			name:        "wrapped deadline joined with transport timeout",
+			providerErr: fmt.Errorf("%s: %w", testPrivateWrapper, errors.Join(context.DeadlineExceeded, retryableTransport)),
+			want:        context.DeadlineExceeded, wantOutcome: OutcomeTimeout,
+		},
+		{
+			name:        "cancellation joined with internal error",
+			providerErr: errors.Join(context.Canceled, syntheticAPIError(t, http.StatusInternalServerError)),
+			want:        context.Canceled, wantOutcome: OutcomeCanceled,
+		},
+		{
+			name:        "wrapped cancellation joined with transport timeout",
+			providerErr: fmt.Errorf("%s: %w", testPrivateWrapper, errors.Join(context.Canceled, retryableTransport)),
+			want:        context.Canceled, wantOutcome: OutcomeCanceled,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeResponsesAPI{errors: []error{test.providerErr}}
+			recorder := &recordingInvocationRecorder{}
+			options := validOptions()
+			options.Recorder = recorder
+			waitCalls := 0
+			client, err := newClient(api, options, func(context.Context, time.Duration) error {
+				waitCalls++
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(context.Background(), validPlannerRequest())
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Plan() error = %v, want %v", err, test.want)
+			}
+			if len(api.params) != 1 || waitCalls != 0 {
+				t.Fatalf("Plan() calls/waits = %d/%d, want 1/0", len(api.params), waitCalls)
+			}
+			assertOneObservation(t, recorder, test.wantOutcome, 1)
+			assertPlannerErrorIsBounded(t, err, validPlannerRequest())
+			assertPlannerTelemetryIsBounded(t, recorder)
 		})
 	}
 }
@@ -877,9 +941,19 @@ func assertPlannerErrorIsBounded(t *testing.T, err error, request queryplan.Mode
 	if contractErr != nil {
 		t.Fatalf("load planner contract: %v", contractErr)
 	}
-	for _, marker := range []string{testPrivateQuestion, string(request.JSONSchema), string(contract.JSONSchema), testPrivateError, testAPIKey, "resp_synthetic"} {
+	for _, marker := range []string{testPrivateQuestion, string(request.JSONSchema), string(contract.JSONSchema), testPrivateError, testPrivateWrapper, testAPIKey, "resp_synthetic"} {
 		if strings.Contains(err.Error(), marker) {
 			t.Fatalf("Plan() error leaks private/provider data %q: %v", marker, err)
+		}
+	}
+}
+
+func assertPlannerTelemetryIsBounded(t *testing.T, recorder *recordingInvocationRecorder) {
+	t.Helper()
+	encoded := fmt.Sprintf("%+v", recorder.observations)
+	for _, marker := range []string{testPrivateQuestion, testPrivateError, testPrivateWrapper, testAPIKey, "resp_synthetic"} {
+		if strings.Contains(encoded, marker) {
+			t.Fatalf("planner telemetry leaks private/provider data %q: %s", marker, encoded)
 		}
 	}
 }
