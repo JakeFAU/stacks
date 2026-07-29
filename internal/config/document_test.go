@@ -150,19 +150,128 @@ ingestion:
   attempt_timeout: 4m
 extraction:
   prompt_version: v1
-analysis:
-  prompt_version: v1
 `,
 		},
 		{
 			name:   "JSON",
 			format: "json",
-			body:   `{"http":{"host":"127.0.0.1","port":8080,"read_header_timeout_seconds":5},"log":{"level":"info"},"telemetry":{"enabled":true,"endpoint":"collector:4317","insecure":false,"metric_export_interval":"10s","service_name":"stacks","trace_sample_ratio":0.5},"database":{"scopes":["core","directory"],"application_role":"stacks_app"},"google":{"folder_id":"synthetic-folder","oauth_client_file":"/synthetic/client.json","oauth_token_file":"/synthetic/token.json","transcript_titles":["Transcripts"],"notes_titles":["Notes"]},"directory":{"enabled":false,"oauth_client_file":"/synthetic/directory-client.json","oauth_token_file":"/synthetic/directory-token.json","email_domains":["example.test"],"freshness":"24h","retry_after":"15m","max_attempts":3},"model":{"data_mode":"remote","provider":"openai","id":"synthetic-model","max_output_tokens":256,"max_attempts":2,"aws_profile":"synthetic","aws_region":"us-east-1"},"ingestion":{"lease_duration":"5m","attempt_timeout":"4m"},"extraction":{"prompt_version":"v1"},"analysis":{"prompt_version":"v1"}}`,
+			body:   `{"http":{"host":"127.0.0.1","port":8080,"read_header_timeout_seconds":5},"log":{"level":"info"},"telemetry":{"enabled":true,"endpoint":"collector:4317","insecure":false,"metric_export_interval":"10s","service_name":"stacks","trace_sample_ratio":0.5},"database":{"scopes":["core","directory"],"application_role":"stacks_app"},"google":{"folder_id":"synthetic-folder","oauth_client_file":"/synthetic/client.json","oauth_token_file":"/synthetic/token.json","transcript_titles":["Transcripts"],"notes_titles":["Notes"]},"directory":{"enabled":false,"oauth_client_file":"/synthetic/directory-client.json","oauth_token_file":"/synthetic/directory-token.json","email_domains":["example.test"],"freshness":"24h","retry_after":"15m","max_attempts":3},"model":{"data_mode":"remote","provider":"openai","id":"synthetic-model","max_output_tokens":256,"max_attempts":2,"aws_profile":"synthetic","aws_region":"us-east-1"},"ingestion":{"lease_duration":"5m","attempt_timeout":"4m"},"extraction":{"prompt_version":"v1"}}`,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			if err := validateConfigDocument(testCase.format, []byte(testCase.body)); err != nil {
 				t.Fatalf("validateConfigDocument() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateConfigDocumentAcceptsQueryLimitsInYAMLAndJSON(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		format string
+		body   string
+	}{
+		{name: "YAML", format: "yaml", body: "query:\n  max_entities: 16\n  max_predicates: 32\n  max_chronology: 1000\n"},
+		{name: "JSON", format: "json", body: `{"query":{"max_entities":16,"max_predicates":32,"max_chronology":1000}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if err := validateConfigDocument(testCase.format, []byte(testCase.body)); err != nil {
+				t.Fatalf("validateConfigDocument() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigDocumentRejectsRetiredAnalysisSection(t *testing.T) {
+	retiredSection := strings.ReplaceAll("analXysis", "X", "")
+	retiredPromptVersion := strings.ReplaceAll("analyXze-v1", "X", "")
+	for _, testCase := range []struct {
+		name   string
+		format string
+		body   string
+	}{
+		{name: "YAML", format: "yaml", body: retiredSection + ":\n  prompt_version: " + retiredPromptVersion + "\n"},
+		{name: "JSON", format: "json", body: `{"` + retiredSection + `":{"prompt_version":"` + retiredPromptVersion + `"}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateConfigDocument(testCase.format, []byte(testCase.body))
+			if err == nil || !strings.Contains(err.Error(), "analysis") {
+				t.Fatalf("validateConfigDocument() error = %v, want strict retired analysis key rejection", err)
+			}
+			if strings.Contains(err.Error(), retiredPromptVersion) {
+				t.Fatalf("validateConfigDocument() error exposed retired value: %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigurationExamplesPassStrictValidation(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		format string
+		path   string
+	}{
+		{name: "YAML", format: "yaml", path: filepath.Join("..", "..", "config.example.yaml")},
+		{name: "JSON", format: "json", path: filepath.Join("..", "..", "config.example.json")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			data, err := os.ReadFile(testCase.path)
+			if err != nil {
+				t.Fatalf("read example: %v", err)
+			}
+			if err := validateConfigDocument(testCase.format, data); err != nil {
+				t.Fatalf("validateConfigDocument(%s) error = %v", testCase.path, err)
+			}
+		})
+	}
+}
+
+func TestEnvironmentExampleContainsOnlyCurrentQueryConfiguration(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".env.example"))
+	if err != nil {
+		t.Fatalf("read environment example: %v", err)
+	}
+	contents := string(data)
+	for _, name := range []string{
+		QueryMaxEntitiesEnvironmentVariable,
+		QueryMaxPredicatesEnvironmentVariable,
+		QueryMaxChronologyEnvironmentVariable,
+	} {
+		if !strings.Contains(contents, name+"=") {
+			t.Fatalf(".env.example is missing current query input %q", name)
+		}
+	}
+	for _, retired := range []string{
+		strings.ReplaceAll("STACKS_ANALXYSIS_PROMPT_VERSION", "X", ""),
+		strings.ReplaceAll("STACKXS_EMPLOYEE_ENTITY_ID", "X", ""),
+		strings.ReplaceAll("STACKXS_MANAGER_ENTITY_ID", "X", ""),
+	} {
+		if strings.Contains(contents, retired+"=") {
+			t.Fatalf(".env.example retains retired input %q", retired)
+		}
+	}
+}
+
+func TestValidateConfigDocumentRejectsUnknownAndWrongTypedQueryLimits(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		format     string
+		body       string
+		wantConfig string
+	}{
+		{name: "unknown YAML key", format: "yaml", body: "query:\n  max_entitys: 16\n", wantConfig: "query.max_entitys"},
+		{name: "unknown JSON key", format: "json", body: `{"query":{"max_entitys":16}}`, wantConfig: "query.max_entitys"},
+		{name: "YAML string", format: "yaml", body: "query:\n  max_entities: private-query-limit\n", wantConfig: "query.max_entities"},
+		{name: "JSON string", format: "json", body: `{"query":{"max_chronology":"private-query-limit"}}`, wantConfig: "query.max_chronology"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateConfigDocument(testCase.format, []byte(testCase.body))
+			if err == nil || !strings.Contains(err.Error(), testCase.wantConfig) {
+				t.Fatalf("validateConfigDocument() error = %v, want strict %s rejection", err, testCase.wantConfig)
+			}
+			if strings.Contains(err.Error(), "private-query-limit") {
+				t.Fatalf("validateConfigDocument() error exposed query value: %v", err)
 			}
 		})
 	}

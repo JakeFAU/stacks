@@ -64,8 +64,55 @@ func TestLoadDefaults(t *testing.T) {
 	if settings.Application.ExtractionPromptVersion != defaultExtractionPromptVersion {
 		t.Errorf("Application.ExtractionPromptVersion = %q, want %q", settings.Application.ExtractionPromptVersion, defaultExtractionPromptVersion)
 	}
-	if settings.Application.ManagerConfidence.PromptVersion != defaultAnalysisPromptVersion {
-		t.Errorf("Application.ManagerConfidence.PromptVersion = %q, want %q", settings.Application.ManagerConfidence.PromptVersion, defaultAnalysisPromptVersion)
+}
+
+func TestSettingsValidateQueryRequiresOnlyDatabaseAndBoundedQuerySettings(t *testing.T) {
+	settings := Settings{
+		Database: DatabaseSettings{
+			URL:    "postgres://app:synthetic@127.0.0.1/stacks",
+			Scopes: []DatabaseScope{DatabaseScopeCore},
+		},
+		Query: QuerySettings{
+			MaxEntities:   16,
+			MaxPredicates: 32,
+			MaxChronology: 1000,
+		},
+		Application: ApplicationSettings{Directory: GoogleDirectorySettings{Enabled: true}},
+	}
+	if err := settings.Validate(CommandQuery); err != nil {
+		t.Fatalf("Settings.Validate(query) error = %v, want only database URL and query settings required", err)
+	}
+}
+
+func TestSettingsValidateQueryRejectsOutOfBoundsLimitsWithoutValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*QuerySettings)
+		wantName  string
+	}{
+		{name: "entities below minimum", configure: func(settings *QuerySettings) { settings.MaxEntities = 0 }, wantName: QueryMaxEntitiesEnvironmentVariable},
+		{name: "entities above maximum", configure: func(settings *QuerySettings) { settings.MaxEntities = 65 }, wantName: QueryMaxEntitiesEnvironmentVariable},
+		{name: "predicates below minimum", configure: func(settings *QuerySettings) { settings.MaxPredicates = 0 }, wantName: QueryMaxPredicatesEnvironmentVariable},
+		{name: "predicates above maximum", configure: func(settings *QuerySettings) { settings.MaxPredicates = 257 }, wantName: QueryMaxPredicatesEnvironmentVariable},
+		{name: "chronology below minimum", configure: func(settings *QuerySettings) { settings.MaxChronology = 0 }, wantName: QueryMaxChronologyEnvironmentVariable},
+		{name: "chronology above maximum", configure: func(settings *QuerySettings) { settings.MaxChronology = 10001 }, wantName: QueryMaxChronologyEnvironmentVariable},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := Settings{
+				Database: DatabaseSettings{URL: "postgres://app:synthetic@127.0.0.1/stacks", Scopes: []DatabaseScope{DatabaseScopeCore}},
+				Query:    QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+			}
+			testCase.configure(&settings.Query)
+
+			err := settings.Validate(CommandQuery)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantName) {
+				t.Fatalf("Settings.Validate(query) error = %v, want bounded %s rejection", err, testCase.wantName)
+			}
+			if strings.Contains(err.Error(), "10001") || strings.Contains(err.Error(), "257") || strings.Contains(err.Error(), "65") {
+				t.Fatalf("Settings.Validate(query) error exposed configured limit: %v", err)
+			}
+		})
 	}
 }
 
@@ -307,9 +354,6 @@ func TestLoadReadsApplicationSettings(t *testing.T) {
 	t.Setenv(IngestionLeaseDurationEnvironmentVariable, "2m")
 	t.Setenv(IngestionAttemptTimeoutEnvironmentVariable, "90s")
 	t.Setenv(ExtractionPromptVersionEnvironmentVariable, "extract-test-v1")
-	t.Setenv(AnalysisPromptVersionEnvironmentVariable, "analyze-test-v1")
-	t.Setenv(EmployeeEntityIDEnvironmentVariable, "employee-id")
-	t.Setenv(ManagerEntityIDEnvironmentVariable, "manager-id")
 
 	settings, err := Load()
 	if err != nil {
@@ -321,7 +365,6 @@ func TestLoadReadsApplicationSettings(t *testing.T) {
 	want.IngestionLeaseDuration = 2 * time.Minute
 	want.IngestionAttemptTimeout = 90 * time.Second
 	want.ExtractionPromptVersion = "extract-test-v1"
-	want.ManagerConfidence.PromptVersion = "analyze-test-v1"
 	want.TranscriptTitles = []string{"Transcript", "Meeting transcript"}
 	if diff := diffApplicationSettings(settings.Application, want); diff != "" {
 		t.Error(diff)
@@ -344,7 +387,6 @@ func TestApplicationSettingsValidateSyncRequiresCorpusAndDisclosureSettings(t *t
 		{name: "model max tokens", invalidate: func(settings *ApplicationSettings) { settings.Model.MaxOutputTokens = 0 }},
 		{name: "model max attempts", invalidate: func(settings *ApplicationSettings) { settings.Model.MaxAttempts = 0 }},
 		{name: "extraction prompt version", invalidate: func(settings *ApplicationSettings) { settings.ExtractionPromptVersion = "" }},
-		{name: "analysis prompt version", invalidate: func(settings *ApplicationSettings) { settings.ManagerConfidence.PromptVersion = "" }},
 	}
 
 	for _, test := range tests {
@@ -359,65 +401,29 @@ func TestApplicationSettingsValidateSyncRequiresCorpusAndDisclosureSettings(t *t
 	}
 }
 
-func TestApplicationSettingsValidateAllowsDefaultAWSCredentialChainForSyncAndAnalyze(t *testing.T) {
+func TestApplicationSettingsValidateAllowsDefaultAWSCredentialChainForSync(t *testing.T) {
 	settings := validApplicationSettings()
 	settings.Model.AWSProfile = ""
-	for _, command := range []Command{CommandSync, CommandAnalyze} {
-		if err := settings.Validate(command); err != nil {
-			t.Errorf("Validate(%q) error = %v, want optional AWS profile", command, err)
-		}
+	if err := settings.Validate(CommandSync); err != nil {
+		t.Errorf("Validate(%q) error = %v, want optional AWS profile", CommandSync, err)
 	}
 }
 
 func TestApplicationSettingsValidateRejectsSupersededPromptContractsWithUpgradeGuidance(t *testing.T) {
-	tests := []struct {
-		name       string
-		command    Command
-		configure  func(*ApplicationSettings)
-		wantConfig string
-		wantValue  string
-	}{
-		{
-			name: "sync legacy extraction", command: CommandSync,
-			configure:  func(settings *ApplicationSettings) { settings.ExtractionPromptVersion = "extract-v1" },
-			wantConfig: ExtractionPromptVersionEnvironmentVariable, wantValue: "extract-v2",
-		},
-		{
-			name: "analyze legacy extraction", command: CommandAnalyze,
-			configure:  func(settings *ApplicationSettings) { settings.ExtractionPromptVersion = "extract-v1" },
-			wantConfig: ExtractionPromptVersionEnvironmentVariable, wantValue: "extract-v2",
-		},
-		{
-			name: "sync legacy analysis", command: CommandSync,
-			configure:  func(settings *ApplicationSettings) { settings.ManagerConfidence.PromptVersion = "analyze-v0" },
-			wantConfig: AnalysisPromptVersionEnvironmentVariable, wantValue: "analyze-v1",
-		},
-		{
-			name: "analyze legacy analysis", command: CommandAnalyze,
-			configure:  func(settings *ApplicationSettings) { settings.ManagerConfidence.PromptVersion = "analyze-v0" },
-			wantConfig: AnalysisPromptVersionEnvironmentVariable, wantValue: "analyze-v1",
-		},
+	settings := validApplicationSettings()
+	settings.ExtractionPromptVersion = "extract-v1"
+
+	err := settings.Validate(CommandSync)
+	if err == nil {
+		t.Fatal("Validate() error = nil, want superseded prompt rejection")
 	}
-
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			settings := validApplicationSettings()
-			settings.ExtractionPromptVersion = "extract-v2"
-			testCase.configure(&settings)
-
-			err := settings.Validate(testCase.command)
-			if err == nil {
-				t.Fatal("Validate() error = nil, want superseded prompt rejection")
-			}
-			if !strings.Contains(err.Error(), testCase.wantConfig) ||
-				!strings.Contains(err.Error(), testCase.wantValue) ||
-				!strings.Contains(err.Error(), "sync") {
-				t.Fatalf("Validate() error = %q, want bounded config name, current version, and resync guidance", err)
-			}
-			if strings.Contains(err.Error(), "extract-v1") || strings.Contains(err.Error(), "analyze-v0") {
-				t.Fatalf("Validate() error echoed unsupported user-controlled version: %v", err)
-			}
-		})
+	if !strings.Contains(err.Error(), ExtractionPromptVersionEnvironmentVariable) ||
+		!strings.Contains(err.Error(), "extract-v2") ||
+		!strings.Contains(err.Error(), "sync") {
+		t.Fatalf("Validate() error = %q, want bounded config name, current version, and resync guidance", err)
+	}
+	if strings.Contains(err.Error(), "extract-v1") {
+		t.Fatalf("Validate() error echoed unsupported user-controlled version: %v", err)
 	}
 }
 
@@ -483,9 +489,6 @@ func TestApplicationSettingsValidateRejectsWhitespaceOnlyRequiredSettings(t *tes
 		{name: "AWS region", command: CommandSync, invalidate: func(settings *ApplicationSettings) { settings.Model.AWSRegion = " \t " }},
 		{name: "model ID", command: CommandSync, invalidate: func(settings *ApplicationSettings) { settings.Model.ModelID = " \t " }},
 		{name: "extraction prompt version", command: CommandSync, invalidate: func(settings *ApplicationSettings) { settings.ExtractionPromptVersion = " \t " }},
-		{name: "analysis prompt version", command: CommandSync, invalidate: func(settings *ApplicationSettings) { settings.ManagerConfidence.PromptVersion = " \t " }},
-		{name: "employee entity ID", command: CommandAnalyze, invalidate: func(settings *ApplicationSettings) { settings.ManagerConfidence.EmployeeEntityID = " \t " }},
-		{name: "manager entity ID", command: CommandAnalyze, invalidate: func(settings *ApplicationSettings) { settings.ManagerConfidence.ManagerEntityID = " \t " }},
 	}
 
 	for _, test := range tests {
@@ -530,14 +533,12 @@ func TestApplicationSettingsValidationDoesNotExposeOverlappingTitle(t *testing.T
 	}
 }
 
-func TestApplicationSettingsValidateDoctorDoesNotRequireAnalysisSettings(t *testing.T) {
+func TestApplicationSettingsValidateDoctorAllowsDefaultAWSCredentialChain(t *testing.T) {
 	settings := validApplicationSettings()
 	settings.Model.AWSProfile = ""
-	settings.ManagerConfidence.EmployeeEntityID = ""
-	settings.ManagerConfidence.ManagerEntityID = ""
 
 	if err := settings.Validate(CommandDoctor); err != nil {
-		t.Fatalf("Validate(doctor) error = %v, want optional profile and no analysis entity settings", err)
+		t.Fatalf("Validate(doctor) error = %v, want optional profile", err)
 	}
 }
 
@@ -586,11 +587,6 @@ func validApplicationSettings() ApplicationSettings {
 		IngestionLeaseDuration:  defaultIngestionLeaseDuration,
 		IngestionAttemptTimeout: defaultIngestionAttemptTimeout,
 		ExtractionPromptVersion: "extract-v2",
-		ManagerConfidence: ManagerConfidenceSettings{
-			PromptVersion:    "analyze-v1",
-			EmployeeEntityID: "employee-id",
-			ManagerEntityID:  "manager-id",
-		},
 	}
 }
 
@@ -601,10 +597,7 @@ func diffApplicationSettings(got, want ApplicationSettings) string {
 		got.Model != want.Model ||
 		got.IngestionLeaseDuration != want.IngestionLeaseDuration ||
 		got.IngestionAttemptTimeout != want.IngestionAttemptTimeout ||
-		got.ExtractionPromptVersion != want.ExtractionPromptVersion ||
-		got.ManagerConfidence.PromptVersion != want.ManagerConfidence.PromptVersion ||
-		got.ManagerConfidence.EmployeeEntityID != want.ManagerConfidence.EmployeeEntityID ||
-		got.ManagerConfidence.ManagerEntityID != want.ManagerConfidence.ManagerEntityID {
+		got.ExtractionPromptVersion != want.ExtractionPromptVersion {
 		return "application settings did not match environment values"
 	}
 	if len(got.TranscriptTitles) != len(want.TranscriptTitles) || len(got.NotesTitles) != len(want.NotesTitles) {

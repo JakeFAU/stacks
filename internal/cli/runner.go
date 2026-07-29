@@ -9,11 +9,23 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"stacks/internal/query"
 )
 
 const (
 	rootCommandUse                = "stacks"
 	configFlagName                = "config"
+	queryEntityFlagName           = "entity"
+	queryEntityMatchFlagName      = "entity-match"
+	queryPredicateFlagName        = "predicate"
+	queryAtFlagName               = "at"
+	queryBeforeFlagName           = "before"
+	queryAfterFlagName            = "after"
+	queryBetweenFlagName          = "between"
+	queryLimitFlagName            = "limit"
+	queryKnownAsOfFlagName        = "known-as-of"
+	queryOutputFlagName           = "output"
 	reviewCreateNameFlagName      = "name"
 	reviewCreateEmailFlagName     = "email"
 	acceptDirectoryEntityFlagName = "entity"
@@ -31,7 +43,7 @@ const (
 	CommandSync      CommandName = "sync"
 	CommandEntities  CommandName = "entities"
 	CommandReview    CommandName = "review"
-	CommandAnalyze   CommandName = "analyze"
+	CommandQuery     CommandName = "query"
 	CommandDBMigrate CommandName = "db-migrate"
 	CommandDBStatus  CommandName = "db-status"
 	CommandDBReset   CommandName = "db-reset"
@@ -51,6 +63,10 @@ const (
 	ActionReject              Action = "reject"
 	ActionCreate              Action = "create"
 	ActionCorrect             Action = "correct"
+	ActionPoint               Action = "point"
+	ActionTrend               Action = "trend"
+	ActionTrajectory          Action = "trajectory"
+	ActionCausal              Action = "causal"
 )
 
 // Invocation is the validated, provider-neutral CLI input for one application command.
@@ -62,6 +78,7 @@ type Invocation struct {
 	ConfigValidation *ConfigValidationInput
 	CreatePerson     *CreatePersonInput
 	AcceptDirectory  *AcceptDirectoryInput
+	Query            *QueryInput
 }
 
 // Command executes a typed application invocation.
@@ -154,7 +171,6 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	root.AddCommand(serve)
 	root.AddCommand(leaf(string(CommandDoctor), CommandDoctor, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandSync), CommandSync, "", cobra.NoArgs))
-	root.AddCommand(leaf(string(CommandAnalyze), CommandAnalyze, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandDBMigrate), CommandDBMigrate, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandDBStatus), CommandDBStatus, "", cobra.NoArgs))
 	root.AddCommand(leaf(string(CommandDBReset)+" <confirmation>", CommandDBReset, "", cobra.ExactArgs(1)))
@@ -192,7 +208,7 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 		CommandSync,
 		CommandEntities,
 		CommandReview,
-		CommandAnalyze,
+		CommandQuery,
 		CommandDBMigrate,
 		CommandDBStatus,
 		CommandDBReset,
@@ -210,6 +226,98 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	auth.AddCommand(leaf(string(ActionAuthGoogle), CommandAuth, ActionAuthGoogle, cobra.NoArgs))
 	auth.AddCommand(leaf(string(ActionAuthGoogleDirectory), CommandAuth, ActionAuthGoogleDirectory, cobra.NoArgs))
 	root.AddCommand(auth)
+
+	queryCommand := invalidGroup(string(CommandQuery))
+	addQueryCommonFlags := func(command *cobra.Command, predicates bool) {
+		command.Flags().StringArray(queryEntityFlagName, nil, "canonical entity ID")
+		command.Flags().Var(newSingleStringFlag(string(query.EntityMatchAll)), queryEntityMatchFlagName, "entity matching policy")
+		if predicates {
+			command.Flags().StringArray(queryPredicateFlagName, nil, "exact observation predicate")
+		}
+		command.Flags().Var(newSingleStringFlag(""), queryKnownAsOfFlagName, "recorded-time RFC3339 cutoff")
+		command.Flags().Var(newSingleStringFlag(string(QueryOutputText)), queryOutputFlagName, "output format")
+		_ = command.MarkFlagRequired(queryEntityFlagName)
+	}
+	point := &cobra.Command{
+		Use:  string(ActionPoint),
+		Args: cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			input, err := parsePointQuery(command)
+			if err != nil {
+				return err
+			}
+			return execute(command, Invocation{
+				Command: CommandQuery,
+				Action:  ActionPoint,
+				Query:   &input,
+			})
+		},
+	}
+	addQueryCommonFlags(point, true)
+	point.Flags().Var(newSingleStringFlag(""), queryAtFlagName, "point RFC3339 instant")
+	_ = point.MarkFlagRequired(queryAtFlagName)
+	trend := &cobra.Command{
+		Use:  string(ActionTrend),
+		Args: cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			input, err := parseTrendQuery(command)
+			if err != nil {
+				return err
+			}
+			return execute(command, Invocation{
+				Command: CommandQuery,
+				Action:  ActionTrend,
+				Query:   &input,
+			})
+		},
+	}
+	addQueryCommonFlags(trend, true)
+	trend.Flags().Var(newSingleStringFlag(""), queryBeforeFlagName, "before half-open RFC3339 window")
+	trend.Flags().Var(newSingleStringFlag(""), queryAfterFlagName, "after half-open RFC3339 window")
+	_ = trend.MarkFlagRequired(queryBeforeFlagName)
+	_ = trend.MarkFlagRequired(queryAfterFlagName)
+	trajectory := &cobra.Command{
+		Use:  string(ActionTrajectory),
+		Args: cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			input, err := parseTrajectoryQuery(command)
+			if err != nil {
+				return err
+			}
+			return execute(command, Invocation{
+				Command: CommandQuery,
+				Action:  ActionTrajectory,
+				Query:   &input,
+			})
+		},
+	}
+	addQueryCommonFlags(trajectory, true)
+	trajectory.Flags().Var(newSingleStringFlag(""), queryBetweenFlagName, "half-open RFC3339 window")
+	trajectory.Flags().Var(newSingleStringFlag(""), queryLimitFlagName, "positive chronology limit")
+	_ = trajectory.MarkFlagRequired(queryBetweenFlagName)
+	_ = trajectory.MarkFlagRequired(queryLimitFlagName)
+	causal := &cobra.Command{
+		Use:  string(ActionCausal),
+		Args: cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			input, err := parseCausalQuery(command)
+			if err != nil {
+				return err
+			}
+			return execute(command, Invocation{
+				Command: CommandQuery,
+				Action:  ActionCausal,
+				Query:   &input,
+			})
+		},
+	}
+	addQueryCommonFlags(causal, false)
+	causal.Flags().Var(newSingleStringFlag(""), queryBetweenFlagName, "half-open RFC3339 window")
+	causal.Flags().Var(newSingleStringFlag(""), queryLimitFlagName, "positive chronology limit")
+	_ = causal.MarkFlagRequired(queryBetweenFlagName)
+	_ = causal.MarkFlagRequired(queryLimitFlagName)
+	queryCommand.AddCommand(point, trend, trajectory, causal)
+	root.AddCommand(queryCommand)
 
 	entities := &cobra.Command{Use: string(CommandEntities)}
 	entities.AddCommand(leaf(string(ActionList), CommandEntities, ActionList, cobra.NoArgs))
@@ -275,4 +383,30 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	root.AddCommand(review)
 
 	return root
+}
+
+type singleStringFlag struct {
+	value string
+	set   bool
+}
+
+func newSingleStringFlag(defaultValue string) *singleStringFlag {
+	return &singleStringFlag{value: defaultValue}
+}
+
+func (flag *singleStringFlag) Set(value string) error {
+	if flag.set {
+		return fmt.Errorf("flag may be provided only once")
+	}
+	flag.value = value
+	flag.set = true
+	return nil
+}
+
+func (flag *singleStringFlag) String() string {
+	return flag.value
+}
+
+func (*singleStringFlag) Type() string {
+	return "string"
 }

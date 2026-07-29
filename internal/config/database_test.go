@@ -121,7 +121,6 @@ func TestApplicationDatabaseCommandsRequireCanonicalDatabaseURL(t *testing.T) {
 		CommandSync,
 		CommandEntities,
 		CommandReview,
-		CommandAnalyze,
 	} {
 		command := command
 		t.Run(string(command), func(t *testing.T) {
@@ -134,6 +133,16 @@ func TestApplicationDatabaseCommandsRequireCanonicalDatabaseURL(t *testing.T) {
 				t.Fatalf("Settings.Validate(%q) error = %v, want canonical database URL rejection", command, err)
 			}
 		})
+	}
+}
+
+func TestQueryCommandRequiresCanonicalDatabaseURL(t *testing.T) {
+	settings := Settings{
+		Database: DatabaseSettings{Scopes: []DatabaseScope{DatabaseScopeCore}},
+		Query:    QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+	}
+	if err := settings.Validate(CommandQuery); err == nil || !strings.Contains(err.Error(), DatabaseURLEnvironmentVariable) {
+		t.Fatalf("Settings.Validate(query) error = %v, want canonical database URL rejection", err)
 	}
 }
 

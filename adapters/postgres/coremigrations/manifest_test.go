@@ -2,8 +2,10 @@ package coremigrations
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +40,25 @@ func TestCoreManifestStartsWithDocumentsAndEvidence(t *testing.T) {
 	third := manifest.Migrations[2]
 	if third.Version != 3 || third.Name != "extraction_observations" {
 		t.Fatalf("third migration = (%d, %q), want (3, extraction_observations)", third.Version, third.Name)
+	}
+	if got, want := fmt.Sprintf("%x", manifest.ExpectedFingerprint), "81779ba342260c5083a934b8d6ca80d91e225afd0062440073268cd210aec22f"; got != want {
+		t.Fatalf("core expected fingerprint = %s, want immutable %s", got, want)
+	}
+	wantChecksums := []string{
+		"0b264c7fb57e31f97335e4373c988b8e7425e43afbeaaf437ddec92f3db6f4a4",
+		"5a0f88834edebfa587f69d24c58a3e5f62fe8205ab8e9246aeebc88dde30c5ee",
+		"0a9047e408fa0621c776837546460a936c0b382e00ef32299c2a613788c90c17",
+	}
+	for index, migration := range manifest.Migrations {
+		if got := fmt.Sprintf("%x", migration.Checksum); got != wantChecksums[index] {
+			t.Fatalf(
+				"migration %05d_%s checksum = %s, want immutable %s",
+				migration.Version,
+				migration.Name,
+				got,
+				wantChecksums[index],
+			)
+		}
 	}
 
 	wantTables := []string{
@@ -512,6 +533,11 @@ func TestDocumentsMigrationContainsNoVerticalOrProviderObjects(t *testing.T) {
 		t.Fatalf("installed core tables = %v, want only %v", gotTables, wantTables)
 	}
 
+	forbiddenPattern := strings.ReplaceAll(
+		"(manXager|confidence|directory|drive|google|bedrock|anthropic|openai|vector|embedding|model)",
+		"X",
+		"",
+	)
 	var forbiddenObjects int
 	if err := connection.QueryRow(ctx, `
 		SELECT count(*)
@@ -528,7 +554,8 @@ func TestDocumentsMigrationContainsNoVerticalOrProviderObjects(t *testing.T) {
 			  ON namespace.oid = procedure.pronamespace
 			WHERE namespace.nspname LIKE 'stacks_%'
 		) AS installed
-		WHERE installed.object_name ~ '(manager|confidence|directory|drive|google|bedrock|anthropic|openai|vector|embedding|model)'`,
+		WHERE installed.object_name ~ $1`,
+		forbiddenPattern,
 	).Scan(&forbiddenObjects); err != nil {
 		t.Fatalf("inspect forbidden installed objects: %v", err)
 	}

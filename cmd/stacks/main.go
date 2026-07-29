@@ -25,7 +25,6 @@ import (
 	"github.com/JakeFAU/stacks/adapters/postgres/directorymigrations"
 	"github.com/JakeFAU/stacks/adapters/postgres/migration"
 
-	"stacks/internal/analysis"
 	"stacks/internal/app"
 	"stacks/internal/cli"
 	"stacks/internal/config"
@@ -39,6 +38,7 @@ import (
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
+	"stacks/internal/query"
 	"stacks/internal/source"
 	"stacks/internal/source/drive"
 )
@@ -158,10 +158,20 @@ type doctorDatabase interface {
 	Close()
 }
 
+type queryDatabase interface {
+	LoadTemporalQuerySnapshot(
+		context.Context,
+		postgres.TemporalQuerySelection,
+		postgres.TemporalSnapshotObserver,
+	) (postgres.TemporalQuerySnapshot, error)
+	Close()
+}
+
 type commandRuntime struct {
 	newDriveAuthorizer        func(string, string, io.Writer) cli.GoogleAuthorizer
 	newDirectoryAuthorizer    func(string, string, io.Writer) cli.GoogleAuthorizer
 	openDoctorDatabase        func(context.Context, string) (doctorDatabase, error)
+	openQueryDatabase         func(context.Context, string) (queryDatabase, error)
 	newDoctorGoogle           func(config.ApplicationSettings) doctor.Google
 	newDoctorDirectory        func(config.GoogleDirectorySettings) doctor.DirectoryProbe
 	newDoctorProviderProbe    func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error)
@@ -179,7 +189,6 @@ type canonicalRepositories struct {
 	directory directory.Repository
 	entities  cli.EntityStore
 	review    cli.CanonicalReviewRepository
-	analysis  analysis.Repository
 	close     func()
 }
 
@@ -196,6 +205,9 @@ func defaultCommandRuntime() commandRuntime {
 			return googledirectory.NewAuthorizer(clientFile, tokenFile, output)
 		},
 		openDoctorDatabase: func(ctx context.Context, databaseURL string) (doctorDatabase, error) {
+			return postgres.Open(ctx, databaseURL)
+		},
+		openQueryDatabase: func(ctx context.Context, databaseURL string) (queryDatabase, error) {
 			return postgres.Open(ctx, databaseURL)
 		},
 		newDoctorGoogle: func(settings config.ApplicationSettings) doctor.Google {
@@ -247,7 +259,6 @@ func defaultCommandRuntime() commandRuntime {
 				directory: directoryRepository,
 				entities:  reviewRepository,
 				review:    reviewRepository,
-				analysis:  analysis.PostgresRepository{Database: database},
 				close:     database.Close,
 			}, nil
 		},
@@ -526,38 +537,45 @@ func commandProviderWithRuntime(
 				Service: &cli.ReviewService{Store: store}, Output: stdout,
 			}).Run(ctx, invocation)
 		}),
-		string(config.CommandAnalyze): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
-			if err := settings.Validate(config.CommandAnalyze); err != nil {
+		string(config.CommandQuery): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
+			if err := settings.Validate(config.CommandQuery); err != nil {
 				return err
 			}
-			if err := requireRestrictedDisclosure(ctx, settings.Application.Model, runtime); err != nil {
+			if err := cli.ValidateQueryInvocation(invocation); err != nil {
 				return err
 			}
-			if runtime.openCanonicalRepositories == nil || runtime.newModel == nil {
-				return errors.New("analyze command dependencies are not configured")
+			limits := query.Limits{
+				MaxEntities:   settings.Query.MaxEntities,
+				MaxPredicates: settings.Query.MaxPredicates,
+				MaxChronology: settings.Query.MaxChronology,
 			}
-			repositories, err := runtime.openCanonicalRepositories(
-				ctx,
-				settings.Database.URL,
-				false,
-			)
+			if _, err := query.NormalizeRequest(invocation.Query.Request, limits); err != nil {
+				return err
+			}
+			if runtime.openQueryDatabase == nil {
+				return errors.New("query command dependencies are not configured")
+			}
+			database, err := runtime.openQueryDatabase(ctx, settings.Database.URL)
 			if err != nil {
-				return err
+				if cancellationErr := canonicalContextError(ctx, err); cancellationErr != nil {
+					return cancellationErr
+				}
+				return errors.New("open query database failed")
 			}
-			if repositories.close != nil {
-				defer repositories.close()
+			defer database.Close()
+			service := query.Service{
+				Reader: query.PostgresRepository{
+					Database: database,
+					SnapshotObserver: query.PostgresSnapshotObserver{
+						Tracer: tracer,
+					},
+				},
+				Limits: limits,
+				Tracer: tracer,
 			}
-			model, err := runtime.newModel(ctx, settings.Application.Model, invocations, tracer)
-			if err != nil {
-				return err
-			}
-			service := newAnalysisService(
-				settings.Application, repositories.analysis, model,
-				tracer, decisions, time.Now,
-			)
-			return (cli.AnalyzeCommand{
-				Service: service, EmployeeID: settings.Application.ManagerConfidence.EmployeeEntityID,
-				ManagerID: settings.Application.ManagerConfidence.ManagerEntityID, Output: stdout,
+			return (cli.QueryCommand{
+				Service: service,
+				Output:  stdout,
 			}).Run(ctx, invocation)
 		}),
 	}, nil
@@ -761,23 +779,6 @@ func waitForDirectoryRetry(ctx context.Context, delay time.Duration) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
-	}
-}
-
-func newAnalysisService(
-	settings config.ApplicationSettings,
-	repository analysis.Repository,
-	model extract.Model,
-	tracer trace.Tracer,
-	decisions analysis.DecisionRecorder,
-	now func() time.Time,
-) *analysis.Service {
-	return &analysis.Service{
-		Repository: repository, Model: model, PromptVersion: settings.ManagerConfidence.PromptVersion,
-		Provider: settings.Model.Provider, DataMode: settings.Model.DataMode,
-		Region: modelInvocation(settings.Model).Region, ModelID: strings.TrimSpace(settings.Model.ModelID),
-		MaxTokens: settings.Model.MaxOutputTokens, Tracer: tracer,
-		Decisions: decisions, Now: now,
 	}
 }
 

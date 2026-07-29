@@ -22,7 +22,7 @@ const (
 // facts; After is absent for removed facts.
 type Change struct {
 	Kind   ChangeKind
-	Key    string
+	Key    StateKey
 	Before *Fact
 	After  *Fact
 }
@@ -34,7 +34,7 @@ type Comparison struct {
 	BeforeFacts      []Fact
 	AfterFacts       []Fact
 	Changes          []Change
-	UnresolvedKeys   []string
+	UnresolvedKeys   []StateKey
 	BeforeUnresolved []UnresolvedFact
 	AfterUnresolved  []UnresolvedFact
 }
@@ -54,44 +54,38 @@ func CompareWindowSummaries(before, after WindowSummary) (Comparison, error) {
 		return Comparison{}, fmt.Errorf("comparison windows must be ordered by start time")
 	}
 
-	keys := make(map[string]struct{}, len(beforeFacts)+len(afterFacts)+len(beforeUnresolved)+len(afterUnresolved))
-	for key := range beforeFacts {
-		keys[key] = struct{}{}
+	keys := make(map[stateKeyIdentity]StateKey, len(beforeFacts)+len(afterFacts)+len(beforeUnresolved)+len(afterUnresolved))
+	for identity, fact := range beforeFacts {
+		keys[identity] = fact.Key
 	}
-	for key := range afterFacts {
-		keys[key] = struct{}{}
+	for identity, fact := range afterFacts {
+		keys[identity] = fact.Key
 	}
-	for key := range beforeUnresolved {
-		keys[key] = struct{}{}
+	for identity, item := range beforeUnresolved {
+		keys[identity] = item.Key
 	}
-	for key := range afterUnresolved {
-		keys[key] = struct{}{}
+	for identity, item := range afterUnresolved {
+		keys[identity] = item.Key
 	}
-	orderedKeys := make([]string, 0, len(keys))
-	for key := range keys {
+	orderedKeys := make([]StateKey, 0, len(keys))
+	for _, key := range keys {
 		orderedKeys = append(orderedKeys, key)
 	}
-	sort.Strings(orderedKeys)
+	sort.Slice(orderedKeys, func(left, right int) bool { return CompareStateKeys(orderedKeys[left], orderedKeys[right]) < 0 })
 
-	comparison := Comparison{
-		Before:           before.Selection,
-		After:            after.Selection,
-		BeforeFacts:      orderedFacts(beforeFacts),
-		AfterFacts:       orderedFacts(afterFacts),
-		BeforeUnresolved: orderedUnresolved(beforeUnresolved),
-		AfterUnresolved:  orderedUnresolved(afterUnresolved),
-	}
+	comparison := Comparison{Before: before.Selection, After: after.Selection, BeforeFacts: orderedFacts(beforeFacts), AfterFacts: orderedFacts(afterFacts), BeforeUnresolved: orderedUnresolved(beforeUnresolved), AfterUnresolved: orderedUnresolved(afterUnresolved)}
 	for _, key := range orderedKeys {
-		if _, unresolved := beforeUnresolved[key]; unresolved {
+		identity := identityForStateKey(key)
+		if _, unresolved := beforeUnresolved[identity]; unresolved {
 			comparison.UnresolvedKeys = append(comparison.UnresolvedKeys, key)
 			continue
 		}
-		if _, unresolved := afterUnresolved[key]; unresolved {
+		if _, unresolved := afterUnresolved[identity]; unresolved {
 			comparison.UnresolvedKeys = append(comparison.UnresolvedKeys, key)
 			continue
 		}
-		beforeFact, inBefore := beforeFacts[key]
-		afterFact, inAfter := afterFacts[key]
+		beforeFact, inBefore := beforeFacts[identity]
+		afterFact, inAfter := afterFacts[identity]
 		switch {
 		case !inBefore && inAfter:
 			afterCopy := cloneFact(afterFact)
@@ -99,42 +93,35 @@ func CompareWindowSummaries(before, after WindowSummary) (Comparison, error) {
 		case inBefore && !inAfter:
 			beforeCopy := cloneFact(beforeFact)
 			comparison.Changes = append(comparison.Changes, Change{Kind: ChangeRemoved, Key: key, Before: &beforeCopy})
-		case inBefore && inAfter && beforeFact.Value != afterFact.Value:
-			beforeCopy := cloneFact(beforeFact)
-			afterCopy := cloneFact(afterFact)
-			comparison.Changes = append(comparison.Changes, Change{
-				Kind:   ChangeChanged,
-				Key:    key,
-				Before: &beforeCopy,
-				After:  &afterCopy,
-			})
+		case inBefore && inAfter && CompareTerms(beforeFact.Value, afterFact.Value) != 0:
+			beforeCopy, afterCopy := cloneFact(beforeFact), cloneFact(afterFact)
+			comparison.Changes = append(comparison.Changes, Change{Kind: ChangeChanged, Key: key, Before: &beforeCopy, After: &afterCopy})
 		}
 	}
 	return comparison, nil
 }
 
-func validateSummary(name string, summary WindowSummary) (map[string]Fact, map[string]UnresolvedFact, error) {
+func validateSummary(name string, summary WindowSummary) (map[stateKeyIdentity]Fact, map[stateKeyIdentity]UnresolvedFact, error) {
 	if summary.Selection.kind != SelectionWindow {
 		return nil, nil, fmt.Errorf("%s summary requires a window selection", name)
 	}
-
-	facts := make(map[string]Fact, len(summary.Facts))
+	facts := make(map[stateKeyIdentity]Fact, len(summary.Facts))
 	for _, fact := range summary.Facts {
 		normalized, err := validateFact(name, fact)
 		if err != nil {
 			return nil, nil, err
 		}
-		if _, exists := facts[normalized.Key]; exists {
+		identity := identityForStateKey(normalized.Key)
+		if _, exists := facts[identity]; exists {
 			return nil, nil, fmt.Errorf("%s summary fact keys must be unique", name)
 		}
-		facts[normalized.Key] = normalized
+		facts[identity] = normalized
 	}
 
-	unresolved := make(map[string]UnresolvedFact, len(summary.Unresolved))
+	unresolved := make(map[stateKeyIdentity]UnresolvedFact, len(summary.Unresolved))
 	for _, item := range summary.Unresolved {
-		item.Key = strings.TrimSpace(item.Key)
-		if item.Key == "" {
-			return nil, nil, fmt.Errorf("%s summary unresolved key is required", name)
+		if err := validateStateKey(item.Key); err != nil {
+			return nil, nil, fmt.Errorf("%s summary unresolved key: %w", name, err)
 		}
 		if !item.Reason.valid() {
 			return nil, nil, fmt.Errorf("%s summary unresolved reason is invalid", name)
@@ -145,44 +132,43 @@ func validateSummary(name string, summary WindowSummary) (map[string]Fact, map[s
 		if item.Reason == UnresolvedConflict && len(item.Candidates) < 2 {
 			return nil, nil, fmt.Errorf("%s summary conflict requires at least two candidates", name)
 		}
-		if _, exists := unresolved[item.Key]; exists {
+		identity := identityForStateKey(item.Key)
+		if _, exists := unresolved[identity]; exists {
 			return nil, nil, fmt.Errorf("%s summary unresolved keys must be unique", name)
 		}
-		if _, exists := facts[item.Key]; exists {
+		if _, exists := facts[identity]; exists {
 			return nil, nil, fmt.Errorf("%s summary key cannot be both resolved and unresolved", name)
 		}
-
 		candidates := make([]Fact, len(item.Candidates))
-		seenValues := make(map[string]struct{}, len(item.Candidates))
+		seenValues := make(map[termIdentity]struct{}, len(item.Candidates))
 		for index, candidate := range item.Candidates {
-			candidate.Key = strings.TrimSpace(candidate.Key)
-			if candidate.Key != item.Key {
+			if CompareStateKeys(candidate.Key, item.Key) != 0 {
 				return nil, nil, fmt.Errorf("%s summary unresolved candidate key must match its parent", name)
 			}
 			normalized, err := validateFact(name, candidate)
 			if err != nil {
 				return nil, nil, err
 			}
-			if _, exists := seenValues[normalized.Value]; exists {
+			valueIdentity := identityForTerm(normalized.Value)
+			if _, exists := seenValues[valueIdentity]; exists {
 				return nil, nil, fmt.Errorf("%s summary unresolved candidate values must be unique", name)
 			}
-			seenValues[normalized.Value] = struct{}{}
+			seenValues[valueIdentity] = struct{}{}
 			candidates[index] = normalized
 		}
-		sort.Slice(candidates, func(left, right int) bool {
-			return candidates[left].Value < candidates[right].Value
-		})
+		sort.Slice(candidates, func(left, right int) bool { return CompareTerms(candidates[left].Value, candidates[right].Value) < 0 })
 		item.Candidates = candidates
-		unresolved[item.Key] = item
+		unresolved[identity] = item
 	}
 	return facts, unresolved, nil
 }
 
 func validateFact(name string, fact Fact) (Fact, error) {
-	fact.Key = strings.TrimSpace(fact.Key)
-	fact.Value = strings.TrimSpace(fact.Value)
-	if fact.Key == "" || fact.Value == "" {
-		return Fact{}, fmt.Errorf("%s summary fact key and value are required", name)
+	if err := validateStateKey(fact.Key); err != nil {
+		return Fact{}, fmt.Errorf("%s summary fact key: %w", name, err)
+	}
+	if err := validateCanonicalTerm("summary fact value", fact.Value); err != nil {
+		return Fact{}, fmt.Errorf("%s %w", name, err)
 	}
 	if len(fact.ObservationIDs) == 0 {
 		return Fact{}, fmt.Errorf("%s summary fact observation provenance is required", name)
@@ -190,7 +176,6 @@ func validateFact(name string, fact Fact) (Fact, error) {
 	if len(fact.SupportingEvidenceIDs)+len(fact.ContradictingEvidenceIDs) == 0 {
 		return Fact{}, fmt.Errorf("%s summary fact evidence is required", name)
 	}
-
 	observationIDs, err := normalizeObservationIDs(name, fact.ObservationIDs)
 	if err != nil {
 		return Fact{}, err
@@ -203,53 +188,36 @@ func validateFact(name string, fact Fact) (Fact, error) {
 	if err != nil {
 		return Fact{}, err
 	}
-	fact.ObservationIDs = observationIDs
-	fact.SupportingEvidenceIDs = supportingEvidenceIDs
-	fact.ContradictingEvidenceIDs = contradictingEvidenceIDs
+	fact.ObservationIDs, fact.SupportingEvidenceIDs, fact.ContradictingEvidenceIDs = observationIDs, supportingEvidenceIDs, contradictingEvidenceIDs
 	return fact, nil
 }
 
 func (reason UnresolvedReason) valid() bool {
 	switch reason {
-	case UnresolvedConflict,
-		UnresolvedTransition,
-		UnresolvedTemporalUncertainty,
-		UnresolvedHypothesis,
-		UnresolvedCounterevidenceOnly:
+	case UnresolvedConflict, UnresolvedTransition, UnresolvedTemporalUncertainty, UnresolvedHypothesis, UnresolvedCounterevidenceOnly:
 		return true
 	default:
 		return false
 	}
 }
-
-func orderedFacts(facts map[string]Fact) []Fact {
-	keys := make([]string, 0, len(facts))
-	for key := range facts {
-		keys = append(keys, key)
+func orderedFacts(facts map[stateKeyIdentity]Fact) []Fact {
+	ordered := make([]Fact, 0, len(facts))
+	for _, fact := range facts {
+		ordered = append(ordered, cloneFact(fact))
 	}
-	sort.Strings(keys)
-	ordered := make([]Fact, 0, len(keys))
-	for _, key := range keys {
-		ordered = append(ordered, cloneFact(facts[key]))
-	}
+	sort.Slice(ordered, func(left, right int) bool { return CompareStateKeys(ordered[left].Key, ordered[right].Key) < 0 })
 	return ordered
 }
-
-func orderedUnresolved(items map[string]UnresolvedFact) []UnresolvedFact {
-	keys := make([]string, 0, len(items))
-	for key := range items {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	ordered := make([]UnresolvedFact, 0, len(keys))
-	for _, key := range keys {
-		item := items[key]
+func orderedUnresolved(items map[stateKeyIdentity]UnresolvedFact) []UnresolvedFact {
+	ordered := make([]UnresolvedFact, 0, len(items))
+	for _, item := range items {
 		item.Candidates = append([]Fact(nil), item.Candidates...)
 		for index := range item.Candidates {
 			item.Candidates[index] = cloneFact(item.Candidates[index])
 		}
 		ordered = append(ordered, item)
 	}
+	sort.Slice(ordered, func(left, right int) bool { return CompareStateKeys(ordered[left].Key, ordered[right].Key) < 0 })
 	return ordered
 }
 
@@ -267,12 +235,9 @@ func normalizeObservationIDs(name string, values []observation.ObservationID) ([
 		seen[value] = struct{}{}
 		normalized[index] = value
 	}
-	sort.Slice(normalized, func(left, right int) bool {
-		return normalized[left] < normalized[right]
-	})
+	sort.Slice(normalized, func(left, right int) bool { return normalized[left] < normalized[right] })
 	return normalized, nil
 }
-
 func normalizeEvidenceIDs(name, role string, values []evidence.EvidenceID) ([]evidence.EvidenceID, error) {
 	normalized := make([]evidence.EvidenceID, len(values))
 	seen := make(map[evidence.EvidenceID]struct{}, len(values))
@@ -287,12 +252,9 @@ func normalizeEvidenceIDs(name, role string, values []evidence.EvidenceID) ([]ev
 		seen[value] = struct{}{}
 		normalized[index] = value
 	}
-	sort.Slice(normalized, func(left, right int) bool {
-		return normalized[left] < normalized[right]
-	})
+	sort.Slice(normalized, func(left, right int) bool { return normalized[left] < normalized[right] })
 	return normalized, nil
 }
-
 func cloneFact(fact Fact) Fact {
 	fact.ObservationIDs = append([]observation.ObservationID(nil), fact.ObservationIDs...)
 	fact.SupportingEvidenceIDs = append([]evidence.EvidenceID(nil), fact.SupportingEvidenceIDs...)

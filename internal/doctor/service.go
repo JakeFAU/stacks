@@ -1,6 +1,7 @@
-// Package doctor performs bounded, read-only preflight checks for the manager
-// confidence workflow. Provider errors are deliberately converted to fixed
-// messages so private identifiers and account details cannot reach the CLI.
+// Package doctor performs bounded, read-only dependency, migration, source,
+// and provider preflight checks. Provider errors are deliberately converted to
+// fixed messages so private identifiers and account details cannot reach the
+// CLI.
 package doctor
 
 import (

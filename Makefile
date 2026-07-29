@@ -9,12 +9,7 @@ case "$$STACKS_MAKE_ENV_FILE" in \
 esac;
 endef
 
-.PHONY: analyze auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up review run staticcheck sync test test-env-file test-integration test-race
-
-analyze:
-	@$(resolve_env_file_path) \
-	test -f "$$env_file_path" || { printf 'copy .env.example to %s and configure the application\n' "$$STACKS_MAKE_ENV_FILE" >&2; exit 1; }; \
-	set -a; . "$$env_file_path"; set +a; go run ./cmd/stacks analyze
+.PHONY: auth-google auth-google-directory build db-down db-migrate db-reset db-status db-up doctor entities fmt modules-check obs-config obs-down obs-up query-trend review run staticcheck sync test test-env-file test-integration test-integration-contract test-race test-retired-analysis-terminology
 
 auth-google:
 	@$(resolve_env_file_path) \
@@ -85,6 +80,11 @@ obs-down:
 obs-up:
 	docker compose -f compose.observability.yaml up --detach
 
+query-trend:
+	@$(resolve_env_file_path) \
+	test -f "$$env_file_path" || { printf 'copy .env.example to %s and configure the query database\n' "$$STACKS_MAKE_ENV_FILE" >&2; exit 1; }; \
+	set -a; . "$$env_file_path"; set +a; go run ./cmd/stacks query trend $(ARGS)
+
 review:
 	@$(resolve_env_file_path) \
 	test -f "$$env_file_path" || { printf 'copy .env.example to %s and configure the application\n' "$$STACKS_MAKE_ENV_FILE" >&2; exit 1; }; \
@@ -98,13 +98,19 @@ sync:
 	test -f "$$env_file_path" || { printf 'copy .env.example to %s and configure the application\n' "$$STACKS_MAKE_ENV_FILE" >&2; exit 1; }; \
 	set -a; . "$$env_file_path"; set +a; go run ./cmd/stacks sync
 
-test: test-env-file
+test: test-env-file test-integration-contract test-retired-analysis-terminology
 	@sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' modules.txt | while IFS= read -r module; do \
 		(cd "$$module" && go test ./...) || exit; \
 	done
 
 test-env-file:
 	sh scripts/check-env-file-loading.sh
+
+test-integration-contract:
+	sh scripts/check-test-integration-packages.sh
+
+test-retired-analysis-terminology:
+	sh scripts/check-retired-analysis-terminology.sh
 
 test-race:
 	@sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' modules.txt | while IFS= read -r module; do \
@@ -120,7 +126,7 @@ test-integration:
 		test -n "$$STACKS_TEST_MIGRATION_DATABASE_URL" || (echo "STACKS_TEST_MIGRATION_DATABASE_URL is required" >&2; exit 1); \
 		(cd adapters/postgres && GOWORK=off go run ./cmd/validate-test-database) && \
 		(cd adapters/postgres && GOWORK=off go test ./... -count=1) && \
-		go test ./internal/ingest ./internal/directory ./internal/analysis ./internal/app ./internal/doctor -count=1
+		go test ./internal/ingest ./internal/directory ./internal/app ./internal/doctor ./internal/query -count=1
 
 staticcheck:
 	@sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' modules.txt | while IFS= read -r module; do \

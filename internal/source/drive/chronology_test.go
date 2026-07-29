@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/JakeFAU/stacks/core/evidence"
-	"stacks/internal/analysis"
+	"github.com/JakeFAU/stacks/core/observation"
 	"stacks/internal/entity"
 	"stacks/internal/extract"
 	"stacks/internal/ingest"
@@ -26,7 +26,7 @@ type chronologyDocument struct {
 	direction  string
 }
 
-func TestDriveMeetingTitleDatesFlowThroughSyncIntoAnalysisChronology(t *testing.T) {
+func TestDriveMeetingTitleDatesFlowThroughSyncIntoCanonicalChronology(t *testing.T) {
 	documents := []chronologyDocument{
 		{
 			id: "meeting-earlier", title: "[2026-06-03] Synthetic weekly meeting",
@@ -91,54 +91,45 @@ func TestDriveMeetingTitleDatesFlowThroughSyncIntoAnalysisChronology(t *testing.
 		t.Fatalf("sync summary/model calls = %#v/%d, want four completed source documents", summary, model.calls)
 	}
 
-	var dated, contentDated []analysis.Signal
 	for index, result := range summary.Results {
 		completion := repository.completions[result.VersionID]
 		if len(completion.Observations) != 1 {
 			t.Fatalf("completion %d = %#v, want one canonical observation", index, completion)
 		}
-		observation := completion.Observations[0]
-		category, direction, err := analysis.ParseInteractionObservationPredicate(observation.Predicate)
+		draft := completion.Observations[0]
+		category, direction, err := extract.ParseInteractionObservationPredicate(draft.Predicate)
 		if err != nil {
 			t.Fatalf("completion %d predicate error = %v", index, err)
 		}
-		var validTime *time.Time
-		if instant, ok := observation.ValidTime.Instant(); ok {
-			validTime = &instant
+		if category != extract.SignalCategoryScrutinyCorrection ||
+			direction != documents[index].direction {
+			t.Fatalf(
+				"completion %d interaction = (%q, %q), want (%q, %q)",
+				index,
+				category,
+				direction,
+				extract.SignalCategoryScrutinyCorrection,
+				documents[index].direction,
+			)
 		}
-		converted := analysis.Signal{
-			ID: string(observation.ID), MeetingID: result.DocumentID,
-			Category: category, Direction: direction,
-			ValidTime: validTime, Validated: true, TranscriptBacked: true,
-		}
-		if index < 2 {
-			dated = append(dated, converted)
-		} else {
-			contentDated = append(contentDated, converted)
-		}
-	}
 
-	if got := analysis.AdmitConclusion(analysis.AdmissionInput{
-		PairAccepted: true, Proposed: analysis.StatusPossibleDecline, Signals: dated,
-		SupportingSignalIDs: []string{dated[0].ID, dated[1].ID},
-	}); got != analysis.StatusPossibleDecline {
-		t.Fatalf("dated source-title admission = %q, want %q", got, analysis.StatusPossibleDecline)
-	}
-	wantEarlier := time.Date(2026, time.June, 3, 0, 0, 0, 0, time.UTC)
-	wantLater := time.Date(2026, time.July, 8, 0, 0, 0, 0, time.UTC)
-	if dated[0].ValidTime == nil || !dated[0].ValidTime.Equal(wantEarlier) ||
-		dated[1].ValidTime == nil || !dated[1].ValidTime.Equal(wantLater) {
-		t.Fatalf("dated source times = %v/%v, want title-derived %v/%v", dated[0].ValidTime, dated[1].ValidTime, wantEarlier, wantLater)
-	}
-	if got := analysis.AdmitConclusion(analysis.AdmissionInput{
-		PairAccepted: true, Proposed: analysis.StatusPossibleDecline, Signals: contentDated,
-		SupportingSignalIDs: []string{contentDated[0].ID, contentDated[1].ID},
-	}); got != analysis.StatusInsufficientEvidence {
-		t.Fatalf("deadline/unused-date admission = %q, want no chronology from arbitrary content dates", got)
-	}
-	for index, signal := range contentDated {
-		if signal.ValidTime != nil {
-			t.Fatalf("content-dated signal %d valid time = %v, want unknown", index, signal.ValidTime)
+		if index < 2 {
+			want := []time.Time{
+				time.Date(2026, time.June, 3, 0, 0, 0, 0, time.UTC),
+				time.Date(2026, time.July, 8, 0, 0, 0, 0, time.UTC),
+			}[index]
+			got, ok := draft.ValidTime.Instant()
+			if !ok || !got.Equal(want) {
+				t.Fatalf("completion %d valid time = %#v, want title-derived instant %v", index, draft.ValidTime, want)
+			}
+			continue
+		}
+		if draft.ValidTime.Kind() != observation.TemporalUnknown {
+			t.Fatalf(
+				"completion %d valid time kind = %q, want unknown despite model/content date",
+				index,
+				draft.ValidTime.Kind(),
+			)
 		}
 	}
 }

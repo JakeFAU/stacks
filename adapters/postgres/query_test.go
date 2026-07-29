@@ -340,63 +340,63 @@ func TestObservationQueryResolvesCurrentIdentityAndAdmission(t *testing.T) {
 
 func TestRelationshipSnapshotUsesCurrentAcceptedAuthorityAndCorrectionWithoutIdentityAdmission(t *testing.T) {
 	fixture := newObservationRepositoryFixture(t)
-	manager := canonicalEntity(
+	participantA := canonicalEntity(
 		t,
-		"entity:opaque/snapshot-manager",
-		"Synthetic Manager",
+		"entity:opaque/snapshot-participant-a",
+		"Synthetic Participant A",
 	)
-	employee := canonicalEntity(
+	participantB := canonicalEntity(
 		t,
-		"entity:opaque/snapshot-employee",
-		"Synthetic Employee",
+		"entity:opaque/snapshot-participant-b",
+		"Synthetic Participant B",
 	)
-	correctedManager := canonicalEntity(
+	correctedParticipantA := canonicalEntity(
 		t,
-		"entity:opaque/snapshot-corrected-manager",
-		"Synthetic Corrected Manager",
+		"entity:opaque/snapshot-corrected-participant-a",
+		"Synthetic Corrected Participant A",
 	)
-	managerMention := canonicalMention(
+	participantAMention := canonicalMention(
 		t,
-		"mention:opaque/snapshot-manager",
+		"mention:opaque/snapshot-participant-a",
 		fixture.evidence[0],
-		"Synthetic Manager",
+		"Synthetic Participant A",
 		"",
 	)
-	employeeMention := canonicalMention(
+	participantBMention := canonicalMention(
 		t,
-		"mention:opaque/snapshot-employee",
+		"mention:opaque/snapshot-participant-b",
 		fixture.evidence[1],
-		"Synthetic Employee",
+		"Synthetic Participant B",
 		"",
 	)
-	managerProposal := canonicalProposal(
+	participantAProposal := canonicalProposal(
 		t,
-		"proposal:opaque/snapshot-manager",
-		managerMention.ID(),
+		"proposal:opaque/snapshot-participant-a",
+		participantAMention.ID(),
 		fixture.evidence[0],
 	)
-	employeeProposal := canonicalProposal(
+	participantBProposal := canonicalProposal(
 		t,
-		"proposal:opaque/snapshot-employee",
-		employeeMention.ID(),
+		"proposal:opaque/snapshot-participant-b",
+		participantBMention.ID(),
 		fixture.evidence[1],
 	)
-	managerDecision := canonicalResolutionDecision(
+	participantADecision := canonicalResolutionDecision(
 		t,
-		"decision:opaque/snapshot-manager",
-		managerProposal.ID(),
+		"decision:opaque/snapshot-participant-a",
+		participantAProposal.ID(),
 		identity.DecisionAccepted,
-		manager.ID(),
+		participantA.ID(),
 		identity.AuthorityReviewer,
 		"",
 		observationRecordedAt.Add(time.Minute),
 	)
-	employeeDecision := canonicalResolutionDecision(
+	participantBDecision := canonicalResolutionDecision(
 		t,
-		"decision:opaque/snapshot-employee",
-		employeeProposal.ID(),
+		"decision:opaque/snapshot-participant-b",
+		participantBProposal.ID(),
 		identity.DecisionAccepted,
-		employee.ID(),
+		participantB.ID(),
 		identity.AuthorityReviewer,
 		"",
 		observationRecordedAt.Add(time.Minute),
@@ -405,25 +405,25 @@ func TestRelationshipSnapshotUsesCurrentAcceptedAuthorityAndCorrectionWithoutIde
 		fixture.ctx,
 		func(transaction *postgres.Transaction) error {
 			for _, entity := range []identity.Entity{
-				manager,
-				employee,
-				correctedManager,
+				participantA,
+				participantB,
+				correctedParticipantA,
 			} {
 				if _, err := transaction.PutEntity(fixture.ctx, entity); err != nil {
 					return err
 				}
 			}
 			for _, mention := range []identity.MentionRecord{
-				managerMention,
-				employeeMention,
+				participantAMention,
+				participantBMention,
 			} {
 				if _, err := transaction.PutMention(fixture.ctx, mention); err != nil {
 					return err
 				}
 			}
 			for _, proposal := range []identity.ResolutionProposal{
-				managerProposal,
-				employeeProposal,
+				participantAProposal,
+				participantBProposal,
 			} {
 				if _, err := transaction.PutResolutionProposal(
 					fixture.ctx,
@@ -433,8 +433,8 @@ func TestRelationshipSnapshotUsesCurrentAcceptedAuthorityAndCorrectionWithoutIde
 				}
 			}
 			for _, decision := range []identity.ResolutionDecision{
-				managerDecision,
-				employeeDecision,
+				participantADecision,
+				participantBDecision,
 			} {
 				if err := transaction.AppendResolutionDecision(
 					fixture.ctx,
@@ -450,20 +450,20 @@ func TestRelationshipSnapshotUsesCurrentAcceptedAuthorityAndCorrectionWithoutIde
 		t.Fatalf("persist snapshot identity authority: %v", err)
 	}
 
-	managerTerm, err := observation.NewMentionTerm(string(managerMention.ID()))
+	participantATerm, err := observation.NewMentionTerm(string(participantAMention.ID()))
 	if err != nil {
-		t.Fatalf("observation.NewMentionTerm(manager) error = %v", err)
+		t.Fatalf("observation.NewMentionTerm(participant A) error = %v", err)
 	}
-	employeeTerm, err := observation.NewMentionTerm(string(employeeMention.ID()))
+	participantBTerm, err := observation.NewMentionTerm(string(participantBMention.ID()))
 	if err != nil {
-		t.Fatalf("observation.NewMentionTerm(employee) error = %v", err)
+		t.Fatalf("observation.NewMentionTerm(participant B) error = %v", err)
 	}
 	value := canonicalObservation(
 		t,
 		"observation:opaque/relationship-snapshot",
-		managerTerm,
+		participantATerm,
 		"collaboration.supports",
-		employeeTerm,
+		participantBTerm,
 		observation.UnknownTime(),
 		observationRecordedAt.Add(3*time.Minute),
 		observation.StatusObserved,
@@ -497,8 +497,8 @@ func TestRelationshipSnapshotUsesCurrentAcceptedAuthorityAndCorrectionWithoutIde
 
 	snapshot, err := fixture.database.LoadRelationshipSnapshot(
 		fixture.ctx,
-		manager.ID(),
-		employee.ID(),
+		participantA.ID(),
+		participantB.ID(),
 	)
 	if err != nil {
 		t.Fatalf("LoadRelationshipSnapshot() error = %v", err)
@@ -512,12 +512,12 @@ func TestRelationshipSnapshotUsesCurrentAcceptedAuthorityAndCorrectionWithoutIde
 
 	correction := canonicalResolutionDecision(
 		t,
-		"decision:opaque/snapshot-manager-correction",
-		managerProposal.ID(),
+		"decision:opaque/snapshot-participant-a-correction",
+		participantAProposal.ID(),
 		identity.DecisionAccepted,
-		correctedManager.ID(),
+		correctedParticipantA.ID(),
 		identity.AuthorityReviewer,
-		managerDecision.ID(),
+		participantADecision.ID(),
 		observationRecordedAt.Add(5*time.Minute),
 	)
 	if err := fixture.database.InTransaction(
@@ -535,8 +535,8 @@ func TestRelationshipSnapshotUsesCurrentAcceptedAuthorityAndCorrectionWithoutIde
 
 	original, err := fixture.database.LoadRelationshipSnapshot(
 		fixture.ctx,
-		manager.ID(),
-		employee.ID(),
+		participantA.ID(),
+		participantB.ID(),
 	)
 	if err != nil {
 		t.Fatalf("LoadRelationshipSnapshot(original after correction) error = %v", err)
@@ -547,11 +547,11 @@ func TestRelationshipSnapshotUsesCurrentAcceptedAuthorityAndCorrectionWithoutIde
 	}
 	corrected, err := fixture.database.LoadRelationshipSnapshot(
 		fixture.ctx,
-		correctedManager.ID(),
-		employee.ID(),
+		correctedParticipantA.ID(),
+		participantB.ID(),
 	)
 	if err != nil {
-		t.Fatalf("LoadRelationshipSnapshot(corrected pair) error = %v", err)
+		t.Fatalf("LoadRelationshipSnapshot(corrected participants) error = %v", err)
 	}
 	if !corrected.SubjectAccepted ||
 		!corrected.ObjectAccepted ||

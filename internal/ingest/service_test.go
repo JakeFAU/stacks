@@ -1453,6 +1453,20 @@ func TestCompletionBuildsCanonicalCompatibleObservationDraft(t *testing.T) {
 	if draft.Predicate != "stacks.interaction.v1/future_responsibility/strengthening" {
 		t.Fatalf("draft predicate = %q", draft.Predicate)
 	}
+	category, direction, err := extract.ParseInteractionObservationPredicate(draft.Predicate)
+	if err != nil {
+		t.Fatalf("ParseInteractionObservationPredicate() error = %v", err)
+	}
+	if category != extract.SignalCategoryFutureResponsibility ||
+		direction != extract.SignalDirectionStrengthening {
+		t.Fatalf(
+			"parsed interaction = (%q, %q), want (%q, %q)",
+			category,
+			direction,
+			extract.SignalCategoryFutureResponsibility,
+			extract.SignalDirectionStrengthening,
+		)
+	}
 	instant, ok := draft.ValidTime.Instant()
 	if !ok || !instant.Equal(meetingDate) {
 		t.Fatalf("draft valid time = %#v, want AtTime(%v)", draft.ValidTime, meetingDate)

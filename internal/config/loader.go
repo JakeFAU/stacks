@@ -50,7 +50,9 @@ const (
 	configKeyIngestionLeaseDuration    = "ingestion.lease_duration"
 	configKeyIngestionAttemptTimeout   = "ingestion.attempt_timeout"
 	configKeyExtractionPromptVersion   = "extraction.prompt_version"
-	configKeyAnalysisPromptVersion     = "analysis.prompt_version"
+	configKeyQueryMaxEntities          = "query.max_entities"
+	configKeyQueryMaxPredicates        = "query.max_predicates"
+	configKeyQueryMaxChronology        = "query.max_chronology"
 )
 
 type environmentBinding struct {
@@ -94,7 +96,9 @@ func configurationEnvironmentBindings() []environmentBinding {
 		{configKeyIngestionLeaseDuration, IngestionLeaseDurationEnvironmentVariable},
 		{configKeyIngestionAttemptTimeout, IngestionAttemptTimeoutEnvironmentVariable},
 		{configKeyExtractionPromptVersion, ExtractionPromptVersionEnvironmentVariable},
-		{configKeyAnalysisPromptVersion, AnalysisPromptVersionEnvironmentVariable},
+		{configKeyQueryMaxEntities, QueryMaxEntitiesEnvironmentVariable},
+		{configKeyQueryMaxPredicates, QueryMaxPredicatesEnvironmentVariable},
+		{configKeyQueryMaxChronology, QueryMaxChronologyEnvironmentVariable},
 	}
 }
 
@@ -150,7 +154,9 @@ func setDefaults(values *viper.Viper) {
 	values.SetDefault(configKeyIngestionLeaseDuration, defaultIngestionLeaseDuration)
 	values.SetDefault(configKeyIngestionAttemptTimeout, defaultIngestionAttemptTimeout)
 	values.SetDefault(configKeyExtractionPromptVersion, defaultExtractionPromptVersion)
-	values.SetDefault(configKeyAnalysisPromptVersion, defaultAnalysisPromptVersion)
+	values.SetDefault(configKeyQueryMaxEntities, defaultQueryMaxEntities)
+	values.SetDefault(configKeyQueryMaxPredicates, defaultQueryMaxPredicates)
+	values.SetDefault(configKeyQueryMaxChronology, defaultQueryMaxChronology)
 }
 
 func bindEnvironment(values *viper.Viper) error {
@@ -315,7 +321,15 @@ func settingsFrom(values *viper.Viper) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	analysisPromptVersion, err := defaultedStringValue(values, configKeyAnalysisPromptVersion, AnalysisPromptVersionEnvironmentVariable, defaultAnalysisPromptVersion)
+	queryMaxEntities, err := boundedIntegerValue(values, configKeyQueryMaxEntities, QueryMaxEntitiesEnvironmentVariable, maximumQueryEntities)
+	if err != nil {
+		return Settings{}, err
+	}
+	queryMaxPredicates, err := boundedIntegerValue(values, configKeyQueryMaxPredicates, QueryMaxPredicatesEnvironmentVariable, maximumQueryPredicates)
+	if err != nil {
+		return Settings{}, err
+	}
+	queryMaxChronology, err := boundedIntegerValue(values, configKeyQueryMaxChronology, QueryMaxChronologyEnvironmentVariable, maximumQueryChronology)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -332,6 +346,9 @@ func settingsFrom(values *viper.Viper) (Settings, error) {
 			URL: os.Getenv(DatabaseURLEnvironmentVariable), MigrationURL: os.Getenv(MigrationDatabaseURLEnvironmentVariable),
 			Scopes: databaseScopes, ApplicationRole: applicationRole,
 		},
+		Query: QuerySettings{
+			MaxEntities: queryMaxEntities, MaxPredicates: queryMaxPredicates, MaxChronology: queryMaxChronology,
+		},
 		Application: ApplicationSettings{
 			GoogleFolderID: googleFolderID, GoogleOAuthClientFile: googleOAuthClientFile, GoogleOAuthTokenFile: googleOAuthTokenFile,
 			Directory: GoogleDirectorySettings{
@@ -347,9 +364,6 @@ func settingsFrom(values *viper.Viper) (Settings, error) {
 			LegacyModelEnvironment: configuredUnsupportedModelEnvironment(),
 			IngestionLeaseDuration: ingestionLeaseDuration, IngestionAttemptTimeout: ingestionAttemptTimeout,
 			ExtractionPromptVersion: extractionPromptVersion,
-			ManagerConfidence: ManagerConfidenceSettings{
-				PromptVersion: analysisPromptVersion, EmployeeEntityID: os.Getenv(EmployeeEntityIDEnvironmentVariable), ManagerEntityID: os.Getenv(ManagerEntityIDEnvironmentVariable),
-			},
 		},
 	}, nil
 }
@@ -397,6 +411,14 @@ func positiveIntegerValue(values *viper.Viper, key, environmentName string, opti
 		return 0, fmt.Errorf("%s must be a positive integer", environmentName)
 	}
 	return integer, nil
+}
+
+func boundedIntegerValue(values *viper.Viper, key, environmentName string, maximum int) (int, error) {
+	value, ok := integer(values.Get(key))
+	if !ok || value < minimumQueryLimit || value > maximum {
+		return 0, fmt.Errorf("%s must be between %d and %d", environmentName, minimumQueryLimit, maximum)
+	}
+	return value, nil
 }
 
 func integer(value any) (int, bool) {

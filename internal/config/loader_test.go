@@ -53,6 +53,106 @@ func TestLoadWithOptionsEmptyEnvironmentDoesNotSuppressFileValue(t *testing.T) {
 	}
 }
 
+func TestLoadQueryUsesDefaultsAndInclusiveEnvironmentBounds(t *testing.T) {
+	clearConfigurationEnvironment(t)
+
+	settings, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if settings.Query != (QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000}) {
+		t.Fatalf("Query = %#v, want named defaults", settings.Query)
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		variable string
+		value    string
+		assert   func(QuerySettings) bool
+	}{
+		{name: "minimum entities", variable: QueryMaxEntitiesEnvironmentVariable, value: "1", assert: func(settings QuerySettings) bool { return settings.MaxEntities == 1 }},
+		{name: "maximum entities", variable: QueryMaxEntitiesEnvironmentVariable, value: "64", assert: func(settings QuerySettings) bool { return settings.MaxEntities == 64 }},
+		{name: "minimum predicates", variable: QueryMaxPredicatesEnvironmentVariable, value: "1", assert: func(settings QuerySettings) bool { return settings.MaxPredicates == 1 }},
+		{name: "maximum predicates", variable: QueryMaxPredicatesEnvironmentVariable, value: "256", assert: func(settings QuerySettings) bool { return settings.MaxPredicates == 256 }},
+		{name: "minimum chronology", variable: QueryMaxChronologyEnvironmentVariable, value: "1", assert: func(settings QuerySettings) bool { return settings.MaxChronology == 1 }},
+		{name: "maximum chronology", variable: QueryMaxChronologyEnvironmentVariable, value: "10000", assert: func(settings QuerySettings) bool { return settings.MaxChronology == 10000 }},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			t.Setenv(testCase.variable, testCase.value)
+
+			settings, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !testCase.assert(settings.Query) {
+				t.Fatalf("Query = %#v, want %s accepted", settings.Query, testCase.name)
+			}
+		})
+	}
+}
+
+func TestLoadWithOptionsAppliesQueryEnvironmentOverFileOverDefaults(t *testing.T) {
+	clearConfigurationEnvironment(t)
+	path := writeConfigFixture(t, ".yaml", "query:\n  max_entities: 2\n  max_predicates: 34\n  max_chronology: 999\n")
+	t.Setenv(QueryMaxEntitiesEnvironmentVariable, "3")
+
+	settings, err := LoadWithOptions(LoadOptions{ConfigFile: &path})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+	want := QuerySettings{MaxEntities: 3, MaxPredicates: 34, MaxChronology: 999}
+	if settings.Query != want {
+		t.Fatalf("Query = %#v, want %#v from environment over file", settings.Query, want)
+	}
+}
+
+func TestLoadWithOptionsKeepsQueryLoadsIndependent(t *testing.T) {
+	clearConfigurationEnvironment(t)
+	path := writeConfigFixture(t, ".json", `{"query":{"max_entities":4,"max_predicates":40,"max_chronology":400}}`)
+
+	if _, err := LoadWithOptions(LoadOptions{ConfigFile: &path}); err != nil {
+		t.Fatalf("first LoadWithOptions() error = %v", err)
+	}
+	settings, err := LoadWithOptions(LoadOptions{})
+	if err != nil {
+		t.Fatalf("second LoadWithOptions() error = %v", err)
+	}
+	if settings.Query != (QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000}) {
+		t.Fatalf("second Query = %#v, want defaults without prior file", settings.Query)
+	}
+}
+
+func TestLoadRejectsInvalidQueryLimitsWithoutDisclosingValues(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		variable string
+		value    string
+		private  bool
+	}{
+		{name: "entities below minimum", variable: QueryMaxEntitiesEnvironmentVariable, value: "0"},
+		{name: "entities above maximum", variable: QueryMaxEntitiesEnvironmentVariable, value: "65"},
+		{name: "predicates below minimum", variable: QueryMaxPredicatesEnvironmentVariable, value: "0"},
+		{name: "predicates above maximum", variable: QueryMaxPredicatesEnvironmentVariable, value: "257"},
+		{name: "chronology below minimum", variable: QueryMaxChronologyEnvironmentVariable, value: "0"},
+		{name: "chronology above maximum", variable: QueryMaxChronologyEnvironmentVariable, value: "10001"},
+		{name: "not an integer", variable: QueryMaxChronologyEnvironmentVariable, value: "private-query-limit", private: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			t.Setenv(testCase.variable, testCase.value)
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), testCase.variable) {
+				t.Fatalf("Load() error = %v, want bounded %s rejection", err, testCase.variable)
+			}
+			if testCase.private && strings.Contains(err.Error(), testCase.value) {
+				t.Fatalf("Load() error exposed configured query limit: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadWithOptionsAppliesJSONFileValues(t *testing.T) {
 	clearConfigurationEnvironment(t)
 	path := writeConfigFixture(t, ".json", `{
@@ -108,6 +208,38 @@ func TestLoadWithOptionsUsesIndependentBindingMetadata(t *testing.T) {
 	}
 }
 
+func TestLoadDoesNotBindRetiredAnalysisEnvironmentInputs(t *testing.T) {
+	clearConfigurationEnvironment(t)
+	baseline, err := Load()
+	if err != nil {
+		t.Fatalf("baseline Load() error = %v", err)
+	}
+
+	retired := []string{
+		strings.ReplaceAll("STACKS_ANALXYSIS_PROMPT_VERSION", "X", ""),
+		strings.ReplaceAll("STACKXS_EMPLOYEE_ENTITY_ID", "X", ""),
+		strings.ReplaceAll("STACKXS_MANAGER_ENTITY_ID", "X", ""),
+	}
+	for _, binding := range configurationEnvironmentBindings() {
+		for _, name := range retired {
+			if binding.name == name {
+				t.Fatalf("configuration binding retains retired environment name %q", name)
+			}
+		}
+	}
+	for _, name := range retired {
+		t.Setenv(name, "synthetic-retired-value")
+	}
+
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load() read retired environment input: %v", err)
+	}
+	if !reflect.DeepEqual(got, baseline) {
+		t.Fatal("retired analysis environment inputs changed loaded settings")
+	}
+}
+
 func TestLoadWithOptionsUsesDefaultsForEmptyDefaultedFileStrings(t *testing.T) {
 	clearConfigurationEnvironment(t)
 	path := writeConfigFixture(t, ".yaml", `
@@ -122,8 +254,6 @@ database:
   application_role: ""
 extraction:
   prompt_version: ""
-analysis:
-  prompt_version: ""
 `)
 
 	settings, err := LoadWithOptions(LoadOptions{ConfigFile: &path})
@@ -133,8 +263,7 @@ analysis:
 	if settings.HTTPAddress != "127.0.0.1:8080" || settings.LogLevel != defaultLogLevel ||
 		settings.Telemetry.Endpoint != defaultOTelEndpoint || settings.Telemetry.ServiceName != defaultOTelServiceName ||
 		settings.Database.ApplicationRole != defaultDatabaseAppRole ||
-		settings.Application.ExtractionPromptVersion != defaultExtractionPromptVersion ||
-		settings.Application.ManagerConfidence.PromptVersion != defaultAnalysisPromptVersion {
+		settings.Application.ExtractionPromptVersion != defaultExtractionPromptVersion {
 		t.Fatal("empty defaulted file strings did not select their named defaults")
 	}
 }
@@ -223,14 +352,10 @@ func TestLoadWithOptionsKeepsCredentialsEnvironmentOnly(t *testing.T) {
 	const migrationDatabaseSecret = "postgres://synthetic-admin-secret@localhost/stacks"
 	const providerSecret = "synthetic-provider-secret"
 	const anthropicSecret = "synthetic-anthropic-secret"
-	const employeeID = "synthetic-employee"
-	const managerID = "synthetic-manager"
 	t.Setenv(DatabaseURLEnvironmentVariable, databaseSecret)
 	t.Setenv(MigrationDatabaseURLEnvironmentVariable, migrationDatabaseSecret)
 	t.Setenv(OpenAIAPIKeyEnvironmentVariable, providerSecret)
 	t.Setenv(AnthropicAPIKeyEnvironmentVariable, anthropicSecret)
-	t.Setenv(EmployeeEntityIDEnvironmentVariable, employeeID)
-	t.Setenv(ManagerEntityIDEnvironmentVariable, managerID)
 	path := writeConfigFixture(t, ".json", `{"model":{"provider":"openai"}}`)
 
 	settings, err := LoadWithOptions(LoadOptions{ConfigFile: &path})
@@ -238,8 +363,7 @@ func TestLoadWithOptionsKeepsCredentialsEnvironmentOnly(t *testing.T) {
 		t.Fatalf("LoadWithOptions() error = %v", err)
 	}
 	if settings.Database.URL != databaseSecret || settings.Database.MigrationURL != migrationDatabaseSecret ||
-		settings.Application.Model.OpenAIAPIKey != providerSecret || settings.Application.Model.AnthropicAPIKey != anthropicSecret ||
-		settings.Application.ManagerConfidence.EmployeeEntityID != employeeID || settings.Application.ManagerConfidence.ManagerEntityID != managerID {
+		settings.Application.Model.OpenAIAPIKey != providerSecret || settings.Application.Model.AnthropicAPIKey != anthropicSecret {
 		t.Fatal("environment-only credentials were not retained in memory")
 	}
 }
@@ -308,9 +432,12 @@ func clearConfigurationEnvironment(t *testing.T) {
 		IngestionLeaseDurationEnvironmentVariable,
 		IngestionAttemptTimeoutEnvironmentVariable,
 		ExtractionPromptVersionEnvironmentVariable,
-		AnalysisPromptVersionEnvironmentVariable,
-		EmployeeEntityIDEnvironmentVariable,
-		ManagerEntityIDEnvironmentVariable,
+		QueryMaxEntitiesEnvironmentVariable,
+		QueryMaxPredicatesEnvironmentVariable,
+		QueryMaxChronologyEnvironmentVariable,
+		strings.ReplaceAll("STACKS_ANALXYSIS_PROMPT_VERSION", "X", ""),
+		strings.ReplaceAll("STACKXS_EMPLOYEE_ENTITY_ID", "X", ""),
+		strings.ReplaceAll("STACKXS_MANAGER_ENTITY_ID", "X", ""),
 	} {
 		t.Setenv(name, "")
 	}

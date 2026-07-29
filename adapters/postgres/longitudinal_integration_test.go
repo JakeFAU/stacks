@@ -255,13 +255,16 @@ func TestProjectCommitmentChronologyPreservesChangeUncertaintyAndCounterevidence
 
 	candidates := make([]temporal.StateCandidate, len(loaded))
 	for index, value := range loaded {
-		objectText, ok := value.Statement().Object.Text()
-		if !ok {
-			t.Fatalf("Project Atlas observation %q object is not exact text", value.ID())
+		key, err := temporal.NewStateKey(
+			value.Statement().Subject,
+			value.Statement().Predicate,
+		)
+		if err != nil {
+			t.Fatalf("temporal.NewStateKey(%q) error = %v", value.ID(), err)
 		}
 		candidates[index] = temporal.StateCandidate{
-			Key:         string(value.Statement().Predicate),
-			Value:       objectText,
+			Key:         key,
+			Value:       value.Statement().Object,
 			Observation: value,
 		}
 	}
@@ -288,9 +291,15 @@ func TestProjectCommitmentChronologyPreservesChangeUncertaintyAndCounterevidence
 	if len(comparison.Changes) != 1 ||
 		comparison.Changes[0].Kind != temporal.ChangeChanged ||
 		comparison.Changes[0].Before == nil ||
-		comparison.Changes[0].Before.Value != "2026-08-15" ||
-		comparison.Changes[0].After == nil ||
-		comparison.Changes[0].After.Value != "2026-09-01" {
+		comparison.Changes[0].After == nil {
+		t.Fatalf("Project Atlas comparison = %#v, want one changed commitment", comparison)
+	}
+	beforeValue, beforeOK := comparison.Changes[0].Before.Value.Text()
+	afterValue, afterOK := comparison.Changes[0].After.Value.Text()
+	if !beforeOK ||
+		beforeValue != "2026-08-15" ||
+		!afterOK ||
+		afterValue != "2026-09-01" {
 		t.Fatalf("Project Atlas comparison = %#v, want one changed commitment", comparison)
 	}
 	if !sameSortedEvidenceIDs(

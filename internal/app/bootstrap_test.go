@@ -29,7 +29,7 @@ func TestExecuteLoadsValidatesThenBootstrapsSelectedCommand(t *testing.T) {
 	calls := []string{}
 	settings := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	loader := SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) {
 		calls = append(calls, "load")
@@ -115,6 +115,30 @@ func TestExecuteSyntaxAndHelpDoNotLoadOrBootstrap(t *testing.T) {
 				t.Fatalf("loader/bootstrap calls = %d/%d, want 0/0", loaderCalls, len(bootstrapCalls))
 			}
 		})
+	}
+}
+
+func TestExecuteRejectsRetiredAnalyzeBeforeLoadOrBootstrap(t *testing.T) {
+	loaderCalls := 0
+	bootstrapCalls := []string{}
+	loader := SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) {
+		loaderCalls++
+		return config.Settings{}, nil
+	})
+
+	err := Execute(
+		t.Context(),
+		[]string{"analyze"},
+		loader,
+		recordingBootstrap{calls: &bootstrapCalls},
+		io.Discard,
+		io.Discard,
+	)
+	if err == nil {
+		t.Fatal("Execute(analyze) error = nil, want retired command rejection")
+	}
+	if loaderCalls != 0 || len(bootstrapCalls) != 0 {
+		t.Fatalf("loader/bootstrap calls = %d/%d, want 0/0", loaderCalls, len(bootstrapCalls))
 	}
 }
 
@@ -276,7 +300,6 @@ func TestExecuteOfflineTargetsUseSettingsValidation(t *testing.T) {
 		{"sync"},
 		{"entities"},
 		{"review"},
-		{"analyze"},
 		{"db-migrate"},
 		{"db-status"},
 		{"db-reset"},
@@ -326,6 +349,86 @@ func TestExecuteOfflineValidationDelegatesBoundedOutput(t *testing.T) {
 	}
 }
 
+func TestExecuteOfflineQueryValidationDoesNotBootstrap(t *testing.T) {
+	var output bytes.Buffer
+	calls := []string{}
+	settings := config.Settings{
+		Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+		Query:    config.QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+	}
+	err := Execute(
+		t.Context(),
+		[]string{"config", "validate", "query"},
+		settingsLoader(settings),
+		recordingBootstrap{calls: &calls},
+		&output,
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output.String() != "configuration valid for query\n" {
+		t.Fatalf("output = %q, want exact query validation outcome", output.String())
+	}
+	if len(calls) != 0 {
+		t.Fatalf("bootstrap calls = %d, want 0", len(calls))
+	}
+}
+
+func TestExecuteInvalidQueryConfigurationDoesNotBootstrapOrWriteSuccess(t *testing.T) {
+	var output bytes.Buffer
+	calls := []string{}
+	settings := config.Settings{
+		Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+		Query:    config.QuerySettings{},
+	}
+	err := Execute(
+		t.Context(),
+		[]string{"config", "validate", "query"},
+		settingsLoader(settings),
+		recordingBootstrap{calls: &calls},
+		&output,
+		io.Discard,
+	)
+	if err == nil || !strings.Contains(err.Error(), config.QueryMaxEntitiesEnvironmentVariable) {
+		t.Fatalf("Execute() error = %v, want invalid query limit rejection", err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("output = %q, want no success output", output.String())
+	}
+	if len(calls) != 0 {
+		t.Fatalf("bootstrap calls = %d, want 0", len(calls))
+	}
+}
+
+func TestExecuteRejectsInvalidTrendSyntaxBeforeLoadOrBootstrap(t *testing.T) {
+	loaderCalls := 0
+	bootstrapCalls := []string{}
+	loader := SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) {
+		loaderCalls++
+		return config.Settings{}, errors.New("loader must not run")
+	})
+	err := Execute(
+		t.Context(),
+		[]string{
+			"query", "trend",
+			"--entity", "entity-a",
+			"--before", "2025-01-01T00:00:00Z",
+			"--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z",
+		},
+		loader,
+		recordingBootstrap{calls: &bootstrapCalls},
+		io.Discard,
+		io.Discard,
+	)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want syntax failure")
+	}
+	if loaderCalls != 0 || len(bootstrapCalls) != 0 {
+		t.Fatalf("loader/bootstrap calls = %d/%d, want 0/0", loaderCalls, len(bootstrapCalls))
+	}
+}
+
 func TestExecuteBootstrapFailurePreservesIdentity(t *testing.T) {
 	bootstrapError := errors.New("bootstrap sentinel")
 	calls := []string{}
@@ -365,7 +468,7 @@ func TestExecuteCommandFailureStillShutsDown(t *testing.T) {
 
 	settings := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	err := Execute(t.Context(), []string{"sync"}, settingsLoader(settings), bootstrap, io.Discard, io.Discard)
 	if !errors.Is(err, commandError) {
@@ -398,7 +501,7 @@ func TestExecuteJoinsCommandAndShutdownErrors(t *testing.T) {
 
 	settings := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	err := Execute(t.Context(), []string{"sync"}, settingsLoader(settings), bootstrap, io.Discard, io.Discard)
 	if !errors.Is(err, commandError) || !errors.Is(err, shutdownError) {
@@ -466,7 +569,7 @@ func TestExecuteCanceledCommandUsesValuePreservingShutdownContext(t *testing.T) 
 func TestExecuteRejectsMissingShutdownBeforeApplicationWork(t *testing.T) {
 	validSync := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	tests := []struct {
 		name         string
@@ -532,7 +635,7 @@ func TestExecuteRejectsMissingShutdownBeforeApplicationWork(t *testing.T) {
 func TestExecuteReportsMissingRequiredDependencies(t *testing.T) {
 	validSync := config.Settings{
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
-		Application: validSyncSettingsForExecute("extract-v2", "analyze-v1"),
+		Application: validSyncSettingsForExecute("extract-v2"),
 	}
 	tests := []struct {
 		name      string

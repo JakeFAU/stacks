@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/temporal"
+
 	"stacks/internal/cli"
 	"stacks/internal/config"
 )
@@ -143,7 +145,6 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 		IngestionLeaseDuration:  5 * time.Minute,
 		IngestionAttemptTimeout: 4 * time.Minute,
 		ExtractionPromptVersion: "extract-v2",
-		ManagerConfidence:       config.ManagerConfidenceSettings{PromptVersion: "analyze-v1"},
 	}}
 	providerCalls := 0
 	syncCalls := 0
@@ -205,38 +206,105 @@ func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
 	}
 }
 
-func TestExecuteRoutesAnalyzeThroughLazyCommandProvider(t *testing.T) {
-	settings := config.Settings{Database: config.DatabaseSettings{URL: "postgres://synthetic"}, Application: config.ApplicationSettings{
-		Model: config.ModelSettings{
-			DataMode: "personal", Provider: "bedrock", ModelID: "synthetic-model",
-			MaxOutputTokens: 256, MaxAttempts: 1, AWSProfile: "synthetic-profile", AWSRegion: "us-east-1",
-		},
-		ExtractionPromptVersion: "extract-v2",
-		ManagerConfidence: config.ManagerConfidenceSettings{
-			PromptVersion: "analyze-v1", EmployeeEntityID: "employee-id", ManagerEntityID: "manager-id",
-		},
-	}}
+func TestExecuteRoutesTypedTrendThroughLazyQueryCommand(t *testing.T) {
+	settings := config.Settings{
+		Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+		Query:    config.QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+	}
+	var got cli.Invocation
 	providerCalls := 0
-	analyzeCalls := 0
 	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
 		providerCalls++
-		return map[string]cli.Command{"analyze": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
-			analyzeCalls++
-			if invocation.Command != cli.CommandAnalyze || invocation.Action != "" || len(invocation.Arguments) != 0 {
-				return fmt.Errorf("analyze received unexpected invocation")
-			}
+		return map[string]cli.Command{"query": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
+			got = invocation
 			return nil
 		})}, nil
 	})
 
-	err := executeWithSettings(context.Background(), []string{"analyze"}, settings,
-		RuntimeFunc(func(context.Context, config.Settings) error { return fmt.Errorf("serve should not run") }),
-		provider, io.Discard, io.Discard)
+	err := executeWithSettings(t.Context(), []string{
+		"query", "trend",
+		"--entity", "entity-a",
+		"--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z",
+		"--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z",
+	}, settings, RuntimeFunc(func(context.Context, config.Settings) error {
+		return errors.New("serve must not run")
+	}), provider, io.Discard, io.Discard)
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if providerCalls != 1 || analyzeCalls != 1 {
-		t.Fatalf("provider/analyze calls = %d/%d, want 1/1", providerCalls, analyzeCalls)
+	if providerCalls != 1 || got.Command != cli.CommandQuery || got.Action != cli.ActionTrend ||
+		got.Query == nil || got.Query.Request.Intent != temporal.IntentTrendComparison {
+		t.Fatalf("provider calls/invocation = %d/%#v, want one typed trend dispatch", providerCalls, got)
+	}
+}
+
+func TestExecuteRoutesEveryTemporalQueryLeafThroughOneQueryCommand(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		action cli.Action
+		intent temporal.Intent
+	}{
+		{
+			name: "point", action: cli.ActionPoint, intent: temporal.IntentPointInTime,
+			args: []string{"query", "point", "--entity", "entity-a", "--at", "2025-01-15T00:00:00Z"},
+		},
+		{
+			name: "trend", action: cli.ActionTrend, intent: temporal.IntentTrendComparison,
+			args: []string{
+				"query", "trend", "--entity", "entity-a",
+				"--before", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z",
+				"--after", "2025-03-01T00:00:00Z/2025-04-01T00:00:00Z",
+			},
+		},
+		{
+			name: "trajectory", action: cli.ActionTrajectory, intent: temporal.IntentTrajectory,
+			args: []string{
+				"query", "trajectory", "--entity", "entity-a",
+				"--between", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z", "--limit", "10",
+			},
+		},
+		{
+			name: "causal", action: cli.ActionCausal, intent: temporal.IntentCausalChain,
+			args: []string{
+				"query", "causal", "--entity", "entity-a",
+				"--between", "2025-01-01T00:00:00Z/2025-02-01T00:00:00Z", "--limit", "10",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := config.Settings{
+				Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+				Query: config.QuerySettings{
+					MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000,
+				},
+			}
+			var got cli.Invocation
+			providerCalls := 0
+			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+				providerCalls++
+				return map[string]cli.Command{"query": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
+					got = invocation
+					return nil
+				})}, nil
+			})
+			err := executeWithSettings(
+				t.Context(), test.args, settings,
+				RuntimeFunc(func(context.Context, config.Settings) error {
+					return errors.New("serve must not run")
+				}),
+				provider, io.Discard, io.Discard,
+			)
+			if err != nil {
+				t.Fatalf("executeWithSettings() error = %v", err)
+			}
+			if providerCalls != 1 || got.Command != cli.CommandQuery ||
+				got.Action != test.action || got.Query == nil ||
+				got.Query.Request.Intent != test.intent {
+				t.Fatalf("provider calls/invocation = %d/%#v", providerCalls, got)
+			}
+		})
 	}
 }
 
@@ -245,24 +313,10 @@ func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *
 		name      string
 		arguments []string
 		settings  config.ApplicationSettings
-	}{
-		{
-			name: "sync legacy extraction", arguments: []string{"sync"},
-			settings: validSyncSettingsForExecute("extract-v1", "analyze-v1"),
-		},
-		{
-			name: "analyze legacy extraction", arguments: []string{"analyze"},
-			settings: validAnalyzeSettingsForExecute("extract-v1", "analyze-v1"),
-		},
-		{
-			name: "sync legacy analysis", arguments: []string{"sync"},
-			settings: validSyncSettingsForExecute("extract-v2", "analyze-v0"),
-		},
-		{
-			name: "analyze legacy analysis", arguments: []string{"analyze"},
-			settings: validAnalyzeSettingsForExecute("extract-v2", "analyze-v0"),
-		},
-	}
+	}{{
+		name: "sync legacy extraction", arguments: []string{"sync"},
+		settings: validSyncSettingsForExecute("extract-v1"),
+	}}
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -288,7 +342,7 @@ func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *
 	}
 }
 
-func validSyncSettingsForExecute(extractionVersion, analysisVersion string) config.ApplicationSettings {
+func validSyncSettingsForExecute(extractionVersion string) config.ApplicationSettings {
 	return config.ApplicationSettings{
 		GoogleFolderID:        "synthetic-folder",
 		GoogleOAuthClientFile: "/synthetic/client.json", GoogleOAuthTokenFile: "/synthetic/token.json",
@@ -299,15 +353,7 @@ func validSyncSettingsForExecute(extractionVersion, analysisVersion string) conf
 		},
 		IngestionLeaseDuration: 5 * time.Minute, IngestionAttemptTimeout: 4 * time.Minute,
 		ExtractionPromptVersion: extractionVersion,
-		ManagerConfidence:       config.ManagerConfidenceSettings{PromptVersion: analysisVersion},
 	}
-}
-
-func validAnalyzeSettingsForExecute(extractionVersion, analysisVersion string) config.ApplicationSettings {
-	settings := validSyncSettingsForExecute(extractionVersion, analysisVersion)
-	settings.ManagerConfidence.EmployeeEntityID = "employee-id"
-	settings.ManagerConfidence.ManagerEntityID = "manager-id"
-	return settings
 }
 
 func executeWithSettings(
