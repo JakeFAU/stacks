@@ -25,6 +25,7 @@ import (
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
+	"stacks/internal/queryplan"
 )
 
 const (
@@ -74,8 +75,9 @@ type Options struct {
 	Tracer          trace.Tracer
 }
 
-// Client implements extract.Model with one stateless Anthropic Messages
-// request. It owns retry policy; SDK retries are disabled at construction.
+// Client implements extract.Model and queryplan.Model with one stateless
+// Anthropic Messages request. It owns retry policy; SDK retries are disabled
+// at construction.
 type Client struct {
 	api             messagesAPI
 	modelID         string
@@ -89,6 +91,7 @@ type Client struct {
 }
 
 var _ extract.Model = (*Client)(nil)
+var _ queryplan.Model = (*Client)(nil)
 
 // New creates an Anthropic Messages adapter fixed to the production API. It
 // does not inherit SDK environment settings for profiles, auth tokens, or base
@@ -136,115 +139,195 @@ func newClient(api messagesAPI, options Options, wait waitFunc) (*Client, error)
 // Generate invokes the Messages API and returns only a natural end-turn with
 // one JSON text block. Request input, response content, API keys, and raw
 // provider errors are never included in returned errors or telemetry.
-func (client *Client) Generate(ctx context.Context, request extract.Request) (response extract.Response, resultErr error) {
+func (client *Client) Generate(ctx context.Context, request extract.Request) (extract.Response, error) {
+	response, err := client.generateStructured(ctx, extractionStructuredRequest(request))
+	if err != nil {
+		return extract.Response{}, err
+	}
+	return extract.Response{
+		Output:  append(json.RawMessage(nil), response.output...),
+		Usage:   extract.Usage{InputTokens: response.usage.inputTokens, OutputTokens: response.usage.outputTokens, TotalTokens: response.usage.totalTokens},
+		Latency: response.providerLatency, ModelID: response.modelID,
+		PromptVersion: response.promptVersion, Outcome: OutcomeSuccess,
+	}, nil
+}
+
+// Plan invokes the Messages API for the exact reviewed temporal query planner
+// contract. The returned JSON remains untrusted until queryplan validates it.
+func (client *Client) Plan(ctx context.Context, request queryplan.ModelRequest) (queryplan.ModelResponse, error) {
+	response, err := client.generateStructured(ctx, plannerStructuredRequest(request))
+	if err != nil {
+		return queryplan.ModelResponse{}, err
+	}
+	return queryplan.ModelResponse{
+		Output: append(json.RawMessage(nil), response.output...), Provider: modelpolicy.ProviderAnthropic,
+		ModelID: response.modelID, PromptVersion: response.promptVersion, SchemaName: response.schemaName,
+		Usage:    queryplan.Usage{InputTokens: response.usage.inputTokens, OutputTokens: response.usage.outputTokens, TotalTokens: response.usage.totalTokens},
+		Attempts: response.attempts, WallLatency: response.wallLatency, ProviderLatency: response.providerLatency,
+	}, nil
+}
+
+type structuredRequest struct {
+	promptVersion string
+	systemPrompt  string
+	input         string
+	schemaName    string
+	jsonSchema    []byte
+	validate      func(structuredRequest) error
+}
+
+type structuredUsage struct {
+	inputTokens  int64
+	outputTokens int64
+	totalTokens  int64
+}
+
+type structuredResponse struct {
+	output          json.RawMessage
+	usage           structuredUsage
+	modelID         string
+	promptVersion   string
+	schemaName      string
+	attempts        int
+	wallLatency     time.Duration
+	providerLatency time.Duration
+}
+
+func extractionStructuredRequest(request extract.Request) structuredRequest {
+	return structuredRequest{
+		promptVersion: request.PromptVersion, systemPrompt: request.SystemPrompt, input: request.Input,
+		schemaName: request.SchemaName, jsonSchema: append([]byte(nil), request.JSONSchema...),
+		validate: func(snapshot structuredRequest) error {
+			contract, err := extract.PromptContract(snapshot.promptVersion)
+			if err != nil || snapshot.systemPrompt != contract.SystemPrompt || snapshot.schemaName != contract.SchemaName ||
+				!bytes.Equal(snapshot.jsonSchema, contract.JSONSchema) || snapshot.input == "" {
+				return ErrInvalidRequest
+			}
+			return nil
+		},
+	}
+}
+
+func plannerStructuredRequest(request queryplan.ModelRequest) structuredRequest {
+	return structuredRequest{
+		promptVersion: request.PromptVersion, systemPrompt: request.SystemPrompt, input: request.Input,
+		schemaName: request.SchemaName, jsonSchema: append([]byte(nil), request.JSONSchema...),
+		validate: func(snapshot structuredRequest) error {
+			contract, err := queryplan.PromptContract(snapshot.promptVersion)
+			if err != nil || snapshot.systemPrompt != contract.SystemPrompt || snapshot.schemaName != contract.SchemaName ||
+				!bytes.Equal(snapshot.jsonSchema, contract.JSONSchema) || snapshot.input == "" {
+				return ErrInvalidRequest
+			}
+			return nil
+		},
+	}
+}
+
+func (client *Client) generateStructured(ctx context.Context, request structuredRequest) (response structuredResponse, resultErr error) {
 	ctx, span := client.tracer.Start(ctx, invocationSpanName)
 	started := client.now()
 	defer func() { observability.FinishSpan(span, resultErr) }()
 
 	params, err := client.messageParams(request)
 	if err != nil {
-		client.record(ctx, started, "", OutcomeInvalidRequest, extract.Usage{}, 0)
-		return extract.Response{}, err
+		client.record(ctx, started, "", OutcomeInvalidRequest, structuredUsage{}, 0)
+		return structuredResponse{}, err
 	}
 
 	for attempt := 1; attempt <= client.maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
-			client.record(ctx, started, request.PromptVersion, outcomeForError(err), extract.Usage{}, attempt-1)
-			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, err)
+			client.record(ctx, started, request.promptVersion, outcomeForError(err), structuredUsage{}, attempt-1)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, err)
 		}
 
 		output, invokeErr := client.api.New(ctx, params)
 		if invokeErr == nil {
-			response, outputErr := client.response(request.PromptVersion, output)
+			response, outputErr := client.response(request, output)
 			if outputErr != nil {
-				client.record(ctx, started, request.PromptVersion, OutcomeInvalidOutput, boundedUsage(output), attempt)
-				return extract.Response{}, outputErr
+				client.record(ctx, started, request.promptVersion, OutcomeInvalidOutput, boundedUsage(output), attempt)
+				return structuredResponse{}, outputErr
 			}
-			client.record(ctx, started, request.PromptVersion, OutcomeSuccess, response.Usage, attempt)
+			response.attempts = attempt
+			response.wallLatency = client.elapsed(started)
+			client.record(ctx, started, request.promptVersion, OutcomeSuccess, response.usage, attempt)
 			return response, nil
 		}
 
 		if err := ctx.Err(); err != nil {
-			client.record(ctx, started, request.PromptVersion, outcomeForError(err), extract.Usage{}, attempt)
-			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, err)
+			client.record(ctx, started, request.promptVersion, outcomeForError(err), structuredUsage{}, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, err)
 		}
 		if errors.Is(invokeErr, context.Canceled) {
-			client.record(ctx, started, request.PromptVersion, OutcomeCanceled, extract.Usage{}, attempt)
-			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, context.Canceled)
+			client.record(ctx, started, request.promptVersion, OutcomeCanceled, structuredUsage{}, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, context.Canceled)
 		}
 
 		outcome := outcomeForError(invokeErr)
 		if attempt == client.maxAttempts || !isRetryable(invokeErr) {
-			client.record(ctx, started, request.PromptVersion, outcome, extract.Usage{}, attempt)
-			return extract.Response{}, boundedInvocationError(invokeErr, outcome)
+			client.record(ctx, started, request.promptVersion, outcome, structuredUsage{}, attempt)
+			return structuredResponse{}, boundedInvocationError(invokeErr, outcome)
 		}
 		if err := client.wait(ctx, retryDelay(attempt)); err != nil {
-			client.record(ctx, started, request.PromptVersion, outcomeForError(err), extract.Usage{}, attempt)
-			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, err)
+			client.record(ctx, started, request.promptVersion, outcomeForError(err), structuredUsage{}, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, err)
 		}
 	}
 
-	return extract.Response{}, fmt.Errorf("%w: retry policy", ErrInvocation)
+	return structuredResponse{}, fmt.Errorf("%w: retry policy", ErrInvocation)
 }
 
-func (client *Client) messageParams(request extract.Request) (anthropicsdk.MessageNewParams, error) {
-	contract, err := extract.PromptContract(request.PromptVersion)
-	if err != nil || request.SystemPrompt != contract.SystemPrompt || request.SchemaName != contract.SchemaName || !bytes.Equal(request.JSONSchema, contract.JSONSchema) || request.Input == "" {
+func (client *Client) messageParams(request structuredRequest) (anthropicsdk.MessageNewParams, error) {
+	if request.validate == nil || request.validate(request) != nil {
 		return anthropicsdk.MessageNewParams{}, ErrInvalidRequest
 	}
 	var schema map[string]any
-	if err := json.Unmarshal(request.JSONSchema, &schema); err != nil || schema == nil {
+	if err := json.Unmarshal(request.jsonSchema, &schema); err != nil || schema == nil {
 		return anthropicsdk.MessageNewParams{}, ErrInvalidRequest
 	}
-
 	return anthropicsdk.MessageNewParams{
-		MaxTokens: client.maxOutputTokens,
-		Messages: []anthropicsdk.MessageParam{
-			anthropicsdk.NewUserMessage(anthropicsdk.NewTextBlock(request.Input)),
-		},
-		Model: anthropicsdk.Model(client.modelID),
-		OutputConfig: anthropicsdk.OutputConfigParam{
-			Format: anthropicsdk.JSONOutputFormatParam{Schema: schema},
-		},
-		System: []anthropicsdk.TextBlockParam{{Text: request.SystemPrompt}},
+		MaxTokens:    client.maxOutputTokens,
+		Messages:     []anthropicsdk.MessageParam{anthropicsdk.NewUserMessage(anthropicsdk.NewTextBlock(request.input))},
+		Model:        anthropicsdk.Model(client.modelID),
+		OutputConfig: anthropicsdk.OutputConfigParam{Format: anthropicsdk.JSONOutputFormatParam{Schema: schema}},
+		System:       []anthropicsdk.TextBlockParam{{Text: request.systemPrompt}},
 	}, nil
 }
 
-func (client *Client) response(promptVersion string, output *anthropicsdk.Message) (extract.Response, error) {
+func (client *Client) response(request structuredRequest, output *anthropicsdk.Message) (structuredResponse, error) {
 	if output == nil || !output.JSON.Content.Valid() || !output.JSON.Model.Valid() || !output.JSON.StopReason.Valid() ||
 		output.StopReason != anthropicsdk.StopReasonEndTurn || string(output.Model) != client.modelID || len(output.Content) != 1 {
-		return extract.Response{}, ErrInvalidOutput
+		return structuredResponse{}, ErrInvalidOutput
 	}
 	content := output.Content[0]
 	if !content.JSON.Type.Valid() || !content.JSON.Text.Valid() || content.Type != "text" || !json.Valid([]byte(content.Text)) {
-		return extract.Response{}, ErrInvalidOutput
+		return structuredResponse{}, ErrInvalidOutput
 	}
 	usage, ok := messageUsage(output)
 	if !ok {
-		return extract.Response{}, ErrInvalidOutput
+		return structuredResponse{}, ErrInvalidOutput
 	}
-	return extract.Response{
-		Output: append(json.RawMessage(nil), content.Text...), Usage: usage,
-		ModelID: client.modelID, PromptVersion: promptVersion, Outcome: OutcomeSuccess,
+	return structuredResponse{
+		output: append(json.RawMessage(nil), content.Text...), usage: usage,
+		modelID: client.modelID, promptVersion: request.promptVersion, schemaName: request.schemaName,
 	}, nil
 }
 
-func messageUsage(output *anthropicsdk.Message) (extract.Usage, bool) {
+func messageUsage(output *anthropicsdk.Message) (structuredUsage, bool) {
 	if output == nil || !output.JSON.Usage.Valid() || !output.Usage.JSON.InputTokens.Valid() ||
 		!output.Usage.JSON.CacheCreationInputTokens.Valid() || !output.Usage.JSON.CacheReadInputTokens.Valid() ||
 		!output.Usage.JSON.OutputTokens.Valid() || output.Usage.InputTokens < 0 ||
 		output.Usage.CacheCreationInputTokens < 0 || output.Usage.CacheReadInputTokens < 0 || output.Usage.OutputTokens < 0 {
-		return extract.Usage{}, false
+		return structuredUsage{}, false
 	}
 	inputTokens, ok := addTokens(output.Usage.InputTokens, output.Usage.CacheCreationInputTokens, output.Usage.CacheReadInputTokens)
 	if !ok {
-		return extract.Usage{}, false
+		return structuredUsage{}, false
 	}
 	totalTokens, ok := addTokens(inputTokens, output.Usage.OutputTokens)
 	if !ok {
-		return extract.Usage{}, false
+		return structuredUsage{}, false
 	}
-	return extract.Usage{InputTokens: inputTokens, OutputTokens: output.Usage.OutputTokens, TotalTokens: totalTokens}, true
+	return structuredUsage{inputTokens: inputTokens, outputTokens: output.Usage.OutputTokens, totalTokens: totalTokens}, true
 }
 
 func addTokens(values ...int64) (int64, bool) {
@@ -258,10 +341,10 @@ func addTokens(values ...int64) (int64, bool) {
 	return total, true
 }
 
-func boundedUsage(output *anthropicsdk.Message) extract.Usage {
+func boundedUsage(output *anthropicsdk.Message) structuredUsage {
 	usage, ok := messageUsage(output)
 	if !ok {
-		return extract.Usage{}
+		return structuredUsage{}
 	}
 	return usage
 }
@@ -383,13 +466,17 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func (client *Client) record(ctx context.Context, started time.Time, promptVersion, outcome string, usage extract.Usage, attempts int) {
-	if client.recorder == nil {
-		return
-	}
+func (client *Client) elapsed(started time.Time) time.Duration {
 	wallLatency := client.now().Sub(started)
 	if wallLatency < 0 {
-		wallLatency = 0
+		return 0
+	}
+	return wallLatency
+}
+
+func (client *Client) record(ctx context.Context, started time.Time, promptVersion, outcome string, usage structuredUsage, attempts int) {
+	if client.recorder == nil {
+		return
 	}
 	promptVersion = strings.TrimSpace(promptVersion)
 	if promptVersion == "" {
@@ -398,7 +485,7 @@ func (client *Client) record(ctx context.Context, started time.Time, promptVersi
 	client.recorder.Record(ctx, modeltelemetry.Observation{
 		Provider: modelpolicy.ProviderAnthropic, DataMode: client.dataMode,
 		ModelID: client.modelID, PromptVersion: promptVersion, Outcome: outcome,
-		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens,
-		WallLatency: wallLatency, Attempts: attempts,
+		InputTokens: usage.inputTokens, OutputTokens: usage.outputTokens, TotalTokens: usage.totalTokens,
+		WallLatency: client.elapsed(started), Attempts: attempts,
 	})
 }
