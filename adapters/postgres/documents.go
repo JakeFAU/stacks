@@ -56,6 +56,10 @@ type documentReader interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+type documentSectionBatcher interface {
+	SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+}
+
 // PutDocumentVersion stores canonical immutable content. Callers that observe
 // provider revision metadata must append a SourceRevisionObservation
 // explicitly in the same transaction.
@@ -183,34 +187,17 @@ func (transaction *Transaction) PutDocumentVersion(
 				err,
 			)
 		}
-		for _, section := range version.Sections() {
-			if _, err := transaction.transaction.Exec(ctx, `
-				INSERT INTO stacks_core.document_sections (
-					document_version_id,
-					section_id,
-					title,
-					parent_id,
-					path,
-					section_order,
-					role,
-					content
-				)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-				versionID,
-				section.ID(),
-				section.Title(),
-				section.ParentID(),
-				section.Path(),
-				section.Order(),
-				section.Role(),
-				section.Text(),
-			); err != nil {
-				return PutDocumentVersionResult{}, wrapDocumentError(
-					ctx,
-					"insert document section",
-					conflictError(err),
-				)
-			}
+		if err := insertDocumentSections(
+			ctx,
+			transaction.transaction,
+			versionID,
+			version.Sections(),
+		); err != nil {
+			return PutDocumentVersionResult{}, wrapDocumentError(
+				ctx,
+				"insert document section",
+				conflictError(err),
+			)
 		}
 		return PutDocumentVersionResult{
 			Ref: DocumentVersionRef{
@@ -244,6 +231,42 @@ func (transaction *Transaction) PutDocumentVersion(
 			conflictError(insertErr),
 		)
 	}
+}
+
+func insertDocumentSections(
+	ctx context.Context,
+	batcher documentSectionBatcher,
+	versionID string,
+	sections []evidence.Section,
+) error {
+	const insertDocumentSectionSQL = `
+		INSERT INTO stacks_core.document_sections (
+			document_version_id,
+			section_id,
+			title,
+			parent_id,
+			path,
+			section_order,
+			role,
+			content
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+
+	batch := &pgx.Batch{}
+	for _, section := range sections {
+		batch.Queue(
+			insertDocumentSectionSQL,
+			versionID,
+			section.ID(),
+			section.Title(),
+			section.ParentID(),
+			section.Path(),
+			section.Order(),
+			section.Role(),
+			section.Text(),
+		)
+	}
+	return batcher.SendBatch(ctx, batch).Close()
 }
 
 // PutSourceRevisionObservation appends one immutable provider revision for a
