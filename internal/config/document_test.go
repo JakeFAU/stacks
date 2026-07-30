@@ -183,6 +183,23 @@ func TestValidateConfigDocumentAcceptsQueryLimitsInYAMLAndJSON(t *testing.T) {
 	}
 }
 
+func TestValidateConfigDocumentAcceptsQueryPlannerInYAMLAndJSON(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		format string
+		body   string
+	}{
+		{name: "YAML", format: "yaml", body: "query_planner:\n  timeout: 1m\n  max_question_bytes: 16384\n"},
+		{name: "JSON", format: "json", body: `{"query_planner":{"timeout":"1m","max_question_bytes":16384}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if err := validateConfigDocument(testCase.format, []byte(testCase.body)); err != nil {
+				t.Fatalf("validateConfigDocument() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestConfigDocumentRejectsRetiredAnalysisSection(t *testing.T) {
 	retiredSection := strings.ReplaceAll("analXysis", "X", "")
 	retiredPromptVersion := strings.ReplaceAll("analyXze-v1", "X", "")
@@ -237,6 +254,8 @@ func TestEnvironmentExampleContainsOnlyCurrentQueryConfiguration(t *testing.T) {
 		QueryMaxEntitiesEnvironmentVariable,
 		QueryMaxPredicatesEnvironmentVariable,
 		QueryMaxChronologyEnvironmentVariable,
+		QueryPlannerTimeoutEnvironmentVariable,
+		QueryPlannerMaxQuestionBytesEnvironmentVariable,
 	} {
 		if !strings.Contains(contents, name+"=") {
 			t.Fatalf(".env.example is missing current query input %q", name)
@@ -272,6 +291,30 @@ func TestValidateConfigDocumentRejectsUnknownAndWrongTypedQueryLimits(t *testing
 			}
 			if strings.Contains(err.Error(), "private-query-limit") {
 				t.Fatalf("validateConfigDocument() error exposed query value: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateConfigDocumentRejectsUnknownAndWrongTypedQueryPlannerSettings(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		format     string
+		body       string
+		wantConfig string
+	}{
+		{name: "unknown YAML key", format: "yaml", body: "query_planner:\n  question_limit: 16\n", wantConfig: "query_planner.question_limit"},
+		{name: "unknown JSON nested key", format: "json", body: `{"query_planner":{"nested":{"timeout":"1m"}}}`, wantConfig: "query_planner.nested"},
+		{name: "YAML non-duration", format: "yaml", body: "query_planner:\n  timeout: 12\n", wantConfig: "query_planner.timeout"},
+		{name: "JSON noninteger bytes", format: "json", body: `{"query_planner":{"max_question_bytes":"private-planner-value"}}`, wantConfig: "query_planner.max_question_bytes"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateConfigDocument(testCase.format, []byte(testCase.body))
+			if err == nil || !strings.Contains(err.Error(), testCase.wantConfig) {
+				t.Fatalf("validateConfigDocument() error = %v, want strict %s rejection", err, testCase.wantConfig)
+			}
+			if strings.Contains(err.Error(), "private-planner-value") {
+				t.Fatalf("validateConfigDocument() error exposed planner value: %v", err)
 			}
 		})
 	}

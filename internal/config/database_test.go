@@ -146,6 +146,21 @@ func TestQueryCommandRequiresCanonicalDatabaseURL(t *testing.T) {
 	}
 }
 
+func TestQueryAskCommandRequiresCanonicalDatabaseURL(t *testing.T) {
+	settings := Settings{
+		Database: DatabaseSettings{Scopes: []DatabaseScope{DatabaseScopeCore}},
+		Query:    QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+		QueryPlanner: QueryPlannerSettings{
+			Timeout:          defaultQueryPlannerTimeout,
+			MaxQuestionBytes: defaultQueryPlannerMaxQuestionBytes,
+		},
+		Application: validQueryAskApplicationSettings(),
+	}
+	if err := settings.Validate(CommandQueryAsk); err == nil || !strings.Contains(err.Error(), DatabaseURLEnvironmentVariable) {
+		t.Fatalf("Settings.Validate(query-ask) error = %v, want canonical database URL rejection", err)
+	}
+}
+
 func TestDBMigrateRejectsUnsafeApplicationRoleBeforeConstruction(t *testing.T) {
 	t.Parallel()
 

@@ -105,6 +105,10 @@ var configurationSchema = configObjectSchema(map[string]configSchemaNode{
 		"max_predicates": configLeafSchema(configSchemaInteger),
 		"max_chronology": configLeafSchema(configSchemaInteger),
 	}),
+	"query_planner": configObjectSchema(map[string]configSchemaNode{
+		"timeout":            configLeafSchema(configSchemaDurationString),
+		"max_question_bytes": configLeafSchema(configSchemaInteger),
+	}),
 })
 
 func configObjectSchema(children map[string]configSchemaNode) configSchemaNode {

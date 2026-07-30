@@ -84,6 +84,81 @@ func TestSettingsValidateQueryRequiresOnlyDatabaseAndBoundedQuerySettings(t *tes
 	}
 }
 
+func TestSettingsValidateQueryAskRequiresPlannerAndExplicitModelSettings(t *testing.T) {
+	settings := Settings{
+		Database: DatabaseSettings{URL: "postgres://app:synthetic@127.0.0.1/stacks", Scopes: []DatabaseScope{DatabaseScopeCore}},
+		Query:    QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+		QueryPlanner: QueryPlannerSettings{
+			Timeout:          time.Minute,
+			MaxQuestionBytes: 16 * 1024,
+		},
+	}
+
+	if err := settings.Validate(CommandQuery); err != nil {
+		t.Fatalf("Settings.Validate(query) error = %v, want provider-free typed query", err)
+	}
+	if err := settings.Validate(CommandQueryAsk); err == nil || !strings.Contains(err.Error(), ModelProviderEnvironmentVariable) {
+		t.Fatalf("Settings.Validate(query-ask) error = %v, want explicit model provider requirement", err)
+	}
+
+	settings.Application = validQueryAskApplicationSettings()
+	if err := settings.Validate(CommandQueryAsk); err != nil {
+		t.Fatalf("Settings.Validate(query-ask) error = %v, want explicit planner and model settings accepted", err)
+	}
+}
+
+func TestSettingsValidateQueryAskUsesCoreScopeWhenDirectoryIsEnabled(t *testing.T) {
+	settings := Settings{
+		Database: DatabaseSettings{URL: "postgres://app:synthetic@127.0.0.1/stacks", Scopes: []DatabaseScope{DatabaseScopeCore}},
+		Query:    QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+		QueryPlanner: QueryPlannerSettings{
+			Timeout:          time.Minute,
+			MaxQuestionBytes: 16 * 1024,
+		},
+		Application: validQueryAskApplicationSettings(),
+	}
+	settings.Application.Directory.Enabled = true
+
+	for _, command := range []Command{CommandQuery, CommandQueryAsk} {
+		if err := settings.Validate(command); err != nil {
+			t.Fatalf("Settings.Validate(%s) error = %v, want core-only query scope exemption", command, err)
+		}
+	}
+}
+
+func TestSettingsValidateQueryAskRejectsOutOfRangePlannerSettings(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*QueryPlannerSettings)
+		wantName  string
+	}{
+		{name: "zero timeout", configure: func(settings *QueryPlannerSettings) { settings.Timeout = 0 }, wantName: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "subsecond timeout", configure: func(settings *QueryPlannerSettings) { settings.Timeout = 999 * time.Millisecond }, wantName: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "timeout above maximum", configure: func(settings *QueryPlannerSettings) { settings.Timeout = 5*time.Minute + time.Second }, wantName: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "zero question bytes", configure: func(settings *QueryPlannerSettings) { settings.MaxQuestionBytes = 0 }, wantName: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "question bytes above maximum", configure: func(settings *QueryPlannerSettings) { settings.MaxQuestionBytes = 64*1024 + 1 }, wantName: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := Settings{
+				Database: DatabaseSettings{URL: "postgres://app:synthetic@127.0.0.1/stacks", Scopes: []DatabaseScope{DatabaseScopeCore}},
+				Query:    QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+				QueryPlanner: QueryPlannerSettings{
+					Timeout:          time.Minute,
+					MaxQuestionBytes: 16 * 1024,
+				},
+				Application: validQueryAskApplicationSettings(),
+			}
+			testCase.configure(&settings.QueryPlanner)
+
+			err := settings.Validate(CommandQueryAsk)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantName) {
+				t.Fatalf("Settings.Validate(query-ask) error = %v, want bounded %s rejection", err, testCase.wantName)
+			}
+		})
+	}
+}
+
 func TestSettingsValidateQueryRejectsOutOfBoundsLimitsWithoutValues(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -588,6 +663,18 @@ func validApplicationSettings() ApplicationSettings {
 		IngestionAttemptTimeout: defaultIngestionAttemptTimeout,
 		ExtractionPromptVersion: "extract-v2",
 	}
+}
+
+func validQueryAskApplicationSettings() ApplicationSettings {
+	return ApplicationSettings{Model: ModelSettings{
+		DataMode:        "personal",
+		Provider:        "bedrock",
+		ModelID:         "synthetic-planner-model",
+		MaxOutputTokens: 1000,
+		MaxAttempts:     defaultModelMaxAttempts,
+		AWSProfile:      "synthetic-planner-profile",
+		AWSRegion:       "us-east-1",
+	}}
 }
 
 func diffApplicationSettings(got, want ApplicationSettings) string {

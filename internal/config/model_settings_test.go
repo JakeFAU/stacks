@@ -82,6 +82,87 @@ func TestApplicationSettingsValidateModelCommandsRequireExplicitModelSelection(t
 	}
 }
 
+func TestApplicationSettingsValidateQueryAskAppliesExistingModelPolicies(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*ModelSettings)
+		wantError string
+	}{
+		{name: "personal OpenAI", configure: func(model *ModelSettings) {
+			model.Provider = modelpolicy.ProviderOpenAI
+			model.AWSRegion = ""
+			model.OpenAIAPIKey = "synthetic-openai-key"
+		}},
+		{name: "personal Anthropic", configure: func(model *ModelSettings) {
+			model.Provider = modelpolicy.ProviderAnthropic
+			model.AWSRegion = ""
+			model.AnthropicAPIKey = "synthetic-anthropic-key"
+		}},
+		{name: "personal OpenAI requires credential", configure: func(model *ModelSettings) {
+			model.Provider = modelpolicy.ProviderOpenAI
+			model.AWSRegion = ""
+		}, wantError: OpenAIAPIKeyEnvironmentVariable},
+		{name: "personal Anthropic requires credential", configure: func(model *ModelSettings) {
+			model.Provider = modelpolicy.ProviderAnthropic
+			model.AWSRegion = ""
+		}, wantError: AnthropicAPIKeyEnvironmentVariable},
+		{name: "restricted OpenAI", configure: func(model *ModelSettings) {
+			model.DataMode = modelpolicy.DataModeRestricted
+			model.Provider = modelpolicy.ProviderOpenAI
+			model.AWSRegion = ""
+			model.OpenAIAPIKey = "synthetic-openai-key"
+		}, wantError: "model policy"},
+		{name: "restricted Anthropic", configure: func(model *ModelSettings) {
+			model.DataMode = modelpolicy.DataModeRestricted
+			model.Provider = modelpolicy.ProviderAnthropic
+			model.AWSRegion = ""
+			model.AnthropicAPIKey = "synthetic-anthropic-key"
+		}, wantError: "model policy"},
+		{name: "restricted Bedrock", configure: func(model *ModelSettings) {
+			model.DataMode = modelpolicy.DataModeRestricted
+			model.AWSProfile = "synthetic-profile"
+			model.AWSRegion = "us-east-1"
+		}},
+		{name: "Bedrock requires exact region", configure: func(model *ModelSettings) {
+			model.AWSRegion = " us-east-1 "
+		}, wantError: "model policy"},
+		{name: "legacy data mode", configure: func(model *ModelSettings) {
+			model.DataMode = modelpolicy.DataModeLegacy
+		}, wantError: "model policy"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings := validQueryAskApplicationSettings()
+			testCase.configure(&settings.Model)
+
+			err := settings.Validate(CommandQueryAsk)
+			if testCase.wantError == "" {
+				if err != nil {
+					t.Fatalf("Validate(query-ask) error = %v, want accepted explicit model policy", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+				t.Fatalf("Validate(query-ask) error = %v, want %s rejection", err, testCase.wantError)
+			}
+		})
+	}
+}
+
+func TestApplicationSettingsValidateQueryAskRejectsEveryUnsupportedModelEnvironment(t *testing.T) {
+	for _, environment := range unsupportedModelEnvironmentNames {
+		t.Run(environment, func(t *testing.T) {
+			settings := validQueryAskApplicationSettings()
+			settings.LegacyModelEnvironment = []string{environment}
+
+			err := settings.Validate(CommandQueryAsk)
+			if err == nil || !strings.Contains(err.Error(), environment) {
+				t.Fatalf("Validate(query-ask) error = %v, want unsupported %s rejection", err, environment)
+			}
+		})
+	}
+}
+
 func TestApplicationSettingsValidateRejectsInvalidModelPolicyBeforeProviderBoundary(t *testing.T) {
 	tests := []struct {
 		name      string

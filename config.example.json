@@ -55,5 +55,9 @@
     "max_entities": 16,
     "max_predicates": 32,
     "max_chronology": 1000
+  },
+  "query_planner": {
+    "timeout": "1m",
+    "max_question_bytes": 16384
   }
 }

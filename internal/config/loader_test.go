@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadWithOptionsAppliesEnvironmentOverFileOverDefaults(t *testing.T) {
@@ -120,6 +121,97 @@ func TestLoadWithOptionsKeepsQueryLoadsIndependent(t *testing.T) {
 	}
 	if settings.Query != (QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000}) {
 		t.Fatalf("second Query = %#v, want defaults without prior file", settings.Query)
+	}
+}
+
+func TestLoadQueryPlannerUsesDefaultsAndInclusiveEnvironmentBounds(t *testing.T) {
+	clearConfigurationEnvironment(t)
+
+	settings, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if settings.QueryPlanner != (QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: 16 * 1024}) {
+		t.Fatalf("QueryPlanner = %#v, want named defaults", settings.QueryPlanner)
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		variable string
+		value    string
+		assert   func(QueryPlannerSettings) bool
+	}{
+		{name: "minimum timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "1s", assert: func(settings QueryPlannerSettings) bool { return settings.Timeout == time.Second }},
+		{name: "maximum timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "5m", assert: func(settings QueryPlannerSettings) bool { return settings.Timeout == 5*time.Minute }},
+		{name: "minimum question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "1", assert: func(settings QueryPlannerSettings) bool { return settings.MaxQuestionBytes == 1 }},
+		{name: "maximum question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "65536", assert: func(settings QueryPlannerSettings) bool { return settings.MaxQuestionBytes == 65536 }},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			t.Setenv(testCase.variable, testCase.value)
+
+			settings, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !testCase.assert(settings.QueryPlanner) {
+				t.Fatalf("QueryPlanner = %#v, want %s accepted", settings.QueryPlanner, testCase.name)
+			}
+		})
+	}
+}
+
+func TestLoadWithOptionsAppliesQueryPlannerEnvironmentOverYAMLAndJSON(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		extension string
+		contents  string
+	}{
+		{name: "YAML", extension: ".yaml", contents: "query_planner:\n  timeout: 2m\n  max_question_bytes: 12\n"},
+		{name: "JSON", extension: ".json", contents: `{"query_planner":{"timeout":"2m","max_question_bytes":12}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			path := writeConfigFixture(t, testCase.extension, testCase.contents)
+			t.Setenv(QueryPlannerTimeoutEnvironmentVariable, "3m")
+			t.Setenv(QueryPlannerMaxQuestionBytesEnvironmentVariable, "13")
+
+			settings, err := LoadWithOptions(LoadOptions{ConfigFile: &path})
+			if err != nil {
+				t.Fatalf("LoadWithOptions() error = %v", err)
+			}
+			want := QueryPlannerSettings{Timeout: 3 * time.Minute, MaxQuestionBytes: 13}
+			if settings.QueryPlanner != want {
+				t.Fatalf("QueryPlanner = %#v, want %#v from environment over file", settings.QueryPlanner, want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidQueryPlannerSettingsWithoutDisclosingValues(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		variable string
+		value    string
+	}{
+		{name: "zero timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "0s"},
+		{name: "subsecond timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "999ms"},
+		{name: "timeout over maximum", variable: QueryPlannerTimeoutEnvironmentVariable, value: "5m1s"},
+		{name: "zero question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "0"},
+		{name: "question bytes over maximum", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "65537"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			t.Setenv(testCase.variable, testCase.value)
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), testCase.variable) {
+				t.Fatalf("Load() error = %v, want bounded %s rejection", err, testCase.variable)
+			}
+			if strings.Contains(err.Error(), testCase.value) {
+				t.Fatalf("Load() error exposed configured planner value: %v", err)
+			}
+		})
 	}
 }
 
@@ -435,6 +527,8 @@ func clearConfigurationEnvironment(t *testing.T) {
 		QueryMaxEntitiesEnvironmentVariable,
 		QueryMaxPredicatesEnvironmentVariable,
 		QueryMaxChronologyEnvironmentVariable,
+		QueryPlannerTimeoutEnvironmentVariable,
+		QueryPlannerMaxQuestionBytesEnvironmentVariable,
 		strings.ReplaceAll("STACKS_ANALXYSIS_PROMPT_VERSION", "X", ""),
 		strings.ReplaceAll("STACKXS_EMPLOYEE_ENTITY_ID", "X", ""),
 		strings.ReplaceAll("STACKXS_MANAGER_ENTITY_ID", "X", ""),
