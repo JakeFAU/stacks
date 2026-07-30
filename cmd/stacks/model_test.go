@@ -14,7 +14,6 @@ import (
 	"stacks/internal/doctor"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/openai"
-	"stacks/internal/queryplan"
 )
 
 func TestNewModelSelectsOnlyConfiguredProvider(t *testing.T) {
@@ -105,9 +104,6 @@ func TestNewQueryPlannerModelSelectsOnlyConfiguredProvider(t *testing.T) {
 			model, err := newQueryPlannerModelWithContext(context.Background(), testCase.settings, nil, tracer)
 			if err != nil {
 				t.Fatalf("newQueryPlannerModelWithContext() error = %v", err)
-			}
-			if _, ok := model.(queryplan.Model); !ok {
-				t.Fatalf("planner model = %T, does not satisfy queryplan.Model", model)
 			}
 			if got, want := typeName(model), typeName(testCase.want); got != want {
 				t.Fatalf("planner model type = %s, want %s", got, want)

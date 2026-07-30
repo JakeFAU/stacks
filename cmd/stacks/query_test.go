@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -97,6 +98,28 @@ func TestTemporalQueryExecutorBoundsOpenErrorsAndPreservesCallerCancellation(t *
 	_, err = executor.Query(canceled, validQueryTrendInvocation(t).Query.Request)
 	if err != context.Canceled {
 		t.Fatalf("caller cancellation error = %v, want context.Canceled", err)
+	}
+}
+
+func TestTemporalQueryExecutorPrefersCallerCancellationAndRedactsReadDatabaseDetail(t *testing.T) {
+	const privateDatabaseURL = "postgres://private-user:private-password@private-host/private-database"
+	database := &recordingQueryDatabase{err: fmt.Errorf("%s: %w", privateDatabaseURL, context.DeadlineExceeded)}
+	executor := temporalQueryExecutor{
+		Open:        func(context.Context, string) (queryDatabase, error) { return database, nil },
+		DatabaseURL: privateDatabaseURL,
+		Limits:      query.Limits{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := executor.Query(canceled, validQueryTrendInvocation(t).Query.Request)
+	if err != context.Canceled {
+		t.Fatalf("read cancellation error = %v, want context.Canceled", err)
+	}
+	if strings.Contains(err.Error(), privateDatabaseURL) {
+		t.Fatalf("read cancellation error exposed database URL: %v", err)
+	}
+	if database.loads != 1 || database.closes != 1 {
+		t.Fatalf("read cancellation calls = load:%d close:%d, want 1/1", database.loads, database.closes)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
+	"stacks/internal/app"
 	"stacks/internal/cli"
 	"stacks/internal/config"
 	"stacks/internal/directory"
@@ -27,6 +28,7 @@ import (
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/query"
+	"stacks/internal/queryplan"
 	"stacks/internal/source"
 )
 
@@ -909,4 +911,268 @@ func TestEnabledDirectoryWithoutScopeFailsBeforeConstruction(t *testing.T) {
 	if constructions != 0 {
 		t.Fatalf("constructions before scope failure = %d, want 0", constructions)
 	}
+}
+
+func TestQueryAskApplicationCompositionIsLazyAndPrivacyBounded(t *testing.T) {
+	const (
+		questionMarker = "private-question-marker"
+		providerMarker = "private-provider-body-marker"
+		databaseURL    = "postgres://private-user:private-password@private-host/private-database"
+	)
+	tests := []struct {
+		name          string
+		question      string
+		modelResponse func(*testing.T) (queryplan.ModelResponse, error)
+		open          func(context.Context, string) (queryDatabase, error)
+		wantProvider  int
+		wantDatabase  int
+		wantError     bool
+	}{
+		{
+			name:     "valid execution",
+			question: questionMarker,
+			modelResponse: func(t *testing.T) (queryplan.ModelResponse, error) {
+				return executableTrendPlanResponse(t), nil
+			},
+			open: func(context.Context, string) (queryDatabase, error) {
+				return &recordingQueryDatabase{snapshot: postgres.TemporalQuerySnapshot{Entities: []postgres.TemporalEntityRecord{{EntityID: "entity-a", Known: true}}}}, nil
+			},
+			wantProvider: 1, wantDatabase: 1,
+		},
+		{
+			name:     "provider failure writes no output",
+			question: questionMarker,
+			modelResponse: func(*testing.T) (queryplan.ModelResponse, error) {
+				return queryplan.ModelResponse{}, errors.New(providerMarker)
+			},
+			open: func(context.Context, string) (queryDatabase, error) {
+				t.Fatal("database opened after provider failure")
+				return nil, nil
+			},
+			wantProvider: 1, wantError: true,
+		},
+		{
+			name:     "database failure writes no output",
+			question: questionMarker,
+			modelResponse: func(t *testing.T) (queryplan.ModelResponse, error) {
+				return executableTrendPlanResponse(t), nil
+			},
+			open:         func(context.Context, string) (queryDatabase, error) { return nil, errors.New(databaseURL) },
+			wantProvider: 1, wantDatabase: 1, wantError: true,
+		},
+		{
+			name:     "invalid proposal opens no database",
+			question: questionMarker,
+			modelResponse: func(*testing.T) (queryplan.ModelResponse, error) {
+				return queryplan.ModelResponse{Output: []byte(`{`), Provider: modelpolicy.ProviderOpenAI, ModelID: "synthetic-model", PromptVersion: queryplan.PromptVersion, SchemaName: queryplan.SchemaName, Attempts: 1}, nil
+			},
+			open: func(context.Context, string) (queryDatabase, error) {
+				t.Fatal("database opened after invalid proposal")
+				return nil, nil
+			},
+			wantProvider: 1, wantError: true,
+		},
+		{
+			name:     "cannot plan opens no database",
+			question: questionMarker,
+			modelResponse: func(*testing.T) (queryplan.ModelResponse, error) {
+				return queryplan.ModelResponse{Output: []byte(`{"status":"cannot-plan","reason":"ambiguous-question","intent":"","entity_match":"","predicates":[],"selections":[],"knowledge_scope":{"kind":"","as_of":""},"chronology_limit":0}`), Provider: modelpolicy.ProviderOpenAI, ModelID: "synthetic-model", PromptVersion: queryplan.PromptVersion, SchemaName: queryplan.SchemaName, Attempts: 1}, nil
+			},
+			open: func(context.Context, string) (queryDatabase, error) {
+				t.Fatal("database opened after cannot-plan proposal")
+				return nil, nil
+			},
+			wantProvider: 1, wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var providerCalls, databaseCalls, unrelatedCalls int
+			var stdout, stderr strings.Builder
+			runtime := commandRuntime{
+				openQueryDatabase: func(ctx context.Context, url string) (queryDatabase, error) {
+					databaseCalls++
+					return test.open(ctx, url)
+				},
+				newQueryPlannerModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (queryplan.Model, error) {
+					providerCalls++
+					return queryPlanModelFunc(func(context.Context, queryplan.ModelRequest) (queryplan.ModelResponse, error) {
+						return test.modelResponse(t)
+					}), nil
+				},
+				newSource: func(context.Context, config.ApplicationSettings) (source.Source, error) {
+					unrelatedCalls++
+					return emptyRuntimeSource{}, nil
+				},
+				newDirectoryLookup: func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error) {
+					unrelatedCalls++
+					return &recordingRuntimeDirectoryLookup{}, nil
+				},
+				openCanonicalRepositories: func(context.Context, string, bool) (canonicalRepositories, error) {
+					unrelatedCalls++
+					return canonicalRepositories{}, nil
+				},
+				newModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error) {
+					unrelatedCalls++
+					return noOpRuntimeModel{}, nil
+				},
+			}
+			err := executeRootQueryAsk(t, validQueryAskSettings(), runtime, strings.NewReader(test.question), &stdout, &stderr)
+			if (err != nil) != test.wantError {
+				t.Fatalf("app.Execute() error = %v, want error %t", err, test.wantError)
+			}
+			if providerCalls != test.wantProvider || databaseCalls != test.wantDatabase || unrelatedCalls != 0 {
+				t.Fatalf("constructions = provider:%d database:%d unrelated:%d, want %d/%d/0", providerCalls, databaseCalls, unrelatedCalls, test.wantProvider, test.wantDatabase)
+			}
+			if test.wantError && stdout.Len() != 0 {
+				t.Fatalf("failure stdout = %q, want empty", stdout.String())
+			}
+			for _, marker := range []string{questionMarker, providerMarker, databaseURL} {
+				if strings.Contains(stderr.String(), marker) || (err != nil && strings.Contains(err.Error(), marker)) {
+					t.Fatalf("private marker %q leaked through error or stderr", marker)
+				}
+			}
+		})
+	}
+}
+
+func TestQueryAskApplicationRejectsLocalDisclosureBeforeProviderConstruction(t *testing.T) {
+	var providerCalls, databaseCalls int
+	runtime := commandRuntime{
+		openQueryDatabase: func(context.Context, string) (queryDatabase, error) {
+			databaseCalls++
+			return &recordingQueryDatabase{}, nil
+		},
+		newQueryPlannerModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (queryplan.Model, error) {
+			providerCalls++
+			return nil, errors.New("unexpected")
+		},
+	}
+	var stdout, stderr strings.Builder
+	err := executeRootQueryAsk(t, validQueryAskSettings(), runtime, strings.NewReader("entity-a private disclosure"), &stdout, &stderr)
+	if err == nil {
+		t.Fatal("app.Execute() error = nil, want local disclosure rejection")
+	}
+	if providerCalls != 0 || databaseCalls != 0 || stdout.Len() != 0 {
+		t.Fatalf("local disclosure handling = provider:%d database:%d stdout:%d, want 0/0/0", providerCalls, databaseCalls, stdout.Len())
+	}
+}
+
+func TestQueryAskApplicationRestrictedDisclosureFailsClosedBeforePlannerConstruction(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider modelpolicy.Provider
+		probe    doctor.DisclosureProbe
+	}{
+		{name: "openai", provider: modelpolicy.ProviderOpenAI},
+		{name: "anthropic", provider: modelpolicy.ProviderAnthropic},
+		{name: "bedrock logging enabled", provider: modelpolicy.ProviderBedrock, probe: rootDisclosureProbe{state: doctor.InvocationLoggingEnabled}},
+		{name: "bedrock logging unknown", provider: modelpolicy.ProviderBedrock, probe: rootDisclosureProbe{state: doctor.InvocationLoggingUnknown}},
+		{name: "bedrock access denied", provider: modelpolicy.ProviderBedrock, probe: rootDisclosureProbe{err: errors.New("private request ID marker")}},
+		{name: "bedrock timeout", provider: modelpolicy.ProviderBedrock, probe: rootDisclosureProbe{err: context.DeadlineExceeded}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := validQueryAskSettings()
+			settings.Application.Model.Provider = test.provider
+			settings.Application.Model.DataMode = modelpolicy.DataModeRestricted
+			settings.Application.Model.AWSRegion = "us-east-1"
+			if test.provider == modelpolicy.ProviderAnthropic {
+				settings.Application.Model.AnthropicAPIKey = "synthetic-anthropic-key"
+			}
+			var providerCalls, databaseCalls, probeCalls int
+			runtime := commandRuntime{
+				openQueryDatabase: func(context.Context, string) (queryDatabase, error) {
+					databaseCalls++
+					return &recordingQueryDatabase{}, nil
+				},
+				newQueryPlannerModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (queryplan.Model, error) {
+					providerCalls++
+					return nil, errors.New("unexpected")
+				},
+				newDoctorProviderProbe: func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error) {
+					probeCalls++
+					return nil, test.probe, nil
+				},
+			}
+			var stdout, stderr strings.Builder
+			err := executeRootQueryAsk(t, settings, runtime, strings.NewReader("private question"), &stdout, &stderr)
+			if err == nil {
+				t.Fatal("app.Execute() error = nil, want restricted disclosure rejection")
+			}
+			if providerCalls != 0 || databaseCalls != 0 || stdout.Len() != 0 {
+				t.Fatalf("restricted constructions = provider:%d database:%d stdout:%d, want 0/0/0", providerCalls, databaseCalls, stdout.Len())
+			}
+			if test.provider == modelpolicy.ProviderBedrock && probeCalls != 1 {
+				t.Fatalf("Bedrock disclosure probes = %d, want 1", probeCalls)
+			}
+			if test.provider != modelpolicy.ProviderBedrock && probeCalls != 0 {
+				t.Fatalf("direct-provider disclosure probes = %d, want 0", probeCalls)
+			}
+			if strings.Contains(stderr.String(), "private request ID marker") || strings.Contains(err.Error(), "private request ID marker") {
+				t.Fatal("restricted disclosure error leaked private probe detail")
+			}
+		})
+	}
+}
+
+func TestTypedQueryApplicationConstructsNoPlanner(t *testing.T) {
+	database := &recordingQueryDatabase{snapshot: postgres.TemporalQuerySnapshot{Entities: []postgres.TemporalEntityRecord{{EntityID: "entity-a", Known: true}}}}
+	var plannerCalls int
+	runtime := commandRuntime{
+		openQueryDatabase: func(context.Context, string) (queryDatabase, error) { return database, nil },
+		newQueryPlannerModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (queryplan.Model, error) {
+			plannerCalls++
+			return nil, errors.New("typed query must not construct planner")
+		},
+	}
+	settings := validQueryCommandSettings()
+	var stdout, stderr strings.Builder
+	err := app.Execute(
+		context.Background(),
+		[]string{"query", "trend", "--entity", "entity-a", "--before", "2024-01-01T00:00:00Z/2024-02-01T00:00:00Z", "--after", "2024-03-01T00:00:00Z/2024-04-01T00:00:00Z"},
+		app.SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) { return settings, nil }),
+		app.BootstrapFunc(func(context.Context, config.Settings) (app.ExecutionDependencies, error) {
+			return app.ExecutionDependencies{
+				CommandProvider: app.CommandProviderFunc(func(ctx context.Context, settings config.Settings, stdin io.Reader, output, errors io.Writer) (map[string]cli.Command, error) {
+					return commandProviderWithRuntime(ctx, settings, output, errors, tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime, stdin)
+				}),
+				Shutdown: func(context.Context) error { return nil },
+			}, nil
+		}),
+		strings.NewReader("private typed question must remain unread"), &stdout, &stderr,
+	)
+	if err != nil {
+		t.Fatalf("app.Execute() error = %v", err)
+	}
+	if plannerCalls != 0 || database.loads != 1 || database.closes != 1 {
+		t.Fatalf("typed lifecycle = planner:%d load:%d close:%d, want 0/1/1", plannerCalls, database.loads, database.closes)
+	}
+}
+
+type rootDisclosureProbe struct {
+	state doctor.InvocationLoggingState
+	err   error
+}
+
+func (probe rootDisclosureProbe) InvocationLogging(context.Context) (doctor.InvocationLoggingState, error) {
+	return probe.state, probe.err
+}
+
+func executeRootQueryAsk(t *testing.T, settings config.Settings, runtime commandRuntime, input io.Reader, stdout, stderr io.Writer) error {
+	t.Helper()
+	return app.Execute(
+		context.Background(),
+		[]string{"query", "ask", "--entity", "entity-a", "--reference-time", "2026-07-29T16:00:00Z", "--output", "json"},
+		app.SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) { return settings, nil }),
+		app.BootstrapFunc(func(context.Context, config.Settings) (app.ExecutionDependencies, error) {
+			return app.ExecutionDependencies{
+				CommandProvider: app.CommandProviderFunc(func(ctx context.Context, settings config.Settings, stdin io.Reader, output, errors io.Writer) (map[string]cli.Command, error) {
+					return commandProviderWithRuntime(ctx, settings, output, errors, tracenoop.NewTracerProvider().Tracer("synthetic"), nil, nil, runtime, stdin)
+				}),
+				Shutdown: func(context.Context) error { return nil },
+			}, nil
+		}),
+		input, stdout, stderr,
+	)
 }
