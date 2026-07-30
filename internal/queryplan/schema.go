@@ -2,7 +2,7 @@ package queryplan
 
 import _ "embed"
 
-//go:embed prompts/query-plan-v1.txt
+//go:embed prompts/query-plan-v2.txt
 var queryPlanPrompt string
 
 var queryPlanSchema = []byte(`{
