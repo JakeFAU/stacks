@@ -16,43 +16,45 @@ import (
 )
 
 const (
-	configKeyHTTPHost                  = "http.host"
-	configKeyHTTPPort                  = "http.port"
-	configKeyHTTPReadHeaderTimeout     = "http.read_header_timeout_seconds"
-	configKeyLogLevel                  = "log.level"
-	configKeyTelemetryEnabled          = "telemetry.enabled"
-	configKeyTelemetryEndpoint         = "telemetry.endpoint"
-	configKeyTelemetryInsecure         = "telemetry.insecure"
-	configKeyTelemetryMetricInterval   = "telemetry.metric_export_interval"
-	configKeyTelemetryServiceName      = "telemetry.service_name"
-	configKeyTelemetryTraceSampleRatio = "telemetry.trace_sample_ratio"
-	configKeyDatabaseScopes            = "database.scopes"
-	configKeyDatabaseApplicationRole   = "database.application_role"
-	configKeyGoogleFolderID            = "google.folder_id"
-	configKeyGoogleOAuthClientFile     = "google.oauth_client_file"
-	configKeyGoogleOAuthTokenFile      = "google.oauth_token_file"
-	configKeyGoogleTranscriptTitles    = "google.transcript_titles"
-	configKeyGoogleNotesTitles         = "google.notes_titles"
-	configKeyDirectoryEnabled          = "directory.enabled"
-	configKeyDirectoryOAuthClientFile  = "directory.oauth_client_file"
-	configKeyDirectoryOAuthTokenFile   = "directory.oauth_token_file"
-	configKeyDirectoryEmailDomains     = "directory.email_domains"
-	configKeyDirectoryFreshness        = "directory.freshness"
-	configKeyDirectoryRetryAfter       = "directory.retry_after"
-	configKeyDirectoryMaxAttempts      = "directory.max_attempts"
-	configKeyModelDataMode             = "model.data_mode"
-	configKeyModelProvider             = "model.provider"
-	configKeyModelID                   = "model.id"
-	configKeyModelMaxOutputTokens      = "model.max_output_tokens"
-	configKeyModelMaxAttempts          = "model.max_attempts"
-	configKeyModelAWSProfile           = "model.aws_profile"
-	configKeyModelAWSRegion            = "model.aws_region"
-	configKeyIngestionLeaseDuration    = "ingestion.lease_duration"
-	configKeyIngestionAttemptTimeout   = "ingestion.attempt_timeout"
-	configKeyExtractionPromptVersion   = "extraction.prompt_version"
-	configKeyQueryMaxEntities          = "query.max_entities"
-	configKeyQueryMaxPredicates        = "query.max_predicates"
-	configKeyQueryMaxChronology        = "query.max_chronology"
+	configKeyHTTPHost                     = "http.host"
+	configKeyHTTPPort                     = "http.port"
+	configKeyHTTPReadHeaderTimeout        = "http.read_header_timeout_seconds"
+	configKeyLogLevel                     = "log.level"
+	configKeyTelemetryEnabled             = "telemetry.enabled"
+	configKeyTelemetryEndpoint            = "telemetry.endpoint"
+	configKeyTelemetryInsecure            = "telemetry.insecure"
+	configKeyTelemetryMetricInterval      = "telemetry.metric_export_interval"
+	configKeyTelemetryServiceName         = "telemetry.service_name"
+	configKeyTelemetryTraceSampleRatio    = "telemetry.trace_sample_ratio"
+	configKeyDatabaseScopes               = "database.scopes"
+	configKeyDatabaseApplicationRole      = "database.application_role"
+	configKeyGoogleFolderID               = "google.folder_id"
+	configKeyGoogleOAuthClientFile        = "google.oauth_client_file"
+	configKeyGoogleOAuthTokenFile         = "google.oauth_token_file"
+	configKeyGoogleTranscriptTitles       = "google.transcript_titles"
+	configKeyGoogleNotesTitles            = "google.notes_titles"
+	configKeyDirectoryEnabled             = "directory.enabled"
+	configKeyDirectoryOAuthClientFile     = "directory.oauth_client_file"
+	configKeyDirectoryOAuthTokenFile      = "directory.oauth_token_file"
+	configKeyDirectoryEmailDomains        = "directory.email_domains"
+	configKeyDirectoryFreshness           = "directory.freshness"
+	configKeyDirectoryRetryAfter          = "directory.retry_after"
+	configKeyDirectoryMaxAttempts         = "directory.max_attempts"
+	configKeyModelDataMode                = "model.data_mode"
+	configKeyModelProvider                = "model.provider"
+	configKeyModelID                      = "model.id"
+	configKeyModelMaxOutputTokens         = "model.max_output_tokens"
+	configKeyModelMaxAttempts             = "model.max_attempts"
+	configKeyModelAWSProfile              = "model.aws_profile"
+	configKeyModelAWSRegion               = "model.aws_region"
+	configKeyIngestionLeaseDuration       = "ingestion.lease_duration"
+	configKeyIngestionAttemptTimeout      = "ingestion.attempt_timeout"
+	configKeyExtractionPromptVersion      = "extraction.prompt_version"
+	configKeyQueryMaxEntities             = "query.max_entities"
+	configKeyQueryMaxPredicates           = "query.max_predicates"
+	configKeyQueryMaxChronology           = "query.max_chronology"
+	configKeyQueryPlannerTimeout          = "query_planner.timeout"
+	configKeyQueryPlannerMaxQuestionBytes = "query_planner.max_question_bytes"
 )
 
 type environmentBinding struct {
@@ -99,6 +101,8 @@ func configurationEnvironmentBindings() []environmentBinding {
 		{configKeyQueryMaxEntities, QueryMaxEntitiesEnvironmentVariable},
 		{configKeyQueryMaxPredicates, QueryMaxPredicatesEnvironmentVariable},
 		{configKeyQueryMaxChronology, QueryMaxChronologyEnvironmentVariable},
+		{configKeyQueryPlannerTimeout, QueryPlannerTimeoutEnvironmentVariable},
+		{configKeyQueryPlannerMaxQuestionBytes, QueryPlannerMaxQuestionBytesEnvironmentVariable},
 	}
 }
 
@@ -157,6 +161,8 @@ func setDefaults(values *viper.Viper) {
 	values.SetDefault(configKeyQueryMaxEntities, defaultQueryMaxEntities)
 	values.SetDefault(configKeyQueryMaxPredicates, defaultQueryMaxPredicates)
 	values.SetDefault(configKeyQueryMaxChronology, defaultQueryMaxChronology)
+	values.SetDefault(configKeyQueryPlannerTimeout, defaultQueryPlannerTimeout)
+	values.SetDefault(configKeyQueryPlannerMaxQuestionBytes, defaultQueryPlannerMaxQuestionBytes)
 }
 
 func bindEnvironment(values *viper.Viper) error {
@@ -333,6 +339,14 @@ func settingsFrom(values *viper.Viper) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
+	queryPlannerTimeout, err := queryPlannerDurationValue(values, configKeyQueryPlannerTimeout, QueryPlannerTimeoutEnvironmentVariable)
+	if err != nil {
+		return Settings{}, err
+	}
+	queryPlannerMaxQuestionBytes, err := queryPlannerIntegerValue(values, configKeyQueryPlannerMaxQuestionBytes, QueryPlannerMaxQuestionBytesEnvironmentVariable)
+	if err != nil {
+		return Settings{}, err
+	}
 
 	return Settings{
 		HTTPAddress:       net.JoinHostPort(host, strconv.Itoa(port)),
@@ -348,6 +362,9 @@ func settingsFrom(values *viper.Viper) (Settings, error) {
 		},
 		Query: QuerySettings{
 			MaxEntities: queryMaxEntities, MaxPredicates: queryMaxPredicates, MaxChronology: queryMaxChronology,
+		},
+		QueryPlanner: QueryPlannerSettings{
+			Timeout: queryPlannerTimeout, MaxQuestionBytes: queryPlannerMaxQuestionBytes,
 		},
 		Application: ApplicationSettings{
 			GoogleFolderID: googleFolderID, GoogleOAuthClientFile: googleOAuthClientFile, GoogleOAuthTokenFile: googleOAuthTokenFile,
@@ -471,6 +488,27 @@ func durationValue(values *viper.Viper, key, environmentName string) (time.Durat
 		}
 	}
 	return 0, fmt.Errorf("%s must be a positive duration", environmentName)
+}
+
+func queryPlannerDurationValue(values *viper.Viper, key, environmentName string) (time.Duration, error) {
+	switch value := values.Get(key).(type) {
+	case time.Duration:
+		return value, nil
+	case string:
+		parsed, err := time.ParseDuration(value)
+		if err == nil {
+			return parsed, nil
+		}
+	}
+	return 0, fmt.Errorf("%s must be a duration", environmentName)
+}
+
+func queryPlannerIntegerValue(values *viper.Viper, key, environmentName string) (int, error) {
+	value, ok := integer(values.Get(key))
+	if !ok {
+		return 0, fmt.Errorf("%s must be an integer", environmentName)
+	}
+	return value, nil
 }
 
 func unitIntervalValue(values *viper.Viper, key, environmentName string) (float64, error) {

@@ -126,7 +126,7 @@ test-integration:
 		test -n "$$STACKS_TEST_MIGRATION_DATABASE_URL" || (echo "STACKS_TEST_MIGRATION_DATABASE_URL is required" >&2; exit 1); \
 		(cd adapters/postgres && GOWORK=off go run ./cmd/validate-test-database) && \
 		(cd adapters/postgres && GOWORK=off go test ./... -count=1) && \
-		go test ./internal/ingest ./internal/directory ./internal/app ./internal/doctor ./internal/query -count=1
+		go test ./internal/ingest ./internal/directory ./internal/app ./internal/doctor ./internal/query ./internal/queryplan -count=1
 
 staticcheck:
 	@sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' modules.txt | while IFS= read -r module; do \

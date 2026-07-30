@@ -141,6 +141,43 @@ func TestMetricsRecorderDropsInvalidObservations(t *testing.T) {
 	}
 }
 
+func TestMetricsRecorderRecordsQuestionByteCountWithoutAttributes(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	recorder, err := NewMetricsRecorder(meterProvider.Meter("stacks"))
+	if err != nil {
+		t.Fatalf("NewMetricsRecorder() error = %v", err)
+	}
+
+	recorder.RecordQuestionBytes(context.Background(), 37)
+	recorder.RecordQuestionBytes(context.Background(), -1)
+
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &collected); err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	for _, scope := range collected.ScopeMetrics {
+		for _, measured := range scope.Metrics {
+			if measured.Name != "stacks.query.planner.question.bytes" {
+				continue
+			}
+			data, ok := measured.Data.(metricdata.Histogram[int64])
+			if !ok || len(data.DataPoints) != 1 {
+				t.Fatalf("question byte metric = %#v, want one int64 histogram datapoint", measured.Data)
+			}
+			point := data.DataPoints[0]
+			if point.Sum != 37 || point.Count != 1 {
+				t.Fatalf("question byte datapoint = %#v, want one value of 37", point)
+			}
+			if len(point.Attributes.ToSlice()) != 0 {
+				t.Fatalf("question byte attributes = %#v, want none", point.Attributes.ToSlice())
+			}
+			return
+		}
+	}
+	t.Fatal("question byte metric was not recorded")
+}
+
 func validObservation() Observation {
 	return Observation{
 		Provider:        modelpolicy.ProviderBedrock,

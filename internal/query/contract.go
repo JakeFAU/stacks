@@ -114,7 +114,7 @@ var ErrLimitExceeded = errors.New("query limit exceeded")
 // canonical request. Temporal intent, selections, and knowledge scope are
 // validated by the core temporal planner before any repository read.
 func NormalizeRequest(request Request, limits Limits) (Request, error) {
-	if err := validateLimits(limits); err != nil {
+	if err := ValidateLimits(limits); err != nil {
 		return Request{}, err
 	}
 	entityIDs, err := normalizeEntityIDs(request.EntityIDs, limits.MaxEntities)
@@ -158,7 +158,8 @@ func (request Request) ReadSelection() ReadSelection {
 	}
 }
 
-func validateLimits(limits Limits) error {
+// ValidateLimits rejects nonpositive query bounds.
+func ValidateLimits(limits Limits) error {
 	if limits.MaxEntities <= 0 || limits.MaxPredicates <= 0 || limits.MaxChronology <= 0 {
 		return fmt.Errorf("query limits must be positive")
 	}

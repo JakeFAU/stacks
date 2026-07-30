@@ -40,7 +40,7 @@ func TestExecuteLoadsValidatesThenBootstrapsSelectedCommand(t *testing.T) {
 			return errors.New("serve must not run")
 		}),
 		CommandProvider: CommandProviderFunc(func(
-			context.Context, config.Settings, io.Writer, io.Writer,
+			context.Context, config.Settings, io.Reader, io.Writer, io.Writer,
 		) (map[string]cli.Command, error) {
 			calls = append(calls, "commands")
 			return map[string]cli.Command{"sync": cli.CommandFunc(func(context.Context, cli.Invocation) error {
@@ -55,7 +55,7 @@ func TestExecuteLoadsValidatesThenBootstrapsSelectedCommand(t *testing.T) {
 	}
 	bootstrap := recordingBootstrap{calls: &calls, dependencies: dependencies}
 
-	if err := Execute(t.Context(), []string{"sync"}, loader, bootstrap, io.Discard, io.Discard); err != nil {
+	if err := Execute(t.Context(), []string{"sync"}, loader, bootstrap, strings.NewReader(""), io.Discard, io.Discard); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if got, want := strings.Join(calls, ","), "load,bootstrap,commands,run,shutdown"; got != want {
@@ -71,7 +71,7 @@ func TestExecuteRejectsInvalidSettingsBeforeBootstrap(t *testing.T) {
 	})
 	bootstrap := recordingBootstrap{calls: &calls}
 
-	err := Execute(t.Context(), []string{"sync"}, loader, bootstrap, io.Discard, io.Discard)
+	err := Execute(t.Context(), []string{"sync"}, loader, bootstrap, strings.NewReader(""), io.Discard, io.Discard)
 	if err == nil {
 		t.Fatal("Execute() error = nil, want validation failure")
 	}
@@ -103,7 +103,7 @@ func TestExecuteSyntaxAndHelpDoNotLoadOrBootstrap(t *testing.T) {
 				return config.Settings{}, errors.New("loader must not run")
 			})
 
-			err := Execute(t.Context(), testCase.args, loader, recordingBootstrap{calls: &bootstrapCalls}, io.Discard, io.Discard)
+			err := Execute(t.Context(), testCase.args, loader, recordingBootstrap{calls: &bootstrapCalls}, strings.NewReader(""), io.Discard, io.Discard)
 			if testCase.wantHelp {
 				if err != nil {
 					t.Fatalf("Execute() error = %v, want help success", err)
@@ -131,6 +131,7 @@ func TestExecuteRejectsRetiredAnalyzeBeforeLoadOrBootstrap(t *testing.T) {
 		[]string{"analyze"},
 		loader,
 		recordingBootstrap{calls: &bootstrapCalls},
+		strings.NewReader(""),
 		io.Discard,
 		io.Discard,
 	)
@@ -155,7 +156,7 @@ func TestExecutePassesSelectedConfigFileToLoader(t *testing.T) {
 		}, nil
 	})
 
-	if err := Execute(t.Context(), []string{"serve", "--config", "/synthetic/stacks.yaml"}, loader, bootstrap, io.Discard, io.Discard); err != nil {
+	if err := Execute(t.Context(), []string{"serve", "--config", "/synthetic/stacks.yaml"}, loader, bootstrap, strings.NewReader(""), io.Discard, io.Discard); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if gotOptions.ConfigFile == nil || *gotOptions.ConfigFile != "/synthetic/stacks.yaml" {
@@ -171,7 +172,7 @@ func TestExecuteLoaderFailureDoesNotBootstrap(t *testing.T) {
 		return config.Settings{}, loadError
 	})
 
-	err := Execute(t.Context(), []string{"serve"}, loader, recordingBootstrap{calls: &calls}, io.Discard, io.Discard)
+	err := Execute(t.Context(), []string{"serve"}, loader, recordingBootstrap{calls: &calls}, strings.NewReader(""), io.Discard, io.Discard)
 	if !errors.Is(err, loadError) {
 		t.Fatalf("Execute() error = %v, want loader sentinel", err)
 	}
@@ -211,7 +212,7 @@ func TestExecuteValidatesSelectedGoogleAuthBeforeBootstrap(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			calls := []string{}
 			loader := settingsLoader(config.Settings{Application: testCase.application})
-			err := Execute(t.Context(), []string{"auth", testCase.action}, loader, recordingBootstrap{calls: &calls}, io.Discard, io.Discard)
+			err := Execute(t.Context(), []string{"auth", testCase.action}, loader, recordingBootstrap{calls: &calls}, strings.NewReader(""), io.Discard, io.Discard)
 			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
 				t.Fatalf("Execute() error = %v, want selected auth target failure containing %s", err, testCase.wantError)
 			}
@@ -273,6 +274,7 @@ func TestExecuteOfflineGoogleAuthValidationDoesNotBootstrap(t *testing.T) {
 				[]string{"config", "validate", "auth", testCase.action},
 				settingsLoader(config.Settings{Application: testCase.application}),
 				recordingBootstrap{calls: &calls},
+				strings.NewReader(""),
 				&output,
 				io.Discard,
 			)
@@ -313,7 +315,7 @@ func TestExecuteOfflineTargetsUseSettingsValidation(t *testing.T) {
 			var output bytes.Buffer
 			calls := []string{}
 			args := append([]string{"config", "validate"}, target...)
-			err := Execute(t.Context(), args, settingsLoader(settings), recordingBootstrap{calls: &calls}, &output, io.Discard)
+			err := Execute(t.Context(), args, settingsLoader(settings), recordingBootstrap{calls: &calls}, strings.NewReader(""), &output, io.Discard)
 			if err == nil || !strings.Contains(err.Error(), config.DatabaseScopesEnvironmentVariable) {
 				t.Fatalf("Execute() error = %v, want Settings.Validate failure", err)
 			}
@@ -335,6 +337,7 @@ func TestExecuteOfflineValidationDelegatesBoundedOutput(t *testing.T) {
 		[]string{"config", "validate", "serve"},
 		settingsLoader(config.Settings{}),
 		recordingBootstrap{calls: &calls},
+		strings.NewReader(""),
 		&output,
 		io.Discard,
 	)
@@ -361,6 +364,7 @@ func TestExecuteOfflineQueryValidationDoesNotBootstrap(t *testing.T) {
 		[]string{"config", "validate", "query"},
 		settingsLoader(settings),
 		recordingBootstrap{calls: &calls},
+		strings.NewReader(""),
 		&output,
 		io.Discard,
 	)
@@ -372,6 +376,126 @@ func TestExecuteOfflineQueryValidationDoesNotBootstrap(t *testing.T) {
 	}
 	if len(calls) != 0 {
 		t.Fatalf("bootstrap calls = %d, want 0", len(calls))
+	}
+}
+
+func TestExecuteConfigValidateQueryAskUsesAskSettingsTarget(t *testing.T) {
+	calls := []string{}
+	settings := config.Settings{
+		Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+		Query:    config.QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+		QueryPlanner: config.QueryPlannerSettings{
+			Timeout: 0, MaxQuestionBytes: 1024,
+		},
+	}
+
+	err := Execute(
+		t.Context(),
+		[]string{"config", "validate", "query", "ask"},
+		settingsLoader(settings),
+		recordingBootstrap{calls: &calls},
+		strings.NewReader("synthetic question\n"),
+		io.Discard,
+		io.Discard,
+	)
+	if err == nil || !strings.Contains(err.Error(), config.QueryPlannerTimeoutEnvironmentVariable) {
+		t.Fatalf("Execute() error = %v, want query ask planner validation failure", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("bootstrap calls = %d, want 0", len(calls))
+	}
+}
+
+func TestExecuteInvalidQueryAskSettingsDoNotBootstrapOrConstructCommands(t *testing.T) {
+	loaderCalls := 0
+	bootstrapCalls := []string{}
+	settings := config.Settings{
+		Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+		Query:    config.QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+		QueryPlanner: config.QueryPlannerSettings{
+			Timeout: time.Minute, MaxQuestionBytes: 0,
+		},
+	}
+	loader := SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) {
+		loaderCalls++
+		return settings, nil
+	})
+
+	err := Execute(
+		t.Context(),
+		[]string{"query", "ask", "--entity", "entity-a", "--reference-time", "2026-07-30T00:00:00Z"},
+		loader,
+		recordingBootstrap{calls: &bootstrapCalls},
+		strings.NewReader("synthetic question\n"),
+		io.Discard,
+		io.Discard,
+	)
+	if err == nil || !strings.Contains(err.Error(), config.QueryPlannerMaxQuestionBytesEnvironmentVariable) {
+		t.Fatalf("Execute() error = %v, want query ask planner validation failure", err)
+	}
+	if loaderCalls != 1 || len(bootstrapCalls) != 0 {
+		t.Fatalf("loader/bootstrap calls = %d/%d, want 1/0", loaderCalls, len(bootstrapCalls))
+	}
+}
+
+func TestExecuteDoesNotReadInputForHelpSyntaxOrConfigValidation(t *testing.T) {
+	validAskSettings := config.Settings{
+		Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+		Query:    config.QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+		QueryPlanner: config.QueryPlannerSettings{
+			Timeout: time.Minute, MaxQuestionBytes: 1024,
+		},
+		Application: config.ApplicationSettings{Model: config.ModelSettings{
+			DataMode: "personal", Provider: "bedrock", ModelID: "synthetic-model",
+			MaxOutputTokens: 256, MaxAttempts: 1, AWSRegion: "us-east-1",
+		}},
+	}
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "help", args: []string{"query", "ask", "--help"}},
+		{name: "malformed ask", args: []string{"query", "ask", "question", "--entity", "entity-a", "--reference-time", "2026-07-30T00:00:00Z"}},
+		{name: "config validation", args: []string{"config", "validate", "query", "ask"}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			input := strings.NewReader("synthetic question\n")
+			loaderCalls := 0
+			bootstrapCalls := []string{}
+			err := Execute(
+				t.Context(),
+				testCase.args,
+				SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) {
+					loaderCalls++
+					return validAskSettings, nil
+				}),
+				recordingBootstrap{calls: &bootstrapCalls},
+				input,
+				io.Discard,
+				io.Discard,
+			)
+			if testCase.name == "malformed ask" {
+				if err == nil {
+					t.Fatal("Execute() error = nil, want syntax failure")
+				}
+			} else if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if input.Len() != len("synthetic question\n") {
+				t.Fatalf("stdin length = %d, want input unread", input.Len())
+			}
+			if len(bootstrapCalls) != 0 {
+				t.Fatalf("bootstrap calls = %d, want 0", len(bootstrapCalls))
+			}
+			wantLoaderCalls := 1
+			if testCase.name != "config validation" {
+				wantLoaderCalls = 0
+			}
+			if loaderCalls != wantLoaderCalls {
+				t.Fatalf("loader calls = %d, want %d", loaderCalls, wantLoaderCalls)
+			}
+		})
 	}
 }
 
@@ -387,6 +511,7 @@ func TestExecuteInvalidQueryConfigurationDoesNotBootstrapOrWriteSuccess(t *testi
 		[]string{"config", "validate", "query"},
 		settingsLoader(settings),
 		recordingBootstrap{calls: &calls},
+		strings.NewReader(""),
 		&output,
 		io.Discard,
 	)
@@ -418,6 +543,7 @@ func TestExecuteRejectsInvalidTrendSyntaxBeforeLoadOrBootstrap(t *testing.T) {
 		},
 		loader,
 		recordingBootstrap{calls: &bootstrapCalls},
+		strings.NewReader(""),
 		io.Discard,
 		io.Discard,
 	)
@@ -437,6 +563,7 @@ func TestExecuteBootstrapFailurePreservesIdentity(t *testing.T) {
 		[]string{"serve"},
 		settingsLoader(config.Settings{}),
 		recordingBootstrap{calls: &calls, err: bootstrapError},
+		strings.NewReader(""),
 		io.Discard,
 		io.Discard,
 	)
@@ -451,7 +578,7 @@ func TestExecuteCommandFailureStillShutsDown(t *testing.T) {
 	bootstrap := BootstrapFunc(func(context.Context, config.Settings) (ExecutionDependencies, error) {
 		return ExecutionDependencies{
 			CommandProvider: CommandProviderFunc(func(
-				context.Context, config.Settings, io.Writer, io.Writer,
+				context.Context, config.Settings, io.Reader, io.Writer, io.Writer,
 			) (map[string]cli.Command, error) {
 				return map[string]cli.Command{
 					"sync": cli.CommandFunc(func(context.Context, cli.Invocation) error {
@@ -470,7 +597,7 @@ func TestExecuteCommandFailureStillShutsDown(t *testing.T) {
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
 		Application: validSyncSettingsForExecute("extract-v2"),
 	}
-	err := Execute(t.Context(), []string{"sync"}, settingsLoader(settings), bootstrap, io.Discard, io.Discard)
+	err := Execute(t.Context(), []string{"sync"}, settingsLoader(settings), bootstrap, strings.NewReader(""), io.Discard, io.Discard)
 	if !errors.Is(err, commandError) {
 		t.Fatalf("Execute() error = %v, want command sentinel", err)
 	}
@@ -485,7 +612,7 @@ func TestExecuteJoinsCommandAndShutdownErrors(t *testing.T) {
 	bootstrap := BootstrapFunc(func(context.Context, config.Settings) (ExecutionDependencies, error) {
 		return ExecutionDependencies{
 			CommandProvider: CommandProviderFunc(func(
-				context.Context, config.Settings, io.Writer, io.Writer,
+				context.Context, config.Settings, io.Reader, io.Writer, io.Writer,
 			) (map[string]cli.Command, error) {
 				return map[string]cli.Command{
 					"sync": cli.CommandFunc(func(context.Context, cli.Invocation) error {
@@ -503,7 +630,7 @@ func TestExecuteJoinsCommandAndShutdownErrors(t *testing.T) {
 		Database:    config.DatabaseSettings{URL: "postgres://synthetic"},
 		Application: validSyncSettingsForExecute("extract-v2"),
 	}
-	err := Execute(t.Context(), []string{"sync"}, settingsLoader(settings), bootstrap, io.Discard, io.Discard)
+	err := Execute(t.Context(), []string{"sync"}, settingsLoader(settings), bootstrap, strings.NewReader(""), io.Discard, io.Discard)
 	if !errors.Is(err, commandError) || !errors.Is(err, shutdownError) {
 		t.Fatalf("Execute() error = %v, want command and shutdown sentinels", err)
 	}
@@ -557,7 +684,7 @@ func TestExecuteCanceledCommandUsesValuePreservingShutdownContext(t *testing.T) 
 		}, nil
 	})
 
-	err := Execute(callerContext, []string{"serve"}, settingsLoader(config.Settings{}), bootstrap, io.Discard, io.Discard)
+	err := Execute(callerContext, []string{"serve"}, settingsLoader(config.Settings{}), bootstrap, strings.NewReader(""), io.Discard, io.Discard)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Execute() error = %v, want context.Canceled", err)
 	}
@@ -596,7 +723,7 @@ func TestExecuteRejectsMissingShutdownBeforeApplicationWork(t *testing.T) {
 			dependencies: func(applicationCalls *int) ExecutionDependencies {
 				return ExecutionDependencies{
 					CommandProvider: CommandProviderFunc(func(
-						context.Context, config.Settings, io.Writer, io.Writer,
+						context.Context, config.Settings, io.Reader, io.Writer, io.Writer,
 					) (map[string]cli.Command, error) {
 						(*applicationCalls)++
 						return map[string]cli.Command{
@@ -619,6 +746,7 @@ func TestExecuteRejectsMissingShutdownBeforeApplicationWork(t *testing.T) {
 				testCase.args,
 				settingsLoader(testCase.settings),
 				fixedBootstrap(testCase.dependencies(&applicationCalls)),
+				strings.NewReader(""),
 				io.Discard,
 				io.Discard,
 			)
@@ -673,7 +801,7 @@ func TestExecuteReportsMissingRequiredDependencies(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			err := Execute(t.Context(), testCase.args, testCase.loader, testCase.bootstrap, io.Discard, io.Discard)
+			err := Execute(t.Context(), testCase.args, testCase.loader, testCase.bootstrap, strings.NewReader(""), io.Discard, io.Discard)
 			if err == nil || !strings.Contains(err.Error(), testCase.want) {
 				t.Fatalf("Execute() error = %v, want %q", err, testCase.want)
 			}

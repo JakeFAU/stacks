@@ -81,6 +81,7 @@ func TestExecutionDependenciesComposeRuntimeCommandsTelemetryAndShutdown(t *test
 	composeCommands = func(
 		_ context.Context,
 		settings config.Settings,
+		_ io.Reader,
 		_, _ io.Writer,
 		tracer trace.Tracer,
 		decisions *observability.DecisionRecorder,
@@ -133,6 +134,7 @@ func TestExecutionDependenciesComposeRuntimeCommandsTelemetryAndShutdown(t *test
 	if _, err := dependencies.CommandProvider.Commands(
 		t.Context(),
 		validatedSettings,
+		strings.NewReader(""),
 		io.Discard,
 		io.Discard,
 	); err != nil {
@@ -1462,7 +1464,7 @@ func TestCommandProviderRegistersDoctorSyncAndQueryWithoutConstructingLiveDepend
 		t.Fatalf("create invocation recorder: %v", err)
 	}
 	commands, err := commandProvider(
-		context.Background(), config.Settings{}, io.Discard, io.Discard,
+		context.Background(), config.Settings{}, strings.NewReader(""), io.Discard, io.Discard,
 		tracenoop.NewTracerProvider().Tracer("synthetic"), recorder, invocations,
 	)
 	if err != nil {

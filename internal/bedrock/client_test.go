@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	"stacks/internal/extract"
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
+	"stacks/internal/queryplan"
 )
 
 const (
@@ -69,6 +71,762 @@ func TestGenerateBuildsStructuredConverseRequestAndCapturesUsage(t *testing.T) {
 	observation := recorder.observations[0]
 	if observation.Provider != modelpolicy.ProviderBedrock || observation.DataMode != modelpolicy.DataModePersonal || observation.ModelID != testModelID || observation.PromptVersion != testPromptVersion || observation.Outcome != OutcomeSuccess || observation.InputTokens != 11 || observation.OutputTokens != 7 || observation.TotalTokens != 18 || observation.ProviderLatency != 47*time.Millisecond || observation.Attempts != 1 {
 		t.Errorf("telemetry observation = %+v", observation)
+	}
+}
+
+func TestClientPlanBuildsExactStructuredConverseRequest(t *testing.T) {
+	api := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{successfulOutput(`{"kind":"point"}`)}}
+	client := newTestClient(t, api, &recordingInvocationRecorder{}, 1)
+	request := validPlanRequest()
+
+	response, err := client.Plan(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	if len(api.inputs) != 1 {
+		t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+	}
+	want := &bedrockruntime.ConverseInput{
+		ModelId: aws.String(client.modelID),
+		InferenceConfig: &types.InferenceConfiguration{
+			MaxTokens: aws.Int32(client.maxTokens),
+		},
+		System: []types.SystemContentBlock{
+			&types.SystemContentBlockMemberText{Value: request.SystemPrompt},
+		},
+		Messages: []types.Message{{
+			Role: types.ConversationRoleUser,
+			Content: []types.ContentBlock{
+				&types.ContentBlockMemberText{Value: request.Input},
+			},
+		}},
+		OutputConfig: &types.OutputConfig{TextFormat: &types.OutputFormat{
+			Type: types.OutputFormatTypeJsonSchema,
+			Structure: &types.OutputFormatStructureMemberJsonSchema{Value: types.JsonSchemaDefinition{
+				Name: aws.String(queryplan.SchemaName), Schema: aws.String(string(request.JSONSchema)),
+			}},
+		}},
+		RequestMetadata: nil,
+	}
+	if !reflect.DeepEqual(api.inputs[0], want) {
+		t.Fatalf("Converse input = %#v, want %#v", api.inputs[0], want)
+	}
+	if response.Provider != modelpolicy.ProviderBedrock || response.ModelID != testModelID ||
+		response.PromptVersion != request.PromptVersion || response.SchemaName != request.SchemaName ||
+		response.Usage != (queryplan.Usage{InputTokens: 11, OutputTokens: 7, TotalTokens: 18}) ||
+		response.Attempts != 1 || response.WallLatency < 0 || response.ProviderLatency != 47*time.Millisecond {
+		t.Fatalf("Plan response = %+v", response)
+	}
+}
+
+func TestClientPlanRejectsMutatedPromptContractWithoutCallingProvider(t *testing.T) {
+	tests := map[string]func(*queryplan.ModelRequest){
+		"unknown version": func(request *queryplan.ModelRequest) { request.PromptVersion = "query-plan-v2" },
+		"mutated prompt":  func(request *queryplan.ModelRequest) { request.SystemPrompt = "mutated" },
+		"mutated schema name": func(request *queryplan.ModelRequest) {
+			request.SchemaName = "mutated_schema"
+		},
+		"mutated schema": func(request *queryplan.ModelRequest) { request.JSONSchema = []byte(`{}`) },
+		"empty input":    func(request *queryplan.ModelRequest) { request.Input = "" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{successfulOutput(`{}`)}}
+			client := newTestClient(t, api, &recordingInvocationRecorder{}, 2)
+			request := validPlanRequest()
+			mutate(&request)
+
+			_, err := client.Plan(context.Background(), request)
+			if !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("Plan() error = %v, want invalid request", err)
+			}
+			if len(api.inputs) != 0 {
+				t.Fatalf("Converse calls = %d, want 0", len(api.inputs))
+			}
+			if strings.Contains(err.Error(), testPrivateInput) {
+				t.Fatalf("Plan() error leaks private input: %v", err)
+			}
+		})
+	}
+}
+
+func TestClientPlanRetriesOnlyApprovedFailuresWithImmutableRequest(t *testing.T) {
+	tests := map[string]error{
+		"throttling":          &smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput},
+		"service unavailable": &smithy.GenericAPIError{Code: serviceUnavailableErrorCode, Message: testPrivateOutput},
+		"transport timeout":   syntheticTimeoutError{},
+	}
+	for name, retryable := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeConverseAPI{
+				errors:  []error{retryable, nil},
+				outputs: []*bedrockruntime.ConverseOutput{nil, successfulOutput(`{"kind":"point"}`)},
+			}
+			client := newTestClient(t, api, &recordingInvocationRecorder{}, 2)
+			request := validPlanRequest()
+			response, err := client.Plan(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Plan() error = %v", err)
+			}
+			if len(api.inputs) != 2 || response.Attempts != 2 {
+				t.Fatalf("calls/attempts = %d/%d, want 2/2", len(api.inputs), response.Attempts)
+			}
+			if !reflect.DeepEqual(api.inputs[0], api.inputs[1]) {
+				t.Fatalf("retry request changed: first=%#v second=%#v", api.inputs[0], api.inputs[1])
+			}
+		})
+	}
+}
+
+func TestClientPlanSnapshotsPrivateRequestBeforeRetries(t *testing.T) {
+	request := validPlanRequest()
+	wantSchema := string(request.JSONSchema)
+	api := &fakeConverseAPI{
+		errors:  []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}, nil},
+		outputs: []*bedrockruntime.ConverseOutput{nil, successfulOutput(`{"kind":"point"}`)},
+	}
+	api.call = func() error {
+		if len(api.inputs) == 1 {
+			request.SystemPrompt = "mutated after snapshot"
+			request.Input = "mutated after snapshot"
+			request.SchemaName = "mutated_after_snapshot"
+			request.JSONSchema[0] = 'x'
+		}
+		return nil
+	}
+	client := newTestClient(t, api, &recordingInvocationRecorder{}, 2)
+
+	if _, err := client.Plan(context.Background(), request); err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	if len(api.inputs) != 2 || !reflect.DeepEqual(api.inputs[0], api.inputs[1]) {
+		t.Fatalf("retry inputs = %#v, want identical snapshot", api.inputs)
+	}
+	structure := api.inputs[0].OutputConfig.TextFormat.Structure.(*types.OutputFormatStructureMemberJsonSchema)
+	if aws.ToString(structure.Value.Schema) != wantSchema || aws.ToString(structure.Value.Name) != queryplan.SchemaName {
+		t.Fatalf("planner schema changed after snapshot: %#v", structure.Value)
+	}
+}
+
+func TestClientPlanDoesNotRetryTerminalFailuresOrInvalidOutput(t *testing.T) {
+	invalidStop := successfulOutput(testPrivateOutput)
+	invalidStop.StopReason = types.StopReasonMaxTokens
+	missingUsage := successfulOutput(testPrivateOutput)
+	missingUsage.Usage = nil
+	tests := map[string]struct {
+		errors  []error
+		outputs []*bedrockruntime.ConverseOutput
+		want    error
+	}{
+		"unrecognized credentials": {
+			errors: []error{&smithy.GenericAPIError{Code: "UnrecognizedClientException", Message: testPrivateOutput}}, want: extract.ErrAuthentication,
+		},
+		"access denied": {
+			errors: []error{&smithy.GenericAPIError{Code: "AccessDeniedException", Message: testPrivateOutput}}, want: extract.ErrAuthorization,
+		},
+		"invalid stop reason": {outputs: []*bedrockruntime.ConverseOutput{invalidStop}, want: ErrInvalidOutput},
+		"missing usage":       {outputs: []*bedrockruntime.ConverseOutput{missingUsage}, want: ErrInvalidOutput},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			recorder := &recordingInvocationRecorder{}
+			api := &fakeConverseAPI{errors: test.errors, outputs: test.outputs}
+			client := newTestClient(t, api, recorder, 2)
+			_, err := client.Plan(context.Background(), validPlanRequest())
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Plan() error = %v, want %v", err, test.want)
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			}
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(fmt.Sprintf("%+v", recorder.observations), testPrivateInput) || strings.Contains(fmt.Sprintf("%+v", recorder.observations), testPrivateOutput) {
+				t.Fatalf("private marker escaped error or telemetry: error=%v telemetry=%+v", err, recorder.observations)
+			}
+		})
+	}
+}
+
+func TestClientPlanCancellationPreventsFurtherAttempts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api := &fakeConverseAPI{call: func() error {
+		cancel()
+		return &smithy.GenericAPIError{Code: "ServiceUnavailableException", Message: testPrivateOutput}
+	}}
+	client := newTestClient(t, api, &recordingInvocationRecorder{}, 3)
+
+	_, err := client.Plan(ctx, validPlanRequest())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Plan() error = %v, want caller cancellation", err)
+	}
+	if len(api.inputs) != 1 {
+		t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+	}
+}
+
+func TestClientPlanTreatsProviderContextErrorsAsTerminal(t *testing.T) {
+	tests := map[string]struct {
+		providerErr error
+		want        error
+		outcome     string
+	}{
+		"raw deadline exceeded": {
+			providerErr: context.DeadlineExceeded, want: context.DeadlineExceeded, outcome: OutcomeTimeout,
+		},
+		"wrapped deadline exceeded": {
+			providerErr: fmt.Errorf("%s: %w", testPrivateOutput, context.DeadlineExceeded),
+			want:        context.DeadlineExceeded, outcome: OutcomeTimeout,
+		},
+		"deadline joined with retryable API failure": {
+			providerErr: errors.Join(context.DeadlineExceeded, &smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}),
+			want:        context.DeadlineExceeded, outcome: OutcomeTimeout,
+		},
+		"deadline joined with retryable transport failure": {
+			providerErr: fmt.Errorf("%s: %w", testPrivateOutput, errors.Join(context.DeadlineExceeded, syntheticTimeoutError{})),
+			want:        context.DeadlineExceeded, outcome: OutcomeTimeout,
+		},
+		"raw canceled": {
+			providerErr: context.Canceled, want: context.Canceled, outcome: OutcomeCanceled,
+		},
+		"wrapped canceled": {
+			providerErr: fmt.Errorf("%s: %w", testPrivateOutput, context.Canceled),
+			want:        context.Canceled, outcome: OutcomeCanceled,
+		},
+		"canceled joined with retryable API failure": {
+			providerErr: errors.Join(context.Canceled, &smithy.GenericAPIError{Code: serviceUnavailableErrorCode, Message: testPrivateOutput}),
+			want:        context.Canceled, outcome: OutcomeCanceled,
+		},
+		"canceled joined with retryable transport failure": {
+			providerErr: fmt.Errorf("%s: %w", testPrivateOutput, errors.Join(context.Canceled, syntheticTimeoutError{})),
+			want:        context.Canceled, outcome: OutcomeCanceled,
+		},
+		"canceled takes precedence over deadline": {
+			providerErr: errors.Join(context.DeadlineExceeded, context.Canceled,
+				&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}),
+			want: context.Canceled, outcome: OutcomeCanceled,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeConverseAPI{
+				errors:  []error{test.providerErr, nil},
+				outputs: []*bedrockruntime.ConverseOutput{nil, successfulOutput(`{}`)},
+			}
+			retryer := &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}}
+			recorder := &recordingInvocationRecorder{}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(context.Background(), validPlanRequest())
+			if !errors.Is(err, ErrInvocation) {
+				t.Fatalf("Plan() error = %v, want terminal invocation error", err)
+			}
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Plan() error = %v, want sentinel %v", err, test.want)
+			}
+			if test.want == context.Canceled && errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Plan() error = %v, want cancellation to take precedence over deadline", err)
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			}
+			if retryer.retryableCalls != 0 || retryer.retryTokenCalls != 0 || retryer.retryDelayCalls != 0 {
+				t.Fatalf("retry policy calls = decision:%d token:%d delay:%d, want 0/0/0",
+					retryer.retryableCalls, retryer.retryTokenCalls, retryer.retryDelayCalls)
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Attempts != 1 ||
+				recorder.observations[0].Outcome != test.outcome {
+				t.Fatalf("telemetry = %+v, want one %s observation at attempt 1", recorder.observations, test.outcome)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+			}
+		})
+	}
+}
+
+func TestClientPlanRecordsCallerContextOutcomeAtEachLifecycleBoundary(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	boundaries := map[string]struct {
+		wantCalls    int
+		wantAttempts int
+		configure    func(*controlledContext, *fakeConverseAPI, *plannerPolicyRetryer)
+	}{
+		"before invocation": {
+			wantCalls: 0, wantAttempts: 0,
+			configure: func(ctx *controlledContext, _ *fakeConverseAPI, _ *plannerPolicyRetryer) {
+				ctx.fail()
+			},
+		},
+		"after provider attempt": {
+			wantCalls: 1, wantAttempts: 1,
+			configure: func(ctx *controlledContext, api *fakeConverseAPI, _ *plannerPolicyRetryer) {
+				api.call = func() error {
+					ctx.fail()
+					return nil
+				}
+			},
+		},
+		"during retry wait": {
+			wantCalls: 1, wantAttempts: 1,
+			configure: func(ctx *controlledContext, _ *fakeConverseAPI, retryer *plannerPolicyRetryer) {
+				retryer.retryDelayHook = ctx.fail
+			},
+		},
+	}
+	for contextName, contextCase := range contextCases {
+		for boundaryName, boundary := range boundaries {
+			t.Run(contextName+"/"+boundaryName, func(t *testing.T) {
+				ctx := newControlledContext(contextCase.err)
+				api := &fakeConverseAPI{
+					errors: []error{&smithy.GenericAPIError{Code: serviceUnavailableErrorCode, Message: testPrivateOutput}},
+				}
+				retryer := &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}}
+				recorder := &recordingInvocationRecorder{}
+				client, err := newClient(api, Options{
+					DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+				}, retryer)
+				if err != nil {
+					t.Fatalf("newClient() error = %v", err)
+				}
+				boundary.configure(ctx, api, retryer)
+
+				_, err = client.Plan(ctx, validPlanRequest())
+				if !errors.Is(err, contextCase.err) {
+					t.Fatalf("Plan() error = %v, want %v", err, contextCase.err)
+				}
+				if len(api.inputs) != boundary.wantCalls {
+					t.Fatalf("Converse calls = %d, want %d", len(api.inputs), boundary.wantCalls)
+				}
+				if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+					recorder.observations[0].Attempts != boundary.wantAttempts {
+					t.Fatalf("telemetry = %+v, want outcome=%s attempts=%d",
+						recorder.observations, contextCase.outcome, boundary.wantAttempts)
+				}
+				telemetry := fmt.Sprintf("%+v", recorder.observations)
+				if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+					strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+					t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+				}
+			})
+		}
+	}
+}
+
+func TestClientPlanPreservesCallerContextAtAdaptiveTokenBoundaries(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	boundaries := map[string]struct {
+		wantCalls    int
+		wantAttempts int
+		configure    func(*controlledContext, *plannerPolicyRetryer)
+	}{
+		"attempt token": {
+			wantCalls: 0, wantAttempts: 0,
+			configure: func(ctx *controlledContext, retryer *plannerPolicyRetryer) {
+				retryer.attemptTokenHook = ctx.fail
+				retryer.attemptTokenErr = errors.New(testPrivateOutput)
+			},
+		},
+		"retry token": {
+			wantCalls: 1, wantAttempts: 1,
+			configure: func(ctx *controlledContext, retryer *plannerPolicyRetryer) {
+				retryer.retryTokenHook = ctx.fail
+				retryer.retryTokenErr = errors.New(testPrivateOutput)
+			},
+		},
+	}
+	for contextName, contextCase := range contextCases {
+		for boundaryName, boundary := range boundaries {
+			t.Run(contextName+"/"+boundaryName, func(t *testing.T) {
+				ctx := newControlledContext(contextCase.err)
+				api := &fakeConverseAPI{
+					errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}},
+				}
+				retryer := &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}}
+				boundary.configure(ctx, retryer)
+				recorder := &recordingInvocationRecorder{}
+				client, err := newClient(api, Options{
+					DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+				}, retryer)
+				if err != nil {
+					t.Fatalf("newClient() error = %v", err)
+				}
+
+				_, err = client.Plan(ctx, validPlanRequest())
+				if !errors.Is(err, ErrInvocation) {
+					t.Fatalf("Plan() error = %v, want invocation error", err)
+				}
+				if !errors.Is(err, contextCase.err) {
+					t.Fatalf("Plan() error = %v, want caller context %v", err, contextCase.err)
+				}
+				if contextCase.err == context.Canceled && errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Plan() error = %v, want cancellation to take precedence over deadline", err)
+				}
+				if len(api.inputs) != boundary.wantCalls {
+					t.Fatalf("Converse calls = %d, want %d", len(api.inputs), boundary.wantCalls)
+				}
+				if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+					recorder.observations[0].Attempts != boundary.wantAttempts {
+					t.Fatalf("telemetry = %+v, want outcome=%s attempts=%d",
+						recorder.observations, contextCase.outcome, boundary.wantAttempts)
+				}
+				telemetry := fmt.Sprintf("%+v", recorder.observations)
+				if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+					strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+					t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+				}
+			})
+		}
+	}
+}
+
+func TestClientPlanStopsBeforeConverseWhenContextEndsDuringAttemptTokenAcquisition(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	for name, contextCase := range contextCases {
+		t.Run(name, func(t *testing.T) {
+			ctx := newControlledContext(contextCase.err)
+			var attemptTokenReleases []error
+			retryer := &plannerPolicyRetryer{
+				zeroRetryer:      zeroRetryer{maxAttempts: 2},
+				attemptTokenHook: ctx.fail,
+				attemptTokenRelease: func(err error) error {
+					attemptTokenReleases = append(attemptTokenReleases, err)
+					return nil
+				},
+			}
+			api := &fakeConverseAPI{}
+			recorder := &recordingInvocationRecorder{}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(ctx, validPlanRequest())
+			if !errors.Is(err, ErrInvocation) || !errors.Is(err, contextCase.err) {
+				t.Fatalf("Plan() error = %v, want invocation wrapping %v", err, contextCase.err)
+			}
+			if len(api.inputs) != 0 {
+				t.Fatalf("Converse calls = %d, want 0", len(api.inputs))
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+				recorder.observations[0].Attempts != 0 {
+				t.Fatalf("telemetry = %+v, want outcome=%s attempts=0", recorder.observations, contextCase.outcome)
+			}
+			if len(attemptTokenReleases) != 1 || !errors.Is(attemptTokenReleases[0], contextCase.err) {
+				t.Fatalf("attempt-token releases = %v, want one canonical %v release", attemptTokenReleases, contextCase.err)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+			}
+		})
+	}
+}
+
+func TestClientPlanReleasesOutstandingTokensWhenContextEndsAfterLaterAttemptToken(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	for name, contextCase := range contextCases {
+		t.Run(name, func(t *testing.T) {
+			ctx := newControlledContext(contextCase.err)
+			var attemptTokenReleases []error
+			var retryTokenReleases []error
+			retryer := &plannerPolicyRetryer{
+				zeroRetryer: zeroRetryer{maxAttempts: 2},
+				attemptTokenRelease: func(err error) error {
+					attemptTokenReleases = append(attemptTokenReleases, err)
+					return nil
+				},
+				retryTokenRelease: func(err error) error {
+					retryTokenReleases = append(retryTokenReleases, err)
+					return nil
+				},
+			}
+			retryer.attemptTokenHook = func() {
+				if retryer.attemptTokenCalls == 2 {
+					ctx.fail()
+				}
+			}
+			api := &fakeConverseAPI{
+				errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}},
+			}
+			recorder := &recordingInvocationRecorder{}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(ctx, validPlanRequest())
+			if !errors.Is(err, ErrInvocation) || !errors.Is(err, contextCase.err) {
+				t.Fatalf("Plan() error = %v, want invocation wrapping %v", err, contextCase.err)
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+				recorder.observations[0].Attempts != 1 {
+				t.Fatalf("telemetry = %+v, want outcome=%s attempts=1", recorder.observations, contextCase.outcome)
+			}
+			if len(attemptTokenReleases) != 2 || !errors.Is(attemptTokenReleases[1], contextCase.err) {
+				t.Fatalf("attempt-token releases = %v, want later canonical %v release", attemptTokenReleases, contextCase.err)
+			}
+			if len(retryTokenReleases) != 1 || !errors.Is(retryTokenReleases[0], contextCase.err) {
+				t.Fatalf("retry-token releases = %v, want one canonical %v release", retryTokenReleases, contextCase.err)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+			}
+		})
+	}
+}
+
+func TestClientPlanStopsBeforeRetryDelayWhenContextEndsDuringRetryTokenAcquisition(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	for name, contextCase := range contextCases {
+		t.Run(name, func(t *testing.T) {
+			ctx := newControlledContext(contextCase.err)
+			var retryTokenReleases []error
+			retryer := &plannerPolicyRetryer{
+				zeroRetryer:    zeroRetryer{maxAttempts: 2},
+				retryTokenHook: ctx.fail,
+				retryTokenRelease: func(err error) error {
+					retryTokenReleases = append(retryTokenReleases, err)
+					return nil
+				},
+			}
+			api := &fakeConverseAPI{
+				errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}},
+			}
+			recorder := &recordingInvocationRecorder{}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(ctx, validPlanRequest())
+			if !errors.Is(err, ErrInvocation) || !errors.Is(err, contextCase.err) {
+				t.Fatalf("Plan() error = %v, want invocation wrapping %v", err, contextCase.err)
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			}
+			if retryer.retryDelayCalls != 0 {
+				t.Fatalf("RetryDelay calls = %d, want 0", retryer.retryDelayCalls)
+			}
+			if len(retryTokenReleases) != 1 || !errors.Is(retryTokenReleases[0], contextCase.err) {
+				t.Fatalf("retry-token releases = %v, want one canonical %v release", retryTokenReleases, contextCase.err)
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+				recorder.observations[0].Attempts != 1 {
+				t.Fatalf("telemetry = %+v, want outcome=%s attempts=1", recorder.observations, contextCase.outcome)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+			}
+		})
+	}
+}
+
+func TestClientPlanPreservesCallerContextWhenRetryDelayAlsoFails(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	for name, contextCase := range contextCases {
+		t.Run(name, func(t *testing.T) {
+			ctx := newControlledContext(contextCase.err)
+			delayErr := errors.New(testPrivateOutput)
+			var retryTokenReleases []error
+			retryer := &plannerPolicyRetryer{
+				zeroRetryer:    zeroRetryer{maxAttempts: 2},
+				retryDelayErr:  delayErr,
+				retryDelayHook: ctx.fail,
+				retryTokenRelease: func(err error) error {
+					retryTokenReleases = append(retryTokenReleases, err)
+					return nil
+				},
+			}
+			api := &fakeConverseAPI{
+				errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}},
+			}
+			recorder := &recordingInvocationRecorder{}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(ctx, validPlanRequest())
+			if !errors.Is(err, ErrInvocation) || !errors.Is(err, contextCase.err) {
+				t.Fatalf("Plan() error = %v, want invocation wrapping %v", err, contextCase.err)
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			}
+			if len(retryTokenReleases) != 1 || !errors.Is(retryTokenReleases[0], contextCase.err) ||
+				errors.Is(retryTokenReleases[0], delayErr) {
+				t.Fatalf("retry-token releases = %v, want one canonical %v release", retryTokenReleases, contextCase.err)
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+				recorder.observations[0].Attempts != 1 {
+				t.Fatalf("telemetry = %+v, want outcome=%s attempts=1", recorder.observations, contextCase.outcome)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+			}
+		})
+	}
+}
+
+func TestClientPlanReleasesOutstandingRetryTokenWithContextWhenLaterAttemptTokenFails(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	for name, contextCase := range contextCases {
+		t.Run(name, func(t *testing.T) {
+			ctx := newControlledContext(contextCase.err)
+			tokenErr := errors.New(testPrivateOutput)
+			var retryTokenReleases []error
+			retryer := &plannerPolicyRetryer{
+				zeroRetryer: zeroRetryer{maxAttempts: 2},
+				retryTokenRelease: func(err error) error {
+					retryTokenReleases = append(retryTokenReleases, err)
+					return nil
+				},
+			}
+			retryer.attemptTokenHook = func() {
+				if retryer.attemptTokenCalls == 2 {
+					ctx.fail()
+					retryer.attemptTokenErr = tokenErr
+				}
+			}
+			api := &fakeConverseAPI{
+				errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}},
+			}
+			recorder := &recordingInvocationRecorder{}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(ctx, validPlanRequest())
+			if !errors.Is(err, ErrInvocation) || !errors.Is(err, contextCase.err) {
+				t.Fatalf("Plan() error = %v, want invocation wrapping %v", err, contextCase.err)
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			}
+			if len(retryTokenReleases) != 1 || !errors.Is(retryTokenReleases[0], contextCase.err) ||
+				errors.Is(retryTokenReleases[0], tokenErr) {
+				t.Fatalf("retry-token releases = %v, want one canonical %v release", retryTokenReleases, contextCase.err)
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+				recorder.observations[0].Attempts != 1 {
+				t.Fatalf("telemetry = %+v, want outcome=%s attempts=1", recorder.observations, contextCase.outcome)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+			}
+		})
+	}
+}
+
+func TestClientPlanBoundsRetryPolicyFailures(t *testing.T) {
+	tests := map[string]struct {
+		retryer   aws.RetryerV2
+		wantCalls int
+	}{
+		"attempt token": {
+			retryer: &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}, attemptTokenErr: errors.New("attempt token marker")},
+		},
+		"retry token": {
+			retryer:   &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}, retryTokenErr: errors.New("retry token marker")},
+			wantCalls: 1,
+		},
+		"retry delay": {
+			retryer:   &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}, retryDelayErr: errors.New("retry delay marker")},
+			wantCalls: 1,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeConverseAPI{errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}}}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2,
+			}, test.retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(context.Background(), validPlanRequest())
+			if !errors.Is(err, ErrInvocation) || strings.Contains(err.Error(), "marker") || strings.Contains(err.Error(), testPrivateOutput) {
+				t.Fatalf("Plan() error = %v, want bounded retry-policy failure", err)
+			}
+			if len(api.inputs) != test.wantCalls {
+				t.Fatalf("Converse calls = %d, want %d", len(api.inputs), test.wantCalls)
+			}
+		})
 	}
 }
 
@@ -485,6 +1243,20 @@ func validRequest() extract.Request {
 	}
 }
 
+func validPlanRequest() queryplan.ModelRequest {
+	contract, err := queryplan.PromptContract(queryplan.PromptVersion)
+	if err != nil {
+		panic(err)
+	}
+	return queryplan.ModelRequest{
+		PromptVersion: contract.Version,
+		SystemPrompt:  contract.SystemPrompt,
+		Input:         testPrivateInput,
+		SchemaName:    contract.SchemaName,
+		JSONSchema:    contract.JSONSchema,
+	}
+}
+
 func successfulOutput(text string) *bedrockruntime.ConverseOutput {
 	return &bedrockruntime.ConverseOutput{
 		StopReason: types.StopReasonEndTurn,
@@ -569,6 +1341,98 @@ type noDelayRetryer struct {
 
 func (retryer *noDelayRetryer) RetryDelay(int, error) (time.Duration, error) {
 	return 0, nil
+}
+
+type plannerPolicyRetryer struct {
+	zeroRetryer
+	attemptTokenErr     error
+	attemptTokenHook    func()
+	attemptTokenRelease func(error) error
+	retryTokenErr       error
+	retryTokenHook      func()
+	retryTokenRelease   func(error) error
+	retryDelayErr       error
+	retryDelayHook      func()
+	retryableCalls      int
+	attemptTokenCalls   int
+	retryTokenCalls     int
+	retryDelayCalls     int
+}
+
+func (retryer *plannerPolicyRetryer) IsErrorRetryable(err error) bool {
+	retryer.retryableCalls++
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	return retryer.zeroRetryer.IsErrorRetryable(err)
+}
+
+func (retryer *plannerPolicyRetryer) GetAttemptToken(context.Context) (func(error) error, error) {
+	retryer.attemptTokenCalls++
+	if retryer.attemptTokenHook != nil {
+		retryer.attemptTokenHook()
+	}
+	if retryer.attemptTokenErr != nil {
+		return nil, retryer.attemptTokenErr
+	}
+	if retryer.attemptTokenRelease != nil {
+		return retryer.attemptTokenRelease, nil
+	}
+	return func(error) error { return nil }, nil
+}
+
+func (retryer *plannerPolicyRetryer) GetRetryToken(context.Context, error) (func(error) error, error) {
+	retryer.retryTokenCalls++
+	if retryer.retryTokenHook != nil {
+		retryer.retryTokenHook()
+	}
+	if retryer.retryTokenErr != nil {
+		return nil, retryer.retryTokenErr
+	}
+	if retryer.retryTokenRelease != nil {
+		return retryer.retryTokenRelease, nil
+	}
+	return func(error) error { return nil }, nil
+}
+
+func (retryer *plannerPolicyRetryer) RetryDelay(attempt int, err error) (time.Duration, error) {
+	retryer.retryDelayCalls++
+	if retryer.retryDelayHook != nil {
+		retryer.retryDelayHook()
+	}
+	if retryer.retryDelayErr != nil {
+		return 0, retryer.retryDelayErr
+	}
+	return retryer.zeroRetryer.RetryDelay(attempt, err)
+}
+
+var _ aws.RetryerV2 = (*plannerPolicyRetryer)(nil)
+
+type controlledContext struct {
+	context.Context
+	done chan struct{}
+	err  error
+}
+
+func newControlledContext(err error) *controlledContext {
+	return &controlledContext{Context: context.Background(), done: make(chan struct{}), err: err}
+}
+
+func (ctx *controlledContext) Done() <-chan struct{} {
+	return ctx.done
+}
+
+func (ctx *controlledContext) Err() error {
+	select {
+	case <-ctx.done:
+		return ctx.err
+	default:
+		return nil
+	}
+}
+
+func (ctx *controlledContext) fail() {
+	close(ctx.done)
 }
 
 type syntheticTimeoutError struct{}

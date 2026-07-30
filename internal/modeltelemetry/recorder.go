@@ -64,6 +64,7 @@ type MetricsRecorder struct {
 	outputTokens     metric.Int64Histogram
 	totalTokens      metric.Int64Histogram
 	attempts         metric.Int64Histogram
+	questionBytes    metric.Int64Histogram
 }
 
 // NewMetricsRecorder constructs reusable model invocation instruments.
@@ -116,10 +117,28 @@ func NewMetricsRecorder(meter metric.Meter) (*MetricsRecorder, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create model attempts histogram: %w", err)
 	}
+	questionBytes, err := meter.Int64Histogram(
+		"stacks.query.planner.question.bytes",
+		metric.WithDescription("Private temporal question byte count"),
+		metric.WithUnit("By"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create query planner question bytes histogram: %w", err)
+	}
 	return &MetricsRecorder{
 		wallDuration: wallDuration, providerDuration: providerDuration,
 		inputTokens: inputTokens, outputTokens: outputTokens, totalTokens: totalTokens, attempts: attempts,
+		questionBytes: questionBytes,
 	}, nil
+}
+
+// RecordQuestionBytes records a private temporal question's size without any
+// attributes, so the question itself cannot become telemetry identity.
+func (recorder *MetricsRecorder) RecordQuestionBytes(ctx context.Context, value int64) {
+	if recorder == nil || value < 0 {
+		return
+	}
+	recorder.questionBytes.Record(ctx, value)
 }
 
 // Record emits only bounded model metadata. Invalid observations are dropped

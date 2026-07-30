@@ -40,6 +40,7 @@ type Settings struct {
 	Telemetry         TelemetrySettings
 	Database          DatabaseSettings
 	Query             QuerySettings
+	QueryPlanner      QueryPlannerSettings
 	Application       ApplicationSettings
 }
 
@@ -48,6 +49,12 @@ type QuerySettings struct {
 	MaxEntities   int
 	MaxPredicates int
 	MaxChronology int
+}
+
+// QueryPlannerSettings bounds one private natural-language planner invocation.
+type QueryPlannerSettings struct {
+	Timeout          time.Duration
+	MaxQuestionBytes int
 }
 
 // DatabaseScope identifies one selected embedded PostgreSQL migration scope.
@@ -87,11 +94,14 @@ func (settings Settings) Validate(command Command) error {
 	if err := settings.Query.validate(command); err != nil {
 		return err
 	}
+	if err := settings.QueryPlanner.validate(command); err != nil {
+		return err
+	}
 	return settings.Application.Validate(command)
 }
 
 func (settings QuerySettings) validate(command Command) error {
-	if command != CommandQuery {
+	if command != CommandQuery && command != CommandQueryAsk {
 		return nil
 	}
 	for _, limit := range []struct {
@@ -110,6 +120,19 @@ func (settings QuerySettings) validate(command Command) error {
 	return nil
 }
 
+func (settings QueryPlannerSettings) validate(command Command) error {
+	if command != CommandQueryAsk {
+		return nil
+	}
+	if settings.Timeout < minimumQueryPlannerTimeout || settings.Timeout > maximumQueryPlannerTimeout {
+		return fmt.Errorf("%s must be between %s and %s", QueryPlannerTimeoutEnvironmentVariable, minimumQueryPlannerTimeout, maximumQueryPlannerTimeout)
+	}
+	if settings.MaxQuestionBytes < minimumQueryPlannerQuestionBytes || settings.MaxQuestionBytes > maximumQueryPlannerQuestionBytes {
+		return fmt.Errorf("%s must be between %d and %d", QueryPlannerMaxQuestionBytesEnvironmentVariable, minimumQueryPlannerQuestionBytes, maximumQueryPlannerQuestionBytes)
+	}
+	return nil
+}
+
 func (settings DatabaseSettings) validate(command Command, directoryEnabled bool) error {
 	scopes := settings.Scopes
 	if len(scopes) == 0 {
@@ -118,7 +141,7 @@ func (settings DatabaseSettings) validate(command Command, directoryEnabled bool
 	if err := validateDatabaseScopes(scopes); err != nil {
 		return err
 	}
-	if directoryEnabled && command != CommandQuery && !containsDatabaseScope(scopes, DatabaseScopeDirectory) {
+	if directoryEnabled && command != CommandQuery && command != CommandQueryAsk && !containsDatabaseScope(scopes, DatabaseScopeDirectory) {
 		return fmt.Errorf(
 			"%s must include %q when %s is enabled",
 			DatabaseScopesEnvironmentVariable,
@@ -127,7 +150,7 @@ func (settings DatabaseSettings) validate(command Command, directoryEnabled bool
 		)
 	}
 	switch command {
-	case CommandDoctor, CommandSync, CommandEntities, CommandReview, CommandQuery, CommandDBStatus:
+	case CommandDoctor, CommandSync, CommandEntities, CommandReview, CommandQuery, CommandQueryAsk, CommandDBStatus:
 		return validateExactRequired(command, DatabaseURLEnvironmentVariable, settings.URL)
 	case CommandDBMigrate, CommandDBReset:
 		if command == CommandDBReset {

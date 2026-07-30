@@ -18,15 +18,15 @@ type Runtime interface {
 // CommandProvider supplies already-wired non-server commands. It keeps process
 // dependencies such as PostgreSQL outside of the argument router.
 type CommandProvider interface {
-	Commands(ctx context.Context, settings config.Settings, stdout, stderr io.Writer) (map[string]cli.Command, error)
+	Commands(ctx context.Context, settings config.Settings, stdin io.Reader, stdout, stderr io.Writer) (map[string]cli.Command, error)
 }
 
 // CommandProviderFunc adapts a function into a CommandProvider.
-type CommandProviderFunc func(ctx context.Context, settings config.Settings, stdout, stderr io.Writer) (map[string]cli.Command, error)
+type CommandProviderFunc func(ctx context.Context, settings config.Settings, stdin io.Reader, stdout, stderr io.Writer) (map[string]cli.Command, error)
 
 // Commands returns the command map constructed by fn.
-func (fn CommandProviderFunc) Commands(ctx context.Context, settings config.Settings, stdout, stderr io.Writer) (map[string]cli.Command, error) {
-	return fn(ctx, settings, stdout, stderr)
+func (fn CommandProviderFunc) Commands(ctx context.Context, settings config.Settings, stdin io.Reader, stdout, stderr io.Writer) (map[string]cli.Command, error) {
+	return fn(ctx, settings, stdin, stdout, stderr)
 }
 
 // RuntimeFunc adapts a function into a Runtime.
@@ -44,10 +44,11 @@ func Execute(
 	args []string,
 	loader SettingsLoader,
 	bootstrap Bootstrap,
+	stdin io.Reader,
 	stdout, stderr io.Writer,
 ) error {
 	runner := cli.Runner{
-		Input: nil, Output: stdout, Error: stderr,
+		Input: stdin, Output: stdout, Error: stderr,
 		Execute: func(ctx context.Context, invocation cli.Invocation) error {
 			if loader == nil {
 				return fmt.Errorf("settings loader is not configured")
@@ -76,7 +77,7 @@ func Execute(
 			if dependencies.Shutdown == nil {
 				return fmt.Errorf("runtime shutdown is not configured")
 			}
-			runError := dispatch(ctx, invocation, settings, dependencies, stdout, stderr)
+			runError := dispatch(ctx, invocation, settings, dependencies, stdin, stdout, stderr)
 			shutdownError := shutdownExecution(ctx, dependencies.Shutdown)
 			return errors.Join(runError, shutdownError)
 		},
@@ -89,6 +90,7 @@ func dispatch(
 	invocation cli.Invocation,
 	settings config.Settings,
 	dependencies ExecutionDependencies,
+	stdin io.Reader,
 	stdout, stderr io.Writer,
 ) error {
 	command := config.Command(invocation.Command)
@@ -101,7 +103,7 @@ func dispatch(
 	if dependencies.CommandProvider == nil {
 		return fmt.Errorf("%s command is not configured", command)
 	}
-	commands, err := dependencies.CommandProvider.Commands(ctx, settings, stdout, stderr)
+	commands, err := dependencies.CommandProvider.Commands(ctx, settings, stdin, stdout, stderr)
 	if err != nil {
 		return err
 	}

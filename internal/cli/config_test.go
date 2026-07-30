@@ -18,6 +18,7 @@ func TestConfigValidateCommandWritesBoundedTargetOutput(t *testing.T) {
 		{"entities", ConfigValidationInput{Command: CommandEntities}, "configuration valid for entities\n"},
 		{"review", ConfigValidationInput{Command: CommandReview}, "configuration valid for review\n"},
 		{"query", ConfigValidationInput{Command: CommandQuery}, "configuration valid for query\n"},
+		{"query ask", ConfigValidationInput{Command: CommandQuery, Action: ActionAsk}, "configuration valid for query ask\n"},
 		{"db migrate", ConfigValidationInput{Command: CommandDBMigrate}, "configuration valid for db-migrate\n"},
 		{"db status", ConfigValidationInput{Command: CommandDBStatus}, "configuration valid for db-status\n"},
 		{"db reset", ConfigValidationInput{Command: CommandDBReset}, "configuration valid for db-reset\n"},

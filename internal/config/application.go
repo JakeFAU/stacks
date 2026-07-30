@@ -11,60 +11,68 @@ import (
 )
 
 const (
-	defaultModelMaxAttempts           = 5
-	defaultExtractionPromptVersion    = extract.ExtractionPromptVersion
-	defaultIngestionLeaseDuration     = 5 * time.Minute
-	defaultIngestionAttemptTimeout    = 4 * time.Minute
-	maximumIngestionLeaseDuration     = time.Hour
-	minimumLeaseCleanupMargin         = 5 * time.Second
-	defaultGoogleDirectoryFreshness   = 24 * time.Hour
-	defaultGoogleDirectoryRetryAfter  = 15 * time.Minute
-	defaultGoogleDirectoryMaxAttempts = 3
-	defaultQueryMaxEntities           = 16
-	defaultQueryMaxPredicates         = 32
-	defaultQueryMaxChronology         = 1000
-	minimumQueryLimit                 = 1
-	maximumQueryEntities              = 64
-	maximumQueryPredicates            = 256
-	maximumQueryChronology            = 10000
+	defaultModelMaxAttempts             = 5
+	defaultExtractionPromptVersion      = extract.ExtractionPromptVersion
+	defaultIngestionLeaseDuration       = 5 * time.Minute
+	defaultIngestionAttemptTimeout      = 4 * time.Minute
+	maximumIngestionLeaseDuration       = time.Hour
+	minimumLeaseCleanupMargin           = 5 * time.Second
+	defaultGoogleDirectoryFreshness     = 24 * time.Hour
+	defaultGoogleDirectoryRetryAfter    = 15 * time.Minute
+	defaultGoogleDirectoryMaxAttempts   = 3
+	defaultQueryMaxEntities             = 16
+	defaultQueryMaxPredicates           = 32
+	defaultQueryMaxChronology           = 1000
+	minimumQueryLimit                   = 1
+	maximumQueryEntities                = 64
+	maximumQueryPredicates              = 256
+	maximumQueryChronology              = 10000
+	defaultQueryPlannerTimeout          = time.Minute
+	minimumQueryPlannerTimeout          = time.Second
+	maximumQueryPlannerTimeout          = 5 * time.Minute
+	defaultQueryPlannerMaxQuestionBytes = 16 * 1024
+	minimumQueryPlannerQuestionBytes    = 1
+	maximumQueryPlannerQuestionBytes    = 64 * 1024
 
-	DatabaseURLEnvironmentVariable                = "STACKS_DATABASE_URL"
-	GoogleFolderIDEnvironmentVariable             = "STACKS_GOOGLE_FOLDER_ID"
-	GoogleOAuthClientFileEnvironmentVariable      = "STACKS_GOOGLE_OAUTH_CLIENT_FILE"
-	GoogleOAuthTokenFileEnvironmentVariable       = "STACKS_GOOGLE_OAUTH_TOKEN_FILE"
-	TranscriptTitlesEnvironmentVariable           = "STACKS_TRANSCRIPT_TITLES"
-	NotesTitlesEnvironmentVariable                = "STACKS_NOTES_TITLES"
-	AWSProfileEnvironmentVariable                 = "STACKS_AWS_PROFILE"
-	AWSRegionEnvironmentVariable                  = "STACKS_AWS_REGION"
-	DataModeEnvironmentVariable                   = "STACKS_DATA_MODE"
-	ModelProviderEnvironmentVariable              = "STACKS_MODEL_PROVIDER"
-	ModelIDEnvironmentVariable                    = "STACKS_MODEL_ID"
-	ModelMaxTokensEnvironmentVariable             = "STACKS_MODEL_MAX_OUTPUT_TOKENS"
-	ModelMaxAttemptsEnvironmentVariable           = "STACKS_MODEL_MAX_ATTEMPTS"
-	OpenAIAPIKeyEnvironmentVariable               = "OPENAI_API_KEY"
-	AnthropicAPIKeyEnvironmentVariable            = "ANTHROPIC_API_KEY"
-	OpenAIBaseURLEnvironmentVariable              = "OPENAI_BASE_URL"
-	OpenAIOrganizationIDEnvironmentVariable       = "OPENAI_ORG_ID"
-	OpenAIProjectIDEnvironmentVariable            = "OPENAI_PROJECT_ID"
-	AnthropicBaseURLEnvironmentVariable           = "ANTHROPIC_BASE_URL"
-	AnthropicAuthTokenEnvironmentVariable         = "ANTHROPIC_AUTH_TOKEN"
-	AnthropicProfileEnvironmentVariable           = "ANTHROPIC_PROFILE"
-	BedrockModelIDEnvironmentVariable             = "STACKS_BEDROCK_MODEL_ID"
-	BedrockMaxTokensEnvironmentVariable           = "STACKS_BEDROCK_MAX_TOKENS"
-	BedrockMaxAttemptsEnvironmentVariable         = "STACKS_BEDROCK_MAX_ATTEMPTS"
-	IngestionLeaseDurationEnvironmentVariable     = "STACKS_INGEST_LEASE_DURATION"
-	IngestionAttemptTimeoutEnvironmentVariable    = "STACKS_INGEST_ATTEMPT_TIMEOUT"
-	ExtractionPromptVersionEnvironmentVariable    = "STACKS_EXTRACTION_PROMPT_VERSION"
-	GoogleDirectoryEnabledEnvironmentVariable     = "STACKS_GOOGLE_DIRECTORY_ENABLED"
-	GoogleDirectoryClientFileEnvironmentVariable  = "STACKS_GOOGLE_DIRECTORY_OAUTH_CLIENT_FILE"
-	GoogleDirectoryTokenFileEnvironmentVariable   = "STACKS_GOOGLE_DIRECTORY_OAUTH_TOKEN_FILE"
-	GoogleDirectoryDomainsEnvironmentVariable     = "STACKS_GOOGLE_DIRECTORY_EMAIL_DOMAINS"
-	GoogleDirectoryFreshnessEnvironmentVariable   = "STACKS_GOOGLE_DIRECTORY_FRESHNESS"
-	GoogleDirectoryRetryAfterEnvironmentVariable  = "STACKS_GOOGLE_DIRECTORY_RETRY_AFTER"
-	GoogleDirectoryMaxAttemptsEnvironmentVariable = "STACKS_GOOGLE_DIRECTORY_MAX_ATTEMPTS"
-	QueryMaxEntitiesEnvironmentVariable           = "STACKS_QUERY_MAX_ENTITIES"
-	QueryMaxPredicatesEnvironmentVariable         = "STACKS_QUERY_MAX_PREDICATES"
-	QueryMaxChronologyEnvironmentVariable         = "STACKS_QUERY_MAX_CHRONOLOGY"
+	DatabaseURLEnvironmentVariable                  = "STACKS_DATABASE_URL"
+	GoogleFolderIDEnvironmentVariable               = "STACKS_GOOGLE_FOLDER_ID"
+	GoogleOAuthClientFileEnvironmentVariable        = "STACKS_GOOGLE_OAUTH_CLIENT_FILE"
+	GoogleOAuthTokenFileEnvironmentVariable         = "STACKS_GOOGLE_OAUTH_TOKEN_FILE"
+	TranscriptTitlesEnvironmentVariable             = "STACKS_TRANSCRIPT_TITLES"
+	NotesTitlesEnvironmentVariable                  = "STACKS_NOTES_TITLES"
+	AWSProfileEnvironmentVariable                   = "STACKS_AWS_PROFILE"
+	AWSRegionEnvironmentVariable                    = "STACKS_AWS_REGION"
+	DataModeEnvironmentVariable                     = "STACKS_DATA_MODE"
+	ModelProviderEnvironmentVariable                = "STACKS_MODEL_PROVIDER"
+	ModelIDEnvironmentVariable                      = "STACKS_MODEL_ID"
+	ModelMaxTokensEnvironmentVariable               = "STACKS_MODEL_MAX_OUTPUT_TOKENS"
+	ModelMaxAttemptsEnvironmentVariable             = "STACKS_MODEL_MAX_ATTEMPTS"
+	OpenAIAPIKeyEnvironmentVariable                 = "OPENAI_API_KEY"
+	AnthropicAPIKeyEnvironmentVariable              = "ANTHROPIC_API_KEY"
+	OpenAIBaseURLEnvironmentVariable                = "OPENAI_BASE_URL"
+	OpenAIOrganizationIDEnvironmentVariable         = "OPENAI_ORG_ID"
+	OpenAIProjectIDEnvironmentVariable              = "OPENAI_PROJECT_ID"
+	AnthropicBaseURLEnvironmentVariable             = "ANTHROPIC_BASE_URL"
+	AnthropicAuthTokenEnvironmentVariable           = "ANTHROPIC_AUTH_TOKEN"
+	AnthropicProfileEnvironmentVariable             = "ANTHROPIC_PROFILE"
+	BedrockModelIDEnvironmentVariable               = "STACKS_BEDROCK_MODEL_ID"
+	BedrockMaxTokensEnvironmentVariable             = "STACKS_BEDROCK_MAX_TOKENS"
+	BedrockMaxAttemptsEnvironmentVariable           = "STACKS_BEDROCK_MAX_ATTEMPTS"
+	IngestionLeaseDurationEnvironmentVariable       = "STACKS_INGEST_LEASE_DURATION"
+	IngestionAttemptTimeoutEnvironmentVariable      = "STACKS_INGEST_ATTEMPT_TIMEOUT"
+	ExtractionPromptVersionEnvironmentVariable      = "STACKS_EXTRACTION_PROMPT_VERSION"
+	GoogleDirectoryEnabledEnvironmentVariable       = "STACKS_GOOGLE_DIRECTORY_ENABLED"
+	GoogleDirectoryClientFileEnvironmentVariable    = "STACKS_GOOGLE_DIRECTORY_OAUTH_CLIENT_FILE"
+	GoogleDirectoryTokenFileEnvironmentVariable     = "STACKS_GOOGLE_DIRECTORY_OAUTH_TOKEN_FILE"
+	GoogleDirectoryDomainsEnvironmentVariable       = "STACKS_GOOGLE_DIRECTORY_EMAIL_DOMAINS"
+	GoogleDirectoryFreshnessEnvironmentVariable     = "STACKS_GOOGLE_DIRECTORY_FRESHNESS"
+	GoogleDirectoryRetryAfterEnvironmentVariable    = "STACKS_GOOGLE_DIRECTORY_RETRY_AFTER"
+	GoogleDirectoryMaxAttemptsEnvironmentVariable   = "STACKS_GOOGLE_DIRECTORY_MAX_ATTEMPTS"
+	QueryMaxEntitiesEnvironmentVariable             = "STACKS_QUERY_MAX_ENTITIES"
+	QueryMaxPredicatesEnvironmentVariable           = "STACKS_QUERY_MAX_PREDICATES"
+	QueryMaxChronologyEnvironmentVariable           = "STACKS_QUERY_MAX_CHRONOLOGY"
+	QueryPlannerTimeoutEnvironmentVariable          = "STACKS_QUERY_PLANNER_TIMEOUT"
+	QueryPlannerMaxQuestionBytesEnvironmentVariable = "STACKS_QUERY_PLANNER_MAX_QUESTION_BYTES"
 )
 
 var unsupportedModelEnvironmentNames = []string{
@@ -90,6 +98,7 @@ const (
 	CommandEntities  Command = "entities"
 	CommandReview    Command = "review"
 	CommandQuery     Command = "query"
+	CommandQueryAsk  Command = "query-ask"
 	CommandDBMigrate Command = "db-migrate"
 	CommandDBStatus  Command = "db-status"
 	CommandDBReset   Command = "db-reset"
@@ -163,6 +172,8 @@ func (settings ApplicationSettings) Validate(command Command) error {
 		return nil
 	case CommandReview:
 		return settings.validateGoogleDirectory(command)
+	case CommandQueryAsk:
+		return settings.validateModelSettings(command)
 	default:
 		return nil
 	}
@@ -269,11 +280,15 @@ func (settings ApplicationSettings) validateModelSettings(command Command) error
 	if err := settings.validateUnsupportedModelEnvironment(command); err != nil {
 		return err
 	}
-	if err := settings.validateRequired(command,
+	required := []string{
 		DataModeEnvironmentVariable,
 		ModelProviderEnvironmentVariable,
 		ModelIDEnvironmentVariable,
-	); err != nil {
+	}
+	if command == CommandQueryAsk {
+		required[0], required[1] = required[1], required[0]
+	}
+	if err := settings.validateRequired(command, required...); err != nil {
 		return err
 	}
 	if (settings.Model.Provider == modelpolicy.ProviderOpenAI || settings.Model.Provider == modelpolicy.ProviderAnthropic) &&
@@ -299,14 +314,16 @@ func (settings ApplicationSettings) validateModelSettings(command Command) error
 	if settings.Model.MaxAttempts <= 0 || settings.Model.MaxAttempts > defaultModelMaxAttempts {
 		return fmt.Errorf("%s must be a positive integer no greater than %d", ModelMaxAttemptsEnvironmentVariable, defaultModelMaxAttempts)
 	}
-	if err := settings.validateRequired(command,
-		ExtractionPromptVersionEnvironmentVariable,
-	); err != nil {
-		return err
-	}
-	if settings.ExtractionPromptVersion != extract.ExtractionPromptVersion {
-		return fmt.Errorf("%s must be %q; update it and run stacks sync to create current derivations",
-			ExtractionPromptVersionEnvironmentVariable, extract.ExtractionPromptVersion)
+	if command != CommandQueryAsk {
+		if err := settings.validateRequired(command,
+			ExtractionPromptVersionEnvironmentVariable,
+		); err != nil {
+			return err
+		}
+		if settings.ExtractionPromptVersion != extract.ExtractionPromptVersion {
+			return fmt.Errorf("%s must be %q; update it and run stacks sync to create current derivations",
+				ExtractionPromptVersionEnvironmentVariable, extract.ExtractionPromptVersion)
+		}
 	}
 	return nil
 }

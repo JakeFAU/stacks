@@ -55,7 +55,7 @@ stacks
 ├── serve
 ├── config
 │   └── validate
-│       ├── serve | doctor | sync | entities | review | query
+│       ├── serve | doctor | sync | entities | review | query | query ask
 │       ├── db-migrate | db-status | db-reset
 │       └── auth
 │           ├── google
@@ -80,7 +80,8 @@ stacks
 │   ├── point --entity <id> --at <instant>
 │   ├── trend --entity <id> --before <start>/<end> --after <start>/<end>
 │   ├── trajectory --entity <id> --between <start>/<end> --limit <positive-integer>
-│   └── causal --entity <id> --between <start>/<end> --limit <positive-integer>
+│   ├── causal --entity <id> --between <start>/<end> --limit <positive-integer>
+│   └── ask --entity <id> --reference-time <instant>
 ├── db-migrate
 ├── db-status
 └── db-reset <confirmation>
@@ -212,6 +213,43 @@ private corpus. It validates the local canonical query boundary only; it does
 not validate live source, directory, model-provider, cloud, web, or cache
 behavior.
 
+### Natural-language temporal query planning
+
+`query ask` accepts one private natural-language question from standard input,
+requires caller-owned canonical entity IDs and an explicit reference instant,
+and asks the explicitly configured model provider to propose only an existing
+closed temporal request. Stdin is private local input but is disclosed to that
+provider. Canonical IDs and retrieved evidence remain attached and queried
+locally; they are not sent in the planner request. The output contains the
+normalized plan together with the unchanged cited deterministic query result.
+
+```sh
+printf '%s\n' 'What changed between the two stated periods?' |
+  go run ./cmd/stacks query ask \
+    --entity entity-atlas-001 \
+    --reference-time 2026-07-29T12:00:00-04:00 \
+    --output json
+```
+
+Validate only the configuration required by this command with:
+
+```sh
+go run ./cmd/stacks config validate query ask
+```
+
+Typed `query point`, `query trend`, `query trajectory`, and `query causal`
+remain the no-provider fallback. `query ask` adds no narration, entity
+matching, web UI, or persistence. Local and synthetic acceptance prove the
+planner boundary and PostgreSQL parity only; live-provider and private-corpus
+validation have not run.
+
+Planner settings are command-specific: `STACKS_QUERY_PLANNER_TIMEOUT` defaults
+to `1m` and accepts `1s` through `5m`; `STACKS_QUERY_PLANNER_MAX_QUESTION_BYTES`
+defaults to `16384` and accepts `1` through `65536`. The existing
+`STACKS_MODEL_PROVIDER`, `STACKS_MODEL_ID`, model output-token limit, and
+provider credential rules apply only when `query ask` constructs its selected
+provider.
+
 ## Configure the local environment
 
 Copy the example and edit the copy; never commit `.env`:
@@ -314,6 +352,8 @@ file schema with synthetic values:
 | `query.max_entities` | integer | `STACKS_QUERY_MAX_ENTITIES` |
 | `query.max_predicates` | integer | `STACKS_QUERY_MAX_PREDICATES` |
 | `query.max_chronology` | integer | `STACKS_QUERY_MAX_CHRONOLOGY` |
+| `query_planner.timeout` | duration string | `STACKS_QUERY_PLANNER_TIMEOUT` |
+| `query_planner.max_question_bytes` | integer | `STACKS_QUERY_PLANNER_MAX_QUESTION_BYTES` |
 
 OAuth client and token paths are file-eligible, but the credential files and
 their contents are not. Keep real configuration files uncommitted, store OAuth
@@ -405,7 +445,7 @@ constructing any source, directory, disclosure, model, or provider client.
 | `STACKS_DATA_MODE` | no default | Explicit disclosure mode: `personal` or `restricted` |
 | `STACKS_MODEL_PROVIDER` | no default | Explicit provider: `bedrock`, `openai`, or `anthropic` |
 | `STACKS_MODEL_ID` | no default | Provider model or inference-profile ID; no model is guessed |
-| `STACKS_MODEL_MAX_OUTPUT_TOKENS` | no default | Required positive output-token limit for `sync` |
+| `STACKS_MODEL_MAX_OUTPUT_TOKENS` | no default | Required positive output-token limit for `sync` and `query ask` |
 | `STACKS_MODEL_MAX_ATTEMPTS` | `5` | Positive retry-attempt bound, at most `5` |
 | `OPENAI_API_KEY` | no default | Personal-mode OpenAI credential; keep only in the ignored `.env` |
 | `ANTHROPIC_API_KEY` | no default | Personal-mode Anthropic credential; keep only in the ignored `.env` |
@@ -418,6 +458,8 @@ constructing any source, directory, disclosure, model, or provider client.
 | `STACKS_QUERY_MAX_ENTITIES` | `16` | Maximum unique entity IDs per temporal query, from `1` to `64` |
 | `STACKS_QUERY_MAX_PREDICATES` | `32` | Maximum unique predicates per temporal query, from `1` to `256` |
 | `STACKS_QUERY_MAX_CHRONOLOGY` | `1000` | Maximum trajectory/causal chronology bound, from `1` to `10000`; point and trend use zero |
+| `STACKS_QUERY_PLANNER_TIMEOUT` | `1m` | Private natural-language planner deadline, from `1s` to `5m`; validated only by `query ask` |
+| `STACKS_QUERY_PLANNER_MAX_QUESTION_BYTES` | `16384` | Maximum UTF-8 standard-input question bytes, from `1` to `65536`; validated only by `query ask` |
 
 `STACKS_TEST_DATABASE_URL` is the credential-bearing application-role input
 used by repository integration tests. `STACKS_TEST_MIGRATION_DATABASE_URL` is
@@ -524,8 +566,13 @@ Paid extraction acceptance is a separate, explicit action. Before `make sync`,
 obtain approval for paid provider calls, select only one provider, restrict the
 configured folder to the smallest synthetic corpus needed, and set deliberate
 `STACKS_MODEL_MAX_OUTPUT_TOKENS` and `STACKS_MODEL_MAX_ATTEMPTS` bounds.
-`make sync` may invoke the selected model; `make doctor` and every `query`
-command do not.
+`make sync` may invoke the selected model. `make doctor` and the typed temporal
+query subcommands (`point`, `trend`, `trajectory`, and `causal`) do not invoke a
+model and remain deterministic/provider-free. `query ask` discloses its private
+standard-input question to the explicitly configured planner provider, then
+executes only the validated normalized request through deterministic cited
+retrieval. Its local and synthetic acceptance does not establish live-provider
+or private-corpus validation.
 
 ### Personal OpenAI operation
 

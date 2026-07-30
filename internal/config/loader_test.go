@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadWithOptionsAppliesEnvironmentOverFileOverDefaults(t *testing.T) {
@@ -120,6 +121,157 @@ func TestLoadWithOptionsKeepsQueryLoadsIndependent(t *testing.T) {
 	}
 	if settings.Query != (QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000}) {
 		t.Fatalf("second Query = %#v, want defaults without prior file", settings.Query)
+	}
+}
+
+func TestLoadQueryPlannerUsesDefaultsAndInclusiveEnvironmentBounds(t *testing.T) {
+	clearConfigurationEnvironment(t)
+
+	settings, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if settings.QueryPlanner != (QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: 16 * 1024}) {
+		t.Fatalf("QueryPlanner = %#v, want named defaults", settings.QueryPlanner)
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		variable string
+		value    string
+		assert   func(QueryPlannerSettings) bool
+	}{
+		{name: "minimum timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "1s", assert: func(settings QueryPlannerSettings) bool { return settings.Timeout == time.Second }},
+		{name: "maximum timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "5m", assert: func(settings QueryPlannerSettings) bool { return settings.Timeout == 5*time.Minute }},
+		{name: "minimum question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "1", assert: func(settings QueryPlannerSettings) bool { return settings.MaxQuestionBytes == 1 }},
+		{name: "maximum question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "65536", assert: func(settings QueryPlannerSettings) bool { return settings.MaxQuestionBytes == 65536 }},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			t.Setenv(testCase.variable, testCase.value)
+
+			settings, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !testCase.assert(settings.QueryPlanner) {
+				t.Fatalf("QueryPlanner = %#v, want %s accepted", settings.QueryPlanner, testCase.name)
+			}
+		})
+	}
+}
+
+func TestLoadWithOptionsAppliesQueryPlannerEnvironmentOverYAMLAndJSON(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		extension string
+		contents  string
+	}{
+		{name: "YAML", extension: ".yaml", contents: "query_planner:\n  timeout: 2m\n  max_question_bytes: 12\n"},
+		{name: "JSON", extension: ".json", contents: `{"query_planner":{"timeout":"2m","max_question_bytes":12}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			path := writeConfigFixture(t, testCase.extension, testCase.contents)
+			t.Setenv(QueryPlannerTimeoutEnvironmentVariable, "3m")
+			t.Setenv(QueryPlannerMaxQuestionBytesEnvironmentVariable, "13")
+
+			settings, err := LoadWithOptions(LoadOptions{ConfigFile: &path})
+			if err != nil {
+				t.Fatalf("LoadWithOptions() error = %v", err)
+			}
+			want := QueryPlannerSettings{Timeout: 3 * time.Minute, MaxQuestionBytes: 13}
+			if settings.QueryPlanner != want {
+				t.Fatalf("QueryPlanner = %#v, want %#v from environment over file", settings.QueryPlanner, want)
+			}
+		})
+	}
+}
+
+func TestLoadPreservesParseableQueryPlannerValuesForCommandValidation(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		variable       string
+		value          string
+		extension      string
+		contents       string
+		want           QueryPlannerSettings
+		wantValidation string
+	}{
+		{name: "environment zero timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "0s", want: QueryPlannerSettings{Timeout: 0, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "environment negative timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "-1s", want: QueryPlannerSettings{Timeout: -time.Second, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "environment timeout above maximum", variable: QueryPlannerTimeoutEnvironmentVariable, value: "5m1s", want: QueryPlannerSettings{Timeout: 5*time.Minute + time.Second, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "environment zero question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "0", want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: 0}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "environment negative question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "-1", want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: -1}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "environment question bytes above maximum", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "65537", want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: 65537}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "YAML subsecond timeout", extension: ".yaml", contents: "query_planner:\n  timeout: 999ms\n", want: QueryPlannerSettings{Timeout: 999 * time.Millisecond, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "YAML zero question bytes", extension: ".yaml", contents: "query_planner:\n  max_question_bytes: 0\n", want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: 0}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "JSON timeout above maximum", extension: ".json", contents: `{"query_planner":{"timeout":"5m1s"}}`, want: QueryPlannerSettings{Timeout: 5*time.Minute + time.Second, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "JSON negative question bytes", extension: ".json", contents: `{"query_planner":{"max_question_bytes":-1}}`, want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: -1}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			var options LoadOptions
+			if testCase.variable != "" {
+				t.Setenv(testCase.variable, testCase.value)
+			} else {
+				path := writeConfigFixture(t, testCase.extension, testCase.contents)
+				options.ConfigFile = &path
+			}
+
+			settings, err := LoadWithOptions(options)
+			if err != nil {
+				t.Fatalf("LoadWithOptions() error = %v, want parseable planner value retained", err)
+			}
+			if settings.QueryPlanner != testCase.want {
+				t.Fatalf("QueryPlanner = %#v, want %#v", settings.QueryPlanner, testCase.want)
+			}
+			settings.Database.URL = "postgres://synthetic-query-app"
+			for _, command := range []Command{CommandQuery, CommandServe} {
+				if err := settings.Validate(command); err != nil {
+					t.Fatalf("Settings.Validate(%s) error = %v, want planner semantics ignored", command, err)
+				}
+			}
+			err = settings.Validate(CommandQueryAsk)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantValidation) {
+				t.Fatalf("Settings.Validate(query-ask) error = %v, want bounded %s rejection", err, testCase.wantValidation)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsMalformedQueryPlannerSyntaxWithoutDisclosingValues(t *testing.T) {
+	const privateValue = "private-planner-syntax"
+	for _, testCase := range []struct {
+		name      string
+		variable  string
+		extension string
+		contents  string
+		wantName  string
+	}{
+		{name: "environment duration", variable: QueryPlannerTimeoutEnvironmentVariable, wantName: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "environment integer", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, wantName: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "YAML duration", extension: ".yaml", contents: "query_planner:\n  timeout: " + privateValue + "\n", wantName: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "JSON integer", extension: ".json", contents: `{"query_planner":{"max_question_bytes":"` + privateValue + `"}}`, wantName: "query_planner.max_question_bytes"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			var options LoadOptions
+			if testCase.variable != "" {
+				t.Setenv(testCase.variable, privateValue)
+			} else {
+				path := writeConfigFixture(t, testCase.extension, testCase.contents)
+				options.ConfigFile = &path
+			}
+
+			_, err := LoadWithOptions(options)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantName) {
+				t.Fatalf("LoadWithOptions() error = %v, want malformed %s rejection", err, testCase.wantName)
+			}
+			if strings.Contains(err.Error(), privateValue) {
+				t.Fatalf("LoadWithOptions() error exposed configured planner syntax: %v", err)
+			}
+		})
 	}
 }
 
@@ -435,6 +587,8 @@ func clearConfigurationEnvironment(t *testing.T) {
 		QueryMaxEntitiesEnvironmentVariable,
 		QueryMaxPredicatesEnvironmentVariable,
 		QueryMaxChronologyEnvironmentVariable,
+		QueryPlannerTimeoutEnvironmentVariable,
+		QueryPlannerMaxQuestionBytesEnvironmentVariable,
 		strings.ReplaceAll("STACKS_ANALXYSIS_PROMPT_VERSION", "X", ""),
 		strings.ReplaceAll("STACKXS_EMPLOYEE_ENTITY_ID", "X", ""),
 		strings.ReplaceAll("STACKXS_MANAGER_ENTITY_ID", "X", ""),

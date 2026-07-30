@@ -25,6 +25,7 @@ func TestExecuteRoutesDBMigrateAndDBStatusThroughLazyCommandProvider(t *testing.
 			provider := CommandProviderFunc(func(
 				context.Context,
 				config.Settings,
+				io.Reader,
 				io.Writer,
 				io.Writer,
 			) (map[string]cli.Command, error) {

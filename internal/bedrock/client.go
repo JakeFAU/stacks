@@ -23,6 +23,7 @@ import (
 	"stacks/internal/modelpolicy"
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
+	"stacks/internal/queryplan"
 )
 
 const (
@@ -89,6 +90,7 @@ type Client struct {
 }
 
 var _ extract.Model = (*Client)(nil)
+var _ queryplan.Model = (*Client)(nil)
 
 func newWithAPI(api converseAPI, options Options) (*Client, error) {
 	adaptiveRetryer := awsretry.NewAdaptiveMode(func(adaptive *awsretry.AdaptiveModeOptions) {
@@ -140,15 +142,105 @@ func newClient(api converseAPI, options Options, retryer aws.Retryer) (*Client, 
 // Generate invokes Converse and returns untrusted structured JSON plus bounded
 // metadata. It never includes private request or response data in errors or
 // telemetry.
-func (client *Client) Generate(ctx context.Context, request extract.Request) (response extract.Response, resultErr error) {
+func (client *Client) Generate(ctx context.Context, request extract.Request) (extract.Response, error) {
+	response, err := client.generateStructured(ctx, extractionStructuredRequest(request))
+	if err != nil {
+		return extract.Response{}, err
+	}
+	return extract.Response{
+		Output: append(json.RawMessage(nil), response.output...),
+		Usage: extract.Usage{
+			InputTokens: response.usage.inputTokens, OutputTokens: response.usage.outputTokens, TotalTokens: response.usage.totalTokens,
+		},
+		Latency: response.providerLatency, ModelID: response.modelID,
+		PromptVersion: response.promptVersion, Outcome: OutcomeSuccess,
+	}, nil
+}
+
+// Plan invokes Converse for the exact reviewed temporal query planner
+// contract. The returned JSON remains untrusted until queryplan validates it.
+func (client *Client) Plan(ctx context.Context, request queryplan.ModelRequest) (queryplan.ModelResponse, error) {
+	response, err := client.generateStructured(ctx, plannerStructuredRequest(request))
+	if err != nil {
+		return queryplan.ModelResponse{}, err
+	}
+	return queryplan.ModelResponse{
+		Output: append(json.RawMessage(nil), response.output...), Provider: modelpolicy.ProviderBedrock,
+		ModelID: response.modelID, PromptVersion: response.promptVersion, SchemaName: response.schemaName,
+		Usage: queryplan.Usage{
+			InputTokens: response.usage.inputTokens, OutputTokens: response.usage.outputTokens, TotalTokens: response.usage.totalTokens,
+		},
+		Attempts: response.attempts, WallLatency: response.wallLatency, ProviderLatency: response.providerLatency,
+	}, nil
+}
+
+type structuredRequest struct {
+	promptVersion         string
+	systemPrompt          string
+	input                 string
+	schemaName            string
+	jsonSchema            []byte
+	validate              func(structuredRequest) error
+	retryProviderDeadline bool
+}
+
+type structuredUsage struct {
+	inputTokens  int64
+	outputTokens int64
+	totalTokens  int64
+}
+
+type structuredResponse struct {
+	output          json.RawMessage
+	usage           structuredUsage
+	modelID         string
+	promptVersion   string
+	schemaName      string
+	attempts        int
+	wallLatency     time.Duration
+	providerLatency time.Duration
+}
+
+func extractionStructuredRequest(request extract.Request) structuredRequest {
+	return structuredRequest{
+		promptVersion: request.PromptVersion, systemPrompt: request.SystemPrompt, input: request.Input,
+		schemaName: request.SchemaName, jsonSchema: append([]byte(nil), request.JSONSchema...),
+		retryProviderDeadline: true,
+		validate: func(snapshot structuredRequest) error {
+			contract, err := extract.PromptContract(snapshot.promptVersion)
+			if err != nil || snapshot.systemPrompt != contract.SystemPrompt || snapshot.schemaName != contract.SchemaName ||
+				!bytes.Equal(snapshot.jsonSchema, contract.JSONSchema) || snapshot.input == "" {
+				return ErrInvalidRequest
+			}
+			return nil
+		},
+	}
+}
+
+func plannerStructuredRequest(request queryplan.ModelRequest) structuredRequest {
+	return structuredRequest{
+		promptVersion: request.PromptVersion, systemPrompt: request.SystemPrompt, input: request.Input,
+		schemaName: request.SchemaName, jsonSchema: append([]byte(nil), request.JSONSchema...),
+		validate: func(snapshot structuredRequest) error {
+			contract, err := queryplan.PromptContract(snapshot.promptVersion)
+			if err != nil || snapshot.systemPrompt != contract.SystemPrompt || snapshot.schemaName != contract.SchemaName ||
+				!bytes.Equal(snapshot.jsonSchema, contract.JSONSchema) || snapshot.input == "" {
+				return ErrInvalidRequest
+			}
+			return nil
+		},
+	}
+}
+
+func (client *Client) generateStructured(ctx context.Context, request structuredRequest) (response structuredResponse, resultErr error) {
 	ctx, span := client.tracer.Start(ctx, invocationSpanName)
 	started := client.now()
 	defer func() { observability.FinishSpan(span, resultErr) }()
 
 	input, err := client.converseInput(request)
 	if err != nil {
-		client.record(ctx, started, "", OutcomeInvalidRequest, extract.Usage{}, 0, 0)
-		return extract.Response{}, err
+		client.record(ctx, started, "", OutcomeInvalidRequest, structuredUsage{}, 0, 0)
+		return structuredResponse{}, err
 	}
 
 	var retryToken func(error) error
@@ -157,17 +249,34 @@ func (client *Client) Generate(ctx context.Context, request extract.Request) (re
 			if retryToken != nil {
 				_ = retryToken(err)
 			}
-			client.record(ctx, started, request.PromptVersion, OutcomeCanceled, extract.Usage{}, 0, attempt-1)
-			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, err)
+			client.record(ctx, started, request.promptVersion, outcomeForError(err), structuredUsage{}, 0, attempt-1)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, err)
 		}
 
 		attemptToken, tokenErr := getAttemptToken(ctx, client.retryer)
 		if tokenErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if retryToken != nil {
+					_ = retryToken(ctxErr)
+					retryToken = nil
+				}
+				client.record(ctx, started, request.promptVersion, outcomeForError(ctxErr), structuredUsage{}, 0, attempt-1)
+				return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctxErr)
+			}
 			if retryToken != nil {
 				_ = retryToken(tokenErr)
 			}
-			client.record(ctx, started, request.PromptVersion, outcomeForError(tokenErr), extract.Usage{}, 0, attempt-1)
-			return extract.Response{}, fmt.Errorf("%w: retry policy", ErrInvocation)
+			client.record(ctx, started, request.promptVersion, outcomeForError(tokenErr), structuredUsage{}, 0, attempt-1)
+			return structuredResponse{}, fmt.Errorf("%w: retry policy", ErrInvocation)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = attemptToken(ctxErr)
+			if retryToken != nil {
+				_ = retryToken(ctxErr)
+				retryToken = nil
+			}
+			client.record(ctx, started, request.promptVersion, outcomeForError(ctxErr), structuredUsage{}, 0, attempt-1)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctxErr)
 		}
 		output, invokeErr := client.api.Converse(ctx, input)
 		_ = attemptToken(invokeErr)
@@ -177,62 +286,99 @@ func (client *Client) Generate(ctx context.Context, request extract.Request) (re
 		}
 
 		if invokeErr == nil {
-			response, outputErr := client.response(request.PromptVersion, output)
+			response, outputErr := client.response(request, output)
 			if outputErr != nil {
 				usage, latency := boundedMetadata(output)
-				client.record(ctx, started, request.PromptVersion, OutcomeInvalidOutput, usage, latency, attempt)
-				return extract.Response{}, outputErr
+				client.record(ctx, started, request.promptVersion, OutcomeInvalidOutput, usage, latency, attempt)
+				return structuredResponse{}, outputErr
 			}
-			client.record(ctx, started, request.PromptVersion, OutcomeSuccess, response.Usage, response.Latency, attempt)
+			response.attempts = attempt
+			response.wallLatency = client.record(ctx, started, request.promptVersion, OutcomeSuccess, response.usage, response.providerLatency, attempt)
 			return response, nil
 		}
 
-		if ctx.Err() != nil {
-			client.record(ctx, started, request.PromptVersion, OutcomeCanceled, extract.Usage{}, 0, attempt)
-			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, ctx.Err())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			client.record(ctx, started, request.promptVersion, outcomeForError(ctxErr), structuredUsage{}, 0, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctxErr)
 		}
-		if attempt == client.retryer.MaxAttempts() || !client.retryer.IsErrorRetryable(invokeErr) {
+		if attempt == client.retryer.MaxAttempts() || !client.isRetryable(request, invokeErr) {
 			outcome := outcomeForError(invokeErr)
-			client.record(ctx, started, request.PromptVersion, outcome, extract.Usage{}, 0, attempt)
-			return extract.Response{}, boundedInvocationError(invokeErr, outcome)
+			client.record(ctx, started, request.promptVersion, outcome, structuredUsage{}, 0, attempt)
+			return structuredResponse{}, boundedStructuredInvocationError(request, invokeErr, outcome)
 		}
 
 		retryToken, tokenErr = client.retryer.GetRetryToken(ctx, invokeErr)
 		if tokenErr != nil {
-			client.record(ctx, started, request.PromptVersion, outcomeForError(invokeErr), extract.Usage{}, 0, attempt)
-			return extract.Response{}, fmt.Errorf("%w: retry policy", ErrInvocation)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				client.record(ctx, started, request.promptVersion, outcomeForError(ctxErr), structuredUsage{}, 0, attempt)
+				return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctxErr)
+			}
+			client.record(ctx, started, request.promptVersion, outcomeForError(invokeErr), structuredUsage{}, 0, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: retry policy", ErrInvocation)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = retryToken(ctxErr)
+			retryToken = nil
+			client.record(ctx, started, request.promptVersion, outcomeForError(ctxErr), structuredUsage{}, 0, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctxErr)
 		}
 		delay, delayErr := client.retryer.RetryDelay(attempt, invokeErr)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = retryToken(ctxErr)
+			retryToken = nil
+			client.record(ctx, started, request.promptVersion, outcomeForError(ctxErr), structuredUsage{}, 0, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctxErr)
+		}
 		if delayErr != nil {
 			_ = retryToken(delayErr)
 			retryToken = nil
-			client.record(ctx, started, request.PromptVersion, outcomeForError(invokeErr), extract.Usage{}, 0, attempt)
-			return extract.Response{}, fmt.Errorf("%w: retry policy", ErrInvocation)
+			client.record(ctx, started, request.promptVersion, outcomeForError(invokeErr), structuredUsage{}, 0, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: retry policy", ErrInvocation)
 		}
 		if err := wait(ctx, delay); err != nil {
 			_ = retryToken(err)
 			retryToken = nil
-			client.record(ctx, started, request.PromptVersion, OutcomeCanceled, extract.Usage{}, 0, attempt)
-			return extract.Response{}, fmt.Errorf("%w: %w", ErrInvocation, err)
+			client.record(ctx, started, request.promptVersion, outcomeForError(err), structuredUsage{}, 0, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, err)
 		}
 	}
-	return extract.Response{}, fmt.Errorf("%w: retry policy", ErrInvocation)
+	return structuredResponse{}, fmt.Errorf("%w: retry policy", ErrInvocation)
 }
 
-func boundedMetadata(output *bedrockruntime.ConverseOutput) (extract.Usage, time.Duration) {
-	if output == nil {
-		return extract.Usage{}, 0
+func boundedStructuredInvocationError(request structuredRequest, err error, outcome string) error {
+	if !request.retryProviderDeadline {
+		if errors.Is(err, context.Canceled) {
+			return fmt.Errorf("%w: %w", ErrInvocation, context.Canceled)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("%w: %w", ErrInvocation, context.DeadlineExceeded)
+		}
 	}
-	var usage extract.Usage
+	return boundedInvocationError(err, outcome)
+}
+
+func (client *Client) isRetryable(request structuredRequest, err error) bool {
+	if !request.retryProviderDeadline &&
+		(errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+		return false
+	}
+	return client.retryer.IsErrorRetryable(err)
+}
+
+func boundedMetadata(output *bedrockruntime.ConverseOutput) (structuredUsage, time.Duration) {
+	if output == nil {
+		return structuredUsage{}, 0
+	}
+	var usage structuredUsage
 	if output.Usage != nil {
 		if value := aws.ToInt32(output.Usage.InputTokens); value >= 0 {
-			usage.InputTokens = int64(value)
+			usage.inputTokens = int64(value)
 		}
 		if value := aws.ToInt32(output.Usage.OutputTokens); value >= 0 {
-			usage.OutputTokens = int64(value)
+			usage.outputTokens = int64(value)
 		}
 		if value := aws.ToInt32(output.Usage.TotalTokens); value >= 0 {
-			usage.TotalTokens = int64(value)
+			usage.totalTokens = int64(value)
 		}
 	}
 	var latency time.Duration
@@ -244,76 +390,66 @@ func boundedMetadata(output *bedrockruntime.ConverseOutput) (extract.Usage, time
 	return usage, latency
 }
 
-func (client *Client) converseInput(request extract.Request) (*bedrockruntime.ConverseInput, error) {
-	contract, err := extract.PromptContract(request.PromptVersion)
-	if err != nil || request.SystemPrompt != contract.SystemPrompt || request.SchemaName != contract.SchemaName || !bytes.Equal(request.JSONSchema, contract.JSONSchema) {
+func (client *Client) converseInput(request structuredRequest) (*bedrockruntime.ConverseInput, error) {
+	if request.validate == nil || request.validate(request) != nil || !json.Valid(request.jsonSchema) {
 		return nil, ErrInvalidRequest
 	}
-	if request.Input == "" || !json.Valid(request.JSONSchema) {
-		return nil, ErrInvalidRequest
-	}
-	schema := string(request.JSONSchema)
+	schema := string(request.jsonSchema)
 	return &bedrockruntime.ConverseInput{
 		ModelId: aws.String(client.modelID),
 		InferenceConfig: &types.InferenceConfiguration{
 			MaxTokens: aws.Int32(client.maxTokens),
 		},
 		System: []types.SystemContentBlock{
-			&types.SystemContentBlockMemberText{Value: request.SystemPrompt},
+			&types.SystemContentBlockMemberText{Value: request.systemPrompt},
 		},
 		Messages: []types.Message{{
 			Role: types.ConversationRoleUser,
 			Content: []types.ContentBlock{
-				&types.ContentBlockMemberText{Value: request.Input},
+				&types.ContentBlockMemberText{Value: request.input},
 			},
 		}},
 		OutputConfig: &types.OutputConfig{TextFormat: &types.OutputFormat{
 			Type: types.OutputFormatTypeJsonSchema,
 			Structure: &types.OutputFormatStructureMemberJsonSchema{Value: types.JsonSchemaDefinition{
-				Name: aws.String(request.SchemaName), Schema: aws.String(schema),
+				Name: aws.String(request.schemaName), Schema: aws.String(schema),
 			}},
 		}},
 		RequestMetadata: nil,
 	}, nil
 }
 
-func (client *Client) response(promptVersion string, output *bedrockruntime.ConverseOutput) (extract.Response, error) {
+func (client *Client) response(request structuredRequest, output *bedrockruntime.ConverseOutput) (structuredResponse, error) {
 	if output == nil || output.StopReason != types.StopReasonEndTurn || output.Metrics == nil || output.Metrics.LatencyMs == nil || output.Usage == nil || output.Usage.InputTokens == nil || output.Usage.OutputTokens == nil || output.Usage.TotalTokens == nil {
-		return extract.Response{}, ErrInvalidOutput
+		return structuredResponse{}, ErrInvalidOutput
 	}
 	message, ok := output.Output.(*types.ConverseOutputMemberMessage)
 	if !ok || message.Value.Role != types.ConversationRoleAssistant || len(message.Value.Content) != 1 {
-		return extract.Response{}, ErrInvalidOutput
+		return structuredResponse{}, ErrInvalidOutput
 	}
 	text, ok := message.Value.Content[0].(*types.ContentBlockMemberText)
 	if !ok || !json.Valid([]byte(text.Value)) {
-		return extract.Response{}, ErrInvalidOutput
+		return structuredResponse{}, ErrInvalidOutput
 	}
 	latencyMillis := aws.ToInt64(output.Metrics.LatencyMs)
 	inputTokens := aws.ToInt32(output.Usage.InputTokens)
 	outputTokens := aws.ToInt32(output.Usage.OutputTokens)
 	totalTokens := aws.ToInt32(output.Usage.TotalTokens)
 	if latencyMillis < 0 || latencyMillis > maxLatencyMilliseconds || inputTokens < 0 || outputTokens < 0 || totalTokens < 0 {
-		return extract.Response{}, ErrInvalidOutput
+		return structuredResponse{}, ErrInvalidOutput
 	}
-	usage := extract.Usage{InputTokens: int64(inputTokens), OutputTokens: int64(outputTokens), TotalTokens: int64(totalTokens)}
-	return extract.Response{
-		Output:        append(json.RawMessage(nil), text.Value...),
-		Usage:         usage,
-		Latency:       time.Duration(latencyMillis) * time.Millisecond,
-		ModelID:       client.modelID,
-		PromptVersion: promptVersion,
-		Outcome:       OutcomeSuccess,
+	usage := structuredUsage{inputTokens: int64(inputTokens), outputTokens: int64(outputTokens), totalTokens: int64(totalTokens)}
+	return structuredResponse{
+		output: append(json.RawMessage(nil), text.Value...), usage: usage, modelID: client.modelID,
+		promptVersion: request.promptVersion, schemaName: request.schemaName,
+		providerLatency: time.Duration(latencyMillis) * time.Millisecond,
 	}, nil
 }
 
-func (client *Client) record(ctx context.Context, started time.Time, promptVersion, outcome string, usage extract.Usage, providerLatency time.Duration, attempts int) {
+func (client *Client) record(ctx context.Context, started time.Time, promptVersion, outcome string, usage structuredUsage, providerLatency time.Duration, attempts int) time.Duration {
+	wallLatency := client.elapsed(started)
 	if client.recorder == nil {
-		return
-	}
-	wallLatency := client.now().Sub(started)
-	if wallLatency < 0 {
-		wallLatency = 0
+		return wallLatency
 	}
 	promptVersion = strings.TrimSpace(promptVersion)
 	if promptVersion == "" {
@@ -322,9 +458,18 @@ func (client *Client) record(ctx context.Context, started time.Time, promptVersi
 	client.recorder.Record(ctx, modeltelemetry.Observation{
 		Provider: modelpolicy.ProviderBedrock, DataMode: client.dataMode,
 		ModelID: client.modelID, PromptVersion: promptVersion, Outcome: outcome,
-		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens,
+		InputTokens: usage.inputTokens, OutputTokens: usage.outputTokens, TotalTokens: usage.totalTokens,
 		WallLatency: wallLatency, ProviderLatency: providerLatency, Attempts: attempts,
 	})
+	return wallLatency
+}
+
+func (client *Client) elapsed(started time.Time) time.Duration {
+	elapsed := client.now().Sub(started)
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
 }
 
 func getAttemptToken(ctx context.Context, retryer aws.Retryer) (func(error) error, error) {

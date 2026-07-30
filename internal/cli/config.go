@@ -43,6 +43,9 @@ func configValidationTarget(input ConfigValidationInput) (string, error) {
 			return "", fmt.Errorf("configuration validation target is invalid")
 		}
 	}
+	if input.Command == CommandQuery && input.Action == ActionAsk {
+		return fmt.Sprintf("%s %s", input.Command, input.Action), nil
+	}
 	if input.Action != "" {
 		return "", fmt.Errorf("configuration validation target is invalid")
 	}

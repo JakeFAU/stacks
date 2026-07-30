@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -60,6 +61,65 @@ func TestNewModelSelectsOnlyConfiguredProvider(t *testing.T) {
 				t.Fatalf("newModel() type = %s, want %s", got, want)
 			}
 		})
+	}
+}
+
+func TestNewQueryPlannerModelSelectsOnlyConfiguredProvider(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "synthetic-access-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "synthetic-secret-key")
+	tracer := tracenoop.NewTracerProvider().Tracer("synthetic")
+	tests := []struct {
+		name     string
+		settings config.ModelSettings
+		want     any
+	}{
+		{
+			name: "bedrock",
+			settings: config.ModelSettings{
+				Provider: modelpolicy.ProviderBedrock, DataMode: modelpolicy.DataModePersonal,
+				ModelID: "synthetic-model", MaxOutputTokens: 256, MaxAttempts: 1, AWSRegion: "us-east-1",
+			},
+			want: (*bedrock.Client)(nil),
+		},
+		{
+			name: "openai",
+			settings: config.ModelSettings{
+				Provider: modelpolicy.ProviderOpenAI, DataMode: modelpolicy.DataModePersonal,
+				ModelID: "synthetic-model", MaxOutputTokens: 256, MaxAttempts: 1, OpenAIAPIKey: "synthetic-openai-key",
+			},
+			want: (*openai.Client)(nil),
+		},
+		{
+			name: "anthropic",
+			settings: config.ModelSettings{
+				Provider: modelpolicy.ProviderAnthropic, DataMode: modelpolicy.DataModePersonal,
+				ModelID: "synthetic-model", MaxOutputTokens: 256, MaxAttempts: 1, AnthropicAPIKey: "synthetic-anthropic-key",
+			},
+			want: (*anthropic.Client)(nil),
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			model, err := newQueryPlannerModelWithContext(context.Background(), testCase.settings, nil, tracer)
+			if err != nil {
+				t.Fatalf("newQueryPlannerModelWithContext() error = %v", err)
+			}
+			if got, want := typeName(model), typeName(testCase.want); got != want {
+				t.Fatalf("planner model type = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestNewQueryPlannerModelRejectsUnsupportedProviderWithoutFallback(t *testing.T) {
+	settings := config.ModelSettings{Provider: "unsupported", OpenAIAPIKey: "private-openai-key"}
+	_, err := newQueryPlannerModelWithContext(context.Background(), settings, nil, tracenoop.NewTracerProvider().Tracer("synthetic"))
+	if err == nil || !strings.Contains(err.Error(), "unsupported model provider") {
+		t.Fatalf("newQueryPlannerModelWithContext() error = %v, want unsupported provider rejection", err)
+	}
+	if strings.Contains(err.Error(), settings.OpenAIAPIKey) {
+		t.Fatalf("planner model error exposed credential: %v", err)
 	}
 }
 

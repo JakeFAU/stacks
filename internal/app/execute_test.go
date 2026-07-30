@@ -31,7 +31,7 @@ func TestExecuteHelpAndSyntaxFailuresDoNotConstructCommands(t *testing.T) {
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			providerCalls := 0
-			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Reader, io.Writer, io.Writer) (map[string]cli.Command, error) {
 				providerCalls++
 				return nil, errors.New("provider must not be constructed")
 			})
@@ -86,7 +86,7 @@ func TestExecuteRoutesEntityAndReviewCommandsWithRemainingArguments(t *testing.T
 		t.Run(testCase.name, func(t *testing.T) {
 			var gotInvocation cli.Invocation
 			var stdoutCalled bool
-			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Reader, io.Writer, io.Writer) (map[string]cli.Command, error) {
 				return map[string]cli.Command{testCase.commandName: cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
 					gotInvocation = invocation
 					stdoutCalled = true
@@ -113,7 +113,7 @@ func TestExecuteRoutesGoogleAuthWithRemainingArguments(t *testing.T) {
 		GoogleOAuthTokenFile:  "/synthetic/token.json",
 	}}
 	var gotInvocation cli.Invocation
-	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Reader, io.Writer, io.Writer) (map[string]cli.Command, error) {
 		return map[string]cli.Command{"auth": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
 			gotInvocation = invocation
 			return nil
@@ -148,7 +148,7 @@ func TestExecuteRoutesSyncThroughLazyCommandProvider(t *testing.T) {
 	}}
 	providerCalls := 0
 	syncCalls := 0
-	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Reader, io.Writer, io.Writer) (map[string]cli.Command, error) {
 		providerCalls++
 		return map[string]cli.Command{"sync": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
 			syncCalls++
@@ -184,7 +184,7 @@ func TestExecuteRoutesDoctorThroughLazyCommandProvider(t *testing.T) {
 	}}
 	providerCalls := 0
 	doctorCalls := 0
-	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Reader, io.Writer, io.Writer) (map[string]cli.Command, error) {
 		providerCalls++
 		return map[string]cli.Command{"doctor": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
 			doctorCalls++
@@ -213,7 +213,7 @@ func TestExecuteRoutesTypedTrendThroughLazyQueryCommand(t *testing.T) {
 	}
 	var got cli.Invocation
 	providerCalls := 0
-	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+	provider := CommandProviderFunc(func(context.Context, config.Settings, io.Reader, io.Writer, io.Writer) (map[string]cli.Command, error) {
 		providerCalls++
 		return map[string]cli.Command{"query": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
 			got = invocation
@@ -235,6 +235,45 @@ func TestExecuteRoutesTypedTrendThroughLazyQueryCommand(t *testing.T) {
 	if providerCalls != 1 || got.Command != cli.CommandQuery || got.Action != cli.ActionTrend ||
 		got.Query == nil || got.Query.Request.Intent != temporal.IntentTrendComparison {
 		t.Fatalf("provider calls/invocation = %d/%#v, want one typed trend dispatch", providerCalls, got)
+	}
+}
+
+func TestExecuteRoutesQueryAskThroughLazyQueryCommand(t *testing.T) {
+	settings := config.Settings{
+		Database: config.DatabaseSettings{URL: "postgres://synthetic"},
+		Query:    config.QuerySettings{MaxEntities: 16, MaxPredicates: 32, MaxChronology: 1000},
+		QueryPlanner: config.QueryPlannerSettings{
+			Timeout: time.Minute, MaxQuestionBytes: 1024,
+		},
+		Application: config.ApplicationSettings{Model: config.ModelSettings{
+			DataMode: "personal", Provider: "bedrock", ModelID: "synthetic-model",
+			MaxOutputTokens: 256, MaxAttempts: 1, AWSRegion: "us-east-1",
+		}},
+	}
+	var got cli.Invocation
+	providerCalls := 0
+	input := strings.NewReader("synthetic question\n")
+	provider := CommandProviderFunc(func(_ context.Context, _ config.Settings, stdin io.Reader, _ io.Writer, _ io.Writer) (map[string]cli.Command, error) {
+		providerCalls++
+		if stdin != input {
+			return nil, errors.New("command provider received a different stdin reader")
+		}
+		return map[string]cli.Command{"query": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
+			got = invocation
+			return nil
+		})}, nil
+	})
+
+	err := Execute(t.Context(), []string{
+		"query", "ask", "--entity", "entity-a", "--reference-time", "2026-07-30T00:00:00Z",
+	}, settingsLoader(settings), commandBootstrap(RuntimeFunc(func(context.Context, config.Settings) error {
+		return errors.New("serve must not run")
+	}), provider), input, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if providerCalls != 1 || got.Command != cli.CommandQuery || got.Action != cli.ActionAsk || got.QueryAsk == nil {
+		t.Fatalf("provider calls/invocation = %d/%#v, want one query ask dispatch", providerCalls, got)
 	}
 }
 
@@ -282,7 +321,7 @@ func TestExecuteRoutesEveryTemporalQueryLeafThroughOneQueryCommand(t *testing.T)
 			}
 			var got cli.Invocation
 			providerCalls := 0
-			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Reader, io.Writer, io.Writer) (map[string]cli.Command, error) {
 				providerCalls++
 				return map[string]cli.Command{"query": cli.CommandFunc(func(_ context.Context, invocation cli.Invocation) error {
 					got = invocation
@@ -321,7 +360,7 @@ func TestExecuteRejectsSupersededPromptContractsBeforeConstructingBoundaries(t *
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			providerCalls := 0
-			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Writer, io.Writer) (map[string]cli.Command, error) {
+			provider := CommandProviderFunc(func(context.Context, config.Settings, io.Reader, io.Writer, io.Writer) (map[string]cli.Command, error) {
 				providerCalls++
 				return nil, fmt.Errorf("provider must not be constructed")
 			})
@@ -369,6 +408,7 @@ func executeWithSettings(
 		args,
 		settingsLoader(settings),
 		commandBootstrap(runtime, commandProvider),
+		strings.NewReader(""),
 		stdout,
 		stderr,
 	)
