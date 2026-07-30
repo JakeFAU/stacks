@@ -265,6 +265,15 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 			client.record(ctx, started, request.promptVersion, outcomeForError(tokenErr), structuredUsage{}, 0, attempt-1)
 			return structuredResponse{}, fmt.Errorf("%w: retry policy", ErrInvocation)
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = attemptToken(ctxErr)
+			if retryToken != nil {
+				_ = retryToken(ctxErr)
+				retryToken = nil
+			}
+			client.record(ctx, started, request.promptVersion, outcomeForError(ctxErr), structuredUsage{}, 0, attempt-1)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctxErr)
+		}
 		output, invokeErr := client.api.Converse(ctx, input)
 		_ = attemptToken(invokeErr)
 		if retryToken != nil {

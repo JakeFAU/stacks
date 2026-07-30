@@ -499,6 +499,124 @@ func TestClientPlanPreservesCallerContextAtAdaptiveTokenBoundaries(t *testing.T)
 	}
 }
 
+func TestClientPlanStopsBeforeConverseWhenContextEndsDuringAttemptTokenAcquisition(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	for name, contextCase := range contextCases {
+		t.Run(name, func(t *testing.T) {
+			ctx := newControlledContext(contextCase.err)
+			var attemptTokenReleases []error
+			retryer := &plannerPolicyRetryer{
+				zeroRetryer:      zeroRetryer{maxAttempts: 2},
+				attemptTokenHook: ctx.fail,
+				attemptTokenRelease: func(err error) error {
+					attemptTokenReleases = append(attemptTokenReleases, err)
+					return nil
+				},
+			}
+			api := &fakeConverseAPI{}
+			recorder := &recordingInvocationRecorder{}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(ctx, validPlanRequest())
+			if !errors.Is(err, ErrInvocation) || !errors.Is(err, contextCase.err) {
+				t.Fatalf("Plan() error = %v, want invocation wrapping %v", err, contextCase.err)
+			}
+			if len(api.inputs) != 0 {
+				t.Fatalf("Converse calls = %d, want 0", len(api.inputs))
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+				recorder.observations[0].Attempts != 0 {
+				t.Fatalf("telemetry = %+v, want outcome=%s attempts=0", recorder.observations, contextCase.outcome)
+			}
+			if len(attemptTokenReleases) != 1 || !errors.Is(attemptTokenReleases[0], contextCase.err) {
+				t.Fatalf("attempt-token releases = %v, want one canonical %v release", attemptTokenReleases, contextCase.err)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+			}
+		})
+	}
+}
+
+func TestClientPlanReleasesOutstandingTokensWhenContextEndsAfterLaterAttemptToken(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	for name, contextCase := range contextCases {
+		t.Run(name, func(t *testing.T) {
+			ctx := newControlledContext(contextCase.err)
+			var attemptTokenReleases []error
+			var retryTokenReleases []error
+			retryer := &plannerPolicyRetryer{
+				zeroRetryer: zeroRetryer{maxAttempts: 2},
+				attemptTokenRelease: func(err error) error {
+					attemptTokenReleases = append(attemptTokenReleases, err)
+					return nil
+				},
+				retryTokenRelease: func(err error) error {
+					retryTokenReleases = append(retryTokenReleases, err)
+					return nil
+				},
+			}
+			retryer.attemptTokenHook = func() {
+				if retryer.attemptTokenCalls == 2 {
+					ctx.fail()
+				}
+			}
+			api := &fakeConverseAPI{
+				errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}},
+			}
+			recorder := &recordingInvocationRecorder{}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(ctx, validPlanRequest())
+			if !errors.Is(err, ErrInvocation) || !errors.Is(err, contextCase.err) {
+				t.Fatalf("Plan() error = %v, want invocation wrapping %v", err, contextCase.err)
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+				recorder.observations[0].Attempts != 1 {
+				t.Fatalf("telemetry = %+v, want outcome=%s attempts=1", recorder.observations, contextCase.outcome)
+			}
+			if len(attemptTokenReleases) != 2 || !errors.Is(attemptTokenReleases[1], contextCase.err) {
+				t.Fatalf("attempt-token releases = %v, want later canonical %v release", attemptTokenReleases, contextCase.err)
+			}
+			if len(retryTokenReleases) != 1 || !errors.Is(retryTokenReleases[0], contextCase.err) {
+				t.Fatalf("retry-token releases = %v, want one canonical %v release", retryTokenReleases, contextCase.err)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+			}
+		})
+	}
+}
+
 func TestClientPlanBoundsRetryPolicyFailures(t *testing.T) {
 	tests := map[string]struct {
 		retryer   aws.RetryerV2
@@ -1052,15 +1170,18 @@ func (retryer *noDelayRetryer) RetryDelay(int, error) (time.Duration, error) {
 
 type plannerPolicyRetryer struct {
 	zeroRetryer
-	attemptTokenErr  error
-	attemptTokenHook func()
-	retryTokenErr    error
-	retryTokenHook   func()
-	retryDelayErr    error
-	retryDelayHook   func()
-	retryableCalls   int
-	retryTokenCalls  int
-	retryDelayCalls  int
+	attemptTokenErr     error
+	attemptTokenHook    func()
+	attemptTokenRelease func(error) error
+	retryTokenErr       error
+	retryTokenHook      func()
+	retryTokenRelease   func(error) error
+	retryDelayErr       error
+	retryDelayHook      func()
+	retryableCalls      int
+	attemptTokenCalls   int
+	retryTokenCalls     int
+	retryDelayCalls     int
 }
 
 func (retryer *plannerPolicyRetryer) IsErrorRetryable(err error) bool {
@@ -1072,11 +1193,15 @@ func (retryer *plannerPolicyRetryer) IsErrorRetryable(err error) bool {
 }
 
 func (retryer *plannerPolicyRetryer) GetAttemptToken(context.Context) (func(error) error, error) {
+	retryer.attemptTokenCalls++
 	if retryer.attemptTokenHook != nil {
 		retryer.attemptTokenHook()
 	}
 	if retryer.attemptTokenErr != nil {
 		return nil, retryer.attemptTokenErr
+	}
+	if retryer.attemptTokenRelease != nil {
+		return retryer.attemptTokenRelease, nil
 	}
 	return func(error) error { return nil }, nil
 }
@@ -1088,6 +1213,9 @@ func (retryer *plannerPolicyRetryer) GetRetryToken(context.Context, error) (func
 	}
 	if retryer.retryTokenErr != nil {
 		return nil, retryer.retryTokenErr
+	}
+	if retryer.retryTokenRelease != nil {
+		return retryer.retryTokenRelease, nil
 	}
 	return func(error) error { return nil }, nil
 }
