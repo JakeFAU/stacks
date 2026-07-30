@@ -262,6 +262,47 @@ func TestDocumentVersionStableIdentityConflictIsBounded(t *testing.T) {
 	}
 }
 
+func TestDocumentVersionSectionBatchConflictRollsBackCanonicalWrite(t *testing.T) {
+	fixture := newDocumentRepositoryFixture(t)
+	document := documentWithDuplicateSectionOrder(
+		t,
+		"source-section-conflict",
+		documentRecordedAt,
+	)
+
+	_, err := fixture.database.PutDocumentVersion(fixture.ctx, document)
+	if !errors.Is(err, postgres.ErrConflict) {
+		t.Fatalf("PutDocumentVersion() error = %v, want ErrConflict", err)
+	}
+
+	var sourceDocuments, documentVersions, documentSections int
+	if err := fixture.admin.QueryRow(fixture.ctx, `
+		SELECT
+			count(DISTINCT source.id),
+			count(DISTINCT version.id),
+			count(DISTINCT (section.document_version_id, section.section_id))
+		FROM stacks_core.source_documents AS source
+		LEFT JOIN stacks_core.document_versions AS version
+		  ON version.source_document_id = source.id
+		LEFT JOIN stacks_core.document_sections AS section
+		  ON section.document_version_id = version.id
+		WHERE source.provider = $1
+		  AND source.provider_document_id = $2`,
+		document.Provider(),
+		document.ProviderDocumentID(),
+	).Scan(&sourceDocuments, &documentVersions, &documentSections); err != nil {
+		t.Fatalf("count canonical state after section conflict: %v", err)
+	}
+	if sourceDocuments != 0 || documentVersions != 0 || documentSections != 0 {
+		t.Fatalf(
+			"canonical state after section conflict = source documents %d, document versions %d, document sections %d, want all zero",
+			sourceDocuments,
+			documentVersions,
+			documentSections,
+		)
+	}
+}
+
 func TestDocumentRepositoryPreservesCancellation(t *testing.T) {
 	fixture := newDocumentRepositoryFixture(t)
 	document := canonicalDocument(t, "source-opaque-a", "revision-a", documentRecordedAt)
@@ -278,6 +319,63 @@ func TestDocumentRepositoryPreservesCancellation(t *testing.T) {
 	if _, err := fixture.database.PutDocumentVersion(canceled, document); !errors.Is(err, context.Canceled) {
 		t.Fatalf("PutDocumentVersion() error = %v, want context.Canceled", err)
 	}
+}
+
+func documentWithDuplicateSectionOrder(
+	t testing.TB,
+	providerDocumentID string,
+	recordedAt time.Time,
+) evidence.DocumentVersion {
+	t.Helper()
+	first, err := evidence.NewSection(evidence.SectionInput{
+		ID:       "section-first",
+		Title:    "Synthetic first section",
+		Path:     []string{"Synthetic conflict", "First"},
+		Order:    0,
+		Role:     "transcript",
+		Text:     "First synthetic section.",
+		ParentID: "section-root",
+	})
+	if err != nil {
+		t.Fatalf("NewSection(first) error = %v", err)
+	}
+	second, err := evidence.NewSection(evidence.SectionInput{
+		ID:       "section-second",
+		Title:    "Synthetic second section",
+		Path:     []string{"Synthetic conflict", "Second"},
+		Order:    0,
+		Role:     "notes",
+		Text:     "Second synthetic section.",
+		ParentID: "section-root",
+	})
+	if err != nil {
+		t.Fatalf("NewSection(second) error = %v", err)
+	}
+	sourceTime := time.Date(
+		2026,
+		time.July,
+		24,
+		10,
+		0,
+		0,
+		123456789,
+		time.FixedZone("synthetic", -4*60*60),
+	)
+	document, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
+		Provider:           syntheticProvider,
+		ProviderDocumentID: providerDocumentID,
+		Title:              "Synthetic section conflict",
+		Locator:            "synthetic://documents/" + providerDocumentID,
+		ProviderVersion:    syntheticProviderVersion,
+		ModifiedAt:         documentModifiedAt,
+		SourceTime:         &sourceTime,
+		RecordedAt:         recordedAt,
+		Sections:           []evidence.Section{first, second},
+	})
+	if err != nil {
+		t.Fatalf("NewDocumentVersion() error = %v", err)
+	}
+	return document
 }
 
 func assertDocumentRecord(
