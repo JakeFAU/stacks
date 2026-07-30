@@ -26,6 +26,7 @@ const (
 	queryLimitFlagName            = "limit"
 	queryKnownAsOfFlagName        = "known-as-of"
 	queryOutputFlagName           = "output"
+	queryReferenceTimeFlagName    = "reference-time"
 	reviewCreateNameFlagName      = "name"
 	reviewCreateEmailFlagName     = "email"
 	acceptDirectoryEntityFlagName = "entity"
@@ -67,6 +68,7 @@ const (
 	ActionTrend               Action = "trend"
 	ActionTrajectory          Action = "trajectory"
 	ActionCausal              Action = "causal"
+	ActionAsk                 Action = "ask"
 )
 
 // Invocation is the validated, provider-neutral CLI input for one application command.
@@ -79,6 +81,7 @@ type Invocation struct {
 	CreatePerson     *CreatePersonInput
 	AcceptDirectory  *AcceptDirectoryInput
 	Query            *QueryInput
+	QueryAsk         *QueryAskInput
 }
 
 // Command executes a typed application invocation.
@@ -208,13 +211,15 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 		CommandSync,
 		CommandEntities,
 		CommandReview,
-		CommandQuery,
 		CommandDBMigrate,
 		CommandDBStatus,
 		CommandDBReset,
 	} {
 		validate.AddCommand(configValidationLeaf(string(target), target, ""))
 	}
+	configQuery := configValidationLeaf(string(CommandQuery), CommandQuery, "")
+	configQuery.AddCommand(configValidationLeaf(string(ActionAsk), CommandQuery, ActionAsk))
+	validate.AddCommand(configQuery)
 	configAuth := invalidGroup(string(CommandAuth))
 	configAuth.AddCommand(configValidationLeaf(string(ActionAuthGoogle), CommandAuth, ActionAuthGoogle))
 	configAuth.AddCommand(configValidationLeaf(string(ActionAuthGoogleDirectory), CommandAuth, ActionAuthGoogleDirectory))
@@ -316,7 +321,27 @@ func (r Runner) newRootCommand(handled *bool) *cobra.Command {
 	causal.Flags().Var(newSingleStringFlag(""), queryLimitFlagName, "positive chronology limit")
 	_ = causal.MarkFlagRequired(queryBetweenFlagName)
 	_ = causal.MarkFlagRequired(queryLimitFlagName)
-	queryCommand.AddCommand(point, trend, trajectory, causal)
+	ask := &cobra.Command{
+		Use:  string(ActionAsk),
+		Args: cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			input, err := parseQueryAsk(command)
+			if err != nil {
+				return err
+			}
+			return execute(command, Invocation{
+				Command:  CommandQuery,
+				Action:   ActionAsk,
+				QueryAsk: &input,
+			})
+		},
+	}
+	ask.Flags().StringArray(queryEntityFlagName, nil, "canonical entity ID")
+	ask.Flags().Var(newSingleStringFlag(""), queryReferenceTimeFlagName, "RFC3339 reference instant")
+	ask.Flags().Var(newSingleStringFlag(string(QueryOutputText)), queryOutputFlagName, "output format")
+	_ = ask.MarkFlagRequired(queryEntityFlagName)
+	_ = ask.MarkFlagRequired(queryReferenceTimeFlagName)
+	queryCommand.AddCommand(point, trend, trajectory, causal, ask)
 	root.AddCommand(queryCommand)
 
 	entities := &cobra.Command{Use: string(CommandEntities)}

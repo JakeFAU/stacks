@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/JakeFAU/stacks/core/temporal"
 
@@ -17,79 +18,92 @@ func renderQueryText(result query.Result) ([]byte, error) {
 	}
 
 	var rendered strings.Builder
-	fmt.Fprintf(&rendered, "intent: %s\n", result.Intent)
-	fmt.Fprintf(&rendered, "entities: %s\n", textList(entityIDStrings(result)))
-	fmt.Fprintf(&rendered, "entity match: %s\n", result.EntityMatch)
-	fmt.Fprintf(&rendered, "predicates: %s\n", textList(predicateStrings(result)))
-	for _, selection := range result.Selections {
-		if err := renderTextSelection(&rendered, selection); err != nil {
-			return nil, err
-		}
-	}
-	if err := renderTextKnowledge(&rendered, result.KnowledgeScope); err != nil {
+	if err := renderQueryRequestText(&rendered, queryRequestFromResult(result)); err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(&rendered, "limit: %d\n", result.Limit)
+	if err := renderQueryResultText(&rendered, result); err != nil {
+		return nil, err
+	}
+	return []byte(rendered.String()), nil
+}
 
+func renderQueryRequestText(output *strings.Builder, request query.Request) error {
+	fmt.Fprintf(output, "intent: %s\n", request.Intent)
+	fmt.Fprintf(output, "entities: %s\n", textList(entityIDStrings(request.EntityIDs)))
+	fmt.Fprintf(output, "entity match: %s\n", request.EntityMatch)
+	fmt.Fprintf(output, "predicates: %s\n", textList(predicateStrings(request.Predicates)))
+	for _, selection := range request.Selections {
+		if err := renderTextSelection(output, selection); err != nil {
+			return err
+		}
+	}
+	if err := renderTextKnowledge(output, request.KnowledgeScope); err != nil {
+		return err
+	}
+	fmt.Fprintf(output, "limit: %d\n", request.Limit)
+	return nil
+}
+
+func renderQueryResultText(rendered *strings.Builder, result query.Result) error {
 	switch result.Intent {
 	case temporal.IntentPointInTime:
 		point, ok := result.Payload.Point()
 		if !ok {
-			return nil, fmt.Errorf("render query text: point result is required")
+			return fmt.Errorf("render query text: point result is required")
 		}
-		if err := renderTextFacts(&rendered, "facts", point.Facts, "  "); err != nil {
-			return nil, err
+		if err := renderTextFacts(rendered, "facts", point.Facts, "  "); err != nil {
+			return err
 		}
-		if err := renderTextUnresolved(&rendered, "unresolved", point.Unresolved, "  "); err != nil {
-			return nil, err
+		if err := renderTextUnresolved(rendered, "unresolved", point.Unresolved, "  "); err != nil {
+			return err
 		}
 	case temporal.IntentTrendComparison:
 		trend, ok := result.Payload.Trend()
 		if !ok {
-			return nil, fmt.Errorf("render query text: trend result is required")
+			return fmt.Errorf("render query text: trend result is required")
 		}
-		if err := renderTextFacts(&rendered, "before facts", trend.Before.Facts, "  "); err != nil {
-			return nil, err
+		if err := renderTextFacts(rendered, "before facts", trend.Before.Facts, "  "); err != nil {
+			return err
 		}
-		if err := renderTextUnresolved(&rendered, "before unresolved", trend.Before.Unresolved, "  "); err != nil {
-			return nil, err
+		if err := renderTextUnresolved(rendered, "before unresolved", trend.Before.Unresolved, "  "); err != nil {
+			return err
 		}
-		if err := renderTextFacts(&rendered, "after facts", trend.After.Facts, "  "); err != nil {
-			return nil, err
+		if err := renderTextFacts(rendered, "after facts", trend.After.Facts, "  "); err != nil {
+			return err
 		}
-		if err := renderTextUnresolved(&rendered, "after unresolved", trend.After.Unresolved, "  "); err != nil {
-			return nil, err
+		if err := renderTextUnresolved(rendered, "after unresolved", trend.After.Unresolved, "  "); err != nil {
+			return err
 		}
-		if err := renderTextChanges(&rendered, trend.Changes); err != nil {
-			return nil, err
+		if err := renderTextChanges(rendered, trend.Changes); err != nil {
+			return err
 		}
-		if err := renderTextStateKeys(&rendered, trend.UnresolvedKeys); err != nil {
-			return nil, err
+		if err := renderTextStateKeys(rendered, trend.UnresolvedKeys); err != nil {
+			return err
 		}
 	case temporal.IntentTrajectory:
 		trajectory, ok := result.Payload.Trajectory()
 		if !ok {
-			return nil, fmt.Errorf("render query text: trajectory result is required")
+			return fmt.Errorf("render query text: trajectory result is required")
 		}
-		if err := renderTextTransitions(&rendered, trajectory.Transitions); err != nil {
-			return nil, err
+		if err := renderTextTransitions(rendered, trajectory.Transitions); err != nil {
+			return err
 		}
-		if err := renderTextUnresolved(&rendered, "unresolved", trajectory.Unresolved, "  "); err != nil {
-			return nil, err
+		if err := renderTextUnresolved(rendered, "unresolved", trajectory.Unresolved, "  "); err != nil {
+			return err
 		}
 	case temporal.IntentCausalChain:
 		causal, ok := result.Payload.Causal()
 		if !ok {
-			return nil, fmt.Errorf("render query text: causal result is required")
+			return fmt.Errorf("render query text: causal result is required")
 		}
-		if err := renderTextCausalLinks(&rendered, causal.Links); err != nil {
-			return nil, err
+		if err := renderTextCausalLinks(rendered, causal.Links); err != nil {
+			return err
 		}
 	default:
-		return nil, fmt.Errorf("render query text: result intent is invalid")
+		return fmt.Errorf("render query text: result intent is invalid")
 	}
-	renderTextGaps(&rendered, result.Gaps)
-	return []byte(rendered.String()), nil
+	renderTextGaps(rendered, result.Gaps)
+	return nil
 }
 
 func renderTextSelection(output *strings.Builder, value temporal.TemporalSelection) error {
@@ -452,17 +466,17 @@ func textExtent(value observation.TemporalExtent) (string, error) {
 	}
 }
 
-func entityIDStrings(result query.Result) []string {
-	values := make([]string, len(result.EntityIDs))
-	for index, value := range result.EntityIDs {
+func entityIDStrings(entityIDs []identity.EntityID) []string {
+	values := make([]string, len(entityIDs))
+	for index, value := range entityIDs {
 		values[index] = string(value)
 	}
 	return values
 }
 
-func predicateStrings(result query.Result) []string {
-	values := make([]string, len(result.Predicates))
-	for index, value := range result.Predicates {
+func predicateStrings(predicates []observation.Predicate) []string {
+	values := make([]string, len(predicates))
+	for index, value := range predicates {
 		values[index] = string(value)
 	}
 	return values

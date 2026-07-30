@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/JakeFAU/stacks/core/temporal"
 
@@ -220,70 +221,77 @@ type queryGapJSON struct {
 }
 
 func renderQueryJSON(result query.Result) ([]byte, error) {
-	if err := query.ValidateResult(result); err != nil {
-		return nil, fmt.Errorf("render query JSON: invalid result: %w", err)
-	}
-	request, err := queryRequestToJSON(result)
+	envelope, err := queryEnvelopeToJSON(result)
 	if err != nil {
 		return nil, err
-	}
-	union := queryResultJSON{Intent: result.Intent}
-	switch result.Intent {
-	case temporal.IntentPointInTime:
-		point, ok := result.Payload.Point()
-		if !ok {
-			return nil, fmt.Errorf("render query JSON: point result is required")
-		}
-		converted, err := queryPointToJSON(point)
-		if err != nil {
-			return nil, err
-		}
-		union.Point = &converted
-	case temporal.IntentTrendComparison:
-		trend, ok := result.Payload.Trend()
-		if !ok {
-			return nil, fmt.Errorf("render query JSON: trend result is required")
-		}
-		converted, err := queryTrendToJSON(trend)
-		if err != nil {
-			return nil, err
-		}
-		union.Trend = &converted
-	case temporal.IntentTrajectory:
-		trajectory, ok := result.Payload.Trajectory()
-		if !ok {
-			return nil, fmt.Errorf("render query JSON: trajectory result is required")
-		}
-		converted, err := queryTrajectoryToJSON(trajectory)
-		if err != nil {
-			return nil, err
-		}
-		union.Trajectory = &converted
-	case temporal.IntentCausalChain:
-		causal, ok := result.Payload.Causal()
-		if !ok {
-			return nil, fmt.Errorf("render query JSON: causal result is required")
-		}
-		converted, err := queryCausalToJSON(causal)
-		if err != nil {
-			return nil, err
-		}
-		union.Causal = &converted
-	default:
-		return nil, fmt.Errorf("render query JSON: result intent is invalid")
-	}
-	envelope := queryEnvelopeJSON{
-		SchemaVersion: temporalQuerySchemaVersion,
-		Intent:        string(result.Intent),
-		Request:       request,
-		Result:        union,
-		Gaps:          queryGapsToJSON(result.Gaps),
 	}
 	rendered, err := json.Marshal(envelope)
 	if err != nil {
 		return nil, fmt.Errorf("render query JSON: %w", err)
 	}
 	return append(rendered, '\n'), nil
+}
+
+func queryEnvelopeToJSON(result query.Result) (queryEnvelopeJSON, error) {
+	if err := query.ValidateResult(result); err != nil {
+		return queryEnvelopeJSON{}, fmt.Errorf("render query JSON: invalid result: %w", err)
+	}
+	request, err := queryRequestToJSON(queryRequestFromResult(result))
+	if err != nil {
+		return queryEnvelopeJSON{}, err
+	}
+	union := queryResultJSON{Intent: result.Intent}
+	switch result.Intent {
+	case temporal.IntentPointInTime:
+		point, ok := result.Payload.Point()
+		if !ok {
+			return queryEnvelopeJSON{}, fmt.Errorf("render query JSON: point result is required")
+		}
+		converted, err := queryPointToJSON(point)
+		if err != nil {
+			return queryEnvelopeJSON{}, err
+		}
+		union.Point = &converted
+	case temporal.IntentTrendComparison:
+		trend, ok := result.Payload.Trend()
+		if !ok {
+			return queryEnvelopeJSON{}, fmt.Errorf("render query JSON: trend result is required")
+		}
+		converted, err := queryTrendToJSON(trend)
+		if err != nil {
+			return queryEnvelopeJSON{}, err
+		}
+		union.Trend = &converted
+	case temporal.IntentTrajectory:
+		trajectory, ok := result.Payload.Trajectory()
+		if !ok {
+			return queryEnvelopeJSON{}, fmt.Errorf("render query JSON: trajectory result is required")
+		}
+		converted, err := queryTrajectoryToJSON(trajectory)
+		if err != nil {
+			return queryEnvelopeJSON{}, err
+		}
+		union.Trajectory = &converted
+	case temporal.IntentCausalChain:
+		causal, ok := result.Payload.Causal()
+		if !ok {
+			return queryEnvelopeJSON{}, fmt.Errorf("render query JSON: causal result is required")
+		}
+		converted, err := queryCausalToJSON(causal)
+		if err != nil {
+			return queryEnvelopeJSON{}, err
+		}
+		union.Causal = &converted
+	default:
+		return queryEnvelopeJSON{}, fmt.Errorf("render query JSON: result intent is invalid")
+	}
+	return queryEnvelopeJSON{
+		SchemaVersion: temporalQuerySchemaVersion,
+		Intent:        string(result.Intent),
+		Request:       request,
+		Result:        union,
+		Gaps:          queryGapsToJSON(result.Gaps),
+	}, nil
 }
 
 func queryPointToJSON(value query.PointInTimeResult) (queryPointJSON, error) {
@@ -302,31 +310,40 @@ func queryPointToJSON(value query.PointInTimeResult) (queryPointJSON, error) {
 	return queryPointJSON{Selection: selection, Facts: facts, Unresolved: unresolved}, nil
 }
 
-func queryRequestToJSON(result query.Result) (queryRequestJSON, error) {
-	entityIDs := make([]string, len(result.EntityIDs))
-	for index, entityID := range result.EntityIDs {
+func queryRequestToJSON(request query.Request) (queryRequestJSON, error) {
+	entityIDs := make([]string, len(request.EntityIDs))
+	for index, entityID := range request.EntityIDs {
 		entityIDs[index] = string(entityID)
 	}
-	predicates := make([]string, len(result.Predicates))
-	for index, predicate := range result.Predicates {
+	predicates := make([]string, len(request.Predicates))
+	for index, predicate := range request.Predicates {
 		predicates[index] = string(predicate)
 	}
-	selections := make([]querySelectionJSON, len(result.Selections))
-	for index, selection := range result.Selections {
+	selections := make([]querySelectionJSON, len(request.Selections))
+	for index, selection := range request.Selections {
 		converted, err := querySelectionToJSON(selection)
 		if err != nil {
 			return queryRequestJSON{}, fmt.Errorf("render query JSON request: %w", err)
 		}
 		selections[index] = converted
 	}
-	knowledge, err := queryKnowledgeToJSON(result.KnowledgeScope)
+	knowledge, err := queryKnowledgeToJSON(request.KnowledgeScope)
 	if err != nil {
 		return queryRequestJSON{}, fmt.Errorf("render query JSON request: %w", err)
 	}
 	return queryRequestJSON{
-		EntityIDs: entityIDs, EntityMatch: string(result.EntityMatch),
-		Predicates: predicates, Selections: selections, KnowledgeScope: knowledge, Limit: result.Limit,
+		EntityIDs: entityIDs, EntityMatch: string(request.EntityMatch),
+		Predicates: predicates, Selections: selections, KnowledgeScope: knowledge, Limit: request.Limit,
 	}, nil
+}
+
+func queryRequestFromResult(result query.Result) query.Request {
+	return query.Request{
+		Intent: result.Intent, EntityIDs: append([]identity.EntityID{}, result.EntityIDs...),
+		EntityMatch: result.EntityMatch, Predicates: append([]observation.Predicate{}, result.Predicates...),
+		Selections:     append([]temporal.TemporalSelection{}, result.Selections...),
+		KnowledgeScope: result.KnowledgeScope, Limit: result.Limit,
+	}
 }
 
 func querySelectionToJSON(value temporal.TemporalSelection) (querySelectionJSON, error) {

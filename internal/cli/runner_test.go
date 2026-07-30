@@ -137,6 +137,7 @@ func TestRunnerParsesConfigValidationTargets(t *testing.T) {
 		{[]string{"config", "validate", "entities"}, CommandEntities, ""},
 		{[]string{"config", "validate", "review"}, CommandReview, ""},
 		{[]string{"config", "validate", "query"}, CommandQuery, ""},
+		{[]string{"config", "validate", "query", "ask"}, CommandQuery, ActionAsk},
 		{[]string{"config", "validate", "db-migrate"}, CommandDBMigrate, ""},
 		{[]string{"config", "validate", "db-status"}, CommandDBStatus, ""},
 		{[]string{"config", "validate", "db-reset"}, CommandDBReset, ""},
@@ -158,6 +159,68 @@ func TestRunnerParsesConfigValidationTargets(t *testing.T) {
 				got.ConfigValidation.Command != testCase.wantCommand ||
 				got.ConfigValidation.Action != testCase.wantAction {
 				t.Fatalf("Run(%q) invocation = %#v", testCase.args, got)
+			}
+		})
+	}
+}
+
+func TestRunnerParsesQueryAskWithoutReadingInput(t *testing.T) {
+	var got Invocation
+	input := &readTrackingReader{payload: "synthetic private question"}
+	err := (Runner{
+		Input: input,
+		Execute: func(_ context.Context, invocation Invocation) error {
+			got = invocation
+			return nil
+		},
+	}).Run(t.Context(), []string{
+		"query", "ask", "--entity", "entity-atlas-001", "--entity", "entity-atlas-002",
+		"--reference-time", "2026-07-29T12:00:00-04:00", "--output", "json",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if input.reads != 0 {
+		t.Fatalf("stdin reads = %d, want none during Cobra parsing", input.reads)
+	}
+	if got.Command != CommandQuery || got.Action != ActionAsk || got.QueryAsk == nil ||
+		got.QueryAsk.Output != QueryOutputJSON ||
+		!reflect.DeepEqual(got.QueryAsk.EntityIDs, []identity.EntityID{"entity-atlas-001", "entity-atlas-002"}) ||
+		got.QueryAsk.ReferenceTime.Format(time.RFC3339) != "2026-07-29T16:00:00Z" {
+		t.Fatalf("invocation = %#v, want parsed query ask", got)
+	}
+}
+
+func TestRunnerRejectsInvalidQueryAskSyntaxBeforeExecution(t *testing.T) {
+	valid := []string{"query", "ask", "--entity", "entity-atlas-001", "--reference-time", "2026-07-29T12:00:00Z"}
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"query group", []string{"query"}},
+		{"ask group misuse", []string{"query", "ask", "unexpected"}},
+		{"missing entity", withoutQueryFlag(valid, "--entity")},
+		{"blank entity", replaceQueryFlag(valid, "--entity", " \t ")},
+		{"duplicate entity", append(append([]string{}, valid...), "--entity", "entity-atlas-001")},
+		{"missing reference", withoutQueryFlag(valid, "--reference-time")},
+		{"invalid reference", replaceQueryFlag(valid, "--reference-time", "not-a-time")},
+		{"invalid output", append(append([]string{}, valid...), "--output", "yaml")},
+		{"positional question", append(append([]string{}, valid...), "private question")},
+		{"question flag", append(append([]string{}, valid...), "--question", "private question")},
+		{"extra args", append(append([]string{}, valid...), "extra", "arguments")},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			calls := 0
+			err := (Runner{Execute: func(context.Context, Invocation) error {
+				calls++
+				return nil
+			}}).Run(t.Context(), testCase.args)
+			if err == nil {
+				t.Fatal("Run() error = nil, want syntax rejection")
+			}
+			if calls != 0 {
+				t.Fatalf("Execute calls = %d, want 0", calls)
 			}
 		})
 	}
