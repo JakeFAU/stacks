@@ -426,17 +426,102 @@ func TestClientPlanRecordsCallerContextOutcomeAtEachLifecycleBoundary(t *testing
 	}
 }
 
-func TestClientPlanBoundsRetryPolicyFailures(t *testing.T) {
-	tests := map[string]aws.RetryerV2{
-		"retry token": &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}, retryTokenErr: errors.New("retry token marker")},
-		"retry delay": &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}, retryDelayErr: errors.New("retry delay marker")},
+func TestClientPlanPreservesCallerContextAtAdaptiveTokenBoundaries(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
 	}
-	for name, retryer := range tests {
+	boundaries := map[string]struct {
+		wantCalls    int
+		wantAttempts int
+		configure    func(*controlledContext, *plannerPolicyRetryer)
+	}{
+		"attempt token": {
+			wantCalls: 0, wantAttempts: 0,
+			configure: func(ctx *controlledContext, retryer *plannerPolicyRetryer) {
+				retryer.attemptTokenHook = ctx.fail
+				retryer.attemptTokenErr = errors.New(testPrivateOutput)
+			},
+		},
+		"retry token": {
+			wantCalls: 1, wantAttempts: 1,
+			configure: func(ctx *controlledContext, retryer *plannerPolicyRetryer) {
+				retryer.retryTokenHook = ctx.fail
+				retryer.retryTokenErr = errors.New(testPrivateOutput)
+			},
+		},
+	}
+	for contextName, contextCase := range contextCases {
+		for boundaryName, boundary := range boundaries {
+			t.Run(contextName+"/"+boundaryName, func(t *testing.T) {
+				ctx := newControlledContext(contextCase.err)
+				api := &fakeConverseAPI{
+					errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}},
+				}
+				retryer := &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}}
+				boundary.configure(ctx, retryer)
+				recorder := &recordingInvocationRecorder{}
+				client, err := newClient(api, Options{
+					DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+				}, retryer)
+				if err != nil {
+					t.Fatalf("newClient() error = %v", err)
+				}
+
+				_, err = client.Plan(ctx, validPlanRequest())
+				if !errors.Is(err, ErrInvocation) {
+					t.Fatalf("Plan() error = %v, want invocation error", err)
+				}
+				if !errors.Is(err, contextCase.err) {
+					t.Fatalf("Plan() error = %v, want caller context %v", err, contextCase.err)
+				}
+				if contextCase.err == context.Canceled && errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Plan() error = %v, want cancellation to take precedence over deadline", err)
+				}
+				if len(api.inputs) != boundary.wantCalls {
+					t.Fatalf("Converse calls = %d, want %d", len(api.inputs), boundary.wantCalls)
+				}
+				if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+					recorder.observations[0].Attempts != boundary.wantAttempts {
+					t.Fatalf("telemetry = %+v, want outcome=%s attempts=%d",
+						recorder.observations, contextCase.outcome, boundary.wantAttempts)
+				}
+				telemetry := fmt.Sprintf("%+v", recorder.observations)
+				if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+					strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+					t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+				}
+			})
+		}
+	}
+}
+
+func TestClientPlanBoundsRetryPolicyFailures(t *testing.T) {
+	tests := map[string]struct {
+		retryer   aws.RetryerV2
+		wantCalls int
+	}{
+		"attempt token": {
+			retryer: &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}, attemptTokenErr: errors.New("attempt token marker")},
+		},
+		"retry token": {
+			retryer:   &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}, retryTokenErr: errors.New("retry token marker")},
+			wantCalls: 1,
+		},
+		"retry delay": {
+			retryer:   &plannerPolicyRetryer{zeroRetryer: zeroRetryer{maxAttempts: 2}, retryDelayErr: errors.New("retry delay marker")},
+			wantCalls: 1,
+		},
+	}
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			api := &fakeConverseAPI{errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}}}
 			client, err := newClient(api, Options{
 				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2,
-			}, retryer)
+			}, test.retryer)
 			if err != nil {
 				t.Fatalf("newClient() error = %v", err)
 			}
@@ -445,8 +530,8 @@ func TestClientPlanBoundsRetryPolicyFailures(t *testing.T) {
 			if !errors.Is(err, ErrInvocation) || strings.Contains(err.Error(), "marker") || strings.Contains(err.Error(), testPrivateOutput) {
 				t.Fatalf("Plan() error = %v, want bounded retry-policy failure", err)
 			}
-			if len(api.inputs) != 1 {
-				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			if len(api.inputs) != test.wantCalls {
+				t.Fatalf("Converse calls = %d, want %d", len(api.inputs), test.wantCalls)
 			}
 		})
 	}
@@ -967,12 +1052,15 @@ func (retryer *noDelayRetryer) RetryDelay(int, error) (time.Duration, error) {
 
 type plannerPolicyRetryer struct {
 	zeroRetryer
-	retryTokenErr   error
-	retryDelayErr   error
-	retryDelayHook  func()
-	retryableCalls  int
-	retryTokenCalls int
-	retryDelayCalls int
+	attemptTokenErr  error
+	attemptTokenHook func()
+	retryTokenErr    error
+	retryTokenHook   func()
+	retryDelayErr    error
+	retryDelayHook   func()
+	retryableCalls   int
+	retryTokenCalls  int
+	retryDelayCalls  int
 }
 
 func (retryer *plannerPolicyRetryer) IsErrorRetryable(err error) bool {
@@ -983,8 +1071,21 @@ func (retryer *plannerPolicyRetryer) IsErrorRetryable(err error) bool {
 	return retryer.zeroRetryer.IsErrorRetryable(err)
 }
 
+func (retryer *plannerPolicyRetryer) GetAttemptToken(context.Context) (func(error) error, error) {
+	if retryer.attemptTokenHook != nil {
+		retryer.attemptTokenHook()
+	}
+	if retryer.attemptTokenErr != nil {
+		return nil, retryer.attemptTokenErr
+	}
+	return func(error) error { return nil }, nil
+}
+
 func (retryer *plannerPolicyRetryer) GetRetryToken(context.Context, error) (func(error) error, error) {
 	retryer.retryTokenCalls++
+	if retryer.retryTokenHook != nil {
+		retryer.retryTokenHook()
+	}
 	if retryer.retryTokenErr != nil {
 		return nil, retryer.retryTokenErr
 	}
