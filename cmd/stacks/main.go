@@ -39,6 +39,7 @@ import (
 	"stacks/internal/modeltelemetry"
 	"stacks/internal/observability"
 	"stacks/internal/query"
+	"stacks/internal/queryplan"
 	"stacks/internal/source"
 	"stacks/internal/source/drive"
 )
@@ -112,7 +113,7 @@ func newExecutionDependencies(
 		CommandProvider: app.CommandProviderFunc(func(
 			ctx context.Context,
 			settings config.Settings,
-			_ io.Reader,
+			stdin io.Reader,
 			stdout, stderr io.Writer,
 		) (map[string]cli.Command, error) {
 			decisions, err := runtime.DecisionRecorder()
@@ -128,6 +129,7 @@ func newExecutionDependencies(
 			return composeCommands(
 				ctx,
 				settings,
+				stdin,
 				stdout,
 				stderr,
 				runtime.TracerProvider().Tracer("stacks"),
@@ -142,12 +144,13 @@ func newExecutionDependencies(
 func commandProvider(
 	ctx context.Context,
 	settings config.Settings,
+	stdin io.Reader,
 	stdout, _ io.Writer,
 	tracer trace.Tracer,
 	decisions *observability.DecisionRecorder,
 	invocations modeltelemetry.Recorder,
 ) (map[string]cli.Command, error) {
-	return commandProviderWithRuntime(ctx, settings, stdout, io.Discard, tracer, decisions, invocations, defaultCommandRuntime())
+	return commandProviderWithRuntime(ctx, settings, stdout, io.Discard, tracer, decisions, invocations, defaultCommandRuntime(), stdin)
 }
 
 type doctorDatabase interface {
@@ -181,6 +184,7 @@ type commandRuntime struct {
 	newDirectoryLookup        func(context.Context, config.GoogleDirectorySettings) (directory.Lookup, error)
 	openCanonicalRepositories func(context.Context, string, bool) (canonicalRepositories, error)
 	newModel                  func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (extract.Model, error)
+	newQueryPlannerModel      queryPlannerModelFactory
 	newMigrationApplier       func(config.DatabaseSettings) cli.MigrationApplier
 	newMigrationInspector     func(config.DatabaseSettings) cli.MigrationInspector
 	newDatabaseResetter       func(config.DatabaseSettings) cli.DatabaseResetter
@@ -264,7 +268,8 @@ func defaultCommandRuntime() commandRuntime {
 				close:     database.Close,
 			}, nil
 		},
-		newModel: newModelWithContext,
+		newModel:             newModelWithContext,
+		newQueryPlannerModel: newQueryPlannerModelWithContext,
 		newMigrationApplier: func(settings config.DatabaseSettings) cli.MigrationApplier {
 			return embeddedMigrationApplier{settings: settings}
 		},
@@ -289,7 +294,12 @@ func commandProviderWithRuntime(
 	decisions *observability.DecisionRecorder,
 	invocations modeltelemetry.Recorder,
 	runtime commandRuntime,
+	inputs ...io.Reader,
 ) (map[string]cli.Command, error) {
+	stdin := io.Reader(strings.NewReader(""))
+	if len(inputs) > 0 && inputs[0] != nil {
+		stdin = inputs[0]
+	}
 	return map[string]cli.Command{
 		string(config.CommandDBMigrate): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
 			return runDatabaseCommand(ctx, tracer, "database.migrate", func(ctx context.Context) error {
@@ -540,47 +550,65 @@ func commandProviderWithRuntime(
 			}).Run(ctx, invocation)
 		}),
 		string(config.CommandQuery): cli.CommandFunc(func(ctx context.Context, invocation cli.Invocation) error {
+			limits := query.Limits{
+				MaxEntities:   settings.Query.MaxEntities,
+				MaxPredicates: settings.Query.MaxPredicates,
+				MaxChronology: settings.Query.MaxChronology,
+			}
+			executor := temporalQueryExecutor{
+				Open: runtime.openQueryDatabase, DatabaseURL: settings.Database.URL,
+				Limits: limits, Tracer: tracer,
+			}
+			if invocation.Action == cli.ActionAsk {
+				if err := settings.Validate(config.CommandQueryAsk); err != nil {
+					return err
+				}
+				if err := cli.ValidateQueryAskInvocation(invocation); err != nil {
+					return err
+				}
+				return (cli.QueryAskCommand{
+					Input: stdin, Output: stdout, Limits: limits,
+					MaxQuestionBytes: settings.QueryPlanner.MaxQuestionBytes,
+					NewService: func(ctx context.Context) (cli.QueryAskService, error) {
+						if err := requireRestrictedDisclosure(ctx, settings.Application.Model, runtime); err != nil {
+							return nil, err
+						}
+						if runtime.newQueryPlannerModel == nil {
+							return nil, errors.New("query ask command dependencies are not configured")
+						}
+						model, err := runtime.newQueryPlannerModel(ctx, settings.Application.Model, invocations, tracer)
+						if err != nil {
+							return nil, err
+						}
+						return queryplan.Service{
+							Model: model, Executor: executor, Limits: limits,
+							PlannerTimeout:   settings.QueryPlanner.Timeout,
+							MaxQuestionBytes: settings.QueryPlanner.MaxQuestionBytes,
+							QuestionRecorder: questionRecorder(invocations), Tracer: tracer,
+						}, nil
+					},
+				}).Run(ctx, invocation)
+			}
 			if err := settings.Validate(config.CommandQuery); err != nil {
 				return err
 			}
 			if err := cli.ValidateQueryInvocation(invocation); err != nil {
 				return err
 			}
-			limits := query.Limits{
-				MaxEntities:   settings.Query.MaxEntities,
-				MaxPredicates: settings.Query.MaxPredicates,
-				MaxChronology: settings.Query.MaxChronology,
-			}
-			if _, err := query.NormalizeRequest(invocation.Query.Request, limits); err != nil {
-				return err
-			}
-			if runtime.openQueryDatabase == nil {
-				return errors.New("query command dependencies are not configured")
-			}
-			database, err := runtime.openQueryDatabase(ctx, settings.Database.URL)
-			if err != nil {
-				if cancellationErr := canonicalContextError(ctx, err); cancellationErr != nil {
-					return cancellationErr
-				}
-				return errors.New("open query database failed")
-			}
-			defer database.Close()
-			service := query.Service{
-				Reader: query.PostgresRepository{
-					Database: database,
-					SnapshotObserver: query.PostgresSnapshotObserver{
-						Tracer: tracer,
-					},
-				},
-				Limits: limits,
-				Tracer: tracer,
-			}
 			return (cli.QueryCommand{
-				Service: service,
+				Service: executor,
 				Output:  stdout,
 			}).Run(ctx, invocation)
 		}),
 	}, nil
+}
+
+func questionRecorder(recorder modeltelemetry.Recorder) queryplan.QuestionRecorder {
+	questionRecorder, ok := recorder.(queryplan.QuestionRecorder)
+	if !ok {
+		return nil
+	}
+	return questionRecorder
 }
 
 func runDatabaseCommand(
