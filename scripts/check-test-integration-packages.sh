@@ -18,6 +18,14 @@ case "$dry_run" in
 esac
 
 case "$dry_run" in
+	*"go test "*"./internal/queryplan"*) ;;
+	*)
+		echo "test-integration does not execute ./internal/queryplan" >&2
+		exit 1
+		;;
+esac
+
+case "$dry_run" in
 	*"go test "*"$retired_package"*)
 		echo "test-integration still executes the retired analysis package" >&2
 		exit 1
