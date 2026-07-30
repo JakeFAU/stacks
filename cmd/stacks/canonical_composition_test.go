@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1150,6 +1151,134 @@ func TestTypedQueryApplicationConstructsNoPlanner(t *testing.T) {
 	}
 }
 
+func TestQueryAskApplicationRestrictedBedrockOrdersDisclosurePlannerAndDatabase(t *testing.T) {
+	settings := validQueryAskSettings()
+	settings.Application.Model.Provider = modelpolicy.ProviderBedrock
+	settings.Application.Model.DataMode = modelpolicy.DataModeRestricted
+	settings.Application.Model.AWSRegion = "us-east-1"
+	calls := []string{}
+	database := &orderedQueryDatabase{
+		calls:    &calls,
+		snapshot: postgres.TemporalQuerySnapshot{Entities: []postgres.TemporalEntityRecord{{EntityID: "entity-a", Known: true}}},
+	}
+	runtime := commandRuntime{
+		newDoctorProviderProbe: func(config.ModelSettings) (doctor.ModelProbe, doctor.DisclosureProbe, error) {
+			return nil, orderedDisclosureProbe{calls: &calls}, nil
+		},
+		newQueryPlannerModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (queryplan.Model, error) {
+			calls = append(calls, "planner.factory")
+			return queryPlanModelFunc(func(context.Context, queryplan.ModelRequest) (queryplan.ModelResponse, error) {
+				calls = append(calls, "model.Plan")
+				response := executableTrendPlanResponse(t)
+				response.Provider = modelpolicy.ProviderBedrock
+				return response, nil
+			}), nil
+		},
+		openQueryDatabase: func(context.Context, string) (queryDatabase, error) {
+			calls = append(calls, "database.Open")
+			return database, nil
+		},
+	}
+	var stdout, stderr strings.Builder
+	if err := executeRootQueryAsk(t, settings, runtime, strings.NewReader("private question"), &stdout, &stderr); err != nil {
+		t.Fatalf("app.Execute() error = %v", err)
+	}
+	want := []string{"disclosure.preflight", "planner.factory", "model.Plan", "database.Open", "database.Read", "database.Close"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("restricted Bedrock lifecycle = %v, want %v", calls, want)
+	}
+}
+
+func TestQueryAskApplicationRedactsDistinctPrivateMarkers(t *testing.T) {
+	const (
+		canonicalIDMarker = "entity-canonical-marker"
+		predicateMarker   = "predicate-private-marker"
+		timestampMarker   = "2026-07-29T16:00:00Z-private-marker"
+		citationMarker    = "citation-private-marker"
+		rawOutputMarker   = "raw-output-private-marker"
+		providerBody      = "provider-body-private-marker"
+		requestID         = "request-id-private-marker"
+		databaseURL       = "postgres://private-user:private-password@private-host/private-database"
+		credential        = "credential-private-marker"
+		question          = "question-private-marker"
+		prompt            = "prompt-private-marker"
+	)
+	markers := []string{canonicalIDMarker, predicateMarker, timestampMarker, citationMarker, rawOutputMarker, providerBody, requestID, databaseURL, credential, question, prompt}
+	assertRedacted := func(t *testing.T, err error, stdout, stderr *strings.Builder) {
+		t.Helper()
+		if err == nil || stdout.Len() != 0 {
+			t.Fatalf("failure result = error:%v stdout:%q, want bounded error and zero stdout", err, stdout.String())
+		}
+		for _, marker := range markers {
+			if strings.Contains(err.Error(), marker) || strings.Contains(stderr.String(), marker) {
+				t.Fatalf("private marker %q leaked through error or stderr", marker)
+			}
+		}
+	}
+	t.Run("canonical ID rejected locally", func(t *testing.T) {
+		var stdout, stderr strings.Builder
+		runtime := commandRuntime{}
+		err := executeRootQueryAskWithEntity(t, validQueryAskSettings(), runtime, canonicalIDMarker, strings.NewReader(question+" "+canonicalIDMarker), &stdout, &stderr)
+		assertRedacted(t, err, &stdout, &stderr)
+	})
+	t.Run("provider error and raw proposal are bounded", func(t *testing.T) {
+		var stdout, stderr strings.Builder
+		runtime := commandRuntime{
+			newQueryPlannerModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (queryplan.Model, error) {
+				return queryPlanModelFunc(func(context.Context, queryplan.ModelRequest) (queryplan.ModelResponse, error) {
+					return queryplan.ModelResponse{}, errors.New(strings.Join([]string{providerBody, requestID, credential, prompt}, " "))
+				}), nil
+			},
+		}
+		err := executeRootQueryAsk(t, validQueryAskSettings(), runtime, strings.NewReader(question), &stdout, &stderr)
+		assertRedacted(t, err, &stdout, &stderr)
+
+		stdout.Reset()
+		stderr.Reset()
+		runtime.newQueryPlannerModel = func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (queryplan.Model, error) {
+			return queryPlanModelFunc(func(context.Context, queryplan.ModelRequest) (queryplan.ModelResponse, error) {
+				return queryplan.ModelResponse{Output: []byte(`{"raw":"` + predicateMarker + " " + timestampMarker + " " + citationMarker + " " + rawOutputMarker + `"}`), Provider: modelpolicy.ProviderOpenAI, ModelID: "synthetic-model", PromptVersion: queryplan.PromptVersion, SchemaName: queryplan.SchemaName, Attempts: 1}, nil
+			}), nil
+		}
+		err = executeRootQueryAsk(t, validQueryAskSettings(), runtime, strings.NewReader(question), &stdout, &stderr)
+		assertRedacted(t, err, &stdout, &stderr)
+	})
+	t.Run("database URL is bounded", func(t *testing.T) {
+		var stdout, stderr strings.Builder
+		runtime := commandRuntime{
+			newQueryPlannerModel: func(context.Context, config.ModelSettings, modeltelemetry.Recorder, trace.Tracer) (queryplan.Model, error) {
+				return queryPlanModelFunc(func(context.Context, queryplan.ModelRequest) (queryplan.ModelResponse, error) {
+					return executableTrendPlanResponse(t), nil
+				}), nil
+			},
+			openQueryDatabase: func(context.Context, string) (queryDatabase, error) { return nil, errors.New(databaseURL) },
+		}
+		err := executeRootQueryAsk(t, validQueryAskSettings(), runtime, strings.NewReader(question), &stdout, &stderr)
+		assertRedacted(t, err, &stdout, &stderr)
+	})
+}
+
+type orderedDisclosureProbe struct{ calls *[]string }
+
+func (probe orderedDisclosureProbe) InvocationLogging(context.Context) (doctor.InvocationLoggingState, error) {
+	*probe.calls = append(*probe.calls, "disclosure.preflight")
+	return doctor.InvocationLoggingDisabled, nil
+}
+
+type orderedQueryDatabase struct {
+	calls    *[]string
+	snapshot postgres.TemporalQuerySnapshot
+}
+
+func (database *orderedQueryDatabase) LoadTemporalQuerySnapshot(context.Context, postgres.TemporalQuerySelection, postgres.TemporalSnapshotObserver) (postgres.TemporalQuerySnapshot, error) {
+	*database.calls = append(*database.calls, "database.Read")
+	return database.snapshot, nil
+}
+
+func (database *orderedQueryDatabase) Close() {
+	*database.calls = append(*database.calls, "database.Close")
+}
+
 type rootDisclosureProbe struct {
 	state doctor.InvocationLoggingState
 	err   error
@@ -1160,10 +1289,14 @@ func (probe rootDisclosureProbe) InvocationLogging(context.Context) (doctor.Invo
 }
 
 func executeRootQueryAsk(t *testing.T, settings config.Settings, runtime commandRuntime, input io.Reader, stdout, stderr io.Writer) error {
+	return executeRootQueryAskWithEntity(t, settings, runtime, "entity-a", input, stdout, stderr)
+}
+
+func executeRootQueryAskWithEntity(t *testing.T, settings config.Settings, runtime commandRuntime, entityID string, input io.Reader, stdout, stderr io.Writer) error {
 	t.Helper()
 	return app.Execute(
 		context.Background(),
-		[]string{"query", "ask", "--entity", "entity-a", "--reference-time", "2026-07-29T16:00:00Z", "--output", "json"},
+		[]string{"query", "ask", "--entity", entityID, "--reference-time", "2026-07-29T16:00:00Z", "--output", "json"},
 		app.SettingsLoaderFunc(func(config.LoadOptions) (config.Settings, error) { return settings, nil }),
 		app.BootstrapFunc(func(context.Context, config.Settings) (app.ExecutionDependencies, error) {
 			return app.ExecutionDependencies{
