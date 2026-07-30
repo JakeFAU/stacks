@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -56,6 +57,24 @@ func TestInsertDocumentSectionsUsesOneBatch(t *testing.T) {
 	}
 }
 
+func TestInsertDocumentSectionsReturnsBatchCloseError(t *testing.T) {
+	wantErr := errors.New("synthetic batch close failure")
+	batcher := &documentSectionBatcherRecorder{}
+	batcher.results.closeErr = wantErr
+
+	err := insertDocumentSections(
+		context.Background(),
+		batcher,
+		"version:synthetic",
+		[]evidence.Section{
+			canonicalDocumentSection(t, "transcript", "Transcript", "", []string{"Meeting", "Transcript"}, 0, "transcript", "Alpha speaks."),
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("insertDocumentSections() error = %v, want batch Close error", err)
+	}
+}
+
 type documentSectionBatcherRecorder struct {
 	calls   int
 	queries []*pgx.QueuedQuery
@@ -79,6 +98,7 @@ func (recorder *documentSectionBatcherRecorder) SendBatch(
 
 type documentSectionBatchResultsRecorder struct {
 	closeCalls int
+	closeErr   error
 }
 
 func (*documentSectionBatchResultsRecorder) Exec() (pgconn.CommandTag, error) {
@@ -95,7 +115,7 @@ func (*documentSectionBatchResultsRecorder) QueryRow() pgx.Row {
 
 func (recorder *documentSectionBatchResultsRecorder) Close() error {
 	recorder.closeCalls++
-	return nil
+	return recorder.closeErr
 }
 
 func canonicalDocumentSection(
