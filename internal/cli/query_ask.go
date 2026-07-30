@@ -106,6 +106,9 @@ func (command QueryAskCommand) Run(ctx context.Context, invocation Invocation) e
 	}
 	service, err := command.NewService(ctx)
 	if err != nil {
+		if cancellationErr := canonicalQueryAskContextError(ctx, err); cancellationErr != nil {
+			return cancellationErr
+		}
 		return errors.New("query ask service construction failed")
 	}
 	if service == nil {
@@ -140,6 +143,24 @@ func (command QueryAskCommand) Run(ctx context.Context, invocation Invocation) e
 	}
 	if err != nil {
 		return fmt.Errorf("write query ask result: %w", err)
+	}
+	return nil
+}
+
+func canonicalQueryAskContextError(ctx context.Context, err error) error {
+	if ctx != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return context.Canceled
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return context.DeadlineExceeded
+		}
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"strings"
@@ -158,6 +159,77 @@ func TestQueryAskRenderersRejectOverflowingPlannerUsage(t *testing.T) {
 	}
 }
 
+func TestQueryAskCanonicalizesServiceFactoryCancellationWithoutLeakingDetails(t *testing.T) {
+	const privateFactoryDetail = "synthetic-private-factory-detail"
+	tests := []struct {
+		name       string
+		callerErr  error
+		factoryErr error
+		want       error
+	}{
+		{
+			name:      "caller canceled during factory wins over deadline",
+			callerErr: context.Canceled, factoryErr: context.DeadlineExceeded,
+			want: context.Canceled,
+		},
+		{
+			name:      "caller deadline during factory wins over cancellation",
+			callerErr: context.DeadlineExceeded, factoryErr: context.Canceled,
+			want: context.DeadlineExceeded,
+		},
+		{
+			name:       "wrapped factory cancellation",
+			factoryErr: fmt.Errorf("%s: %w", privateFactoryDetail, context.Canceled),
+			want:       context.Canceled,
+		},
+		{
+			name:       "joined factory deadline",
+			factoryErr: errors.Join(errors.New(privateFactoryDetail), context.DeadlineExceeded),
+			want:       context.DeadlineExceeded,
+		},
+		{
+			name:       "non cancellation remains bounded",
+			factoryErr: errors.New(privateFactoryDetail),
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := newQueryAskControlledContext(t.Context())
+			service := &recordingQueryAskService{}
+			factoryCalls := 0
+			var output bytes.Buffer
+			err := (QueryAskCommand{
+				Input: strings.NewReader("What was assigned?"), Output: &output,
+				Limits: queryAskLimits(), MaxQuestionBytes: 1024,
+				NewService: func(context.Context) (QueryAskService, error) {
+					factoryCalls++
+					ctx.fail(testCase.callerErr)
+					return service, testCase.factoryErr
+				},
+			}).Run(ctx, validQueryAskInvocation())
+			if factoryCalls != 1 {
+				t.Fatalf("factory calls = %d, want 1", factoryCalls)
+			}
+			if service.calls != 0 {
+				t.Fatalf("service calls = %d, want 0", service.calls)
+			}
+			if output.Len() != 0 {
+				t.Fatalf("stdout = %q, want none", output.String())
+			}
+			if testCase.want != nil {
+				if err != testCase.want {
+					t.Fatalf("Run() error = %v, want canonical %v", err, testCase.want)
+				}
+			} else if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Run() error = %v, want bounded non-cancellation failure", err)
+			}
+			if strings.Contains(err.Error(), privateFactoryDetail) {
+				t.Fatalf("Run() error exposed private factory detail: %q", err)
+			}
+		})
+	}
+}
+
 type queryAskServiceFunc func(context.Context, queryplan.Input) (queryplan.Execution, error)
 
 func (fn queryAskServiceFunc) Ask(ctx context.Context, input queryplan.Input) (queryplan.Execution, error) {
@@ -168,6 +240,27 @@ type recordingQueryAskService struct {
 	execution queryplan.Execution
 	err       error
 	calls     int
+}
+
+type queryAskControlledContext struct {
+	context.Context
+	done chan struct{}
+	err  error
+}
+
+func newQueryAskControlledContext(parent context.Context) *queryAskControlledContext {
+	return &queryAskControlledContext{Context: parent, done: make(chan struct{})}
+}
+
+func (ctx *queryAskControlledContext) Done() <-chan struct{} { return ctx.done }
+func (ctx *queryAskControlledContext) Err() error            { return ctx.err }
+
+func (ctx *queryAskControlledContext) fail(err error) {
+	if err == nil {
+		return
+	}
+	ctx.err = err
+	close(ctx.done)
 }
 
 func (service *recordingQueryAskService) Ask(_ context.Context, _ queryplan.Input) (queryplan.Execution, error) {
