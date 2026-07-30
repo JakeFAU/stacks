@@ -617,6 +617,63 @@ func TestClientPlanReleasesOutstandingTokensWhenContextEndsAfterLaterAttemptToke
 	}
 }
 
+func TestClientPlanStopsBeforeRetryDelayWhenContextEndsDuringRetryTokenAcquisition(t *testing.T) {
+	contextCases := map[string]struct {
+		err     error
+		outcome string
+	}{
+		"deadline":     {err: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		"cancellation": {err: context.Canceled, outcome: OutcomeCanceled},
+	}
+	for name, contextCase := range contextCases {
+		t.Run(name, func(t *testing.T) {
+			ctx := newControlledContext(contextCase.err)
+			var retryTokenReleases []error
+			retryer := &plannerPolicyRetryer{
+				zeroRetryer:    zeroRetryer{maxAttempts: 2},
+				retryTokenHook: ctx.fail,
+				retryTokenRelease: func(err error) error {
+					retryTokenReleases = append(retryTokenReleases, err)
+					return nil
+				},
+			}
+			api := &fakeConverseAPI{
+				errors: []error{&smithy.GenericAPIError{Code: "ThrottlingException", Message: testPrivateOutput}},
+			}
+			recorder := &recordingInvocationRecorder{}
+			client, err := newClient(api, Options{
+				DataMode: modelpolicy.DataModePersonal, ModelID: testModelID, MaxTokens: 321, MaxAttempts: 2, Recorder: recorder,
+			}, retryer)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+
+			_, err = client.Plan(ctx, validPlanRequest())
+			if !errors.Is(err, ErrInvocation) || !errors.Is(err, contextCase.err) {
+				t.Fatalf("Plan() error = %v, want invocation wrapping %v", err, contextCase.err)
+			}
+			if len(api.inputs) != 1 {
+				t.Fatalf("Converse calls = %d, want 1", len(api.inputs))
+			}
+			if retryer.retryDelayCalls != 0 {
+				t.Fatalf("RetryDelay calls = %d, want 0", retryer.retryDelayCalls)
+			}
+			if len(retryTokenReleases) != 1 || !errors.Is(retryTokenReleases[0], contextCase.err) {
+				t.Fatalf("retry-token releases = %v, want one canonical %v release", retryTokenReleases, contextCase.err)
+			}
+			if len(recorder.observations) != 1 || recorder.observations[0].Outcome != contextCase.outcome ||
+				recorder.observations[0].Attempts != 1 {
+				t.Fatalf("telemetry = %+v, want outcome=%s attempts=1", recorder.observations, contextCase.outcome)
+			}
+			telemetry := fmt.Sprintf("%+v", recorder.observations)
+			if strings.Contains(err.Error(), testPrivateInput) || strings.Contains(err.Error(), testPrivateOutput) ||
+				strings.Contains(telemetry, testPrivateInput) || strings.Contains(telemetry, testPrivateOutput) {
+				t.Fatalf("private/provider marker escaped error or telemetry: error=%v telemetry=%s", err, telemetry)
+			}
+		})
+	}
+}
+
 func TestClientPlanBoundsRetryPolicyFailures(t *testing.T) {
 	tests := map[string]struct {
 		retryer   aws.RetryerV2

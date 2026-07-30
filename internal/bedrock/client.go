@@ -312,6 +312,12 @@ func (client *Client) generateStructured(ctx context.Context, request structured
 			client.record(ctx, started, request.promptVersion, outcomeForError(invokeErr), structuredUsage{}, 0, attempt)
 			return structuredResponse{}, fmt.Errorf("%w: retry policy", ErrInvocation)
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = retryToken(ctxErr)
+			retryToken = nil
+			client.record(ctx, started, request.promptVersion, outcomeForError(ctxErr), structuredUsage{}, 0, attempt)
+			return structuredResponse{}, fmt.Errorf("%w: %w", ErrInvocation, ctxErr)
+		}
 		delay, delayErr := client.retryer.RetryDelay(attempt, invokeErr)
 		if delayErr != nil {
 			_ = retryToken(delayErr)
