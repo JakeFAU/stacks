@@ -53,8 +53,9 @@ func TestPostgresPlannedAndDirectTemporalQueriesPreserveFourIntentParity(t *test
 			if err != nil {
 				t.Fatalf("Ask() error = %v", err)
 			}
+			assertPlannerExpectedRequest(t, planned.Request, request)
 			assertPlannedDirectParity(t, planned, directResult)
-			assertPlannerPostgresEvidence(t, planned.Result)
+			assertPlannerPostgresSemantics(t, fixture, test.name, planned.Result)
 		})
 	}
 
@@ -76,22 +77,8 @@ func TestPostgresPlannedAndDirectTemporalQueriesPreserveFourIntentParity(t *test
 		t.Fatalf("historical Ask() error = %v", err)
 	}
 	assertPlannedDirectParity(t, plannedHistorical, directHistorical)
-	historicalPoint, _ := plannedHistorical.Result.Payload.Point()
-	if len(historicalPoint.Facts) != 0 || len(historicalPoint.Unresolved) != 0 {
-		t.Fatalf("historical point = %#v, want late-recorded conflict excluded", historicalPoint)
-	}
-
-	authorityRequest, err := query.NormalizeRequest(fixture.AuthorityRequest, fixture.limits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	authorityResult, err := direct.Query(t.Context(), authorityRequest)
-	if err != nil {
-		t.Fatalf("direct authority Query() error = %v", err)
-	}
-	if !containsPlannerGap(authorityResult.Gaps, query.GapAuthorityExcluded) {
-		t.Fatalf("authority gaps = %#v, want authority exclusion", authorityResult.Gaps)
-	}
+	assertPlannerExpectedRequest(t, plannedHistorical.Request, historicalRequest)
+	assertPlannerHistoricalSemantics(t, fixture, plannedHistorical.Result)
 }
 
 func TestPostgresPlannerInvalidOutputDoesNotReadSnapshot(t *testing.T) {
@@ -133,12 +120,22 @@ type plannerAtlasFixture struct {
 	database                *postgres.Database
 	limits                  query.Limits
 	EntityIDs               []identity.EntityID
+	ownerID                 identity.EntityID
+	responsibilityPredicate observation.Predicate
+	uncertaintyPredicate    observation.Predicate
+	authorityPredicate      observation.Predicate
+	gapPredicate            observation.Predicate
+	windowStart             time.Time
+	boundary                time.Time
+	windowEnd               time.Time
+	historicalCutoff        time.Time
+	supportCitation         query.Citation
+	counterCitation         query.Citation
 	PointRequest            query.Request
 	TrendRequest            query.Request
 	TrajectoryRequest       query.Request
 	CausalRequest           query.Request
 	HistoricalPointRequest  query.Request
-	AuthorityRequest        query.Request
 	referenceTime           time.Time
 	pointProposal           string
 	trendProposal           string
@@ -234,6 +231,19 @@ func seedPlannerAtlasCorpus(t *testing.T, ctx context.Context, database *postgre
 	if err != nil {
 		t.Fatal(err)
 	}
+	gapMention, err := identity.NewMention(identity.MentionInput{
+		ID: "mention:planner-postgres/unresolved", EvidenceID: support.ID(),
+		DerivationRunID: "run:planner-postgres/identity", Surface: "Synthetic unresolved participant",
+		NormalizedName: identity.NormalizeName("Synthetic unresolved participant"), Role: "participant",
+		RecordedAt: recorded.Add(4 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gapTerm, err := observation.NewMentionTerm(string(gapMention.ID()))
+	if err != nil {
+		t.Fatal(err)
+	}
 	text := func(value string) observation.Term {
 		term, err := observation.NewTextTerm(value)
 		if err != nil {
@@ -273,14 +283,16 @@ func seedPlannerAtlasCorpus(t *testing.T, ctx context.Context, database *postgre
 	responsibility := observation.Predicate("planner.postgres/responsibility")
 	uncertainty := observation.Predicate("planner.postgres/uncertainty")
 	authorityPredicate := observation.Predicate("planner.postgres/authority")
+	gapPredicate := observation.Predicate("planner.postgres/unresolved-gap")
 	observations := []observation.Observation{
-		newObservation("initial", owner, responsibility, text("Alex"), during(start, boundary), recorded.Add(10*time.Minute), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting}),
+		newObservation("initial", owner, responsibility, text("Alex"), during(start, end), recorded.Add(10*time.Minute), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting}),
 		newObservation("transfer", owner, responsibility, text("Blair"), during(boundary, end), cutoff.Add(24*time.Hour), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting}),
 		newObservation("conflict", owner, responsibility, text("Casey"), during(boundary, end), cutoff.Add(25*time.Hour), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting, observation.EvidenceContradicting}),
 		newObservation("hypothesis", owner, uncertainty, text("uncertain"), observation.UnknownTime(), recorded.Add(11*time.Minute), observation.StatusHypothesized, []observation.EvidenceRole{observation.EvidenceSupporting}),
 		newObservation("authority", owner, authorityPredicate, text("authority excluded currently"), during(start, end), recorded.Add(12*time.Minute), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting}),
-		newObservation("cause-one", owner, query.CausalPredicate, text("handoff"), at(start.Add(5*24*time.Hour)), recorded.Add(13*time.Minute), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting, observation.EvidenceContradicting}),
-		newObservation("cause-two", text("handoff"), query.CausalPredicate, owner, at(start.Add(10*24*time.Hour)), recorded.Add(14*time.Minute), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting}),
+		newObservation("unresolved-gap", owner, gapPredicate, gapTerm, observation.UnknownTime(), recorded.Add(13*time.Minute), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting}),
+		newObservation("cause-one", owner, query.CausalPredicate, text("handoff"), at(start.Add(5*24*time.Hour)), recorded.Add(14*time.Minute), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting, observation.EvidenceContradicting}),
+		newObservation("cause-two", text("handoff"), query.CausalPredicate, owner, at(start.Add(10*24*time.Hour)), recorded.Add(15*time.Minute), observation.StatusObserved, []observation.EvidenceRole{observation.EvidenceSupporting}),
 	}
 	admissions := make([]admission.Decision, len(observations))
 	for index, value := range observations {
@@ -294,6 +306,10 @@ func seedPlannerAtlasCorpus(t *testing.T, ctx context.Context, database *postgre
 	if err != nil {
 		t.Fatal(err)
 	}
+	gapMentionAdmission, err := admission.NewDecision(admission.DecisionInput{ID: "admission:" + string(gapMention.ID()), TargetKind: admission.TargetMention, TargetID: string(gapMention.ID()), Outcome: admission.Admitted, ReasonCode: "synthetic_acceptance", Authority: admission.AuthorityReviewer, RecordedAt: recorded.Add(5 * time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := database.InTransaction(ctx, func(transaction *postgres.Transaction) error {
 		if err := transaction.SetCurrentDocumentVersion(ctx, documentRef.Ref.SourceDocumentID, documentRef.Ref.VersionID); err != nil {
 			return err
@@ -304,6 +320,12 @@ func seedPlannerAtlasCorpus(t *testing.T, ctx context.Context, database *postgre
 			}
 		}
 		if _, err := transaction.PutEntity(ctx, ownerEntity); err != nil {
+			return err
+		}
+		if _, err := transaction.PutMention(ctx, gapMention); err != nil {
+			return err
+		}
+		if err := transaction.AppendAdmissionDecision(ctx, gapMentionAdmission); err != nil {
 			return err
 		}
 		for _, value := range observations {
@@ -338,14 +360,17 @@ func seedPlannerAtlasCorpus(t *testing.T, ctx context.Context, database *postgre
 	}
 	limits := query.Limits{MaxEntities: 4, MaxPredicates: 8, MaxChronology: 20}
 	return plannerAtlasFixture{
-		database: database, limits: limits, EntityIDs: []identity.EntityID{ownerID}, referenceTime: end,
-		PointRequest:            query.Request{Intent: temporal.IntentPointInTime, EntityIDs: []identity.EntityID{ownerID}, EntityMatch: query.EntityMatchAll, Predicates: []observation.Predicate{responsibility}, Selections: []temporal.TemporalSelection{point}, KnowledgeScope: temporal.CurrentKnowledge()},
+		database: database, limits: limits, EntityIDs: []identity.EntityID{ownerID}, ownerID: ownerID,
+		responsibilityPredicate: responsibility, uncertaintyPredicate: uncertainty, authorityPredicate: authorityPredicate, gapPredicate: gapPredicate,
+		windowStart: start, boundary: boundary, windowEnd: end, historicalCutoff: cutoff, referenceTime: end,
+		supportCitation:         query.Citation{EvidenceID: support.ID(), Role: observation.EvidenceSupporting, SourceDocumentID: documentRef.Ref.SourceDocumentID, DocumentVersionID: documentRef.Ref.VersionID, SectionID: sectionSupport.ID(), SectionTitle: sectionSupport.Title(), SectionPath: sectionSupport.Path(), SectionOrder: sectionSupport.Order(), SectionRole: sectionSupport.Role(), StartOffset: support.StartOffset(), EndOffset: support.EndOffset(), Locator: support.Locator(), Text: support.Text()},
+		counterCitation:         query.Citation{EvidenceID: counter.ID(), Role: observation.EvidenceContradicting, SourceDocumentID: documentRef.Ref.SourceDocumentID, DocumentVersionID: documentRef.Ref.VersionID, SectionID: sectionCounter.ID(), SectionTitle: sectionCounter.Title(), SectionPath: sectionCounter.Path(), SectionOrder: sectionCounter.Order(), SectionRole: sectionCounter.Role(), StartOffset: counter.StartOffset(), EndOffset: counter.EndOffset(), Locator: counter.Locator(), Text: counter.Text()},
+		PointRequest:            query.Request{Intent: temporal.IntentPointInTime, EntityIDs: []identity.EntityID{ownerID}, EntityMatch: query.EntityMatchAll, Predicates: []observation.Predicate{responsibility, authorityPredicate, gapPredicate}, Selections: []temporal.TemporalSelection{point}, KnowledgeScope: temporal.CurrentKnowledge()},
 		TrendRequest:            query.Request{Intent: temporal.IntentTrendComparison, EntityIDs: []identity.EntityID{ownerID}, EntityMatch: query.EntityMatchAll, Predicates: []observation.Predicate{responsibility}, Selections: []temporal.TemporalSelection{before, after}, KnowledgeScope: temporal.CurrentKnowledge()},
 		TrajectoryRequest:       query.Request{Intent: temporal.IntentTrajectory, EntityIDs: []identity.EntityID{ownerID}, EntityMatch: query.EntityMatchAll, Predicates: []observation.Predicate{responsibility, uncertainty}, Selections: []temporal.TemporalSelection{between}, KnowledgeScope: temporal.CurrentKnowledge(), Limit: 20},
 		CausalRequest:           query.Request{Intent: temporal.IntentCausalChain, EntityIDs: []identity.EntityID{ownerID}, EntityMatch: query.EntityMatchAll, Predicates: []observation.Predicate{query.CausalPredicate}, Selections: []temporal.TemporalSelection{between}, KnowledgeScope: temporal.CurrentKnowledge(), Limit: 20},
 		HistoricalPointRequest:  query.Request{Intent: temporal.IntentPointInTime, EntityIDs: []identity.EntityID{ownerID}, EntityMatch: query.EntityMatchAll, Predicates: []observation.Predicate{responsibility}, Selections: []temporal.TemporalSelection{point}, KnowledgeScope: mustPlannerKnownAsOf(t, cutoff)},
-		AuthorityRequest:        query.Request{Intent: temporal.IntentPointInTime, EntityIDs: []identity.EntityID{ownerID}, EntityMatch: query.EntityMatchAll, Predicates: []observation.Predicate{authorityPredicate}, Selections: []temporal.TemporalSelection{point}, KnowledgeScope: temporal.CurrentKnowledge()},
-		pointProposal:           `{"status":"executable","reason":"none","intent":"point-in-time","entity_match":"all","predicates":["planner.postgres/responsibility"],"selections":[{"kind":"point","label":"point","at":"2026-03-15T00:00:00Z","start":"","end":""}],"knowledge_scope":{"kind":"current","as_of":""},"chronology_limit":0}`,
+		pointProposal:           `{"status":"executable","reason":"none","intent":"point-in-time","entity_match":"all","predicates":["planner.postgres/responsibility","planner.postgres/authority","planner.postgres/unresolved-gap"],"selections":[{"kind":"point","label":"point","at":"2026-03-15T00:00:00Z","start":"","end":""}],"knowledge_scope":{"kind":"current","as_of":""},"chronology_limit":0}`,
 		trendProposal:           `{"status":"executable","reason":"none","intent":"trend-comparison","entity_match":"all","predicates":["planner.postgres/responsibility"],"selections":[{"kind":"window","label":"before","at":"","start":"2026-03-01T00:00:00Z","end":"2026-03-15T00:00:00Z"},{"kind":"window","label":"after","at":"","start":"2026-03-15T00:00:00Z","end":"2026-04-01T00:00:00Z"}],"knowledge_scope":{"kind":"current","as_of":""},"chronology_limit":0}`,
 		trajectoryProposal:      `{"status":"executable","reason":"none","intent":"trajectory","entity_match":"all","predicates":["planner.postgres/responsibility","planner.postgres/uncertainty"],"selections":[{"kind":"window","label":"between","at":"","start":"2026-03-01T00:00:00Z","end":"2026-04-01T00:00:00Z"}],"knowledge_scope":{"kind":"current","as_of":""},"chronology_limit":20}`,
 		causalProposal:          `{"status":"executable","reason":"none","intent":"causal-chain","entity_match":"all","predicates":["stacks.causal.v1/causes"],"selections":[{"kind":"window","label":"between","at":"","start":"2026-03-01T00:00:00Z","end":"2026-04-01T00:00:00Z"}],"knowledge_scope":{"kind":"current","as_of":""},"chronology_limit":20}`,
@@ -363,30 +388,188 @@ func assertPlannedDirectParity(t *testing.T, planned Execution, direct query.Res
 	}
 }
 
-func assertPlannerPostgresEvidence(t *testing.T, result query.Result) {
+func assertPlannerExpectedRequest(t *testing.T, got, want query.Request) {
 	t.Helper()
-	switch result.Intent {
-	case temporal.IntentPointInTime:
-		point, _ := result.Payload.Point()
-		if len(point.Unresolved) != 1 || len(point.Unresolved[0].Candidates) != 2 {
-			t.Fatalf("point conflicts = %#v, want competing alternatives", point)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("planned request = %#v, want normalized expected request %#v", got, want)
+	}
+}
+
+func assertPlannerPostgresSemantics(t *testing.T, fixture plannerAtlasFixture, intent string, result query.Result) {
+	t.Helper()
+	if err := query.ValidateResult(result); err != nil {
+		t.Fatal(err)
+	}
+	switch intent {
+	case "point":
+		point, ok := result.Payload.Point()
+		if !ok || point.Selection != result.Selections[0] || len(point.Facts) != 0 {
+			t.Fatalf("point payload = %#v, want the requested conflicting point", point)
 		}
-		if len(point.Unresolved[0].Candidates[0].ContradictingCitations) == 0 && len(point.Unresolved[0].Candidates[1].ContradictingCitations) == 0 {
-			t.Fatalf("point conflict lost citation roles: %#v", point.Unresolved)
+		initial := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Alex", "initial", mustPlannerDuring(t, fixture.windowStart, fixture.windowEnd), fixture.windowStart.Add(70*time.Minute), observation.StatusObserved, false)
+		transfer := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Blair", "transfer", mustPlannerDuring(t, fixture.boundary, fixture.windowEnd), fixture.historicalCutoff.Add(24*time.Hour), observation.StatusObserved, false)
+		conflict := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Casey", "conflict", mustPlannerDuring(t, fixture.boundary, fixture.windowEnd), fixture.historicalCutoff.Add(25*time.Hour), observation.StatusObserved, true)
+		key := initial.Key
+		wantUnresolved := []query.UnresolvedItem{{Key: key, Reason: temporal.UnresolvedConflict, Candidates: []query.Fact{initial, transfer, conflict}}}
+		if !reflect.DeepEqual(point.Unresolved, wantUnresolved) {
+			t.Fatalf("point unresolved = %#v, want exact cited candidates %#v", point.Unresolved, wantUnresolved)
 		}
-		if len(result.Gaps) == 0 {
-			t.Fatalf("point gaps = %#v, want valid-time coverage", result.Gaps)
+		wantGaps := []query.Gap{
+			{Kind: query.GapAuthorityExcluded, EntityID: fixture.ownerID, Predicate: fixture.authorityPredicate},
+			{Kind: query.GapUnresolvedMention, EntityID: fixture.ownerID, Predicate: fixture.gapPredicate},
 		}
-	case temporal.IntentTrajectory:
-		trajectory, _ := result.Payload.Trajectory()
-		if len(trajectory.Unresolved) == 0 {
-			t.Fatalf("trajectory = %#v, want hypothesis/uncertainty", trajectory)
+		if !reflect.DeepEqual(result.Gaps, wantGaps) {
+			t.Fatalf("point gaps = %#v, want exact %#v", result.Gaps, wantGaps)
 		}
-	case temporal.IntentCausalChain:
-		causal, _ := result.Payload.Causal()
-		if len(causal.Links) != 2 || len(causal.Links[0].ContradictingCitations) == 0 {
-			t.Fatalf("causal = %#v, want cited counterevidence", causal)
+	case "trend":
+		trend, ok := result.Payload.Trend()
+		if !ok || trend.Before.Selection != result.Selections[0] || trend.After.Selection != result.Selections[1] {
+			t.Fatalf("trend payload = %#v, want both requested windows", trend)
 		}
+		initial := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Alex", "initial", mustPlannerDuring(t, fixture.windowStart, fixture.windowEnd), fixture.windowStart.Add(70*time.Minute), observation.StatusObserved, false)
+		transfer := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Blair", "transfer", mustPlannerDuring(t, fixture.boundary, fixture.windowEnd), fixture.historicalCutoff.Add(24*time.Hour), observation.StatusObserved, false)
+		conflict := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Casey", "conflict", mustPlannerDuring(t, fixture.boundary, fixture.windowEnd), fixture.historicalCutoff.Add(25*time.Hour), observation.StatusObserved, true)
+		wantTrend := query.TrendResult{
+			Before:  query.WindowResult{Selection: result.Selections[0], Facts: []query.Fact{initial}, Unresolved: []query.UnresolvedItem{}},
+			After:   query.WindowResult{Selection: result.Selections[1], Facts: []query.Fact{}, Unresolved: []query.UnresolvedItem{{Key: initial.Key, Reason: temporal.UnresolvedConflict, Candidates: []query.Fact{initial, transfer, conflict}}}},
+			Changes: []query.Change{}, UnresolvedKeys: []temporal.StateKey{initial.Key},
+		}
+		if !reflect.DeepEqual(trend, wantTrend) {
+			t.Fatalf("trend = %#v, want exact cited trend %#v", trend, wantTrend)
+		}
+		wantGaps := []query.Gap{{Kind: query.GapValidTimeExcluded, EntityID: fixture.ownerID, Predicate: fixture.responsibilityPredicate, SelectionLabel: "before"}}
+		if !reflect.DeepEqual(result.Gaps, wantGaps) {
+			t.Fatalf("trend gaps = %#v, want exact %#v", result.Gaps, wantGaps)
+		}
+	case "trajectory":
+		trajectory, ok := result.Payload.Trajectory()
+		if !ok || trajectory.Selection != result.Selections[0] {
+			t.Fatalf("trajectory payload = %#v, want requested window", trajectory)
+		}
+		assertPlannerTrajectorySemantics(t, fixture, trajectory)
+	case "causal":
+		causal, ok := result.Payload.Causal()
+		if !ok || causal.Selection != result.Selections[0] {
+			t.Fatalf("causal payload = %#v, want requested window", causal)
+		}
+		assertPlannerCausalSemantics(t, fixture, causal)
+	default:
+		t.Fatalf("unexpected intent case %q", intent)
+	}
+}
+
+func assertPlannerHistoricalSemantics(t *testing.T, fixture plannerAtlasFixture, result query.Result) {
+	t.Helper()
+	if err := query.ValidateResult(result); err != nil {
+		t.Fatal(err)
+	}
+	point, ok := result.Payload.Point()
+	if !ok || point.Selection != result.Selections[0] || result.Selections[0].Label() != "point" {
+		t.Fatalf("historical payload = %#v, want the caller valid-time point", point)
+	}
+	selectedAt, ok := point.Selection.Point()
+	if !ok || !selectedAt.Equal(fixture.boundary) {
+		t.Fatalf("historical valid-time selection = %#v, want point %s", point.Selection, fixture.boundary)
+	}
+	cutoff, ok := result.KnowledgeScope.AsOf()
+	if !ok || !cutoff.Equal(fixture.historicalCutoff) {
+		t.Fatalf("historical knowledge scope = %#v, want exact cutoff %s", result.KnowledgeScope, fixture.historicalCutoff)
+	}
+	wantInitial := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Alex", "initial", mustPlannerDuring(t, fixture.windowStart, fixture.windowEnd), fixture.windowStart.Add(70*time.Minute), observation.StatusObserved, false)
+	if !reflect.DeepEqual(point.Facts, []query.Fact{wantInitial}) || len(point.Unresolved) != 0 {
+		t.Fatalf("historical point = %#v, want only exact early recorded evidence", point)
+	}
+	if !reflect.DeepEqual(result.Gaps, []query.Gap{}) {
+		t.Fatalf("historical gaps = %#v, want no excluded valid-time coverage", result.Gaps)
+	}
+}
+
+func plannerPostgresFact(t *testing.T, fixture plannerAtlasFixture, predicate observation.Predicate, value, observationSuffix string, validTime observation.TemporalExtent, recordedAt time.Time, status observation.EpistemicStatus, counter bool) query.Fact {
+	t.Helper()
+	subject, err := observation.NewEntityTerm(string(fixture.ownerID), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := temporal.NewStateKey(subject, predicate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := observation.NewTextTerm(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contradicting := []query.Citation{}
+	if counter {
+		contradicting = []query.Citation{fixture.counterCitation}
+	}
+	return query.Fact{Key: key, Value: object, Contributions: []query.Contribution{{ObservationID: observation.ObservationID("observation:planner-postgres/" + observationSuffix), Status: status, ValidTime: validTime, RecordedAt: recordedAt, Derivation: observation.Derivation{Method: "synthetic", Version: "planner-postgres-v1"}}}, SupportingCitations: []query.Citation{fixture.supportCitation}, ContradictingCitations: contradicting}
+}
+
+func mustPlannerDuring(t *testing.T, start, end time.Time) observation.TemporalExtent {
+	t.Helper()
+	extent, err := observation.During(start, end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return extent
+}
+
+func assertPlannerTrajectorySemantics(t *testing.T, fixture plannerAtlasFixture, trajectory query.TrajectoryResult) {
+	t.Helper()
+	initial := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Alex", "initial", mustPlannerDuring(t, fixture.windowStart, fixture.windowEnd), fixture.windowStart.Add(70*time.Minute), observation.StatusObserved, false)
+	transfer := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Blair", "transfer", mustPlannerDuring(t, fixture.boundary, fixture.windowEnd), fixture.historicalCutoff.Add(24*time.Hour), observation.StatusObserved, false)
+	conflict := plannerPostgresFact(t, fixture, fixture.responsibilityPredicate, "Casey", "conflict", mustPlannerDuring(t, fixture.boundary, fixture.windowEnd), fixture.historicalCutoff.Add(25*time.Hour), observation.StatusObserved, true)
+	hypothesis := plannerPostgresFact(t, fixture, fixture.uncertaintyPredicate, "uncertain", "hypothesis", observation.UnknownTime(), fixture.windowStart.Add(71*time.Minute), observation.StatusHypothesized, false)
+	wantUnresolved := []query.UnresolvedItem{
+		{Key: initial.Key, Reason: temporal.UnresolvedConflict, Candidates: []query.Fact{initial, transfer, conflict}},
+		{Key: hypothesis.Key, Reason: temporal.UnresolvedTemporalUncertainty, Candidates: []query.Fact{hypothesis}},
+	}
+	if !reflect.DeepEqual(trajectory.Unresolved, wantUnresolved) {
+		t.Fatalf("trajectory unresolved = %#v, want exact cited conflict and hypothesis %#v", trajectory.Unresolved, wantUnresolved)
+	}
+	start, err := observation.AtTime(fixture.windowStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary, err := observation.AtTime(fixture.boundary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTransitions := []query.Transition{
+		{Kind: temporal.ChangeAdded, Key: initial.Key, ValidTime: start, After: plannerFactPointer(initial), Unresolved: []query.UnresolvedItem{}},
+		{Kind: temporal.ChangeRemoved, Key: initial.Key, ValidTime: boundary, Before: plannerFactPointer(initial), Unresolved: []query.UnresolvedItem{{Key: initial.Key, Reason: temporal.UnresolvedConflict, Candidates: []query.Fact{initial, transfer, conflict}}}},
+	}
+	if !reflect.DeepEqual(trajectory.Transitions, wantTransitions) {
+		t.Fatalf("trajectory transitions = %#v, want exact transitions %#v", trajectory.Transitions, wantTransitions)
+	}
+}
+
+func plannerFactPointer(value query.Fact) *query.Fact { return &value }
+
+func assertPlannerCausalSemantics(t *testing.T, fixture plannerAtlasFixture, causal query.CausalChainResult) {
+	t.Helper()
+	owner, err := observation.NewEntityTerm(string(fixture.ownerID), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handoff, err := observation.NewTextTerm("handoff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTime, err := observation.AtTime(fixture.windowStart.Add(5 * 24 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTime, err := observation.AtTime(fixture.windowStart.Add(10 * 24 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLinks := []query.CausalLink{
+		{Cause: owner, Effect: handoff, Contributions: []query.Contribution{{ObservationID: "observation:planner-postgres/cause-one", Status: observation.StatusObserved, ValidTime: firstTime, RecordedAt: fixture.windowStart.Add(74 * time.Minute), Derivation: observation.Derivation{Method: "synthetic", Version: "planner-postgres-v1"}}}, SupportingCitations: []query.Citation{fixture.supportCitation}, ContradictingCitations: []query.Citation{fixture.counterCitation}},
+		{Cause: handoff, Effect: owner, Contributions: []query.Contribution{{ObservationID: "observation:planner-postgres/cause-two", Status: observation.StatusObserved, ValidTime: secondTime, RecordedAt: fixture.windowStart.Add(75 * time.Minute), Derivation: observation.Derivation{Method: "synthetic", Version: "planner-postgres-v1"}}}, SupportingCitations: []query.Citation{fixture.supportCitation}, ContradictingCitations: []query.Citation{}},
+	}
+	if !reflect.DeepEqual(causal.Links, wantLinks) {
+		t.Fatalf("causal links = %#v, want exact cited causal links %#v", causal.Links, wantLinks)
 	}
 }
 
@@ -397,15 +580,6 @@ func mustPlannerKnownAsOf(t *testing.T, value time.Time) temporal.KnowledgeScope
 		t.Fatal(err)
 	}
 	return scope
-}
-
-func containsPlannerGap(gaps []query.Gap, kind query.GapKind) bool {
-	for _, gap := range gaps {
-		if gap.Kind == kind {
-			return true
-		}
-	}
-	return false
 }
 
 var _ Executor = plannerPostgresExecutor{}

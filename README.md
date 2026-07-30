@@ -445,7 +445,7 @@ constructing any source, directory, disclosure, model, or provider client.
 | `STACKS_DATA_MODE` | no default | Explicit disclosure mode: `personal` or `restricted` |
 | `STACKS_MODEL_PROVIDER` | no default | Explicit provider: `bedrock`, `openai`, or `anthropic` |
 | `STACKS_MODEL_ID` | no default | Provider model or inference-profile ID; no model is guessed |
-| `STACKS_MODEL_MAX_OUTPUT_TOKENS` | no default | Required positive output-token limit for `sync` |
+| `STACKS_MODEL_MAX_OUTPUT_TOKENS` | no default | Required positive output-token limit for `sync` and `query ask` |
 | `STACKS_MODEL_MAX_ATTEMPTS` | `5` | Positive retry-attempt bound, at most `5` |
 | `OPENAI_API_KEY` | no default | Personal-mode OpenAI credential; keep only in the ignored `.env` |
 | `ANTHROPIC_API_KEY` | no default | Personal-mode Anthropic credential; keep only in the ignored `.env` |
