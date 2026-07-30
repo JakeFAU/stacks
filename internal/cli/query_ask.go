@@ -183,6 +183,7 @@ func queryAskPlannerValid(value queryplan.PlannerMetadata) bool {
 	return value.Provider.Valid() && strings.TrimSpace(value.ModelID) != "" &&
 		value.PromptVersion == queryplan.PromptVersion && value.SchemaName == queryplan.SchemaName &&
 		value.Attempts > 0 && value.Usage.InputTokens >= 0 && value.Usage.OutputTokens >= 0 &&
-		value.Usage.TotalTokens >= value.Usage.InputTokens+value.Usage.OutputTokens &&
+		value.Usage.TotalTokens >= value.Usage.InputTokens &&
+		value.Usage.TotalTokens-value.Usage.InputTokens >= value.Usage.OutputTokens &&
 		value.WallLatency >= 0 && value.ProviderLatency >= 0
 }

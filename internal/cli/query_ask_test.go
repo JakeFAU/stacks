@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -135,6 +136,25 @@ func TestQueryAskPreservesShortWrite(t *testing.T) {
 	}).Run(t.Context(), validQueryAskInvocation())
 	if !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("Run() error = %v, want io.ErrShortWrite", err)
+	}
+}
+
+func TestQueryAskRenderersRejectOverflowingPlannerUsage(t *testing.T) {
+	execution := validQueryAskExecution(t)
+	execution.Planner.Usage = queryplan.Usage{
+		InputTokens:  math.MaxInt64,
+		OutputTokens: 1,
+		TotalTokens:  math.MaxInt64,
+	}
+	for name, render := range map[string]func(queryplan.Execution) ([]byte, error){
+		"text": renderQueryAskText,
+		"json": renderQueryAskJSON,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := render(execution); err == nil {
+				t.Fatal("renderer error = nil, want invalid overflowing usage rejection")
+			}
+		})
 	}
 }
 
