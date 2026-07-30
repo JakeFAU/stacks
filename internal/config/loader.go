@@ -339,19 +339,13 @@ func settingsFrom(values *viper.Viper) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	queryPlannerTimeout, err := durationValue(values, configKeyQueryPlannerTimeout, QueryPlannerTimeoutEnvironmentVariable)
+	queryPlannerTimeout, err := queryPlannerDurationValue(values, configKeyQueryPlannerTimeout, QueryPlannerTimeoutEnvironmentVariable)
 	if err != nil {
 		return Settings{}, err
 	}
-	if queryPlannerTimeout < minimumQueryPlannerTimeout || queryPlannerTimeout > maximumQueryPlannerTimeout {
-		return Settings{}, fmt.Errorf("%s must be between %s and %s", QueryPlannerTimeoutEnvironmentVariable, minimumQueryPlannerTimeout, maximumQueryPlannerTimeout)
-	}
-	queryPlannerMaxQuestionBytes, err := positiveIntegerValue(values, configKeyQueryPlannerMaxQuestionBytes, QueryPlannerMaxQuestionBytesEnvironmentVariable, false)
+	queryPlannerMaxQuestionBytes, err := queryPlannerIntegerValue(values, configKeyQueryPlannerMaxQuestionBytes, QueryPlannerMaxQuestionBytesEnvironmentVariable)
 	if err != nil {
 		return Settings{}, err
-	}
-	if queryPlannerMaxQuestionBytes < minimumQueryPlannerQuestionBytes || queryPlannerMaxQuestionBytes > maximumQueryPlannerQuestionBytes {
-		return Settings{}, fmt.Errorf("%s must be between %d and %d", QueryPlannerMaxQuestionBytesEnvironmentVariable, minimumQueryPlannerQuestionBytes, maximumQueryPlannerQuestionBytes)
 	}
 
 	return Settings{
@@ -494,6 +488,27 @@ func durationValue(values *viper.Viper, key, environmentName string) (time.Durat
 		}
 	}
 	return 0, fmt.Errorf("%s must be a positive duration", environmentName)
+}
+
+func queryPlannerDurationValue(values *viper.Viper, key, environmentName string) (time.Duration, error) {
+	switch value := values.Get(key).(type) {
+	case time.Duration:
+		return value, nil
+	case string:
+		parsed, err := time.ParseDuration(value)
+		if err == nil {
+			return parsed, nil
+		}
+	}
+	return 0, fmt.Errorf("%s must be a duration", environmentName)
+}
+
+func queryPlannerIntegerValue(values *viper.Viper, key, environmentName string) (int, error) {
+	value, ok := integer(values.Get(key))
+	if !ok {
+		return 0, fmt.Errorf("%s must be an integer", environmentName)
+	}
+	return value, nil
 }
 
 func unitIntervalValue(values *viper.Viper, key, environmentName string) (float64, error) {

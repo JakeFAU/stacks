@@ -188,28 +188,88 @@ func TestLoadWithOptionsAppliesQueryPlannerEnvironmentOverYAMLAndJSON(t *testing
 	}
 }
 
-func TestLoadRejectsInvalidQueryPlannerSettingsWithoutDisclosingValues(t *testing.T) {
+func TestLoadPreservesParseableQueryPlannerValuesForCommandValidation(t *testing.T) {
 	for _, testCase := range []struct {
-		name     string
-		variable string
-		value    string
+		name           string
+		variable       string
+		value          string
+		extension      string
+		contents       string
+		want           QueryPlannerSettings
+		wantValidation string
 	}{
-		{name: "zero timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "0s"},
-		{name: "subsecond timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "999ms"},
-		{name: "timeout over maximum", variable: QueryPlannerTimeoutEnvironmentVariable, value: "5m1s"},
-		{name: "zero question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "0"},
-		{name: "question bytes over maximum", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "65537"},
+		{name: "environment zero timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "0s", want: QueryPlannerSettings{Timeout: 0, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "environment negative timeout", variable: QueryPlannerTimeoutEnvironmentVariable, value: "-1s", want: QueryPlannerSettings{Timeout: -time.Second, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "environment timeout above maximum", variable: QueryPlannerTimeoutEnvironmentVariable, value: "5m1s", want: QueryPlannerSettings{Timeout: 5*time.Minute + time.Second, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "environment zero question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "0", want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: 0}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "environment negative question bytes", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "-1", want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: -1}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "environment question bytes above maximum", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, value: "65537", want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: 65537}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "YAML subsecond timeout", extension: ".yaml", contents: "query_planner:\n  timeout: 999ms\n", want: QueryPlannerSettings{Timeout: 999 * time.Millisecond, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "YAML zero question bytes", extension: ".yaml", contents: "query_planner:\n  max_question_bytes: 0\n", want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: 0}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "JSON timeout above maximum", extension: ".json", contents: `{"query_planner":{"timeout":"5m1s"}}`, want: QueryPlannerSettings{Timeout: 5*time.Minute + time.Second, MaxQuestionBytes: 16384}, wantValidation: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "JSON negative question bytes", extension: ".json", contents: `{"query_planner":{"max_question_bytes":-1}}`, want: QueryPlannerSettings{Timeout: time.Minute, MaxQuestionBytes: -1}, wantValidation: QueryPlannerMaxQuestionBytesEnvironmentVariable},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			clearConfigurationEnvironment(t)
-			t.Setenv(testCase.variable, testCase.value)
-
-			_, err := Load()
-			if err == nil || !strings.Contains(err.Error(), testCase.variable) {
-				t.Fatalf("Load() error = %v, want bounded %s rejection", err, testCase.variable)
+			var options LoadOptions
+			if testCase.variable != "" {
+				t.Setenv(testCase.variable, testCase.value)
+			} else {
+				path := writeConfigFixture(t, testCase.extension, testCase.contents)
+				options.ConfigFile = &path
 			}
-			if strings.Contains(err.Error(), testCase.value) {
-				t.Fatalf("Load() error exposed configured planner value: %v", err)
+
+			settings, err := LoadWithOptions(options)
+			if err != nil {
+				t.Fatalf("LoadWithOptions() error = %v, want parseable planner value retained", err)
+			}
+			if settings.QueryPlanner != testCase.want {
+				t.Fatalf("QueryPlanner = %#v, want %#v", settings.QueryPlanner, testCase.want)
+			}
+			settings.Database.URL = "postgres://synthetic-query-app"
+			for _, command := range []Command{CommandQuery, CommandServe} {
+				if err := settings.Validate(command); err != nil {
+					t.Fatalf("Settings.Validate(%s) error = %v, want planner semantics ignored", command, err)
+				}
+			}
+			err = settings.Validate(CommandQueryAsk)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantValidation) {
+				t.Fatalf("Settings.Validate(query-ask) error = %v, want bounded %s rejection", err, testCase.wantValidation)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsMalformedQueryPlannerSyntaxWithoutDisclosingValues(t *testing.T) {
+	const privateValue = "private-planner-syntax"
+	for _, testCase := range []struct {
+		name      string
+		variable  string
+		extension string
+		contents  string
+		wantName  string
+	}{
+		{name: "environment duration", variable: QueryPlannerTimeoutEnvironmentVariable, wantName: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "environment integer", variable: QueryPlannerMaxQuestionBytesEnvironmentVariable, wantName: QueryPlannerMaxQuestionBytesEnvironmentVariable},
+		{name: "YAML duration", extension: ".yaml", contents: "query_planner:\n  timeout: " + privateValue + "\n", wantName: QueryPlannerTimeoutEnvironmentVariable},
+		{name: "JSON integer", extension: ".json", contents: `{"query_planner":{"max_question_bytes":"` + privateValue + `"}}`, wantName: "query_planner.max_question_bytes"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clearConfigurationEnvironment(t)
+			var options LoadOptions
+			if testCase.variable != "" {
+				t.Setenv(testCase.variable, privateValue)
+			} else {
+				path := writeConfigFixture(t, testCase.extension, testCase.contents)
+				options.ConfigFile = &path
+			}
+
+			_, err := LoadWithOptions(options)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantName) {
+				t.Fatalf("LoadWithOptions() error = %v, want malformed %s rejection", err, testCase.wantName)
+			}
+			if strings.Contains(err.Error(), privateValue) {
+				t.Fatalf("LoadWithOptions() error exposed configured planner syntax: %v", err)
 			}
 		})
 	}
