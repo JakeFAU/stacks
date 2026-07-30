@@ -81,6 +81,7 @@ func main() {
 		os.Args[1:],
 		app.SettingsLoaderFunc(config.LoadWithOptions),
 		app.BootstrapFunc(newExecutionDependencies),
+		os.Stdin,
 		os.Stdout,
 		os.Stderr,
 	)
@@ -111,6 +112,7 @@ func newExecutionDependencies(
 		CommandProvider: app.CommandProviderFunc(func(
 			ctx context.Context,
 			settings config.Settings,
+			_ io.Reader,
 			stdout, stderr io.Writer,
 		) (map[string]cli.Command, error) {
 			decisions, err := runtime.DecisionRecorder()

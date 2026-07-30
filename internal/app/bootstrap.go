@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -60,6 +61,12 @@ func targetForInvocation(invocation cli.Invocation) (validationTarget, error) {
 
 	target := validationTarget{Command: config.Command(invocation.Command)}
 	if invocation.Command == cli.CommandQuery {
+		if invocation.Action == cli.ActionAsk {
+			if err := cli.ValidateQueryAskInvocation(invocation); err != nil {
+				return validationTarget{}, errors.New("query ask invocation is invalid")
+			}
+			return validationTarget{Command: config.CommandQueryAsk}, nil
+		}
 		if err := cli.ValidateQueryInvocation(invocation); err != nil {
 			return validationTarget{}, fmt.Errorf("query invocation is invalid")
 		}
@@ -83,6 +90,9 @@ func targetForConfigValidation(input cli.ConfigValidationInput) (validationTarge
 			return validationTarget{}, fmt.Errorf("configuration validation target is invalid")
 		}
 		return validationTarget{Command: config.CommandAuth, Auth: authTarget}, nil
+	}
+	if input.Command == cli.CommandQuery && input.Action == cli.ActionAsk {
+		return validationTarget{Command: config.CommandQueryAsk}, nil
 	}
 	if input.Action != "" {
 		return validationTarget{}, fmt.Errorf("configuration validation target is invalid")

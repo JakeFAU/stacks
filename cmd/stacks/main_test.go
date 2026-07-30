@@ -133,6 +133,7 @@ func TestExecutionDependenciesComposeRuntimeCommandsTelemetryAndShutdown(t *test
 	if _, err := dependencies.CommandProvider.Commands(
 		t.Context(),
 		validatedSettings,
+		strings.NewReader(""),
 		io.Discard,
 		io.Discard,
 	); err != nil {
