@@ -566,8 +566,13 @@ Paid extraction acceptance is a separate, explicit action. Before `make sync`,
 obtain approval for paid provider calls, select only one provider, restrict the
 configured folder to the smallest synthetic corpus needed, and set deliberate
 `STACKS_MODEL_MAX_OUTPUT_TOKENS` and `STACKS_MODEL_MAX_ATTEMPTS` bounds.
-`make sync` may invoke the selected model; `make doctor` and every `query`
-command do not.
+`make sync` may invoke the selected model. `make doctor` and the typed temporal
+query subcommands (`point`, `trend`, `trajectory`, and `causal`) do not invoke a
+model and remain deterministic/provider-free. `query ask` discloses its private
+standard-input question to the explicitly configured planner provider, then
+executes only the validated normalized request through deterministic cited
+retrieval. Its local and synthetic acceptance does not establish live-provider
+or private-corpus validation.
 
 ### Personal OpenAI operation
 
