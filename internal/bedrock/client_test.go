@@ -121,7 +121,7 @@ func TestClientPlanBuildsExactStructuredConverseRequest(t *testing.T) {
 
 func TestClientPlanRejectsMutatedPromptContractWithoutCallingProvider(t *testing.T) {
 	tests := map[string]func(*queryplan.ModelRequest){
-		"unknown version": func(request *queryplan.ModelRequest) { request.PromptVersion = "query-plan-v2" },
+		"unknown version": func(request *queryplan.ModelRequest) { request.PromptVersion = "query-plan-v3" },
 		"mutated prompt":  func(request *queryplan.ModelRequest) { request.SystemPrompt = "mutated" },
 		"mutated schema name": func(request *queryplan.ModelRequest) {
 			request.SchemaName = "mutated_schema"

@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 )
 
 func TestPlannerContractConstants(t *testing.T) {
-	if PromptVersion != "query-plan-v1" {
+	if PromptVersion != "query-plan-v2" {
 		t.Fatalf("PromptVersion = %q", PromptVersion)
 	}
 	if SchemaName != "temporal_query_plan_v1" {
@@ -28,7 +29,7 @@ func TestPromptContractIsExactAndIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Version != "query-plan-v1" || first.SchemaName != "temporal_query_plan_v1" {
+	if first.Version != "query-plan-v2" || first.SchemaName != "temporal_query_plan_v1" {
 		t.Fatalf("contract identity = %#v", first)
 	}
 	if first.SystemPrompt == "" {
@@ -41,8 +42,22 @@ func TestPromptContractIsExactAndIsolated(t *testing.T) {
 	if bytes.Equal(first.JSONSchema, second.JSONSchema) {
 		t.Fatal("PromptContract() returned aliased schema bytes")
 	}
-	if _, err := PromptContract("query-plan-v2"); err == nil {
-		t.Fatal("PromptContract(query-plan-v2) error = nil")
+	if _, err := PromptContract("query-plan-v1"); err == nil {
+		t.Fatal("PromptContract(query-plan-v1) error = nil")
+	}
+}
+
+func TestPromptContractV2SeparatesCurrentFromRecordedTime(t *testing.T) {
+	contract, err := PromptContract("query-plan-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const requiredInstruction = `For an executable request without an explicit recorded-time knowledge cutoff, emit knowledge_scope.kind as "current" and knowledge_scope.as_of as the empty string. Use "as-of" and a non-empty as_of only when the question explicitly asks what was known or recorded by a cutoff.`
+	if contract.Version != "query-plan-v2" {
+		t.Fatalf("contract version = %q", contract.Version)
+	}
+	if !strings.Contains(contract.SystemPrompt, requiredInstruction) {
+		t.Fatal("query-plan-v2 does not define the current-versus-as-of sentinel rule")
 	}
 }
 

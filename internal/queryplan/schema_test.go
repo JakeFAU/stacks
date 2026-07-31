@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	expectedPromptSHA256 = "da154eda05db8fcbf0fe75fd4512d7b3f5b0f3890ac08a40af9689ff9c5aa251"
+	expectedPromptSHA256 = "e978215d5a0bc556fa6579a0e0411f18d8863cfb2360081c22641ce6235ea513"
 	expectedSchemaSHA256 = "017a0a8a370df66feaca9aad672ba90d2ed768d8070f37f57a6ed45c16a88713"
 )
 

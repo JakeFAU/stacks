@@ -14,7 +14,7 @@ import (
 
 const (
 	// PromptVersion identifies the embedded planner instruction contract.
-	PromptVersion = "query-plan-v1"
+	PromptVersion = "query-plan-v2"
 	// SchemaName identifies the structured model-output schema.
 	SchemaName = "temporal_query_plan_v1"
 	// OutputSchemaVersion identifies an executable planner output.
