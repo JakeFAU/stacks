@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/JakeFAU/stacks/core/temporal"
@@ -48,6 +50,34 @@ type recorderFunc func(context.Context, int64)
 
 func (fn recorderFunc) RecordQuestionBytes(ctx context.Context, value int64) {
 	fn(ctx, value)
+}
+
+func BenchmarkServiceAskLargePointResult(b *testing.B) {
+	request, err := composeRequest(
+		[]byte(executablePointProposal),
+		[]identity.EntityID{"entity-atlas-001"},
+		plannerLimits(),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	result := benchmarkPointResult(b, request, 1000)
+	service := validService(
+		modelFunc(func(context.Context, ModelRequest) (ModelResponse, error) {
+			return syntheticModelResponse([]byte(executablePointProposal)), nil
+		}),
+		executorFunc(func(context.Context, query.Request) (query.Result, error) {
+			return result, nil
+		}),
+	)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := service.Ask(context.Background(), serviceInput()); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func TestServiceAskRejectsInvalidInputBeforeRecorderModelAndExecutor(t *testing.T) {
@@ -607,6 +637,72 @@ func syntheticResult(t *testing.T, request query.Request) query.Result {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	return query.Result{
+		Intent: request.Intent, EntityIDs: append([]identity.EntityID(nil), request.EntityIDs...), EntityMatch: request.EntityMatch,
+		Predicates: append([]observation.Predicate(nil), request.Predicates...), Selections: append([]temporal.TemporalSelection(nil), request.Selections...),
+		KnowledgeScope: request.KnowledgeScope, Limit: request.Limit, Payload: payload, Gaps: []query.Gap{},
+	}
+}
+
+func benchmarkPointResult(
+	b testing.TB,
+	request query.Request,
+	factCount int,
+) query.Result {
+	b.Helper()
+	validTime, err := observation.AtTime(
+		time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	facts := make([]query.Fact, factCount)
+	for index := range facts {
+		suffix := strconv.Itoa(index)
+		subject, err := observation.NewEntityTerm("entity-benchmark-"+suffix, "")
+		if err != nil {
+			b.Fatal(err)
+		}
+		key, err := temporal.NewStateKey(subject, "assigned_to")
+		if err != nil {
+			b.Fatal(err)
+		}
+		value, err := observation.NewTextTerm("value-" + suffix)
+		if err != nil {
+			b.Fatal(err)
+		}
+		facts[index] = query.Fact{
+			Key:   key,
+			Value: value,
+			Contributions: []query.Contribution{{
+				ObservationID: observation.ObservationID("observation-benchmark-" + suffix),
+				Status:        observation.StatusObserved,
+				ValidTime:     validTime,
+				RecordedAt:    time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+				Derivation:    observation.Derivation{Method: "synthetic", Version: "v1"},
+			}},
+			SupportingCitations: []query.Citation{{
+				EvidenceID:        evidence.EvidenceID("evidence-benchmark-" + suffix),
+				Role:              observation.EvidenceSupporting,
+				SourceDocumentID:  "document",
+				DocumentVersionID: "version",
+				SectionID:         "section",
+				SectionTitle:      "section",
+				SectionPath:       []string{},
+				SectionRole:       "body",
+				EndOffset:         1,
+			}},
+			ContradictingCitations: []query.Citation{},
+		}
+	}
+	payload, err := query.NewPointPayload(query.PointInTimeResult{
+		Selection:  request.Selections[0],
+		Facts:      facts,
+		Unresolved: []query.UnresolvedItem{},
+	})
+	if err != nil {
+		b.Fatal(err)
 	}
 	return query.Result{
 		Intent: request.Intent, EntityIDs: append([]identity.EntityID(nil), request.EntityIDs...), EntityMatch: request.EntityMatch,
