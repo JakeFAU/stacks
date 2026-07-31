@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/observation"
@@ -298,6 +300,9 @@ func executableRequest(value proposal, entityIDs []identity.EntityID) (query.Req
 	}
 	predicates := make([]observation.Predicate, len(value.Predicates))
 	for index, predicateValue := range value.Predicates {
+		if strings.IndexFunc(predicateValue, unicode.IsControl) >= 0 {
+			return query.Request{}, errors.New("predicate contains a control character")
+		}
 		predicate, err := observation.NewPredicate(predicateValue)
 		if err != nil {
 			return query.Request{}, err

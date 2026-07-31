@@ -120,10 +120,6 @@ func (service Service) Ask(ctx context.Context, input Input) (execution Executio
 		return Execution{}, errors.New("query planner result does not match the normalized request")
 	}
 
-	resultCopy, err := query.NormalizeResult(normalizedResult)
-	if err != nil {
-		return Execution{}, errors.New("query planner result is invalid")
-	}
 	return Execution{
 		SchemaVersion: OutputSchemaVersion,
 		ReferenceTime: normalizedInput.ReferenceTime,
@@ -134,7 +130,7 @@ func (service Service) Ask(ctx context.Context, input Input) (execution Executio
 			Usage: response.Usage, Attempts: response.Attempts,
 			WallLatency: response.WallLatency, ProviderLatency: response.ProviderLatency,
 		},
-		Result: resultCopy,
+		Result: normalizedResult,
 	}, nil
 }
 
