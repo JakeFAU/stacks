@@ -166,6 +166,22 @@ func TestComposeRequestRejectsInvalidExecutableSemantics(t *testing.T) {
 	}
 }
 
+func TestComposeRequestRejectsControlCharactersInPredicates(t *testing.T) {
+	output := strings.Replace(
+		executablePointProposal,
+		`["assigned_to"]`,
+		`["assigned\u001bto"]`,
+		1,
+	)
+
+	_, err := composeRequest(
+		[]byte(output),
+		[]identity.EntityID{"entity-atlas-001"},
+		plannerLimits(),
+	)
+	assertInvalidProposal(t, err)
+}
+
 func TestComposeRequestAttachesCanonicalIDsAndPreservesTemporalScopes(t *testing.T) {
 	output := `{
   "status":"executable", "reason":"none", "intent":"trend-comparison", "entity_match":"any",
