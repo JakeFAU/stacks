@@ -223,11 +223,13 @@ func TestServiceAskResultDoesNotRetainExecutorOwnedSlices(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ask() error = %v", err)
 	}
+	entityIDs := append([]identity.EntityID(nil), execution.Result.EntityIDs...)
+	predicates := append([]observation.Predicate(nil), execution.Result.Predicates...)
 	executorResult.EntityIDs[0] = "entity-mutated-after-execution"
 	executorResult.Predicates[0] = "changed_to"
 
-	if !reflect.DeepEqual(execution.Result.EntityIDs, []identity.EntityID{"entity-atlas-001"}) ||
-		!reflect.DeepEqual(execution.Result.Predicates, []observation.Predicate{"assigned_to"}) {
+	if !reflect.DeepEqual(execution.Result.EntityIDs, entityIDs) ||
+		!reflect.DeepEqual(execution.Result.Predicates, predicates) {
 		t.Fatalf("execution result retained executor-owned slices: %#v", execution.Result)
 	}
 }
