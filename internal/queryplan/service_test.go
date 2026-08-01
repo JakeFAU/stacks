@@ -200,6 +200,38 @@ func TestServiceAskRecordsQuestionBytesBeforePlanningAndExecutesNormalizedReques
 	}
 }
 
+func TestServiceAskResultDoesNotRetainExecutorOwnedSlices(t *testing.T) {
+	request, err := composeRequest(
+		[]byte(executablePointProposal),
+		[]identity.EntityID{"entity-atlas-001"},
+		plannerLimits(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executorResult := syntheticPointResult(t, request)
+	service := validService(
+		modelFunc(func(context.Context, ModelRequest) (ModelResponse, error) {
+			return syntheticModelResponse([]byte(executablePointProposal)), nil
+		}),
+		executorFunc(func(context.Context, query.Request) (query.Result, error) {
+			return executorResult, nil
+		}),
+	)
+
+	execution, err := service.Ask(context.Background(), serviceInput())
+	if err != nil {
+		t.Fatalf("Ask() error = %v", err)
+	}
+	executorResult.EntityIDs[0] = "entity-mutated-after-execution"
+	executorResult.Predicates[0] = "changed_to"
+
+	if !reflect.DeepEqual(execution.Result.EntityIDs, []identity.EntityID{"entity-atlas-001"}) ||
+		!reflect.DeepEqual(execution.Result.Predicates, []observation.Predicate{"assigned_to"}) {
+		t.Fatalf("execution result retained executor-owned slices: %#v", execution.Result)
+	}
+}
+
 func TestServiceAskDoesNotExecuteAfterPlanningFailures(t *testing.T) {
 	tests := []struct {
 		name  string
