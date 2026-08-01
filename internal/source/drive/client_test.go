@@ -154,6 +154,56 @@ func TestListFollowsDrivePagination(t *testing.T) {
 	}
 }
 
+func TestListRejectsRepeatedNextPageToken(t *testing.T) {
+	const privatePageToken = "private-repeated-token"
+	requests := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		if requests > 2 {
+			return nil, errors.New("pagination did not stop")
+		}
+		return jsonResponse(request, `{"nextPageToken":"`+privatePageToken+`"}`), nil
+	})}
+
+	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+	_, err := client.List(context.Background(), "folder-1")
+	if err == nil {
+		t.Fatal("List() error = nil, want repeated page token rejection")
+	}
+	if err.Error() != "list direct Google Docs: invalid pagination response" {
+		t.Fatalf("List() error = %q, want bounded pagination error", err)
+	}
+	if strings.Contains(err.Error(), privatePageToken) {
+		t.Fatalf("List() error disclosed provider page token: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("List() made %d requests, want 2 before repeated token rejection", requests)
+	}
+}
+
+func TestListPrefersCallerCancellationToRepeatedNextPageToken(t *testing.T) {
+	const repeatedPageToken = "synthetic-repeated-token"
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	requests := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		if requests == 2 {
+			cancel()
+		}
+		return jsonResponse(request, `{"nextPageToken":"`+repeatedPageToken+`"}`), nil
+	})}
+
+	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+	_, err := client.List(ctx, "folder-1")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal("List() did not preserve caller cancellation")
+	}
+	if requests != 2 {
+		t.Fatalf("List() made %d requests, want 2 before cancellation", requests)
+	}
+}
+
 func TestCheckCollectionRequestsOnlyFolderIdentityAndMIMEType(t *testing.T) {
 	const folderID = "private-folder-id"
 	var gotPath string

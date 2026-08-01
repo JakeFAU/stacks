@@ -65,6 +65,7 @@ func (client *Client) List(ctx context.Context, folderID string) ([]source.Docum
 	query := fmt.Sprintf("'%s' in parents and trashed = false and mimeType = '%s'", escapeDriveQueryValue(folderID), googleDocumentMIME)
 	var documents []source.Document
 	pageToken := ""
+	seenPageTokens := make(map[string]struct{})
 	for {
 		call := client.drive.Files.List().
 			Q(query).
@@ -95,10 +96,17 @@ func (client *Client) List(ctx context.Context, folderID string) ([]source.Docum
 				MeetingTime: meetingTimeFromTitle(file.Name),
 			})
 		}
-		pageToken = files.NextPageToken
-		if pageToken == "" {
+		if files.NextPageToken == "" {
 			break
 		}
+		if _, repeated := seenPageTokens[files.NextPageToken]; repeated {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("list direct Google Docs: %w", ctxErr)
+			}
+			return nil, errors.New("list direct Google Docs: invalid pagination response")
+		}
+		seenPageTokens[files.NextPageToken] = struct{}{}
+		pageToken = files.NextPageToken
 	}
 	return documents, nil
 }
