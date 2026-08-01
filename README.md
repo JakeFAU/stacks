@@ -240,8 +240,12 @@ go run ./cmd/stacks config validate query ask
 Typed `query point`, `query trend`, `query trajectory`, and `query causal`
 remain the no-provider fallback. `query ask` adds no narration, entity
 matching, web UI, or persistence. Local and synthetic acceptance prove the
-planner boundary and PostgreSQL parity only; live-provider and private-corpus
-validation have not run.
+planner boundary and PostgreSQL parity. A separately authorized bounded live
+run also validated the OpenAI `gpt-5.6-terra` planner against isolated
+synthetic PostgreSQL data. That result is specific to that provider, model, and
+fixture; private-corpus and other-provider/model validation have not run. See
+the [Plan E closeout report](docs/superpowers/reports/2026-08-01-plan-e-closeout.md)
+for the exact claim boundary.
 
 Planner settings are command-specific: `STACKS_QUERY_PLANNER_TIMEOUT` defaults
 to `1m` and accepts `1s` through `5m`; `STACKS_QUERY_PLANNER_MAX_QUESTION_BYTES`
@@ -571,8 +575,11 @@ query subcommands (`point`, `trend`, `trajectory`, and `causal`) do not invoke a
 model and remain deterministic/provider-free. `query ask` discloses its private
 standard-input question to the explicitly configured planner provider, then
 executes only the validated normalized request through deterministic cited
-retrieval. Its local and synthetic acceptance does not establish live-provider
-or private-corpus validation.
+retrieval. Deterministic local acceptance alone does not establish
+live-provider or private-corpus validation. A separate bounded OpenAI
+`gpt-5.6-terra` run validated the planner with isolated synthetic PostgreSQL
+data only; it does not establish private-corpus, other-provider/model,
+provider-availability, or general model-quality acceptance.
 
 ### Personal OpenAI operation
 

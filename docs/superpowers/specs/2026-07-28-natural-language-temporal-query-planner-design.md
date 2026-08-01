@@ -1,6 +1,9 @@
 # Plan E Natural-Language Temporal Query Planner Design
 
-**Status:** Approved design; awaiting written-spec review
+**Status:** Implemented and published. A bounded synthetic OpenAI validation
+was completed after separate authorization; see the
+[Plan E closeout report](../reports/2026-08-01-plan-e-closeout.md). Gate language
+below records the approved design sequence and remains historical.
 
 **Scope:** Add a provider-neutral, read-only planner that converts one private
 natural-language temporal question into the existing closed `query.Request`,

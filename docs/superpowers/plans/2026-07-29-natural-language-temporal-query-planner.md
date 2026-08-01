@@ -1,5 +1,12 @@
 # Natural-Language Temporal Query Planner Implementation Plan
 
+**Status:** Implemented and published. A bounded synthetic OpenAI validation
+was completed after separate authorization; see the
+[Plan E closeout report](../reports/2026-08-01-plan-e-closeout.md). Unchecked
+task and gate boxes below preserve the original executable plan; completion
+evidence is recorded in the closeout report rather than rewritten into the
+historical plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a planner-only `stacks query ask` workflow that turns one bounded private question into the existing closed temporal query request, validates and audits that request, and executes it through the unchanged deterministic cited-query service.
