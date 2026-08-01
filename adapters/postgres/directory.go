@@ -16,6 +16,7 @@ import (
 	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/timepoint"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -603,22 +604,49 @@ func persistDirectoryProfile(
 		return fmt.Errorf("insert directory snapshot: %w", err)
 	}
 
-	for index, email := range profile.profile.Emails {
-		if _, err := transaction.Exec(ctx, `
-			INSERT INTO stacks_directory.profile_emails (
-				snapshot_id, normalized_email, is_primary, email_order
-			)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (snapshot_id, normalized_email) DO NOTHING`,
-			profile.snapshotID,
-			email.Value,
-			email.Primary,
-			index,
-		); err != nil {
-			return fmt.Errorf("insert directory profile email: %w", err)
-		}
+	if err := insertDirectoryProfileEmails(
+		ctx,
+		transaction,
+		profile.snapshotID,
+		profile.profile.Emails,
+	); err != nil {
+		return fmt.Errorf("insert directory profile email: %w", err)
 	}
 	return requireExactDirectoryProfile(ctx, transaction, profile)
+}
+
+type directoryProfileEmailExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func insertDirectoryProfileEmails(
+	ctx context.Context,
+	executor directoryProfileEmailExecutor,
+	snapshotID string,
+	emails []DirectoryEmail,
+) error {
+	values := make([]string, len(emails))
+	primary := make([]bool, len(emails))
+	orders := make([]int32, len(emails))
+	for index, email := range emails {
+		values[index] = email.Value
+		primary[index] = email.Primary
+		orders[index] = int32(index)
+	}
+	_, err := executor.Exec(ctx, `
+		INSERT INTO stacks_directory.profile_emails (
+			snapshot_id, normalized_email, is_primary, email_order
+		)
+		SELECT $1, normalized_email, is_primary, email_order
+		FROM unnest($2::text[], $3::boolean[], $4::integer[])
+			AS email(normalized_email, is_primary, email_order)
+		ON CONFLICT (snapshot_id, normalized_email) DO NOTHING`,
+		snapshotID,
+		values,
+		primary,
+		orders,
+	)
+	return err
 }
 
 func requireExactDirectoryProfile(
