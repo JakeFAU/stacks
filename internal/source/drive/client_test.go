@@ -181,6 +181,29 @@ func TestListRejectsRepeatedNextPageToken(t *testing.T) {
 	}
 }
 
+func TestListPrefersCallerCancellationToRepeatedNextPageToken(t *testing.T) {
+	const repeatedPageToken = "synthetic-repeated-token"
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	requests := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		if requests == 2 {
+			cancel()
+		}
+		return jsonResponse(request, `{"nextPageToken":"`+repeatedPageToken+`"}`), nil
+	})}
+
+	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+	_, err := client.List(ctx, "folder-1")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal("List() did not preserve caller cancellation")
+	}
+	if requests != 2 {
+		t.Fatalf("List() made %d requests, want 2 before cancellation", requests)
+	}
+}
+
 func TestCheckCollectionRequestsOnlyFolderIdentityAndMIMEType(t *testing.T) {
 	const folderID = "private-folder-id"
 	var gotPath string

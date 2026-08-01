@@ -100,6 +100,9 @@ func (client *Client) List(ctx context.Context, folderID string) ([]source.Docum
 			break
 		}
 		if _, repeated := seenPageTokens[files.NextPageToken]; repeated {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("list direct Google Docs: %w", ctxErr)
+			}
 			return nil, errors.New("list direct Google Docs: invalid pagination response")
 		}
 		seenPageTokens[files.NextPageToken] = struct{}{}
