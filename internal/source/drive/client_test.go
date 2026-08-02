@@ -181,6 +181,39 @@ func TestListRejectsRepeatedNextPageToken(t *testing.T) {
 	}
 }
 
+func TestListRejectsNonconsecutiveNextPageTokenCycle(t *testing.T) {
+	const (
+		firstPageToken  = "synthetic-page-a"
+		secondPageToken = "synthetic-page-b"
+	)
+	wantRequestTokens := []string{"", firstPageToken, secondPageToken}
+	nextPageTokens := []string{firstPageToken, secondPageToken, firstPageToken}
+	requests := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if requests >= len(wantRequestTokens) {
+			return nil, errors.New("pagination did not stop")
+		}
+		if got := request.URL.Query().Get("pageToken"); got != wantRequestTokens[requests] {
+			t.Errorf("request %d pageToken = %q, want %q", requests+1, got, wantRequestTokens[requests])
+		}
+		nextPageToken := nextPageTokens[requests]
+		requests++
+		return jsonResponse(request, `{"nextPageToken":"`+nextPageToken+`"}`), nil
+	})}
+
+	client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+	_, err := client.List(context.Background(), "folder-1")
+	if err == nil {
+		t.Fatal("List() error = nil, want nonconsecutive page token cycle rejection")
+	}
+	if err.Error() != "list direct Google Docs: invalid pagination response" {
+		t.Fatalf("List() error = %q, want bounded pagination error", err)
+	}
+	if requests != len(wantRequestTokens) {
+		t.Fatalf("List() made %d requests, want %d before cycle rejection", requests, len(wantRequestTokens))
+	}
+}
+
 func TestListPrefersCallerCancellationToRepeatedNextPageToken(t *testing.T) {
 	const repeatedPageToken = "synthetic-repeated-token"
 	ctx, cancel := context.WithCancel(context.Background())
