@@ -466,11 +466,13 @@ func temporalSnapshotError(
 ) error {
 	cause := errTemporalSnapshotFailure
 	switch {
-	case ctx != nil && errors.Is(ctx.Err(), context.Canceled),
-		errors.Is(err, context.Canceled):
+	case ctx != nil && errors.Is(ctx.Err(), context.Canceled):
 		cause = context.Canceled
-	case ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded),
-		errors.Is(err, context.DeadlineExceeded):
+	case ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded):
+		cause = context.DeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		cause = context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
 		cause = context.DeadlineExceeded
 	case errors.Is(err, ErrConflict):
 		cause = ErrConflict
