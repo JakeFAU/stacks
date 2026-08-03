@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/JakeFAU/stacks/core/admission"
+	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/jackc/pgx/v5"
 )
@@ -185,18 +186,19 @@ func (store ReviewerStore) projectEntity(
 		Entity:       record.Entity,
 		Aliases:      make([]identity.Alias, len(record.Aliases)),
 		MentionCount: len(record.GroundingMentionIDs),
-		Evidence:     make([]ReviewerEvidence, len(record.EvidenceIDs)),
 	}
 	for index, assertion := range record.Aliases {
 		result.Aliases[index] = assertion.Alias()
 	}
-	for index, evidenceID := range record.EvidenceIDs {
-		citation, err := loadReviewerEvidence(ctx, store.Database, string(evidenceID))
-		if err != nil {
-			return ReviewerEntityRecord{}, fmt.Errorf("load reviewer entity evidence: %w", err)
-		}
-		result.Evidence[index] = citation
+	evidenceRecords, err := loadReviewerEvidenceRecords(
+		ctx,
+		store.Database.pool,
+		record.EvidenceIDs,
+	)
+	if err != nil {
+		return ReviewerEntityRecord{}, fmt.Errorf("load reviewer entity evidence: %w", err)
 	}
+	result.Evidence = evidenceRecords
 	sort.Slice(result.Aliases, func(left, right int) bool {
 		if result.Aliases[left].Type == result.Aliases[right].Type {
 			return result.Aliases[left].Value < result.Aliases[right].Value
@@ -363,7 +365,6 @@ func (store ReviewerStore) projectProposal(
 	result := ReviewerProposalRecord{
 		Proposal:          record.Proposal,
 		EffectiveDecision: record.EffectiveDecision,
-		Evidence:          make([]ReviewerEvidence, len(record.Proposal.EvidenceIDs())),
 		Candidates:        make([]ReviewerCandidateRecord, len(record.Candidates)),
 	}
 	mention, err := loadMentionValue(ctx, store.Database.pool, record.Proposal.MentionID())
@@ -371,13 +372,13 @@ func (store ReviewerStore) projectProposal(
 		return ReviewerProposalRecord{}, fmt.Errorf("load reviewer proposal mention: %w", err)
 	}
 	result.Mention = mention
-	evidenceIDs := record.Proposal.EvidenceIDs()
-	for index, evidenceID := range evidenceIDs {
-		citation, err := loadReviewerEvidence(ctx, store.Database, string(evidenceID))
-		if err != nil {
-			return ReviewerProposalRecord{}, fmt.Errorf("load reviewer proposal evidence: %w", err)
-		}
-		result.Evidence[index] = citation
+	result.Evidence, err = loadReviewerEvidenceRecords(
+		ctx,
+		store.Database.pool,
+		record.Proposal.EvidenceIDs(),
+	)
+	if err != nil {
+		return ReviewerProposalRecord{}, fmt.Errorf("load reviewer proposal evidence: %w", err)
 	}
 	for index, candidate := range record.Candidates {
 		entityRecord, err := store.Database.LoadEntity(ctx, candidate.EntityID())
@@ -400,19 +401,40 @@ func (store ReviewerStore) projectProposal(
 	return result, nil
 }
 
-func loadReviewerEvidence(
+func loadReviewerEvidenceRecords(
 	ctx context.Context,
-	database *Database,
-	evidenceID string,
-) (ReviewerEvidence, error) {
-	var result ReviewerEvidence
-	if err := database.pool.QueryRow(ctx, `
-		SELECT id, quote
-		FROM stacks_core.evidence_spans
-		WHERE id = $1`,
-		evidenceID,
-	).Scan(&result.ID, &result.Quote); err != nil {
-		return ReviewerEvidence{}, wrapIdentityReadError(ctx, "load reviewer evidence", err)
+	reader documentReader,
+	evidenceIDs []evidence.EvidenceID,
+) ([]ReviewerEvidence, error) {
+	if len(evidenceIDs) == 0 {
+		return []ReviewerEvidence{}, nil
+	}
+	requestedIDs := make([]string, len(evidenceIDs))
+	for index, evidenceID := range evidenceIDs {
+		requestedIDs[index] = string(evidenceID)
+	}
+	var ids, quotes []string
+	if err := reader.QueryRow(ctx, `
+		WITH requested AS (
+			SELECT id, evidence_order
+			FROM unnest($1::text[]) WITH ORDINALITY AS input(id, evidence_order)
+		)
+		SELECT
+			array_agg(evidence.id ORDER BY requested.evidence_order),
+			array_agg(evidence.quote ORDER BY requested.evidence_order)
+		FROM requested
+		JOIN stacks_core.evidence_spans AS evidence
+		  ON evidence.id = requested.id`,
+		requestedIDs,
+	).Scan(&ids, &quotes); err != nil {
+		return nil, wrapIdentityReadError(ctx, "load reviewer evidence", err)
+	}
+	if len(ids) != len(requestedIDs) || len(quotes) != len(requestedIDs) {
+		return nil, wrapIdentityReadError(ctx, "load reviewer evidence", pgx.ErrNoRows)
+	}
+	result := make([]ReviewerEvidence, len(ids))
+	for index := range ids {
+		result[index] = ReviewerEvidence{ID: ids[index], Quote: quotes[index]}
 	}
 	return result, nil
 }
