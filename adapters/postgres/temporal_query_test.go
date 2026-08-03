@@ -1019,6 +1019,52 @@ func TestTemporalQuerySnapshotRollsBackAndPreservesCancellation(t *testing.T) {
 	}
 }
 
+func TestTemporalSnapshotErrorGivesCallerContextPrecedence(t *testing.T) {
+	canceledContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	deadlineContext, cancelDeadline := context.WithDeadline(
+		context.Background(),
+		time.Unix(0, 0),
+	)
+	t.Cleanup(cancelDeadline)
+
+	tests := []struct {
+		name      string
+		ctx       context.Context
+		cause     error
+		want      error
+		doNotWant error
+	}{
+		{
+			name:      "caller cancellation wins over returned deadline",
+			ctx:       canceledContext,
+			cause:     context.DeadlineExceeded,
+			want:      context.Canceled,
+			doNotWant: context.DeadlineExceeded,
+		},
+		{
+			name:      "caller deadline wins over returned cancellation",
+			ctx:       deadlineContext,
+			cause:     context.Canceled,
+			want:      context.DeadlineExceeded,
+			doNotWant: context.Canceled,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := temporalSnapshotError(test.ctx, "read entity authority", test.cause)
+			if !errors.Is(err, test.want) || errors.Is(err, test.doNotWant) {
+				t.Fatalf(
+					"temporalSnapshotError() = %v, want only %v identity",
+					err,
+					test.want,
+				)
+			}
+			assertTemporalSnapshotErrorIsBounded(t, err)
+		})
+	}
+}
+
 func TestTemporalQuerySnapshotDoesNotApplyValidTimeOrConfidencePolicy(t *testing.T) {
 	confidence, err := observation.NewUnitIntervalConfidence(0.01)
 	if err != nil {
