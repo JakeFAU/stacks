@@ -12,6 +12,7 @@ import (
 	"github.com/JakeFAU/stacks/core/identity"
 	"github.com/JakeFAU/stacks/core/timepoint"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -164,22 +165,17 @@ func (transaction *Transaction) PutResolutionProposal(
 	).Scan(&insertedID)
 	switch {
 	case err == nil:
-		for index, evidenceID := range proposal.EvidenceIDs() {
-			if _, insertErr := transaction.transaction.Exec(ctx, `
-				INSERT INTO stacks_core.resolution_proposal_evidence (
-					proposal_id, evidence_id, evidence_order
-				)
-				VALUES ($1, $2, $3)`,
-				proposal.ID(),
-				evidenceID,
-				index,
-			); insertErr != nil {
-				return false, wrapIdentityError(
-					ctx,
-					"insert resolution proposal evidence",
-					conflictError(insertErr),
-				)
-			}
+		if insertErr := insertResolutionProposalEvidence(
+			ctx,
+			transaction.transaction,
+			proposal.ID(),
+			proposal.EvidenceIDs(),
+		); insertErr != nil {
+			return false, wrapIdentityError(
+				ctx,
+				"insert resolution proposal evidence",
+				conflictError(insertErr),
+			)
 		}
 		return true, nil
 	case errors.Is(err, pgx.ErrNoRows):
@@ -205,6 +201,36 @@ func (transaction *Transaction) PutResolutionProposal(
 			conflictError(err),
 		)
 	}
+}
+
+type resolutionProposalEvidenceExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func insertResolutionProposalEvidence(
+	ctx context.Context,
+	executor resolutionProposalEvidenceExecutor,
+	proposalID identity.ProposalID,
+	evidenceIDs []evidence.EvidenceID,
+) error {
+	values := make([]string, len(evidenceIDs))
+	orders := make([]int32, len(evidenceIDs))
+	for index, evidenceID := range evidenceIDs {
+		values[index] = string(evidenceID)
+		orders[index] = int32(index)
+	}
+	_, err := executor.Exec(ctx, `
+		INSERT INTO stacks_core.resolution_proposal_evidence (
+			proposal_id, evidence_id, evidence_order
+		)
+		SELECT $1, evidence_id, evidence_order
+		FROM unnest($2::text[], $3::integer[])
+			AS evidence(evidence_id, evidence_order)`,
+		proposalID,
+		values,
+		orders,
+	)
+	return err
 }
 
 // PutResolutionCandidate stores one immutable ranked candidate. It returns
