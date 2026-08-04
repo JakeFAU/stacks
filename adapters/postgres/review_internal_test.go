@@ -38,6 +38,21 @@ func TestLoadReviewerEvidenceUsesOneQuery(t *testing.T) {
 	}
 }
 
+func TestLoadReviewerEvidenceEmptyInputUsesNoQuery(t *testing.T) {
+	reader := &reviewerEvidenceReader{}
+
+	got, err := loadReviewerEvidenceRecords(context.Background(), reader, nil)
+	if err != nil {
+		t.Fatalf("loadReviewerEvidenceRecords() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("evidence = %#v, want empty", got)
+	}
+	if reader.queryCount != 0 {
+		t.Fatalf("query count = %d, want 0", reader.queryCount)
+	}
+}
+
 func TestLoadReviewerEvidenceRejectsMissingEvidence(t *testing.T) {
 	reader := &reviewerEvidenceReader{
 		ids:    []string{"evidence-1"},
