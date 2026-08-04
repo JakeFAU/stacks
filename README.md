@@ -224,7 +224,7 @@ locally; they are not sent in the planner request. The output contains the
 normalized plan together with the unchanged cited deterministic query result.
 
 ```sh
-printf '%s\n' 'What changed between the two stated periods?' |
+printf '%s\n' 'What changed between 2026-07-01T00:00:00-04:00/2026-07-15T00:00:00-04:00 and 2026-07-15T00:00:00-04:00/2026-07-29T00:00:00-04:00?' |
   go run ./cmd/stacks query ask \
     --entity entity-atlas-001 \
     --reference-time 2026-07-29T12:00:00-04:00 \
