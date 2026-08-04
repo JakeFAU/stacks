@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/JakeFAU/stacks/core/evidence"
 	"github.com/JakeFAU/stacks/core/identity"
+	"github.com/JakeFAU/stacks/core/observation"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -92,6 +95,190 @@ func TestLoadDocumentVersionRecordCachedLoadsVersionOnce(t *testing.T) {
 	if loadCount != 1 {
 		t.Fatalf("document version load count = %d, want 1", loadCount)
 	}
+}
+
+func TestLoadObservationEvidenceRecordReusesCanonicalProvenance(t *testing.T) {
+	recordedAt := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	section, err := evidence.NewSection(evidence.SectionInput{
+		ID:    "section-1",
+		Title: "Synthetic section",
+		Path:  []string{"Synthetic document", "Synthetic section"},
+		Order: 1,
+		Role:  "body",
+		Text:  "Synthetic citation text.",
+	})
+	if err != nil {
+		t.Fatalf("evidence.NewSection() error = %v", err)
+	}
+	document, err := evidence.NewDocumentVersion(evidence.DocumentVersionInput{
+		Provider:           "synthetic",
+		ProviderDocumentID: "document-1",
+		Title:              "Synthetic document",
+		Locator:            "synthetic://document-1",
+		ProviderVersion:    "version-1",
+		ModifiedAt:         recordedAt,
+		RecordedAt:         recordedAt,
+		Sections:           []evidence.Section{section},
+	})
+	if err != nil {
+		t.Fatalf("evidence.NewDocumentVersion() error = %v", err)
+	}
+	span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
+		Document:    document,
+		SectionID:   section.ID(),
+		StartOffset: 0,
+		EndOffset:   len(section.Text()),
+		Quote:       section.Text(),
+		RecordedAt:  recordedAt,
+	})
+	if err != nil {
+		t.Fatalf("evidence.NewEvidenceSpan() error = %v", err)
+	}
+
+	sourceID := deriveOpaqueID(
+		sourceDocumentIDVersion,
+		[]byte(document.Provider()),
+		[]byte(document.ProviderDocumentID()),
+	)
+	documentDigest := document.Digest()
+	versionID := deriveOpaqueID(
+		documentVersionIDVersion,
+		[]byte(sourceID),
+		[]byte(document.DigestVersion()),
+		documentDigest[:],
+	)
+	spanDigest := span.Digest()
+	reader := &observationEvidenceReader{
+		rowValues: [][]any{
+			{
+				versionID,
+				section.ID(),
+				span.DigestVersion(),
+				spanDigest[:],
+				span.StartOffset(),
+				span.EndOffset(),
+				span.Text(),
+				span.RecordedAt(),
+			},
+			{
+				sourceID,
+				document.Provider(),
+				document.ProviderDocumentID(),
+				document.DigestVersion(),
+				documentDigest[:],
+				document.Title(),
+				document.Locator(),
+				document.ProviderVersion(),
+				document.ModifiedAt(),
+				nil,
+				document.RecordedAt(),
+			},
+		},
+		queryValues: [][][]any{
+			{{
+				section.ID(),
+				section.Title(),
+				section.ParentID(),
+				section.Path(),
+				section.Order(),
+				section.Role(),
+				section.Text(),
+			}},
+			nil,
+		},
+	}
+
+	record, err := loadObservationEvidenceRecord(
+		context.Background(),
+		reader,
+		observation.EvidenceLink{
+			EvidenceID: span.ID(),
+			Role:       observation.EvidenceSupporting,
+		},
+		make(map[string]DocumentVersionRecord),
+	)
+	if err != nil {
+		t.Fatalf("loadObservationEvidenceRecord() error = %v", err)
+	}
+	if reader.queryCount != 4 {
+		t.Fatalf("query count = %d, want 4", reader.queryCount)
+	}
+	if record.Span != span ||
+		record.Role != observation.EvidenceSupporting ||
+		record.SourceDocumentID != sourceID ||
+		record.DocumentVersionID != versionID ||
+		record.SectionID != section.ID() ||
+		record.SectionTitle != section.Title() ||
+		record.SectionOrder != section.Order() ||
+		record.SectionRole != section.Role() {
+		t.Fatalf("record = %#v, want canonical span and provenance", record)
+	}
+	if fmt.Sprint(record.SectionPath) != fmt.Sprint(section.Path()) {
+		t.Fatalf("section path = %#v, want %#v", record.SectionPath, section.Path())
+	}
+}
+
+type observationEvidenceReader struct {
+	rowValues   [][]any
+	queryValues [][][]any
+	queryCount  int
+	rowIndex    int
+	queryIndex  int
+}
+
+func (reader *observationEvidenceReader) Query(
+	context.Context,
+	string,
+	...any,
+) (pgx.Rows, error) {
+	reader.queryCount++
+	if reader.queryIndex >= len(reader.queryValues) {
+		return nil, fmt.Errorf("unexpected Query call %d", reader.queryCount)
+	}
+	values := reader.queryValues[reader.queryIndex]
+	reader.queryIndex++
+	return &temporalQueryFakeRows{values: values}, nil
+}
+
+func (reader *observationEvidenceReader) QueryRow(
+	context.Context,
+	string,
+	...any,
+) pgx.Row {
+	reader.queryCount++
+	if reader.rowIndex >= len(reader.rowValues) {
+		return observationEvidenceRow{err: fmt.Errorf(
+			"unexpected QueryRow call %d",
+			reader.queryCount,
+		)}
+	}
+	values := reader.rowValues[reader.rowIndex]
+	reader.rowIndex++
+	return observationEvidenceRow{values: values}
+}
+
+type observationEvidenceRow struct {
+	values []any
+	err    error
+}
+
+func (row observationEvidenceRow) Scan(destinations ...any) error {
+	if row.err != nil {
+		return row.err
+	}
+	if len(destinations) != len(row.values) {
+		return fmt.Errorf(
+			"scan destination count = %d, want %d",
+			len(destinations),
+			len(row.values),
+		)
+	}
+	for index, destination := range destinations {
+		if err := assignTemporalQueryValue(destination, row.values[index]); err != nil {
+			return fmt.Errorf("scan column %d: %w", index, err)
+		}
+	}
+	return nil
 }
 
 type authorityReader struct {
