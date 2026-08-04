@@ -378,49 +378,53 @@ func loadObservationEvidenceRecords(
 	links := value.EvidenceLinks()
 	records := make([]ObservationEvidenceRecord, 0, len(links))
 	for _, link := range links {
-		span, err := loadEvidenceSpanWithDocumentCache(
+		record, err := loadObservationEvidenceRecord(
 			ctx,
 			reader,
-			link.EvidenceID,
+			link,
 			documentVersions,
 		)
 		if err != nil {
 			return nil, err
 		}
-		var record ObservationEvidenceRecord
-		record.Span = span
-		record.Role = link.Role
-		if err := reader.QueryRow(ctx, `
-			SELECT
-				source.id,
-				evidence.document_version_id,
-				section.section_id,
-				section.title,
-				section.path,
-				section.section_order,
-				section.role
-			FROM stacks_core.evidence_spans AS evidence
-			JOIN stacks_core.document_versions AS version
-			  ON version.id = evidence.document_version_id
-			JOIN stacks_core.source_documents AS source
-			  ON source.id = version.source_document_id
-			JOIN stacks_core.document_sections AS section
-			  ON section.document_version_id = evidence.document_version_id
-			 AND section.section_id = evidence.section_id
-			WHERE evidence.id = $1`,
-			link.EvidenceID,
-		).Scan(
-			&record.SourceDocumentID,
-			&record.DocumentVersionID,
-			&record.SectionID,
-			&record.SectionTitle,
-			&record.SectionPath,
-			&record.SectionOrder,
-			&record.SectionRole,
-		); err != nil {
-			return nil, err
-		}
 		records = append(records, record)
 	}
 	return records, nil
+}
+
+func loadObservationEvidenceRecord(
+	ctx context.Context,
+	reader documentReader,
+	link observation.EvidenceLink,
+	documentVersions map[string]DocumentVersionRecord,
+) (ObservationEvidenceRecord, error) {
+	span, document, err := loadEvidenceSpanAndDocumentWithCache(
+		ctx,
+		reader,
+		link.EvidenceID,
+		documentVersions,
+	)
+	if err != nil {
+		return ObservationEvidenceRecord{}, err
+	}
+	for _, section := range document.Version.Sections() {
+		if section.ID() != span.SectionID() {
+			continue
+		}
+		return ObservationEvidenceRecord{
+			Span:              span,
+			Role:              link.Role,
+			SourceDocumentID:  document.Ref.SourceDocumentID,
+			DocumentVersionID: document.Ref.VersionID,
+			SectionID:         section.ID(),
+			SectionTitle:      section.Title(),
+			SectionPath:       section.Path(),
+			SectionOrder:      section.Order(),
+			SectionRole:       section.Role(),
+		}, nil
+	}
+	return ObservationEvidenceRecord{}, fmt.Errorf(
+		"stored evidence section: %w",
+		ErrConflict,
+	)
 }

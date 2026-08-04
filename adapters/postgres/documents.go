@@ -874,6 +874,21 @@ func loadEvidenceSpanWithDocumentCache(
 	id evidence.EvidenceID,
 	documentVersions map[string]DocumentVersionRecord,
 ) (evidence.EvidenceSpan, error) {
+	span, _, err := loadEvidenceSpanAndDocumentWithCache(
+		ctx,
+		reader,
+		id,
+		documentVersions,
+	)
+	return span, err
+}
+
+func loadEvidenceSpanAndDocumentWithCache(
+	ctx context.Context,
+	reader documentReader,
+	id evidence.EvidenceID,
+	documentVersions map[string]DocumentVersionRecord,
+) (evidence.EvidenceSpan, DocumentVersionRecord, error) {
 	var (
 		versionID, sectionID, storedDigestVersion, quote string
 		storedDigest                                     []byte
@@ -903,11 +918,11 @@ func loadEvidenceSpanWithDocumentCache(
 		&quote,
 		&recordedAt,
 	); err != nil {
-		return evidence.EvidenceSpan{}, err
+		return evidence.EvidenceSpan{}, DocumentVersionRecord{}, err
 	}
 	recordedAt, err := canonicalStoredTime(recordedAt)
 	if err != nil {
-		return evidence.EvidenceSpan{}, err
+		return evidence.EvidenceSpan{}, DocumentVersionRecord{}, err
 	}
 	document, err := loadDocumentVersionRecordCached(
 		ctx,
@@ -917,7 +932,7 @@ func loadEvidenceSpanWithDocumentCache(
 		loadDocumentVersionRecord,
 	)
 	if err != nil {
-		return evidence.EvidenceSpan{}, err
+		return evidence.EvidenceSpan{}, DocumentVersionRecord{}, err
 	}
 	span, err := evidence.NewEvidenceSpan(evidence.EvidenceSpanInput{
 		Document:    document.Version,
@@ -928,14 +943,20 @@ func loadEvidenceSpanWithDocumentCache(
 		RecordedAt:  recordedAt,
 	})
 	if err != nil {
-		return evidence.EvidenceSpan{}, fmt.Errorf("validate stored evidence span: %w", err)
+		return evidence.EvidenceSpan{}, DocumentVersionRecord{}, fmt.Errorf(
+			"validate stored evidence span: %w",
+			err,
+		)
 	}
 	if span.ID() != id ||
 		span.DigestVersion() != storedDigestVersion ||
 		!sameDigestBytes(span.Digest(), storedDigest) {
-		return evidence.EvidenceSpan{}, fmt.Errorf("stored evidence span: %w", ErrConflict)
+		return evidence.EvidenceSpan{}, DocumentVersionRecord{}, fmt.Errorf(
+			"stored evidence span: %w",
+			ErrConflict,
+		)
 	}
-	return span, nil
+	return span, document, nil
 }
 
 func loadDocumentVersionRecordCached(
