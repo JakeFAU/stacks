@@ -76,23 +76,16 @@ func TestSchemasRejectWhitespacePaddedModelLocalIdentifiers(t *testing.T) {
 	}
 }
 
-func TestPromptVersionsAreEmbeddedAndExplicit(t *testing.T) {
-	for _, test := range []struct {
-		version string
-		want    string
-	}{
-		{version: ExtractionPromptVersion, want: "UTF-8 byte offsets"},
-	} {
-		prompt, err := Prompt(test.version)
-		if err != nil {
-			t.Fatalf("Prompt(%q) error = %v", test.version, err)
-		}
-		if !strings.Contains(prompt, test.want) {
-			t.Fatalf("Prompt(%q) does not contain %q", test.version, test.want)
-		}
+func TestPromptContractProvidesEmbeddedCurrentPrompt(t *testing.T) {
+	contract, err := PromptContract(ExtractionPromptVersion)
+	if err != nil {
+		t.Fatalf("PromptContract(%q) error = %v", ExtractionPromptVersion, err)
 	}
-	if _, err := Prompt("unknown-v1"); err == nil {
-		t.Fatal("Prompt(unknown) error = nil")
+	if !strings.Contains(contract.SystemPrompt, "UTF-8 byte offsets") {
+		t.Fatalf("PromptContract(%q) prompt does not contain byte-offset guidance", ExtractionPromptVersion)
+	}
+	if _, err := PromptContract("unknown-v1"); err == nil {
+		t.Fatal("PromptContract(unknown) error = nil")
 	}
 }
 

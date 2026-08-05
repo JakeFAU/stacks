@@ -67,15 +67,6 @@ type Response struct {
 	Outcome       string
 }
 
-// Prompt returns the embedded, reviewable prompt for an exact version.
-func Prompt(version string) (string, error) {
-	contract, err := PromptContract(version)
-	if err != nil {
-		return "", err
-	}
-	return contract.SystemPrompt, nil
-}
-
 // PromptContract returns the exact reviewed prompt and schema pairing for a
 // supported version.
 func PromptContract(version string) (Contract, error) {
