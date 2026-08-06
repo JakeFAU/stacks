@@ -387,24 +387,55 @@ func (transaction *Transaction) AppendResolutionDecision(
 	); err != nil {
 		return wrapIdentityError(ctx, "insert resolution decision", conflictError(err))
 	}
-	for _, assertion := range aliases {
-		alias := assertion.Alias()
-		if _, err := transaction.transaction.Exec(ctx, `
-			INSERT INTO stacks_core.entity_alias_assertions (
-				id, decision_id, entity_id, alias_type, alias_value, recorded_at
-			)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			assertion.ID(),
-			assertion.DecisionID(),
-			assertion.EntityID(),
-			alias.Type,
-			alias.Value,
-			assertion.RecordedAt(),
-		); err != nil {
-			return wrapIdentityError(ctx, "insert entity alias assertion", conflictError(err))
-		}
+	if err := insertEntityAliasAssertions(ctx, transaction.transaction, aliases); err != nil {
+		return wrapIdentityError(ctx, "insert entity alias assertion", conflictError(err))
 	}
 	return nil
+}
+
+type entityAliasAssertionExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func insertEntityAliasAssertions(
+	ctx context.Context,
+	executor entityAliasAssertionExecutor,
+	assertions []identity.AliasAssertion,
+) error {
+	if len(assertions) == 0 {
+		return nil
+	}
+	ids := make([]string, len(assertions))
+	decisionIDs := make([]string, len(assertions))
+	entityIDs := make([]string, len(assertions))
+	types := make([]string, len(assertions))
+	values := make([]string, len(assertions))
+	recordedAt := make([]time.Time, len(assertions))
+	for index, assertion := range assertions {
+		alias := assertion.Alias()
+		ids[index] = string(assertion.ID())
+		decisionIDs[index] = string(assertion.DecisionID())
+		entityIDs[index] = string(assertion.EntityID())
+		types[index] = string(alias.Type)
+		values[index] = alias.Value
+		recordedAt[index] = assertion.RecordedAt()
+	}
+	_, err := executor.Exec(ctx, `
+		INSERT INTO stacks_core.entity_alias_assertions (
+			id, decision_id, entity_id, alias_type, alias_value, recorded_at
+		)
+		SELECT id, decision_id, entity_id, alias_type, alias_value, recorded_at
+		FROM unnest(
+			$1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[]
+		) AS assertion(id, decision_id, entity_id, alias_type, alias_value, recorded_at)`,
+		ids,
+		decisionIDs,
+		entityIDs,
+		types,
+		values,
+		recordedAt,
+	)
+	return err
 }
 
 func lockResolutionProposalAuthority(
