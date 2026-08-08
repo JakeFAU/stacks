@@ -82,6 +82,9 @@ func (client *Client) List(ctx context.Context, folderID string) ([]source.Docum
 			if file == nil {
 				continue
 			}
+			if strings.TrimSpace(file.Id) == "" {
+				return nil, errors.New("list direct Google Docs: invalid response")
+			}
 			modifiedAt, err := parseModifiedTime(file.ModifiedTime)
 			if err != nil {
 				return nil, err

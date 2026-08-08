@@ -405,6 +405,37 @@ func TestListRedactsInvalidModifiedTime(t *testing.T) {
 	}
 }
 
+func TestListRejectsMissingDocumentIDWithoutDisclosingMetadata(t *testing.T) {
+	const privateTitle = "secret-provider-document-title"
+	tests := []struct {
+		name   string
+		idJSON string
+	}{
+		{name: "omitted"},
+		{name: "whitespace", idJSON: `"id":" \t",`},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return jsonResponse(request, `{"files":[{`+testCase.idJSON+`"name":"`+privateTitle+`"}]}`), nil
+			})}
+			client := newTestClient(t, httpClient, NewTabClassifier(nil, nil))
+
+			_, err := client.List(context.Background(), "folder-1")
+			if err == nil {
+				t.Fatal("List() error = nil, want missing document ID rejection")
+			}
+			if err.Error() != "list direct Google Docs: invalid response" {
+				t.Fatalf("List() error = %q, want bounded invalid-response error", err)
+			}
+			if strings.Contains(err.Error(), privateTitle) {
+				t.Fatalf("List() error disclosed provider metadata: %v", err)
+			}
+		})
+	}
+}
+
 func TestGetRedactsDocumentIDFromFetchErrors(t *testing.T) {
 	const (
 		secretDocumentID = "secret-fetch-document-id"
