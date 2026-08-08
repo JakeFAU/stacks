@@ -589,23 +589,138 @@ func (database *Database) LoadResolutionDecision(
 func (database *Database) EntitySnapshots(
 	ctx context.Context,
 ) ([]identity.EntitySnapshot, error) {
-	records, err := database.ListEntities(ctx)
+	if err := contextRequired(ctx, "list entities"); err != nil {
+		return nil, err
+	}
+	if database == nil || database.pool == nil {
+		return nil, fmt.Errorf("list entities: database is closed")
+	}
+	snapshots, err := loadEntitySnapshots(ctx, database.pool)
+	if err != nil {
+		return nil, wrapIdentityError(ctx, "load entity snapshots", err)
+	}
+	return snapshots, nil
+}
+
+func loadEntitySnapshots(
+	ctx context.Context,
+	reader documentReader,
+) ([]identity.EntitySnapshot, error) {
+	rows, err := reader.Query(ctx, `
+		SELECT
+			entity.id,
+			entity.kind,
+			entity.display_name,
+			entity.recorded_at,
+			assertion.id,
+			assertion.decision_id,
+			assertion.alias_type,
+			assertion.alias_value,
+			assertion.recorded_at
+		FROM stacks_core.entities AS entity
+		LEFT JOIN stacks_core.entity_alias_assertions AS assertion
+		  ON assertion.entity_id = entity.id
+		 AND EXISTS (
+			SELECT 1
+			FROM stacks_core.resolution_decisions AS decision
+			WHERE decision.id = assertion.decision_id
+			  AND decision.outcome = 'accepted'
+			  AND decision.entity_id = assertion.entity_id
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM stacks_core.resolution_decisions AS successor
+				WHERE successor.supersedes_id = decision.id
+			  )
+		 )
+		ORDER BY
+			entity.recorded_at,
+			entity.id,
+			assertion.recorded_at,
+			assertion.id`)
 	if err != nil {
 		return nil, err
 	}
-	snapshots := make([]identity.EntitySnapshot, len(records))
-	for index, record := range records {
-		aliases := make([]identity.Alias, len(record.Aliases))
-		for aliasIndex, assertion := range record.Aliases {
-			aliases[aliasIndex] = assertion.Alias()
+	defer rows.Close()
+
+	snapshots := make([]identity.EntitySnapshot, 0)
+	var currentEntityID identity.EntityID
+	for rows.Next() {
+		var (
+			entityID              identity.EntityID
+			kind                  identity.Kind
+			displayName           string
+			entityRecordedAt      time.Time
+			aliasID, decisionID   *string
+			aliasType, aliasValue *string
+			aliasRecordedAt       *time.Time
+		)
+		if err := rows.Scan(
+			&entityID,
+			&kind,
+			&displayName,
+			&entityRecordedAt,
+			&aliasID,
+			&decisionID,
+			&aliasType,
+			&aliasValue,
+			&aliasRecordedAt,
+		); err != nil {
+			return nil, err
 		}
-		snapshots[index] = identity.EntitySnapshot{
-			ID:          string(record.Entity.ID()),
-			Kind:        record.Entity.Kind(),
-			DisplayName: record.Entity.DisplayName(),
-			RecordedAt:  record.Entity.RecordedAt(),
-			Aliases:     aliases,
+		if len(snapshots) == 0 || entityID != currentEntityID {
+			entityRecordedAt, err = canonicalStoredTime(entityRecordedAt)
+			if err != nil {
+				return nil, err
+			}
+			entity, err := identity.NewEntity(identity.EntityInput{
+				ID:          entityID,
+				Kind:        kind,
+				DisplayName: displayName,
+				RecordedAt:  entityRecordedAt,
+			})
+			if err != nil {
+				return nil, err
+			}
+			snapshots = append(snapshots, identity.EntitySnapshot{
+				ID:          string(entity.ID()),
+				Kind:        entity.Kind(),
+				DisplayName: entity.DisplayName(),
+				RecordedAt:  entity.RecordedAt(),
+				Aliases:     make([]identity.Alias, 0),
+			})
+			currentEntityID = entityID
 		}
+		if aliasID == nil {
+			if decisionID != nil || aliasType != nil || aliasValue != nil || aliasRecordedAt != nil {
+				return nil, fmt.Errorf("stored entity alias assertion is incomplete")
+			}
+			continue
+		}
+		if decisionID == nil || aliasType == nil || aliasValue == nil || aliasRecordedAt == nil {
+			return nil, fmt.Errorf("stored entity alias assertion is incomplete")
+		}
+		canonicalAliasRecordedAt, err := canonicalStoredTime(*aliasRecordedAt)
+		if err != nil {
+			return nil, err
+		}
+		assertion, err := identity.NewAliasAssertion(identity.AliasAssertionInput{
+			ID:         identity.AliasAssertionID(*aliasID),
+			DecisionID: identity.DecisionID(*decisionID),
+			EntityID:   entityID,
+			Alias: identity.Alias{
+				Type:  identity.AliasType(*aliasType),
+				Value: *aliasValue,
+			},
+			RecordedAt: canonicalAliasRecordedAt,
+		})
+		if err != nil {
+			return nil, err
+		}
+		last := len(snapshots) - 1
+		snapshots[last].Aliases = append(snapshots[last].Aliases, assertion.Alias())
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return snapshots, nil
 }
