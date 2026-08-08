@@ -83,6 +83,32 @@ func TestSyncPreservesBoundedCancellationFromSourceList(t *testing.T) {
 	}
 }
 
+func TestSyncRejectsFetchedDocumentWithDifferentIdentityBeforeModelOrStorage(t *testing.T) {
+	const listedDocumentID = "document-listed"
+	repository := newMemoryRepository()
+	model := &recordingModel{}
+	service := testServiceWithSource(&memorySource{
+		listed: []source.Document{{Provider: "drive", ID: listedDocumentID}},
+		fetched: map[string]source.Document{
+			listedDocumentID: syntheticDocument("document-fetched", "Synthetic source."),
+		},
+	}, repository, model)
+
+	summary, err := service.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if len(summary.Results) != 1 ||
+		summary.Results[0].DocumentID != listedDocumentID ||
+		summary.Results[0].Outcome != OutcomeFailed ||
+		summary.Results[0].FailureCode != FailureInvalidSource {
+		t.Fatalf("summary results = %#v, want mismatched source identity failure", summary.Results)
+	}
+	if model.calls != 0 || repository.prepareClaims != 0 {
+		t.Fatalf("model/prepare calls = %d/%d, want 0/0", model.calls, repository.prepareClaims)
+	}
+}
+
 func TestSyncPreservesCancellationDuringDocumentProcessing(t *testing.T) {
 	const privateValue = "private dependency cancellation detail"
 	wrappedCancellation := fmt.Errorf("%s: %w", privateValue, context.DeadlineExceeded)
